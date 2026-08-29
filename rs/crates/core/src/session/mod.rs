@@ -19,3 +19,5 @@ pub mod pty;
 pub mod replay;
 pub mod screen;
 pub mod spawn;
+/// The blocking client transport the daemon protocol rides on (UDS / named pipe).
+pub mod transport;

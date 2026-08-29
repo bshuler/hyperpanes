@@ -451,19 +451,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let (etx, erx) = unbounded_channel::<SessionEvent>();
-    // Backend selection (session-daemon-plan M4 — daemon DEFAULT-ON on unix): sessions run in
+    // Backend selection (session-daemon-plan M4 — daemon DEFAULT-ON everywhere): sessions run in
     // the PTY-owning daemon so they survive a GUI crash. Opt OUT with HYPERPANES_SESSION_DAEMON=0
-    // (forces today's in-process path); opt IN on any platform with =1. On Windows the named-pipe
-    // transport is not yet verified (WINDOWS-CI-PENDING), so the default there stays in-process
-    // until it lands. Selected ONCE here — the GUI's `Arc<SessionManager>` and every call site are
-    // backend-agnostic. The daemon is keyed by the SAME `salt` (the user-data dir) as the
+    // (forces today's in-process path); opt IN on any platform with =1. Default-on everywhere:
+    // unix rides a UDS, Windows a named pipe, and on Windows the ConPTYs additionally live in a
+    // pty-host process so a daemon upgrade never touches them. Selected ONCE here — the GUI's
+    // `Arc<SessionManager>` and every call site are backend-agnostic. The daemon is keyed by the SAME `salt` (the user-data dir) as the
     // single-instance gate above, so a dev/isolated instance gets its own daemon. A connect/spawn
     // failure falls back to in-process rather than blocking launch — the daemon is an enhancement,
     // never a hard dependency.
     let want_daemon = match std::env::var("HYPERPANES_SESSION_DAEMON").ok().as_deref() {
         Some("1") => true,
         Some("0") => false,
-        _ => cfg!(unix),
+        _ => true,
     };
     let mgr = Arc::new(if want_daemon {
         match SessionManager::new_daemon(etx.clone(), &salt) {
@@ -899,6 +899,25 @@ mod tests {
         assert_eq!(
             session_daemon_salt(&argv(&["hyperpanes", "--session-daemon=/data/dir"])),
             Some("/data/dir".to_string())
+        );
+    }
+
+    // The Windows pty-host is spawned as a daemon whose salt carries a `\u{1}pty-host`
+    // marker, so the flag must pass a salt through byte-for-byte — no trimming, no splitting
+    // on anything but the argv boundary the OS already drew.
+    #[test]
+    fn session_daemon_salt_passes_the_pty_host_marker_through_verbatim() {
+        let marked = "/data/dir\u{1}pty-host";
+        assert_eq!(
+            session_daemon_salt(&argv(&["hyperpanes", "--session-daemon", marked])),
+            Some(marked.to_string())
+        );
+        assert_eq!(
+            session_daemon_salt(&argv(&[
+                "hyperpanes",
+                &format!("--session-daemon={marked}")
+            ])),
+            Some(marked.to_string())
         );
     }
 

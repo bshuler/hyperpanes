@@ -122,13 +122,21 @@ On GUI launch with a live daemon:
    → This requires the autosave snapshot to also record each pane's **session uid** (and ideally its
    spawn command, already noted as a gap in the crash-recovery work) so restore can match.
 
-## Windows
+## Windows *(built — see `mux-backend-plan.md` M1 for the upgrade story)*
 
-- Transport: named pipe (`\\.\pipe\hyperpanesd-<salt>`), the sibling already sketched in
-  `single_instance`.
-- PTY: `portable-pty`'s ConPTY in the daemon; the bundled ConPTY redistributable ships next to the
-  exe and the daemon is the same exe, so it's found.
-- Detach: `CREATE_NO_WINDOW | DETACHED_PROCESS`.
+- Transport: named pipe (`\\.\pipe\hyperpanesd.<hash>`), same FNV-1a salt token as the unix socket
+  name. `session/transport.rs` is the only cfg'd layer; the whole client above it is shared.
+- One-daemon-per-salt: `first_pipe_instance(true)` — the OS grants the name to one server and gives
+  everyone else `ERROR_ACCESS_DENIED`, mapped to `AddrInUse` so it reads like the unix flock. No
+  named mutex needed (that was only required by `single_instance`, which detects by *connecting*).
+- PTY: `portable-pty`'s ConPTY — but owned by a separate **pty-host** process, not the daemon, so a
+  daemon upgrade never touches a live terminal (`HPCON` cannot cross a process boundary, so the
+  process that holds it must never be replaced). The host is just a daemon whose salt carries a
+  `\u{1}pty-host` marker, launched through the same `--session-daemon <salt>` path.
+- Bounded reads: named pipes have no `SO_RCVTIMEO`, so the version probe peeks with
+  `PeekNamedPipe` until a whole frame is buffered — peeking consumes nothing, so a timeout leaves
+  the stream byte-exact.
+- Detach: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW`.
 
 ## Security
 
@@ -147,7 +155,7 @@ user SID). No network surface. Same trust boundary as the existing single-instan
 - **M2 — reconnect & re-attach.** Record session uid (+ spawn command) in the autosave snapshot; on
   launch, attach surviving sessions and replay into fresh grids. **The crash-survival demo.**
 - **M3 — lifecycle hardening.** idle-exit, daemon crash/restart, proto-version handshake, Windows named
-  pipes, `--kill-daemon`, quit-vs-keep-alive preference, socket perms.
+  pipes ✅, `--kill-daemon`, quit-vs-keep-alive preference, socket perms.
 - **M4 — default on.** Flip `HYPERPANES_SESSION_DAEMON` to default; keep the in-process path as a
   `--no-daemon` fallback (headless/CI, or daemon-spawn failure).
 

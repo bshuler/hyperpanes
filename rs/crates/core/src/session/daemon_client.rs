@@ -4,7 +4,7 @@
 //! [session daemon](crate::session::daemon) (which owns the PTYs) and presents the same
 //! create/write/resize/kill/replay/render_screen/… API so the GUI's `Arc<SessionManager>`
 //! and every call site are untouched (the backend is chosen behind
-//! `HYPERPANES_SESSION_DAEMON=1` — see [`SessionManager::new_daemon`]).
+//! `HYPERPANES_SESSION_DAEMON`, default-on — see [`SessionManager::new_daemon`]).
 //!
 //! ## Keeping the synchronous API non-blocking
 //! The plan's "Keeping `SessionManager`'s synchronous API non-blocking" table is the spec
@@ -35,48 +35,45 @@
 //! the in-process path feeds it); request/response replies (`Sessions` / `Replay` /
 //! `Screen` / `Hello` / `Pong` / `Created`) go to a reply channel a waiting caller drains.
 //!
-//! Unix-only in M1 (the daemon transport is a UDS; Windows named pipes are M3). The
-//! non-unix build provides a stub `new`/`new_connected` that errors, so the enum compiles.
+//! ## Portability
+//! Everything above is platform-neutral: the connection is a
+//! [`transport::Conn`](crate::session::transport::Conn) — a `UnixStream` on unix, a
+//! named-pipe `File` on Windows — and both are blocking, cloneable and bidirectional, so
+//! the write-half-behind-a-mutex plus reader-thread design is shared verbatim. Only
+//! [`transport`](crate::session::transport) is cfg'd.
+//!
+//! One knob is platform-shaped: [`VersionPolicy`]. The GUI→daemon link is `LockStep` (a
+//! version mismatch means a stale daemon, which is handed over or torn down); the Windows
+//! daemon→pty-host link is `Tolerant`, because the host is an *older build by design* — it
+//! outlives daemon upgrades so the ConPTYs it owns are never touched.
 
-#[cfg(unix)]
 use std::collections::HashMap;
 use std::io;
-#[cfg(unix)]
-use std::path::Path;
-#[cfg(unix)]
 use std::sync::mpsc::{Receiver, Sender};
-#[cfg(unix)]
 use std::sync::{Arc, Mutex};
-#[cfg(unix)]
 use std::time::{Duration, Instant};
 
-#[cfg(unix)]
 use tokio::sync::mpsc::UnboundedSender;
 
-#[cfg(unix)]
 use crate::session::proto::{read_frame, write_frame, ClientMsg, DaemonMsg, SpawnSpec, PROTO_VER};
-#[cfg(unix)]
 use crate::session::replay::Replay;
-#[cfg(unix)]
+use crate::session::transport::{self, Conn, Endpoint};
 use crate::session_manager::{SessionEvent, SpawnOptions};
 
 /// How long [`render_screen`](DaemonSessionManager::render_screen) waits for the daemon's
 /// `Screen` reply before giving up (returning `None`). Generous — a screen serialize is
 /// cheap daemon-side — but bounded so a wedged daemon can't hang a control read forever.
-#[cfg(unix)]
 const SCREEN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Total time [`connect_or_spawn`] will keep retrying the connect after spawning the
 /// daemon, before giving up. The daemon binds its socket within a few ms of launch, but a
 /// cold `current_exe` start (plus the Tokio runtime build) can take longer, so we allow a
 /// comfortable margin with exponential-ish backoff.
-#[cfg(unix)]
 const SPAWN_CONNECT_BUDGET: Duration = Duration::from_secs(5);
 
 /// Per-uid client-side shadow of a session's read-path state (the plan's "client shadow"):
 /// what `has`/`uids`/`output_bytes`/`last_output_at`/cwd are answered from, plus the
 /// `replay` mirror buffer. All maintained from the event stream so reads never touch I/O.
-#[cfg(unix)]
 struct Shadow {
     /// Rolling mirror of recent output, grown by `Data` events and seeded once from the
     /// `Attach` reply — the local source for `replay()` (no round-trip).
@@ -89,7 +86,6 @@ struct Shadow {
     cwd: Option<String>,
 }
 
-#[cfg(unix)]
 impl Shadow {
     fn new() -> Self {
         Self {
@@ -105,11 +101,10 @@ impl Shadow {
 /// but the PTYs live in the [session daemon](crate::session::daemon) so they survive a GUI
 /// crash. Owns one socket (a `Mutex`'d write half for requests) plus a reader thread that
 /// maintains the shadow/mirror and forwards events to the GUI channel.
-#[cfg(unix)]
 pub struct DaemonSessionManager {
     /// The write half of the socket, serialized so concurrent `write`/`resize`/… frames
     /// from different threads never interleave on the wire.
-    write_half: Mutex<std::os::unix::net::UnixStream>,
+    write_half: Mutex<Conn>,
     /// The per-uid shadow + replay mirror — read by every hot-path accessor, written by the
     /// reader thread (events) and `create` (immediate insert).
     shadows: Arc<Mutex<HashMap<String, Shadow>>>,
@@ -123,7 +118,6 @@ pub struct DaemonSessionManager {
     _reader: std::thread::JoinHandle<()>,
 }
 
-#[cfg(unix)]
 impl DaemonSessionManager {
     /// Connect to the daemon serving `salt`, spawning it (detached) if none is listening,
     /// then start the reader thread and seed the shadow from `ListSessions`. Streamed
@@ -138,14 +132,39 @@ impl DaemonSessionManager {
     /// ([`tear_down_stale_daemon`]) and respawn a fresh one, then retry. Bounded retries
     /// guard against a wedged respawn loop.
     pub fn new(events: UnboundedSender<SessionEvent>, salt: &str) -> io::Result<Self> {
-        let socket = crate::session::daemon::socket_path_for(salt);
+        Self::new_with_policy(events, salt, VersionPolicy::LockStep)
+    }
+
+    /// Connect to the daemon serving `salt` under an explicit [`VersionPolicy`].
+    ///
+    /// [`VersionPolicy::LockStep`] is [`new`](Self::new): a version mismatch means a stale
+    /// build of our own binary is holding the salt, and it is upgraded (or, failing that, torn
+    /// down) before we proceed. [`VersionPolicy::Tolerant`] is the pty-host link on Windows,
+    /// where an older peer is the *point* — see that variant's docs.
+    pub fn new_with_policy(
+        events: UnboundedSender<SessionEvent>,
+        salt: &str,
+        policy: VersionPolicy,
+    ) -> io::Result<Self> {
+        let endpoint = transport::endpoint_for(salt);
         // Up to a couple of respawn rounds: a single mismatch should resolve in one
         // tear-down + respawn; more than that means something is wrong (e.g. two GUIs of
         // different versions fighting), and we just proceed with whatever answers last.
         for attempt in 0..3 {
-            let stream = connect_or_spawn(&socket, salt)?;
+            let stream = connect_or_spawn(&endpoint, salt)?;
             match probe_proto_version(&stream)? {
                 ProtoCheck::Match => return Self::from_stream(stream, events),
+                ProtoCheck::Mismatch { daemon_ver } if policy == VersionPolicy::Tolerant => {
+                    // Deliberate: the peer is a pty-host from an older build, still holding
+                    // live ConPTYs. Replacing it is exactly what we must NOT do — every
+                    // terminal in it would die. The host surface is frozen (see
+                    // `VersionPolicy::Tolerant`), so an older host is safe to drive.
+                    dbg(&format!(
+                        "pty-host proto skew (client {PROTO_VER}, host {daemon_ver}); \
+                         proceeding — the host surface is version-stable by contract"
+                    ));
+                    return Self::from_stream(stream, events);
+                }
                 ProtoCheck::Mismatch { daemon_ver } => {
                     // The daemon is a stale version of our own binary. Prefer the LIVE UPGRADE
                     // (M1): spawn a daemon from the new binary and let it take the sessions —
@@ -158,9 +177,9 @@ impl DaemonSessionManager {
                          attempting live takeover (attempt {attempt})"
                     ));
                     drop(stream);
-                    if !hand_over_stale_daemon(salt, &socket) {
+                    if !hand_over_stale_daemon(salt, &endpoint) {
                         dbg("takeover did not yield a matching daemon; tearing down instead");
-                        tear_down_stale_daemon(&socket, salt);
+                        tear_down_stale_daemon(&endpoint, salt);
                     }
                     // Loop: connect_or_spawn will start a fresh daemon if none is now up.
                 }
@@ -169,18 +188,15 @@ impl DaemonSessionManager {
         // Last resort after exhausting respawns: connect and proceed regardless of version, so
         // a transient mismatch never hard-blocks launch (the GUI still falls back to in-process
         // upstream if even this errors).
-        let stream = connect_or_spawn(&socket, salt)?;
+        let stream = connect_or_spawn(&endpoint, salt)?;
         Self::from_stream(stream, events)
     }
 
     /// Build a manager over an already-connected socket — the seam tests use with an
     /// in-process daemon on a temp socket (no spawn/discovery). Sends the `Hello`
     /// handshake, starts the reader, and seeds the shadow from a `ListSessions`.
-    pub fn from_stream(
-        stream: std::os::unix::net::UnixStream,
-        events: UnboundedSender<SessionEvent>,
-    ) -> io::Result<Self> {
-        let read_half = stream.try_clone()?;
+    pub fn from_stream(stream: Conn, events: UnboundedSender<SessionEvent>) -> io::Result<Self> {
+        let read_half = transport::try_clone(&stream)?;
         let write_half = stream;
 
         let shadows: Arc<Mutex<HashMap<String, Shadow>>> = Arc::default();
@@ -427,9 +443,8 @@ impl DaemonSessionManager {
 /// The reader thread body: decode inbound frames forever, demuxing events (which update the
 /// shadow/mirror and forward to the GUI channel) from replies (which go to the reply
 /// channel). Exits on EOF, a socket error, or a dropped GUI channel.
-#[cfg(unix)]
 fn reader_loop(
-    read_half: std::os::unix::net::UnixStream,
+    read_half: Conn,
     shadows: Arc<Mutex<HashMap<String, Shadow>>>,
     events: UnboundedSender<SessionEvent>,
     replies: Sender<DaemonMsg>,
@@ -473,7 +488,6 @@ fn reader_loop(
 /// Fold one streamed [`SessionEvent`] into the shadow: `Data` grows the mirror + counters,
 /// `Cwd` updates the cached cwd, `Exit` drops the session (mirrors the in-process driver
 /// removing a session from the map on terminal exit, so `has`/`uids` go false).
-#[cfg(unix)]
 fn apply_event_to_shadow(shadows: &Mutex<HashMap<String, Shadow>>, ev: &SessionEvent) {
     let mut shadows = shadows.lock().unwrap();
     match ev {
@@ -503,7 +517,6 @@ fn apply_event_to_shadow(shadows: &Mutex<HashMap<String, Shadow>>, ev: &SessionE
 /// Epoch-ms now — the client's own `last_output_at` stamp (the daemon's
 /// `SessionEvent::Data` doesn't carry a timestamp, and the GUI compares against its own
 /// wall clock anyway, exactly as the in-process `last_output_at` is a local stamp).
-#[cfg(unix)]
 fn epoch_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -515,7 +528,6 @@ fn epoch_ms() -> u64 {
 /// Build the wire [`SpawnSpec`] from [`SpawnOptions`]: PIN the uid (the GUI owns it),
 /// flatten the integration into the spec's resolved `integration_args`/`integration_env`
 /// (the daemon folds them back via [`SpawnSpec::into_options`]), and carry the rest.
-#[cfg(unix)]
 fn spawn_spec_from(opts: SpawnOptions) -> SpawnSpec {
     let (integration_args, integration_env) = match opts.integration {
         Some(i) => (i.args, i.env),
@@ -537,8 +549,34 @@ fn spawn_spec_from(opts: SpawnOptions) -> SpawnSpec {
     }
 }
 
+/// How a client reacts to a daemon whose `proto_ver` is not ours.
+///
+/// Both peers are always builds of *our own* binary — there is no third-party compatibility
+/// burden — so the default is lock-step: the newer side wins and the older one is upgraded in
+/// place (or, if it predates the takeover protocol, torn down).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VersionPolicy {
+    /// Version skew is resolved before use: take the incumbent's sessions over (M1) and, only
+    /// if that fails, tear it down and respawn. The GUI → daemon link.
+    LockStep,
+    /// Version skew is accepted and driven as-is. Used for exactly one link — the Windows
+    /// daemon → **pty-host** connection — where the peer is a *deliberately* un-upgraded
+    /// process: it owns the ConPTYs, which cannot be handed to another process, so it must
+    /// outlive daemon upgrades. That only works if the slice of the protocol the daemon uses
+    /// against a host stays wire-compatible forever:
+    ///
+    /// > **Frozen host surface.** `Hello`, `ListSessions`, `Attach`, `Create`, `Write`,
+    /// > `Resize`, `Kill`, `KillAll`, `RenderScreen`, `Ping`, `Shutdown` and the
+    /// > `Hello`/`Sessions`/`Created`/`Replay`/`Screen`/`Event`/`Pong` replies may gain
+    /// > *optional* fields, and `SessionEvent` may gain variants (unknown ones are dropped by
+    /// > the receiver), but no existing field may change name, type or meaning.
+    ///
+    /// Break that and a Windows upgrade drops every terminal in the host — the one failure
+    /// this whole design exists to prevent.
+    Tolerant,
+}
+
 /// Result of the proto-version handshake probe ([`probe_proto_version`]).
-#[cfg(unix)]
 enum ProtoCheck {
     /// The daemon's `proto_ver` equals the client's [`PROTO_VER`] — proceed.
     Match,
@@ -546,30 +584,28 @@ enum ProtoCheck {
     Mismatch { daemon_ver: u32 },
 }
 
-/// Do a bare `Hello` round-trip on a freshly-connected (NOT yet manager-owned) socket and
-/// compare the daemon's reported `proto_ver` to the client's [`PROTO_VER`]. Used by `new`
-/// BEFORE the manager + reader thread are built, so a mismatch can be resolved by tearing
-/// the stale daemon down and respawning (the lock-step-upgrade contract — the daemon is our
-/// own binary). A handshake that doesn't answer in time is treated as a `Match` (proceed):
-/// the version gate must never hard-block launch over a slow/odd handshake — the worst case
-/// is talking to a same-version daemon we couldn't confirm, which is harmless.
-#[cfg(unix)]
-fn probe_proto_version(stream: &std::os::unix::net::UnixStream) -> io::Result<ProtoCheck> {
-    let mut w = stream.try_clone()?;
-    let mut r = stream.try_clone()?;
-    // A bounded read so a daemon that never answers doesn't wedge the probe. NB: the read
-    // timeout is a SOCKET-level option (`SO_RCVTIMEO`), shared across `try_clone`'d fds AND
-    // the original `stream` the manager later owns — so it MUST be cleared before we return,
-    // or the manager's reader thread would spuriously time out every 2s. We clear it on every
-    // path below (`r.set_read_timeout(None)` on the shared socket).
-    r.set_read_timeout(Some(Duration::from_secs(2)))?;
+/// How long the version probe waits for the daemon's `Hello` before giving up.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Do a bare `Hello` round-trip on a freshly-connected (NOT yet manager-owned) connection
+/// and compare the daemon's reported `proto_ver` to the client's [`PROTO_VER`]. Used by `new`
+/// BEFORE the manager + reader thread are built, so a mismatch can be resolved by handing the
+/// stale daemon's sessions over (or, failing that, tearing it down) and respawning — the
+/// lock-step-upgrade contract, since the daemon is our own binary. A handshake that doesn't
+/// answer in time is treated as a `Match` (proceed): the version gate must never hard-block
+/// launch over a slow/odd handshake — the worst case is talking to a same-version daemon we
+/// couldn't confirm, which is harmless.
+fn probe_proto_version(stream: &Conn) -> io::Result<ProtoCheck> {
+    let mut w = transport::try_clone(stream)?;
     let send = write_frame(
         &mut w,
         &ClientMsg::Hello {
             proto_ver: PROTO_VER,
         },
     );
-    let check = match send.and_then(|()| read_frame::<_, DaemonMsg>(&mut r)) {
+    let check = match send
+        .and_then(|()| transport::read_frame_deadline::<DaemonMsg>(stream, PROBE_TIMEOUT))
+    {
         Ok(Some(DaemonMsg::Hello { proto_ver, .. })) => {
             if proto_ver == PROTO_VER {
                 ProtoCheck::Match
@@ -579,34 +615,31 @@ fn probe_proto_version(stream: &std::os::unix::net::UnixStream) -> io::Result<Pr
                 }
             }
         }
-        // Any non-Hello reply, EOF, or a (timed-out) read error: don't block launch over an
+        // Any non-Hello reply, EOF, or a (timed-out) read: don't block launch over an
         // unconfirmed handshake — proceed as a match. NB: `from_stream` re-runs its own Hello
         // round-trip, draining the daemon's (second) reply, so this probe's `Hello` reply does
         // not desync the stream the manager later owns.
         _ => ProtoCheck::Match,
     };
-    // Restore blocking reads on the shared socket before the manager takes it over.
-    let _ = r.set_read_timeout(None);
     Ok(check)
 }
 
 /// How long to wait for a spawned successor to take the incumbent's sessions and start
 /// serving. Covers the incumbent's handoff, its exit, and the successor's own cold start
-/// (Tokio runtime + adopting every pty), so it is looser than a plain spawn budget.
-#[cfg(unix)]
+/// (runtime build + adopting every pty), so it is looser than a plain spawn budget.
 const TAKEOVER_BUDGET: Duration = Duration::from_secs(8);
 
-/// Upgrade the daemon at `socket` **without killing its sessions**: spawn a daemon from the
-/// current (new) binary, which finds the salt's lock held, asks the incumbent to hand over
-/// every pty master, and binds once the incumbent exits (see `daemon::take_over`). Returns
-/// whether a daemon speaking our [`PROTO_VER`] is serving by the end of it.
+/// Upgrade the daemon at `endpoint` **without killing its sessions**: spawn a daemon from the
+/// current (new) binary, which finds the salt's endpoint already held, asks the incumbent to
+/// hand every session over, and takes the endpoint once the incumbent exits (see
+/// `daemon::take_over` / `daemon::windows::take_over`). Returns whether a daemon speaking our
+/// [`PROTO_VER`] is serving by the end of it.
 ///
 /// `false` is the expected answer against an incumbent that predates the takeover protocol:
 /// it cannot parse the request and drops the connection, the successor declines to fight for
-/// the lock, and the caller falls back to [`tear_down_stale_daemon`]. That fallback is the
+/// the endpoint, and the caller falls back to [`tear_down_stale_daemon`]. That fallback is the
 /// old, session-destroying path — this function exists to avoid reaching it.
-#[cfg(unix)]
-fn hand_over_stale_daemon(salt: &str, socket: &Path) -> bool {
+fn hand_over_stale_daemon(salt: &str, endpoint: &Endpoint) -> bool {
     if spawn_daemon_detached(salt).is_err() {
         return false;
     }
@@ -614,8 +647,8 @@ fn hand_over_stale_daemon(salt: &str, socket: &Path) -> bool {
     let mut backoff = Duration::from_millis(20);
     loop {
         // Only a version MATCH proves the successor won: while the incumbent still holds the
-        // socket, connecting succeeds and reports the stale version.
-        if let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) {
+        // endpoint, connecting succeeds and reports the stale version.
+        if let Ok(stream) = transport::connect(endpoint) {
             if matches!(probe_proto_version(&stream), Ok(ProtoCheck::Match)) {
                 return true;
             }
@@ -628,22 +661,19 @@ fn hand_over_stale_daemon(salt: &str, socket: &Path) -> bool {
     }
 }
 
-/// Tear down a stale-version daemon at `socket`: connect, send `Shutdown`, then wait (briefly)
-/// for the socket to disappear (the daemon unlinks it on exit). Best-effort — if the connect
-/// fails the daemon is already gone, and if it lingers, `connect_or_spawn`'s `AddrInUse`
-/// handling + retry on the next `new` loop iteration still converges. `salt` is unused today
-/// (the socket path is enough) but kept for symmetry with the spawn side.
-#[cfg(unix)]
-fn tear_down_stale_daemon(socket: &Path, _salt: &str) {
-    if let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) {
+/// Tear down a stale-version daemon at `endpoint`: connect, send `Shutdown`, then wait
+/// (briefly) for it to stop answering. Best-effort — if the connect fails the daemon is
+/// already gone, and if it lingers, the respawn loop in `new` still converges. `salt` is
+/// unused today (the endpoint is enough) but kept for symmetry with the spawn side.
+fn tear_down_stale_daemon(endpoint: &Endpoint, _salt: &str) {
+    if let Ok(stream) = transport::connect(endpoint) {
         let mut w = stream;
         let _ = write_frame(&mut w, &ClientMsg::Shutdown);
-        // Wait for the daemon to exit (it unlinks the socket on the way out). Bounded so a
-        // wedged daemon doesn't hang launch; the respawn loop tolerates a slow teardown.
+        // Wait for the daemon to exit. Bounded so a wedged daemon doesn't hang launch; the
+        // respawn loop tolerates a slow teardown.
         let deadline = Instant::now() + Duration::from_secs(3);
         while Instant::now() < deadline {
-            // Once the socket file is gone (or refuses connections), the stale daemon is down.
-            if !socket.exists() || std::os::unix::net::UnixStream::connect(socket).is_err() {
+            if !transport::is_live(endpoint) {
                 break;
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -653,7 +683,6 @@ fn tear_down_stale_daemon(socket: &Path, _salt: &str) {
 
 /// Append a line to the daemon debug log when `HYPERPANES_DEBUG` is set (mirrors the app's
 /// `dbg_log`; core has no logger of its own). Inert otherwise.
-#[cfg(unix)]
 pub(crate) fn dbg(msg: &str) {
     use std::io::Write;
     if std::env::var_os("HYPERPANES_DEBUG").is_none() {
@@ -669,32 +698,29 @@ pub(crate) fn dbg(msg: &str) {
     }
 }
 
-/// Connect to the daemon socket; if none is listening, spawn the daemon detached and
+/// Connect to the daemon's endpoint; if none is listening, spawn the daemon detached and
 /// retry-connect with backoff until [`SPAWN_CONNECT_BUDGET`]. A spawn race — another client
-/// just launched the daemon, so OUR spawn's bind hits `AddrInUse` — is NOT an error: we
-/// simply keep retrying the connect, since whoever won the lock is now (or soon) listening.
-#[cfg(unix)]
-fn connect_or_spawn(socket: &Path, salt: &str) -> io::Result<std::os::unix::net::UnixStream> {
+/// just launched the daemon, so OUR spawn loses the endpoint — is NOT an error: we simply
+/// keep retrying the connect, since whoever won is now (or soon) listening.
+fn connect_or_spawn(endpoint: &Endpoint, salt: &str) -> io::Result<Conn> {
     // Fast path: a daemon is already up.
-    if let Ok(s) = std::os::unix::net::UnixStream::connect(socket) {
+    if let Ok(s) = transport::connect(endpoint) {
         return Ok(s);
     }
 
     // None listening → spawn it detached. The daemon is a mode of THIS binary
-    // (`current_exe --session-daemon <salt>`); `setsid` + null stdio so it outlives us and
-    // never touches our console (the survival contract — see the plan's "Spawn" note).
+    // (`current_exe --session-daemon <salt>`), launched so it outlives us and never touches
+    // our console (the survival contract — see the plan's "Spawn" note).
     spawn_daemon_detached(salt)?;
 
     // Retry-connect with a short, growing backoff until the daemon binds (cold start +
-    // Tokio runtime build can take a beat). `AddrInUse` cannot surface here — that's a
-    // BIND-side error in the daemon we just (maybe redundantly) launched; on the CONNECT
-    // side we only ever see ConnectionRefused/NotFound until the socket is live, which the
-    // retry rides out. Treating a spawn race as "already running → connect" is exactly this
-    // loop: it doesn't matter whose daemon won, only that one is listening.
+    // runtime build can take a beat). A bind-side race in the daemon we just (maybe
+    // redundantly) launched never surfaces here; on the CONNECT side we only ever see
+    // "refused"/"not found" until the endpoint is live, which the retry rides out.
     let deadline = Instant::now() + SPAWN_CONNECT_BUDGET;
     let mut backoff = Duration::from_millis(10);
     loop {
-        match std::os::unix::net::UnixStream::connect(socket) {
+        match transport::connect(endpoint) {
             Ok(s) => return Ok(s),
             Err(_) if Instant::now() < deadline => {
                 std::thread::sleep(backoff);
@@ -782,85 +808,39 @@ fn spawn_daemon_setsid(exe: &std::path::Path, salt: &str) -> io::Result<()> {
     cmd.spawn().map(|_child| ())
 }
 
-// ---- non-unix stub: the daemon transport is unix-only in M1 (Windows pipes are M3) ----
+/// Windows: launch `current_exe --session-daemon <salt>` detached from this process.
+///
+/// `DETACHED_PROCESS` gives the daemon no console at all (the unix analog of `setsid` +
+/// null stdio: nothing the GUI's console teardown can reach), `CREATE_NEW_PROCESS_GROUP`
+/// keeps a console Ctrl-C in the GUI's group from reaching it, and `CREATE_NO_WINDOW` makes
+/// sure no window flashes even if a future build gains a console. Windows has no parent-death
+/// signal and no cgroup to inherit, so unlike unix there is nothing further to escape: the
+/// spawned process is already independent once we drop its handle.
+#[cfg(windows)]
+fn spawn_daemon_detached(salt: &str) -> io::Result<()> {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
 
-/// On non-unix the daemon transport (UDS) doesn't exist yet, so the daemon backend can't be
-/// constructed; the enum dispatch in [`SessionManager`](crate::session_manager) falls back
-/// to in-process. This stub exists only so the type name resolves in the enum on all
-/// platforms.
-#[cfg(not(unix))]
-pub struct DaemonSessionManager {
-    _never: std::convert::Infallible,
-}
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
-#[cfg(not(unix))]
-impl DaemonSessionManager {
-    pub fn new(
-        _events: tokio::sync::mpsc::UnboundedSender<crate::session_manager::SessionEvent>,
-        _salt: &str,
-    ) -> io::Result<Self> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "the session daemon transport is unix-only in M1 (Windows named pipes are M3)",
-        ))
-    }
-
-    // `new` above only ever returns `Err`, and the struct holds an `Infallible`, so a value
-    // of this type can never exist on non-unix. These methods mirror the `#[cfg(unix)]` impl's
-    // signatures purely so the `SessionManager::Daemon(_) => d.method(..)` match arms in
-    // `session_manager` type-check on Windows; they are statically unreachable.
-    pub fn create(&self, _opts: crate::session_manager::SpawnOptions) -> io::Result<()> {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn create_with(
-        &self,
-        _opts: crate::session_manager::SpawnOptions,
-        _factory: crate::session_manager::SpawnFn,
-    ) -> io::Result<()> {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn has(&self, _uid: &str) -> bool {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn uids(&self) -> Vec<String> {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn replay(&self, _uid: &str) -> Option<String> {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn output_bytes(&self, _uid: &str) -> Option<u64> {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn replay_with_cursor(&self, _uid: &str) -> Option<(String, u64)> {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn last_output_at(&self, _uid: &str) -> Option<u64> {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn render_screen(&self, _uid: &str) -> Option<String> {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn write(&self, _uid: &str, _data: &str) {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn resize(&self, _uid: &str, _cols: u16, _rows: u16) {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn kill(&self, _uid: &str) {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn kill_all(&self) {
-        unreachable!("daemon backend is unix-only")
-    }
-    pub fn shutdown_daemon(&self) {
-        unreachable!("daemon backend is unix-only")
-    }
+    let exe = std::env::current_exe()?;
+    Command::new(exe)
+        .arg("--session-daemon")
+        .arg(salt)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
+        .spawn()
+        .map(|_child| ())
 }
 
 #[cfg(all(unix, test))]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     fn env(pairs: &[(&str, &str)]) -> crate::session::spawn::EnvMap {
         pairs
@@ -1629,7 +1609,7 @@ mod tests {
         let daemon = spawn_in_process(&socket).expect("daemon binds");
         assert!(socket.exists() && !daemon.is_shutting_down());
 
-        tear_down_stale_daemon(&socket, "salt-unused");
+        tear_down_stale_daemon(&Endpoint::new(socket.to_string_lossy()), "salt-unused");
 
         assert!(
             wait_until(Dur::from_secs(3), || daemon.is_shutting_down()),

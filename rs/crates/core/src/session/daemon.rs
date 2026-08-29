@@ -46,8 +46,14 @@
 //!   leftover socket from a dead daemon is removed); the runtime dir is created `0700` and
 //!   the socket tightened to `0600`.
 //!
-//! Windows named pipes are sketched in [`windows`](self::windows) (**WINDOWS-CI-PENDING** —
-//! unbuildable on this Linux box; M4 flips the default on cross-platform).
+//! Everything above describes the **unix** daemon, which is this module. Windows serves the
+//! same protocol over a named pipe from [`windows`](self::windows), and [`run`]/[`kill_daemon`]
+//! dispatch there — but its live-upgrade story differs in kind, because a ConPTY's `HPCON` is
+//! an opaque per-process handle that no documented API can hand to another process. So instead
+//! of *moving* the terminals on upgrade (the unix `SCM_RIGHTS` fd handoff below), Windows never
+//! moves them at all: the ConPTYs live in a **pty-host** process that outlives daemon upgrades,
+//! and a takeover is the successor re-attaching to that same host. See [`windows`] for the
+//! design; the two legs share the wire protocol, the client and every call site.
 
 #[cfg(unix)]
 use std::collections::HashSet;
@@ -73,6 +79,7 @@ use crate::session::proto::{
 };
 #[cfg(unix)]
 use crate::session_manager::SessionSnapshot;
+#[cfg(unix)]
 use crate::session_manager::{SessionEvent, SessionRegistry};
 
 /// How long the daemon stays alive after going fully idle (0 sessions AND 0 clients)
@@ -1163,29 +1170,40 @@ fn spawn_in_process_inner(
     })
 }
 
-/// Non-unix `run` stub: the daemon transport (UDS) is unix-only. Windows named pipes are
-/// sketched in [`windows`](self::windows) (**WINDOWS-CI-PENDING**, M3); the full serve-loop
-/// integration is M4, so `run` still returns `Unsupported` on Windows today and
-/// `SessionManager::new_daemon` falls back to in-process.
-#[cfg(not(unix))]
+/// Non-unix, non-Windows `run`: no transport exists for this OS.
+#[cfg(not(any(unix, windows)))]
 pub fn run(_salt: &str) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "the session daemon transport is unix-only; Windows named-pipe transport is WINDOWS-CI-PENDING (M3/M4)",
+        "the session daemon has no transport on this platform",
     ))
 }
 
-/// Non-unix `kill_daemon` stub — no out-of-process daemon exists on Windows yet (M4), so
-/// there is nothing to kill: a clean no-op.
-#[cfg(not(unix))]
+/// Non-unix, non-Windows `kill_daemon`: nothing can be running, so nothing to kill.
+#[cfg(not(any(unix, windows)))]
 pub fn kill_daemon(_salt: &str) -> io::Result<bool> {
     Ok(false)
 }
 
-// Windows named-pipe daemon transport — best-effort sketch, **WINDOWS-CI-PENDING** (can't be
-// compiled/run on the Linux dev box). Mirrors `single_instance::windows`. The file lives at
-// `session/windows.rs` (a sibling of this `session/daemon.rs`), so point `#[path]` at it
-// rather than the default `session/daemon/windows.rs`.
+/// Windows `run` — the named-pipe daemon. Same contract as the unix one: serve the salt's
+/// endpoint until idle-grace expires or a `Shutdown`/`Takeover` ends it. See
+/// [`windows::run`](self::windows::run).
+#[cfg(windows)]
+pub fn run(salt: &str) -> io::Result<()> {
+    windows::run(salt)
+}
+
+/// Windows `kill_daemon` — connect to the salt's pipe and send `Shutdown`; `Ok(false)` when
+/// no daemon is listening. See [`windows::kill_daemon`](self::windows::kill_daemon).
+#[cfg(windows)]
+pub fn kill_daemon(salt: &str) -> io::Result<bool> {
+    windows::kill_daemon(salt)
+}
+
+// Windows named-pipe daemon transport — the peer of everything above, exercised by the
+// windows-latest CI leg. The file lives at `session/windows.rs` (a sibling of this
+// `session/daemon.rs`), so point `#[path]` at it rather than the default
+// `session/daemon/windows.rs`.
 #[cfg(windows)]
 #[path = "windows.rs"]
 pub mod windows;

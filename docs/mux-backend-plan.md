@@ -28,8 +28,9 @@ GUI (Slint) ── SessionManager, API unchanged ──┐
                     ┌───────────────────────────┼───────────────────────────┐
                     ▼                           ▼                           ▼
              SessionRegistry            SSH server (russh)          live-upgrade takeover
-        PTYs · replay · screen · cwd     per-device keys              PTY fd handoff
-              [exists today]             [new — M3]                  [new — M1]
+        PTYs · replay · screen · cwd     per-device keys           unix: PTY fd handoff
+              [exists today]             [new — M3]              Windows: pty-host stays put
+                                                                        [M1 ✅]
                     │                           │
                     │                           ▼
                     └──────────────────> attach client  ──> any mobile SSH app
@@ -81,7 +82,7 @@ outlive the GUI run and be re-attached by uid, and `daemon_client.rs:1291`
 (`daemon_fresh_uid_is_unique_across_runs`) asserts cross-run uniqueness. `PaneSpec.uid` carries it
 through the relaunch snapshot. Nothing to do.
 
-### M1 — daemon live upgrade via PTY fd handoff ✅ *built (unix); Windows still declines*
+### M1 — daemon live upgrade ✅ *built on every OS (unix: fd handoff; Windows: pty-host)*
 
 **The exact failure today.** Sessions already survive a *GUI* upgrade: quit with keep-alive on
 leaves the daemon running (`main.rs:575`) and a relaunch re-attaches. What they do not survive is a
@@ -119,8 +120,41 @@ in microseconds by exiting; an in-process test daemon never exits, so the transf
 the socket (`takeover_transfers_live_sessions_and_stands_the_incumbent_down` — the shell's process
 group is still alive afterwards) and the re-creation in `session_manager`'s `adopt` tests.
 
-**Still open:** the Windows leg. `windows.rs` answers `Takeover` by closing the connection, so a
-Windows upgrade keeps the old tear-down until ConPTY handle transfer is proven (see Risks).
+**The Windows leg — a different answer to the same question.** A ConPTY is addressed by an
+`HPCON`, an opaque pointer into the owning process's heap holding `hSignal`/`hPtyReference`/
+`hConPtyProcess`. No documented API hands one to another process, and when the owner exits the OS
+closes `hSignal`, at which point conhost kills the attached shell. So the fd-handoff shape is not
+merely unproven on Windows — it is unavailable. The terminals cannot move.
+
+The answer is that they never do: the ConPTYs live in a **pty-host** process that outlives daemon
+upgrades, and the daemon in front of it is a thin proxy. A takeover then transfers *nothing* — the
+successor re-attaches to the same running host, and the incumbent stands down without touching a
+session (its `Takeover` arm must not `kill_all`, the one thing that would break this).
+
+The host is deliberately **not** a new process mode. It is a daemon whose *salt* carries a
+`\u{1}pty-host` marker suffix, so `pipe_name()` gives it a distinct endpoint for free and the
+existing `--session-daemon <salt>` spawn path launches it. A daemon with a host salt runs
+`SessionManager::InProcess`; any other salt proxies to the host via `SessionManager::Daemon`. No
+new flag, no new protocol, no new spawn path.
+
+Because the host is by design an *older build* than the daemon in front of it, that one link runs
+`VersionPolicy::Tolerant` (the GUI→daemon link stays `LockStep`). What makes that safe is a written
+contract — the **frozen host surface** documented on `VersionPolicy`: the host-facing messages may
+gain optional fields and `SessionEvent` may gain variants, but no existing field may change name,
+type or meaning.
+
+One-daemon-per-salt on Windows is `first_pipe_instance(true)`, the race-free peer of the unix
+flock: the OS grants the pipe name to exactly one server and returns `ERROR_ACCESS_DENIED` to the
+rest, which `bind_first_instance` maps to `io::ErrorKind::AddrInUse` — the same kind the flock path
+reports, so callers need no cfg. (This retired the old named-mutex plan: a mutex is only needed
+when you detect by *connecting*, which races; we detect by *binding*, which does not.)
+
+Tested in `windows.rs`'s own test module — the salt marker and its distinct endpoint, the
+first-instance gate admitting one daemon per salt, a real ConPTY spawned and streamed
+(`cmd.exe /c echo …`), and `takeover_stands_the_daemon_down_and_leaves_the_terminals_running`,
+which asks the pty-host directly after the takeover and finds the session still there. Those run on
+the `windows-latest` CI leg; they cannot run on a mac or Linux box, where `cargo xwin check --target
+x86_64-pc-windows-msvc --all-targets` is the local gate.
 
 ### M2 — `hyperpanes attach` terminal client
 A CLI that renders a pane into whatever terminal it is running in: seed from the replay buffer,
@@ -161,10 +195,11 @@ click.
 
 ## Risks and open questions
 
-* **ConPTY fd handoff on Windows is UNVERIFIED.** ConPTY's pipe handles are duplicable via
-  `DuplicateHandle`, but whether pseudoconsole (`HPCON`) *ownership* transfers cleanly across
-  processes is the open question. M1 must prove it on Windows or fall back to "keep the old daemon
-  running for old sessions" there.
+* ~~**ConPTY fd handoff on Windows is UNVERIFIED.**~~ **Answered (M1): it is impossible, and the
+  design routes around it.** `HPCON` ownership cannot cross a process boundary with documented
+  APIs, so Windows keeps the ConPTYs in a pty-host process that upgrades never replace — see M1.
+  The residual risk moves to the *frozen host surface* contract on `VersionPolicy`: break it and a
+  new daemon mis-talks to an old host. Changes to host-facing messages must stay additive.
 * **An embedded SSH server is a real security surface** — it owns every terminal and every
   credential typed into one. Loopback-only default, explicit opt-in to any wider bind, per-device
   revocable keys, and no password auth.

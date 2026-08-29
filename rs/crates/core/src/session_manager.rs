@@ -730,10 +730,25 @@ impl SessionManager {
     /// daemon for `salt` and forward its events to `events`. Errors only if the daemon
     /// can't be reached/spawned — `main` falls back to [`new`](Self::new) on `Err` so a
     /// daemon failure never blocks launch. `salt` is the user-data dir (same key the GUI's
-    /// single-instance gate and the daemon's discovery use). Unix-only in M1.
+    /// single-instance gate and the daemon's discovery use).
     pub fn new_daemon(events: UnboundedSender<SessionEvent>, salt: &str) -> io::Result<Self> {
         Ok(SessionManager::Daemon(Arc::new(
             crate::session::daemon_client::DaemonSessionManager::new(events, salt)?,
+        )))
+    }
+
+    /// Daemon-backed like [`new_daemon`](Self::new_daemon), but **tolerating protocol skew**
+    /// with the peer. Exactly one caller: the Windows daemon connecting to its **pty-host**,
+    /// which owns the ConPTYs and is deliberately never upgraded under a running terminal. See
+    /// [`VersionPolicy::Tolerant`](crate::session::daemon_client::VersionPolicy::Tolerant) for
+    /// the frozen-surface contract that makes it safe.
+    pub fn new_daemon_tolerant(
+        events: UnboundedSender<SessionEvent>,
+        salt: &str,
+    ) -> io::Result<Self> {
+        use crate::session::daemon_client::{DaemonSessionManager, VersionPolicy};
+        Ok(SessionManager::Daemon(Arc::new(
+            DaemonSessionManager::new_with_policy(events, salt, VersionPolicy::Tolerant)?,
         )))
     }
 
