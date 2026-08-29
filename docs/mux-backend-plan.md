@@ -186,12 +186,45 @@ A `WorkspaceSet` model (`sets/*.json`: a name plus member workspace references) 
 existing `WorkspaceFile`. `SaveWorkspaceAs` / `SaveSet` / `OpenSet`. Loading becomes
 **reattach-or-spawn** per pane, using the durable ids from M0.
 
-### M7 — discovery and adopt *(mostly built)*
-Launch-time discovery and re-adoption already exist — `ListSessions` / `Attach` are in the protocol
-(`proto.rs:146,149`), `App::attach_panes_from_specs` (`app.rs:1451`) rebinds snapshot panes to
-surviving sessions, and the daemon backend is default-on. What remains is small: surface the
-sessions the snapshot does *not* claim in M5's detached list so an orphan can be adopted with one
-click.
+### M7 — discovery and adopt ✅ *(built on `mux/m7-adopt`)*
+Launch-time discovery and re-adoption already existed — `ListSessions` / `Attach` are in the
+protocol, `App::attach_panes_from_specs` rebinds snapshot panes to surviving sessions, and the
+daemon backend is default-on. M7 added the part that makes M5's DETACHED list safe with more than
+one hyperpanes process running: **a cross-process claim registry**.
+
+**The daemon is the registry** (`session/claims.rs`), not a file under the runtime dir. A file
+registry would force every reader to judge staleness, and the only honest judgement is pid *plus*
+process start time (bare pids are recycled) — per-OS code — with an `flock` protocol layered on top
+for mutual exclusion, and crash safety left as every future reader's problem. The daemon is
+already the single process that knows every session and that every hyperpanes process connects to,
+so the claim map is ordinary in-memory state behind a `Mutex`: a real compare-and-set with exactly
+one winner and no protocol to get wrong.
+
+* **Wire (`PROTO_VER` → 3, additive):** `Claim{uid}` / `Release{uid}` / `ListClaims` client-side;
+  `ClaimResult{uid,granted,owner}`, `Claims(Vec<ClaimInfo>)` and `SessionsChanged(Vec<SessionMeta>)`
+  daemon-side, plus a `conn_id` on `Hello`. `Claims` and `SessionsChanged` are pushed as **full
+  snapshots**, never deltas, so they are idempotent and a dropped or reordered one cannot desync a
+  client. Pushes are gated on the peer having said `Hello`, and the connect-time seed is sent by
+  *broadcasting* on the same ordered channel as later changes — so a snapshot can never overwrite a
+  newer one, and the raw `Takeover` exchange (which never says `Hello`) is never interrupted.
+* **Crash safety is connection scope, not a lease.** A claim belongs to a daemon-assigned
+  `ConnId`, and the per-connection teardown releases every claim that connection holds. That
+  teardown runs on socket EOF — which the kernel delivers when the owning process dies, however it
+  dies. No heartbeat to miss, no expiry to tune, no pid to mistrust. Proved by a test that
+  `SIGKILL`s a real child process and watches its claim drain.
+* **No double adoption.** `adopt_detached_session` claims before it attaches and obeys the answer.
+  Proved by a test that spawns **six real OS processes** (re-executions of the test binary), fires
+  them at one wall-clock instant against one orphan, and asserts one `granted` and five `denied`
+  — with all six connections still open, so the winner cannot have released and re-opened the race.
+* **Shadow staleness fixed.** The client's shadow map used to be seeded by `ListSessions` at
+  connect and then maintained only from the `Exit` stream plus local creates, so a session another
+  client made after we connected stayed invisible until reconnect. It now reconciles against each
+  pushed `SessionsChanged` snapshot (a `pending` flag protects a local create still in flight).
+* `leftpanel::claimed_by_other_processes` — the M5 stub that returned an empty set — now answers
+  from the pushed claim snapshot: a lock and a set filter, no I/O on the paint path.
+
+Windows (`session/windows.rs`) mirrors all of this, but could not be compiled locally (the
+`ring` build script fails under cross-compilation from macOS) and is unverified on that OS.
 
 ## Risks and open questions
 
@@ -222,9 +255,9 @@ click.
 | M2 attach client | `mux/m2-attach` | — |
 | M3 embedded SSH | `mux/m3-ssh` | M2 |
 | M4 control mode | `mux/m4-ccmode` | M2 |
-| M5 left panel | `mux/m5-panel` | — (adoption list needs M7) |
+| M5 left panel | `mux/m5-panel` | — (adoption list landed with M7) |
 | M6 workspace sets | `mux/m6-sets` | — |
-| M7 orphan adoption | `mux/m7-adopt` | M5 |
+| M7 orphan adoption ✅ | `mux/m7-adopt` | M5 |
 
 **Wave 1 (parallel now):** M5 ‖ M6 — no shared files (M1 landed).
 **Wave 2:** M2 ‖ M7. **Wave 3:** M3 ‖ M4.

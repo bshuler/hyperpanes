@@ -70,6 +70,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+use crate::session::claims::{ClaimRegistry, ConnId as ClaimConnId};
+#[cfg(unix)]
 use crate::session::daemon_client::dbg;
 #[cfg(unix)]
 use crate::session::handoff::{recv_with_fds, send_with_fds, MAX_FDS_PER_MSG};
@@ -515,6 +517,18 @@ struct Daemon {
     /// M3 lifecycle: the shutdown latch + connection counter + socket-to-unlink. Shared with
     /// the idle monitor; the `Shutdown` dispatch and the monitor both call `shutdown` here.
     lifecycle: Arc<Lifecycle>,
+    /// M7: the cross-process claim table — which connection is *hosting* each uid. The
+    /// daemon is the arbiter precisely because it is already the one process every
+    /// hyperpanes window talks to, and because a claim scoped to a connection is released
+    /// by the kernel closing the socket when the owner dies. See
+    /// [`claims`](crate::session::claims).
+    claims: Arc<ClaimRegistry>,
+    /// M7: unsolicited pushes that go to **every** connection regardless of what it has
+    /// attached to — the claim table and the session set. Separate from `bus` because that
+    /// one carries per-uid [`SessionEvent`]s the writer filters by the attached set, and
+    /// these are deliberately unfiltered: a client cannot subscribe to a session it does not
+    /// yet know exists, which is the whole staleness bug they fix.
+    notices: tokio::sync::broadcast::Sender<DaemonMsg>,
 }
 
 #[cfg(unix)]
@@ -525,16 +539,35 @@ impl Daemon {
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let registry = SessionRegistry::new(etx);
         let (bus, _) = tokio::sync::broadcast::channel::<SessionEvent>(4096);
+        let (notices, _) = tokio::sync::broadcast::channel::<DaemonMsg>(256);
         let cwds: Arc<Mutex<std::collections::HashMap<String, String>>> = Arc::default();
+        let claims = Arc::new(ClaimRegistry::new());
 
         // Event pump: registry mpsc → cwd cache + broadcast bus. Runs as a tokio task on
         // the ambient runtime (`run`/`spawn_in_process` enter one before constructing).
         let bus_tx = bus.clone();
         let cwds_pump = Arc::clone(&cwds);
+        let claims_pump = Arc::clone(&claims);
+        let notices_pump = notices.clone();
+        let registry_pump = registry.clone();
         tokio::spawn(async move {
             while let Some(ev) = erx.recv().await {
                 if let SessionEvent::Cwd { uid, cwd } = &ev {
                     cwds_pump.lock().unwrap().insert(uid.clone(), cwd.clone());
+                }
+                // A session that exited can never be adopted, so its claim goes with it —
+                // otherwise the table would pin uids forever. Both the claim table and the
+                // session set changed, so both snapshots are re-pushed (M7).
+                if let SessionEvent::Exit { uid, .. } = &ev {
+                    let dropped = claims_pump.forget_uid(uid);
+                    cwds_pump.lock().unwrap().remove(uid);
+                    if dropped {
+                        let _ = notices_pump.send(DaemonMsg::Claims(claims_pump.snapshot()));
+                    }
+                    let _ = notices_pump.send(DaemonMsg::SessionsChanged(session_metas(
+                        &registry_pump,
+                        &cwds_pump,
+                    )));
                 }
                 // `send` errors only when there are zero receivers — fine, just means no
                 // client is currently attached; the event is simply not delivered live.
@@ -551,7 +584,23 @@ impl Daemon {
             cwds,
             rt,
             lifecycle,
+            claims,
+            notices,
         }
+    }
+
+    /// Push the current claim table to every connection (M7). Called after any change, so a
+    /// client's shadow is a full, idempotent snapshot rather than a delta it could miss.
+    fn broadcast_claims(&self) {
+        let _ = self.notices.send(DaemonMsg::Claims(self.claims.snapshot()));
+    }
+
+    /// Push the current session set to every connection (M7) — the fix for a client whose
+    /// uid shadow would otherwise never learn about sessions another client created.
+    fn broadcast_sessions(&self) {
+        let _ = self
+            .notices
+            .send(DaemonMsg::SessionsChanged(self.list_sessions()));
     }
 
     /// Re-create sessions handed over by a predecessor ([`take_over`]) — the receiving half
@@ -581,6 +630,11 @@ impl Daemon {
                 Err(e) => dbg(&format!("takeover: adopting {} failed: {e}", snap.uid)),
             }
         }
+        // The session set is now whatever we inherited; tell anyone already connected (M7).
+        // Claims are deliberately NOT inherited: the incumbent's clients were connected to
+        // *it*, and their sockets die with it, so every inherited session starts unclaimed
+        // and the reconnecting windows re-claim what they still host.
+        self.broadcast_sessions();
     }
 
     /// Start the **idle-exit monitor** on its own thread: once the daemon has 0 live sessions
@@ -669,13 +723,37 @@ impl Daemon {
         // Count this connection for the idle condition. The decrement on the way out is in a
         // guard so it runs on every exit path (clean close, malformed frame, panic).
         self.lifecycle.conn_opened();
-        struct ConnGuard<'a>(&'a Lifecycle);
+        // M7: this connection's identity for the claim table, assigned by us rather than
+        // asserted by the client.
+        let conn_id = self.claims.next_conn_id();
+        /// Runs on EVERY exit path out of `handle_connection` — clean close, malformed
+        /// frame, panic — and, crucially, on the path taken when the peer *process* dies:
+        /// the kernel closes its socket, the read loop sees EOF, and we unwind through
+        /// here. That is the whole crash-safety story for claims (M7): no heartbeat, no
+        /// lease, no expiry, nothing to hope gets refreshed. A claim cannot outlive the
+        /// process that took it.
+        struct ConnGuard<'a> {
+            lifecycle: &'a Lifecycle,
+            claims: &'a ClaimRegistry,
+            notices: &'a tokio::sync::broadcast::Sender<DaemonMsg>,
+            conn_id: ClaimConnId,
+        }
         impl Drop for ConnGuard<'_> {
             fn drop(&mut self) {
-                self.0.conn_closed();
+                self.lifecycle.conn_closed();
+                if self.claims.release_conn(self.conn_id) {
+                    // Somebody's panes just became adoptable — tell the survivors at once,
+                    // so the left panel's DETACHED list reflects the crash immediately.
+                    let _ = self.notices.send(DaemonMsg::Claims(self.claims.snapshot()));
+                }
             }
         }
-        let _conn_guard = ConnGuard(&self.lifecycle);
+        let _conn_guard = ConnGuard {
+            lifecycle: &self.lifecycle,
+            claims: &self.claims,
+            notices: &self.notices,
+            conn_id,
+        };
 
         let Ok(write_half) = stream.try_clone() else {
             return;
@@ -694,10 +772,29 @@ impl Daemon {
         // across two sources by draining the reply channel first (non-blocking) then doing
         // a bounded poll on the bus, so neither source starves.
         let mut bus_rx = self.bus.subscribe();
+        // Subscribe to the unfiltered notice channel BEFORE the seed snapshots below, so a
+        // change racing our connect is either in the seed or in the stream — never lost.
+        let mut notice_rx = self.notices.subscribe();
+        // Push traffic is gated on the client having said `Hello`, because not every peer on
+        // this socket is a session-manager client: the live-upgrade `Takeover` path speaks a
+        // bare, strictly-ordered frame exchange and would choke on an unsolicited snapshot
+        // landing mid-conversation. `Hello` is exactly the "I am a full protocol client"
+        // signal, and every such client sends one during its handshake.
+        let notices_on = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let attached_w = Arc::clone(&attached);
+        let notices_on_w = Arc::clone(&notices_on);
         let writer = std::thread::Builder::new()
             .name("hp-daemon-writer".into())
-            .spawn(move || writer_loop(write_half, out_rx, &mut bus_rx, attached_w));
+            .spawn(move || {
+                writer_loop(
+                    write_half,
+                    out_rx,
+                    &mut bus_rx,
+                    &mut notice_rx,
+                    &notices_on_w,
+                    attached_w,
+                )
+            });
 
         // Reader/dispatch loop: handle each ClientMsg against the registry.
         let mut takeover = false;
@@ -711,7 +808,7 @@ impl Daemon {
                     break;
                 }
                 Ok(Some(msg)) => {
-                    if !self.dispatch(msg, &out_tx, &attached) {
+                    if !self.dispatch(msg, &out_tx, &attached, conn_id, &notices_on) {
                         break; // a control path asked to close the connection
                     }
                 }
@@ -803,6 +900,8 @@ impl Daemon {
         msg: ClientMsg,
         out: &std::sync::mpsc::Sender<DaemonMsg>,
         attached: &Arc<Mutex<HashSet<String>>>,
+        conn_id: ClaimConnId,
+        notices_on: &std::sync::atomic::AtomicBool,
     ) -> bool {
         match msg {
             ClientMsg::Hello { proto_ver: _ } => {
@@ -815,7 +914,18 @@ impl Daemon {
                 let _ = out.send(DaemonMsg::Hello {
                     proto_ver: PROTO_VER,
                     daemon_pid: std::process::id(),
+                    conn_id,
                 });
+                // M7: `Hello` marks this peer as a full protocol client, so unsolicited
+                // snapshots may now flow to it. Open the gate BEFORE seeding, and seed by
+                // *broadcasting* rather than by a direct reply: the seed then travels the
+                // same channel, in the same total order, as every later change, so a change
+                // racing the seed can never be overwritten by a snapshot older than it. The
+                // cost is that other connections get a redundant snapshot — harmless, since
+                // every push is a complete, idempotent picture.
+                notices_on.store(true, std::sync::atomic::Ordering::SeqCst);
+                self.broadcast_claims();
+                self.broadcast_sessions();
             }
             ClientMsg::ListSessions => {
                 let _ = out.send(DaemonMsg::Sessions(self.list_sessions()));
@@ -860,6 +970,10 @@ impl Daemon {
                 let created = self.registry.create(opts);
                 drop(_guard);
                 let _ = out.send(DaemonMsg::Created { uid: uid.clone() });
+                // Every OTHER client's uid shadow learns about this session here — the M5
+                // residual where a session created after a window connected stayed invisible
+                // to it until reconnect (M7).
+                self.broadcast_sessions();
                 if created.is_err() {
                     // Broadcast so EVERY connection attached to this uid (the creator, and
                     // any future re-attacher that races the failure) sees it; the pump's
@@ -872,10 +986,21 @@ impl Daemon {
             ClientMsg::Kill { uid } => {
                 self.registry.kill(&uid);
                 self.cwds.lock().unwrap().remove(&uid);
+                // A manual kill is deliberately SILENT on the event bus (no `Exit`), so the
+                // claim drop + the two snapshots have to happen here — otherwise other
+                // clients keep a ghost row for a session that no longer exists.
+                if self.claims.forget_uid(&uid) {
+                    self.broadcast_claims();
+                }
+                self.broadcast_sessions();
             }
             ClientMsg::KillAll => {
                 self.registry.kill_all();
                 self.cwds.lock().unwrap().clear();
+                if self.claims.clear() {
+                    self.broadcast_claims();
+                }
+                self.broadcast_sessions();
             }
             ClientMsg::RenderScreen { uid } => {
                 let text = self.registry.render_screen(&uid);
@@ -883,6 +1008,27 @@ impl Daemon {
             }
             ClientMsg::Ping => {
                 let _ = out.send(DaemonMsg::Pong);
+            }
+            ClientMsg::Claim { uid } => {
+                // The atomic compare-and-set that makes double adoption impossible: the
+                // registry's mutex orders two racing claims and the loser is told who won.
+                let outcome = self.claims.claim(&uid, conn_id);
+                let _ = out.send(DaemonMsg::ClaimResult {
+                    uid,
+                    granted: outcome.granted(),
+                    owner: outcome.owner(),
+                });
+                if outcome.granted() {
+                    self.broadcast_claims();
+                }
+            }
+            ClientMsg::Release { uid } => {
+                if self.claims.release(&uid, conn_id) {
+                    self.broadcast_claims();
+                }
+            }
+            ClientMsg::ListClaims => {
+                let _ = out.send(DaemonMsg::Claims(self.claims.snapshot()));
             }
             ClientMsg::Takeover => {
                 // Unreachable in practice: `handle_connection` intercepts `Takeover` before
@@ -908,19 +1054,30 @@ impl Daemon {
 
     /// Snapshot every live session into [`SessionMeta`] (uid + counters + cached cwd).
     fn list_sessions(&self) -> Vec<SessionMeta> {
-        let cwds = self.cwds.lock().unwrap();
-        self.registry
-            .uids()
-            .into_iter()
-            .map(|uid| SessionMeta {
-                cwd: cwds.get(&uid).cloned(),
-                output_bytes: self.registry.output_bytes(&uid).unwrap_or(0),
-                last_output_at: self.registry.last_output_at(&uid),
-                alive: true,
-                uid,
-            })
-            .collect()
+        session_metas(&self.registry, &self.cwds)
     }
+}
+
+/// [`Daemon::list_sessions`] as a free function, so the event pump — which holds clones of
+/// the registry and cwd cache but not a `Daemon` (it is spawned while one is being built) —
+/// can build the same snapshot for its `SessionsChanged` push.
+#[cfg(unix)]
+fn session_metas(
+    registry: &SessionRegistry,
+    cwds: &Mutex<std::collections::HashMap<String, String>>,
+) -> Vec<SessionMeta> {
+    let cwds = cwds.lock().unwrap();
+    registry
+        .uids()
+        .into_iter()
+        .map(|uid| SessionMeta {
+            cwd: cwds.get(&uid).cloned(),
+            output_bytes: registry.output_bytes(&uid).unwrap_or(0),
+            last_output_at: registry.last_output_at(&uid),
+            alive: true,
+            uid,
+        })
+        .collect()
 }
 
 /// The per-connection writer loop: forward replies (drained first, non-blocking) and the
@@ -931,6 +1088,8 @@ fn writer_loop(
     mut write_half: std::os::unix::net::UnixStream,
     out_rx: std::sync::mpsc::Receiver<DaemonMsg>,
     bus_rx: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
+    notice_rx: &mut tokio::sync::broadcast::Receiver<DaemonMsg>,
+    notices_on: &std::sync::atomic::AtomicBool,
     attached: Arc<Mutex<HashSet<String>>>,
 ) {
     use std::sync::mpsc::TryRecvError;
@@ -976,8 +1135,38 @@ fn writer_loop(
             }
         }
 
-        // If the reader is gone AND we've drained the bus, the connection is finished.
-        if reader_gone && bus_idle {
+        // 2b) Forward every pending NOTICE verbatim (M7). Unfiltered by design — claim and
+        // session-set snapshots are about sessions this connection may not know about yet.
+        // Drained even while the gate is shut, so a client that says `Hello` late is not
+        // handed a backlog of pre-`Hello` snapshots; its own seed broadcast follows the gate
+        // opening, so nothing it needs is lost.
+        //
+        // The gate is read PER MESSAGE, not once per pass. The reader thread opens it and
+        // *then* broadcasts the seed; a gate read taken before that store but applied to a
+        // message received after it would drop the seed on the floor and leave this client
+        // with no snapshot until the next unrelated change. Loading after `try_recv` hands
+        // back the message orders the two correctly.
+        let notices_idle;
+        loop {
+            match notice_rx.try_recv() {
+                Ok(msg) => {
+                    let gate_open = notices_on.load(std::sync::atomic::Ordering::SeqCst);
+                    if gate_open && write_frame(&mut write_half, &msg).is_err() {
+                        return;
+                    }
+                }
+                // Lagged: only full snapshots ride this channel, so a dropped one is
+                // harmless — the next push carries the complete state again.
+                Err(BusErr::Lagged(_)) => continue,
+                Err(BusErr::Empty) | Err(BusErr::Closed) => {
+                    notices_idle = true;
+                    break;
+                }
+            }
+        }
+
+        // If the reader is gone AND we've drained both channels, the connection is finished.
+        if reader_gone && bus_idle && notices_idle {
             return;
         }
         // Nothing to do this pass → brief sleep so we don't spin (M0 is a simple poll; a
@@ -1867,5 +2056,413 @@ mod tests {
             "the caller reads this as 'fall back to the tear-down'"
         );
         let _ = stale.join();
+    }
+
+    // ================================================================================
+    // M7: the cross-process claim registry, proved with REAL PROCESSES.
+    //
+    // A crate's unit tests all run as threads inside ONE process, so a threads-only race
+    // test proves nothing about cross-process behaviour — both "processes" would share the
+    // same address space and the same socket. These tests therefore re-execute the test
+    // binary (`current_exe`) as genuinely separate OS processes, hand each one the daemon's
+    // socket path in the environment, and let them race over the wire. The child roles are
+    // `#[ignore]`d tests, invoked as `--ignored --exact <name>`; they no-op when their
+    // environment is absent, so a plain `cargo test -- --ignored` never hangs.
+    // ================================================================================
+
+    /// Socket path for the child roles.
+    const ENV_SOCK: &str = "HP_CLAIM_TEST_SOCK";
+    /// Uid the child should claim.
+    const ENV_UID: &str = "HP_CLAIM_TEST_UID";
+    /// Epoch-ms at which every racer fires its `Claim` — a real starting gun, so the racers
+    /// arrive at the daemon's mutex genuinely together instead of in spawn order.
+    const ENV_AT: &str = "HP_CLAIM_TEST_AT_MS";
+    /// File the child touches once it has its verdict (or owns the claim).
+    const ENV_READY: &str = "HP_CLAIM_TEST_READY";
+    /// File whose appearance tells a racer it may finally exit. Without this the winner
+    /// would drop its socket the instant it won — and since a claim is scoped to the
+    /// connection, the daemon would free the uid and a straggler could legitimately be
+    /// granted it too. That is correct behaviour, but it is not the race under test, so the
+    /// racers are made to hold their claims until the parent has seen every verdict.
+    const ENV_RELEASE: &str = "HP_CLAIM_TEST_RELEASE";
+
+    /// The child process's exit code when the daemon granted it the claim.
+    const EXIT_GRANTED: i32 = 0;
+    /// …and when the daemon told it somebody else already owned the uid.
+    const EXIT_DENIED: i32 = 3;
+
+    fn epoch_ms() -> u128 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0)
+    }
+
+    /// Build the `Command` that re-runs THIS test binary as a separate process, executing
+    /// exactly one ignored test (the child role).
+    fn child_role(role: &str, socket: &Path, uid: &str) -> std::process::Command {
+        let mut cmd = std::process::Command::new(std::env::current_exe().expect("test exe"));
+        cmd.args([
+            "--exact",
+            role,
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(ENV_SOCK, socket)
+        .env(ENV_UID, uid);
+        cmd
+    }
+
+    /// Connect a child to the daemon and complete the handshake, returning the client.
+    fn child_client(socket: &Path) -> DaemonClient {
+        let client = DaemonClient::connect_path(socket).expect("child connects to daemon");
+        client
+            .send(&ClientMsg::Hello {
+                proto_ver: PROTO_VER,
+            })
+            .expect("child says hello");
+        recv_until(&client, Duration::from_secs(5), |m| {
+            matches!(m, DaemonMsg::Hello { .. })
+        })
+        .expect("child gets a hello back");
+        client
+    }
+
+    /// **Child role.** Wait for the starting gun, fire one `Claim`, and exit with a code
+    /// that says whether it won. Runs in its own process; see the module comment above.
+    #[test]
+    #[ignore = "child process role, driven by the multi-process claim tests"]
+    fn m7_child_race_for_one_claim() {
+        let (Ok(sock), Ok(uid), Ok(at)) = (
+            std::env::var(ENV_SOCK),
+            std::env::var(ENV_UID),
+            std::env::var(ENV_AT),
+        ) else {
+            return; // not being driven as a child — nothing to do
+        };
+        let at: u128 = at.parse().expect("start time parses");
+        let client = child_client(Path::new(&sock));
+        // Spin (not sleep) onto the starting gun so every racer leaves at the same instant.
+        while epoch_ms() < at {
+            std::hint::spin_loop();
+        }
+        client
+            .send(&ClientMsg::Claim { uid: uid.clone() })
+            .expect("child sends claim");
+        let reply = recv_until(&client, Duration::from_secs(10), |m| {
+            matches!(m, DaemonMsg::ClaimResult { uid: u, .. } if *u == uid)
+        });
+        let code = match reply {
+            Some(DaemonMsg::ClaimResult { granted: true, .. }) => EXIT_GRANTED,
+            Some(DaemonMsg::ClaimResult { granted: false, .. }) => EXIT_DENIED,
+            _ => 9, // no answer at all — a failure, not a loss
+        };
+        // Report the verdict, then keep the connection open until the parent says go, so
+        // that every racer's claim is simultaneously live when the parent inspects the
+        // registry. Exiting here would release the winner's claim and re-open the race.
+        if let Ok(ready) = std::env::var(ENV_READY) {
+            std::fs::write(&ready, b"done").expect("racer writes its verdict file");
+        }
+        if let Ok(go) = std::env::var(ENV_RELEASE) {
+            let go = Path::new(&go);
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while Instant::now() < deadline && !go.exists() {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        std::process::exit(code)
+    }
+
+    /// **Child role.** Take the claim, announce it by touching a file, then block forever so
+    /// the parent can kill it and watch the claim get released.
+    #[test]
+    #[ignore = "child process role, driven by the multi-process claim tests"]
+    fn m7_child_claim_and_hold() {
+        let (Ok(sock), Ok(uid), Ok(ready)) = (
+            std::env::var(ENV_SOCK),
+            std::env::var(ENV_UID),
+            std::env::var(ENV_READY),
+        ) else {
+            return;
+        };
+        let client = child_client(Path::new(&sock));
+        client
+            .send(&ClientMsg::Claim { uid: uid.clone() })
+            .expect("child sends claim");
+        let reply = recv_until(&client, Duration::from_secs(10), |m| {
+            matches!(m, DaemonMsg::ClaimResult { uid: u, .. } if *u == uid)
+        });
+        assert!(
+            matches!(reply, Some(DaemonMsg::ClaimResult { granted: true, .. })),
+            "the holder must get the uncontested claim"
+        );
+        std::fs::write(&ready, b"held").expect("child writes ready file");
+        // Hold the connection open. The parent SIGKILLs us from here.
+        loop {
+            std::thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    /// Read and discard everything already queued for this client.
+    fn drain_pending(client: &DaemonClient) {
+        while client.recv(Duration::from_millis(50)).is_some() {}
+    }
+
+    /// Ask the daemon for the current claim table (as this connection sees it).
+    ///
+    /// The daemon *pushes* a full `Claims` snapshot to every client whenever the picture
+    /// changes, so a `Claims` frame already sitting in the inbox may well predate the
+    /// question — a real client does not care (it just overwrites its map with each
+    /// snapshot), but a test asking "what is true right now" does. Drain what is queued
+    /// first; the next `Claims` frame is then the answer to *this* `ListClaims`.
+    fn claims_now(client: &DaemonClient) -> Vec<crate::session::claims::ClaimInfo> {
+        drain_pending(client);
+        client.send(&ClientMsg::ListClaims).expect("list claims");
+        match recv_until(client, Duration::from_secs(5), |m| {
+            matches!(m, DaemonMsg::Claims(_))
+        }) {
+            Some(DaemonMsg::Claims(list)) => list,
+            _ => panic!("daemon did not answer ListClaims"),
+        }
+    }
+
+    /// **The no-double-adoption proof.** Six *separate processes* race to claim one orphan
+    /// session at the same wall-clock instant. Exactly one may be granted it; every other
+    /// must be told it lost. This is the property the left panel's adopt button rests on.
+    #[test]
+    fn six_real_processes_racing_one_orphan_produce_exactly_one_winner() {
+        let socket = temp_socket("m7race");
+        let _accept = spawn_in_process(&socket).expect("daemon binds");
+
+        // A real orphan: a live session the daemon owns and that nobody has claimed (this
+        // connection creates it but never claims it — exactly the state a crashed window
+        // leaves behind).
+        let owner = child_client(&socket);
+        owner
+            .send(&ClientMsg::Create(SpawnSpec {
+                command: Some("/bin/sh".into()),
+                args: Some(vec!["-c".into(), "sleep 5".into()]),
+                ..Default::default()
+            }))
+            .expect("create the orphan");
+        let uid = match recv_until(&owner, Duration::from_secs(5), |m| {
+            matches!(m, DaemonMsg::Created { .. })
+        }) {
+            Some(DaemonMsg::Created { uid }) => uid,
+            _ => panic!("no Created reply"),
+        };
+
+        // Starting gun far enough out that every child has connected and handshaken.
+        let at = epoch_ms() + 1500;
+        const RACERS: usize = 6;
+        let go = socket.with_extension("go");
+        let verdicts: Vec<PathBuf> = (0..RACERS)
+            .map(|i| socket.with_extension(format!("v{i}")))
+            .collect();
+        for f in verdicts.iter().chain(std::iter::once(&go)) {
+            let _ = std::fs::remove_file(f);
+        }
+        let children: Vec<std::process::Child> = (0..RACERS)
+            .map(|i| {
+                child_role("session::daemon::tests::m7_child_race_for_one_claim", &socket, &uid)
+                    .env(ENV_AT, at.to_string())
+                    .env(ENV_READY, &verdicts[i])
+                    .env(ENV_RELEASE, &go)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn()
+                    .expect("racer process spawns")
+            })
+            .collect();
+
+        // Every racer has now answered and is holding its connection open.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < deadline && !verdicts.iter().all(|f| f.exists()) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            verdicts.iter().all(|f| f.exists()),
+            "every racer must reach a verdict"
+        );
+
+        // The daemon's own table, taken while all six claims are simultaneously live: one
+        // owner for the uid, and it is not this connection.
+        let table = claims_now(&owner);
+        assert_eq!(
+            table.len(),
+            1,
+            "one claim in the registry while six processes hold connections: {table:?}"
+        );
+        assert_eq!(table[0].uid, uid);
+        assert_ne!(table[0].owner, 0, "a claim always names its owning connection");
+
+        // Release them and collect the verdicts they were holding.
+        std::fs::write(&go, b"go").expect("release the racers");
+        let mut granted = 0;
+        let mut denied = 0;
+        let mut other = Vec::new();
+        for mut c in children {
+            let status = c.wait().expect("racer exits");
+            match status.code() {
+                Some(EXIT_GRANTED) => granted += 1,
+                Some(EXIT_DENIED) => denied += 1,
+                code => other.push(code),
+            }
+        }
+        assert!(
+            other.is_empty(),
+            "every racer must reach a verdict; stray exits: {other:?}"
+        );
+        assert_eq!(
+            granted, 1,
+            "exactly one process may adopt an orphan (granted={granted}, denied={denied})"
+        );
+        assert_eq!(denied, RACERS - 1, "everyone else must be told they lost");
+
+        for f in verdicts.iter().chain(std::iter::once(&go)) {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+
+    /// **The crash-safety proof.** A separate process takes a claim and is then `SIGKILL`ed —
+    /// no chance to release anything, no destructor, no heartbeat to stop refreshing. The
+    /// claim must nevertheless be gone, because it is scoped to the connection and the kernel
+    /// closes the socket when the process dies. After that, the uid is claimable again.
+    #[test]
+    fn a_killed_process_releases_its_claims_and_the_uid_becomes_adoptable() {
+        let socket = temp_socket("m7kill");
+        let _accept = spawn_in_process(&socket).expect("daemon binds");
+        let watcher = child_client(&socket);
+
+        let uid = format!("orphan-{}", std::process::id());
+        let ready = socket.with_extension("ready");
+        let _ = std::fs::remove_file(&ready);
+
+        let mut holder = child_role(
+            "session::daemon::tests::m7_child_claim_and_hold",
+            &socket,
+            &uid,
+        )
+        .env(ENV_READY, &ready)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("holder process spawns");
+
+        // Wait for the holder to own the claim.
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while Instant::now() < deadline && !ready.exists() {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(ready.exists(), "holder never took the claim");
+        assert!(
+            claims_now(&watcher).iter().any(|c| c.uid == uid),
+            "the daemon should be holding the other process's claim"
+        );
+        // While it lives, we cannot take it.
+        watcher
+            .send(&ClientMsg::Claim { uid: uid.clone() })
+            .unwrap();
+        assert!(
+            matches!(
+                recv_until(&watcher, Duration::from_secs(5), |m| matches!(
+                    m,
+                    DaemonMsg::ClaimResult { .. }
+                )),
+                Some(DaemonMsg::ClaimResult { granted: false, .. })
+            ),
+            "a live owner's claim must not be stealable"
+        );
+
+        // Now kill it outright — SIGKILL, so nothing in the child gets to run on the way out.
+        holder.kill().expect("kill the holder");
+        let _ = holder.wait();
+
+        // The claim must drain on its own, with no timeout to wait out.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut released = false;
+        while Instant::now() < deadline {
+            if !claims_now(&watcher).iter().any(|c| c.uid == uid) {
+                released = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            released,
+            "a dead process's claim must not survive it — nothing else would ever free it"
+        );
+
+        // …and the session is adoptable again.
+        watcher
+            .send(&ClientMsg::Claim { uid: uid.clone() })
+            .unwrap();
+        assert!(
+            matches!(
+                recv_until(&watcher, Duration::from_secs(5), |m| matches!(
+                    m,
+                    DaemonMsg::ClaimResult { .. }
+                )),
+                Some(DaemonMsg::ClaimResult { granted: true, .. })
+            ),
+            "after the owner died the uid must be claimable"
+        );
+        let _ = std::fs::remove_file(&ready);
+    }
+
+    /// The other half of the M5 residue: a session created by a DIFFERENT client, after we
+    /// connected, must reach our shadow without a reconnect — and one killed by a different
+    /// client must leave it. Both ride the daemon's pushed `SessionsChanged` snapshots.
+    #[test]
+    fn a_session_made_by_another_client_reaches_an_already_connected_shadow() {
+        let socket = temp_socket("m7shadow");
+        let _accept = spawn_in_process(&socket).expect("daemon binds");
+
+        // The observer: a real `DaemonSessionManager`, connected FIRST and never reconnected.
+        let (etx, _erx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+        let observer = crate::session::daemon_client::DaemonSessionManager::from_stream(
+            std::os::unix::net::UnixStream::connect(&socket).expect("observer connects"),
+            etx,
+        )
+        .expect("observer handshakes");
+        assert!(observer.uids().is_empty(), "nothing to see yet");
+
+        // A second, independent client creates a session.
+        let maker = child_client(&socket);
+        maker
+            .send(&ClientMsg::Create(SpawnSpec {
+                command: Some("/bin/sh".into()),
+                args: Some(vec!["-c".into(), "sleep 5".into()]),
+                ..Default::default()
+            }))
+            .expect("create");
+        let uid = match recv_until(&maker, Duration::from_secs(5), |m| {
+            matches!(m, DaemonMsg::Created { .. })
+        }) {
+            Some(DaemonMsg::Created { uid }) => uid,
+            _ => panic!("no Created reply"),
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !observer.has(&uid) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            observer.has(&uid),
+            "a session another client created must appear without reconnecting"
+        );
+
+        // …and the same for its removal: a deliberate `Kill` is silent on the event bus, so
+        // only the pushed snapshot can clear the ghost row.
+        maker.send(&ClientMsg::Kill { uid: uid.clone() }).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && observer.has(&uid) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !observer.has(&uid),
+            "a session another client killed must leave the shadow"
+        );
     }
 }

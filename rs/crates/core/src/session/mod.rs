@@ -6,6 +6,8 @@
 #[cfg(unix)]
 pub mod adopt;
 pub mod batcher;
+/// The cross-process session claim registry (M7): who is hosting which uid right now.
+pub mod claims;
 pub mod cwd;
 pub mod daemon;
 pub mod daemon_client;

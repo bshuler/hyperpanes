@@ -2940,8 +2940,17 @@ impl State {
     /// Adopt detached session `uid` into the active tab: a re-attach, not a respawn — the
     /// spec carries the uid, so `make_pane_from_spec` re-hosts the live session and seeds
     /// the fresh grid from its replay buffer. Ignored if this window already hosts it.
+    ///
+    /// **M7: claim first, adopt second.** The claim is a compare-and-set in the daemon's
+    /// registry, so if two windows (in two processes) click adopt on the same orphan at the
+    /// same moment, exactly one of them is granted it and the other returns here having
+    /// changed nothing. Losing is silent by design: the winner's claim reaches this process
+    /// on the next pushed snapshot and the row simply leaves the DETACHED list.
     pub fn adopt_detached_session(&mut self, uid: &str, mgr: &SessionManager) {
         if uid.is_empty() || self.find_pane(uid).is_some() {
+            return;
+        }
+        if !mgr.claim_session(uid) {
             return;
         }
         self.attach_panes_from_specs(
