@@ -169,7 +169,18 @@ pub fn run(salt: &str) -> io::Result<()> {
             };
             // The incumbent releases the flock only by dying, and it unlinks its socket on
             // the way out — so acquiring the lock here also proves the socket path is free.
-            if !acquire_when_released(&lock, TAKEOVER_LOCK_BUDGET) {
+            // Everything past this point holds live pty masters in `inherited`. ANY early
+            // return drops them, which closes the masters and SIGHUPs every shell the
+            // incumbent just entrusted to us — the incumbent is already gone, so there is no
+            // one to hand them back to. Wait far longer for a slow incumbent when sessions
+            // are in hand: a late exit costs seconds, a dropped descriptor costs the user's
+            // work.
+            let budget = if inherited.is_empty() {
+                TAKEOVER_LOCK_BUDGET
+            } else {
+                TAKEOVER_LOCK_BUDGET_HOLDING
+            };
+            if !acquire_when_released(&lock, budget) {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     "the incumbent daemon handed over but did not exit",
@@ -189,7 +200,9 @@ pub fn run(salt: &str) -> io::Result<()> {
     // rebind (the stale-socket-reclaim path; a previous daemon that crashed without unlinking
     // its socket must never block the new one's bind).
     let _ = std::fs::remove_file(&names.socket);
-    let listener = std::os::unix::net::UnixListener::bind(&names.socket)?;
+    // Retry the bind while we hold handed-over descriptors: a transient EADDRINUSE (the
+    // incumbent's unlink racing our remove) must not become session loss.
+    let listener = bind_with_retry(&names.socket, !inherited.is_empty())?;
     restrict_socket_perms(&names.socket);
 
     // The pty drivers spawned by `SessionRegistry::create` need a Tokio runtime in scope.
@@ -218,6 +231,38 @@ pub fn run(salt: &str) -> io::Result<()> {
 /// so overrunning this means it is wedged, not slow.
 #[cfg(unix)]
 const TAKEOVER_LOCK_BUDGET: Duration = Duration::from_secs(5);
+
+/// The same wait, for a successor that is ALREADY holding the incumbent's pty masters.
+/// Giving up there closes live terminals, so it is worth waiting out even a badly wedged
+/// incumbent before conceding.
+#[cfg(unix)]
+const TAKEOVER_LOCK_BUDGET_HOLDING: Duration = Duration::from_secs(30);
+
+/// Bind the daemon socket, retrying briefly when `holding_sessions` — see
+/// [`TAKEOVER_LOCK_BUDGET_HOLDING`] for why a successor mid-handoff must not fail fast.
+#[cfg(unix)]
+fn bind_with_retry(
+    socket: &Path,
+    holding_sessions: bool,
+) -> io::Result<std::os::unix::net::UnixListener> {
+    let deadline = Instant::now()
+        + if holding_sessions {
+            TAKEOVER_LOCK_BUDGET_HOLDING
+        } else {
+            Duration::from_millis(0)
+        };
+    loop {
+        match std::os::unix::net::UnixListener::bind(socket) {
+            Ok(l) => return Ok(l),
+            Err(e) if Instant::now() < deadline => {
+                dbg(&format!("bind retry after {e}"));
+                let _ = std::fs::remove_file(socket);
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 /// How long the successor waits for each handoff message. Bounds a wedged or
 /// non-understanding incumbent so a takeover can never hang daemon startup.
