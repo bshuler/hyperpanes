@@ -179,6 +179,26 @@ pub fn build(state: &State) -> Vec<Entry> {
         Command::SpeechToggleFocusedOnly,
     ));
 
+    // ---- workspace library + sets (M6) ----
+    cmds.push(Entry::new(
+        "Save workspace as…",
+        "Write this tab to a new workspace file",
+        "workspace save as library file export",
+        Command::SaveWorkspaceAs,
+    ));
+    cmds.push(Entry::new(
+        "Save set…",
+        "Save every tab as a named set of workspaces",
+        "set workspace library collection save group",
+        Command::SaveSet,
+    ));
+    cmds.push(Entry::new(
+        "Open set…",
+        "Load a saved set (re-attaches live panes)",
+        "set workspace library collection open load restore",
+        Command::OpenSet,
+    ));
+
     // ---- preferences + sidebar ----
     cmds.push(Entry::new(
         "Preferences…",

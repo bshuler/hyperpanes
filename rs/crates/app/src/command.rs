@@ -201,7 +201,15 @@ pub enum Command {
     /// Pick a `workspace.json` and load it (the application menu's "Open workspace…").
     OpenWorkspace,
     /// Serialize the active tab and save it to a chosen file (the menu's "Save workspace…").
+    /// Writes back silently to the remembered path once the workspace has one.
     SaveWorkspace,
+    // ---- workspace library + sets (M6) ----
+    /// Always prompt for a destination, save the active tab there, and remember it.
+    SaveWorkspaceAs,
+    /// Save every non-empty tab as a member workspace and index them in a `sets/*.json`.
+    SaveSet,
+    /// Pick a saved set and load every member workspace (reattach-or-spawn per pane).
+    OpenSet,
     // ---- multi-window (Phase 4) ----
     /// Open a fresh OS window with an empty tab.
     NewWindow,
@@ -449,6 +457,10 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         // ---- workspace file (application menu) ----
         Command::OpenWorkspace => state.open_workspace(mgr),
         Command::SaveWorkspace => state.save_workspace(),
+        // ---- workspace library + sets (M6) ----
+        Command::SaveWorkspaceAs => state.save_workspace_as(),
+        Command::SaveSet => state.save_set(),
+        Command::OpenSet => state.open_set(mgr),
         // ---- multi-window ----
         Command::NewWindow => return Effect::NewWindow,
         Command::MovePaneToNewWindow => {

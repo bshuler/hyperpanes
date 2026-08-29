@@ -220,6 +220,22 @@ pub fn claude_sessions_dir() -> PathBuf {
     state_dir().join("claude-sessions")
 }
 
+/// The saved-workspace **library**: the folder the app writes named workspaces into
+/// (`SaveWorkspaceAs`'s default destination, and where `SaveSet` puts the member files it
+/// generates). Durable user data → [`data_dir`]. Files here are ordinary
+/// [`WorkspaceFile`](crate::workspace::model::WorkspaceFile)s; nothing stops a user
+/// keeping workspaces elsewhere — a set references them by path either way.
+pub fn workspaces_dir() -> PathBuf {
+    data_dir().join("workspaces")
+}
+
+/// Saved **workspace sets** (`sets/*.json`): a name plus references to member workspaces —
+/// see [`crate::workspace::sets`]. Durable user data → [`data_dir`], beside
+/// [`workspaces_dir`].
+pub fn sets_dir() -> PathBuf {
+    data_dir().join("sets")
+}
+
 /// Write `contents` to `path` atomically: create the parent dir, write to a sibling
 /// temp file, then rename over the target (a single filesystem op — readers never see
 /// a half-written file). `std::fs::rename` replaces the destination on Windows.

@@ -1287,6 +1287,13 @@ mod tests {
             reattach_survivor,
             "restore would RE-ATTACH the surviving uid (no re-spawn)"
         );
+        // The same decision through the named API the GUI actually calls (M6): the survivor
+        // re-attaches UNDER ITS RECORDED UID (a different uid would spawn a second session).
+        assert_eq!(
+            mgr2.pane_load(Some(&recorded_uid)),
+            crate::session_manager::PaneLoad::Reattach(recorded_uid.clone()),
+            "pane_load re-attaches the survivor under its recorded uid"
+        );
         assert!(
             wait_until(Dur::from_secs(3), || {
                 mgr2.replay(&recorded_uid)
@@ -1303,6 +1310,16 @@ mod tests {
         assert!(
             !reattach_dead,
             "an unknown/dead uid does NOT re-attach → restore re-spawns it"
+        );
+        let dead_load = mgr2.pane_load(Some(dead_uid));
+        assert!(
+            !dead_load.is_reattach(),
+            "pane_load spawns for a dead uid, got {dead_load:?}"
+        );
+        assert_ne!(
+            dead_load.uid(),
+            dead_uid,
+            "the re-spawn mints a fresh uid rather than re-using the dead one"
         );
 
         mgr2.kill(&recorded_uid);

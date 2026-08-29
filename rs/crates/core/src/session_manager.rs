@@ -710,6 +710,32 @@ impl SessionRegistry {
 /// socket + reader thread (the daemon backend is single-connection; a clone is another
 /// handle, not another connection). Preserving `Clone` keeps GUI code that moves an owned
 /// `mgr.clone()` onto a worker thread (`state.rs::spawn_session_async`) untouched.
+/// How a pane described by a spec should come up: adopt a surviving daemon session under its
+/// durable uid, or spawn a fresh one. See [`SessionManager::pane_load`]. Either way the
+/// variant carries the uid the pane must use.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneLoad {
+    /// The recorded uid names a live daemon session — adopt it (no new shell; the pane's
+    /// prior output is replayed into the fresh grid).
+    Reattach(String),
+    /// No survivor — spawn from the spec under this freshly minted uid.
+    Spawn(String),
+}
+
+impl PaneLoad {
+    /// The uid the pane must be created/adopted under.
+    pub fn uid(&self) -> &str {
+        match self {
+            PaneLoad::Reattach(u) | PaneLoad::Spawn(u) => u,
+        }
+    }
+
+    /// Whether this is a re-attach (as opposed to a fresh spawn).
+    pub fn is_reattach(&self) -> bool {
+        matches!(self, PaneLoad::Reattach(_))
+    }
+}
+
 #[derive(Clone)]
 pub enum SessionManager {
     /// The PTYs live in this process (the default, pre-daemon path).
@@ -827,6 +853,27 @@ impl SessionManager {
         match self {
             SessionManager::InProcess(r) => r.uids(),
             SessionManager::Daemon(d) => d.uids(),
+        }
+    }
+
+    /// **Reattach-or-spawn** for one pane being loaded from a spec — the single decision the
+    /// GUI's restore/open paths branch on (`docs/mux-backend-plan.md` M6, and the M2 re-attach
+    /// of `docs/session-daemon-plan.md`).
+    ///
+    /// [`PaneLoad::Reattach`] only when ALL of:
+    ///   * this manager is daemon-backed ([`is_daemon`](Self::is_daemon)) — the in-process
+    ///     backend's PTYs die with the GUI, so a recorded uid can never name a survivor;
+    ///   * the spec recorded a durable uid (M0's `pane-<uuid>`, minted by
+    ///     [`fresh_uid`](Self::fresh_uid) and carried through the snapshot / saved workspace);
+    ///   * that uid is STILL LIVE in the daemon ([`has`](Self::has)).
+    ///
+    /// Otherwise [`PaneLoad::Spawn`]: mint a fresh uid and re-spawn from the spec. Callers
+    /// must use the returned uid verbatim — re-attaching under any other uid would spawn a
+    /// second session instead of adopting the survivor.
+    pub fn pane_load(&self, recorded_uid: Option<&str>) -> PaneLoad {
+        match recorded_uid {
+            Some(uid) if self.is_daemon() && self.has(uid) => PaneLoad::Reattach(uid.to_string()),
+            _ => PaneLoad::Spawn(self.fresh_uid()),
         }
     }
 
@@ -1971,5 +2018,41 @@ mod tests {
             a,
             "the counter is process-global across managers"
         );
+    }
+
+    // ---- reattach-or-spawn (M6 / M2) ----
+
+    /// On the IN-PROCESS backend re-attach is impossible (the PTYs die with the GUI), so
+    /// `pane_load` always says Spawn — with a FRESH uid, never the recorded one. Adopting a
+    /// recorded uid here would silently alias whatever `pane-N` this run happens to reissue.
+    #[test]
+    fn in_process_pane_load_always_spawns_with_a_fresh_uid() {
+        let (etx, _erx) = unbounded_channel::<SessionEvent>();
+        let mgr = SessionManager::new(etx);
+        for recorded in [None, Some("pane-from-last-run"), Some("pane-0")] {
+            let load = mgr.pane_load(recorded);
+            assert!(
+                !load.is_reattach(),
+                "in-process never re-attaches (recorded={recorded:?}), got {load:?}"
+            );
+            assert_ne!(
+                Some(load.uid()),
+                recorded,
+                "a spawn mints a fresh uid, not the recorded one"
+            );
+            assert!(load.uid().starts_with("pane-"));
+        }
+    }
+
+    /// A spec with no recorded uid (a saved workspace used as a plain launch template) can
+    /// only ever spawn, and each pane gets its own uid.
+    #[test]
+    fn pane_load_without_a_recorded_uid_spawns_uniquely() {
+        let (etx, _erx) = unbounded_channel::<SessionEvent>();
+        let mgr = SessionManager::new(etx);
+        let a = mgr.pane_load(None);
+        let b = mgr.pane_load(None);
+        assert_eq!(a, PaneLoad::Spawn(a.uid().to_string()));
+        assert_ne!(a.uid(), b.uid());
     }
 }
