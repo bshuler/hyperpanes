@@ -37,6 +37,8 @@ mod palette;
 mod paneview;
 mod prefs;
 mod sidebar;
+/// The embedded SSH server (mux backend M3): attach to a live pane from a phone.
+mod ssh;
 mod state;
 mod tetris;
 mod theme;
@@ -279,6 +281,10 @@ USAGE:
     hyperpanes revoke <label>      Revoke a paired device by label
     hyperpanes attach [<pane>] [--resize] [--detach-key <key>]
                                    Render a live pane in THIS terminal (--list to see them)
+    hyperpanes ssh <status|enable|disable|authorize|keys|revoke|serve>
+                                   Manage the embedded SSH server, so a phone running Termius,
+                                   Blink or plain ssh can attach to a pane (off by default,
+                                   loopback-only, public-key auth; `ssh --help` for details)
 
 FLAGS:
     --kill-daemon                  Shut down the running session daemon for this install, then exit
@@ -369,6 +375,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let argv0: Vec<String> = std::env::args().collect();
     if let Some(salt) = session_daemon_salt(&argv0) {
         dbg_log(&format!("session-daemon: starting for salt {salt:?}"));
+        // The SSH front door (M3) rides along with the daemon: the daemon process is the one
+        // that outlives every GUI window, and the server is just another client of its
+        // socket. Off unless the user enabled it, and never fatal to the daemon.
+        ssh::spawn_with_daemon(&salt);
         hyperpanes_core::session::daemon::run(&salt)?;
         return Ok(());
     }
@@ -416,6 +426,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // salted socket the GUI uses and returns without launching a GUI.
     if attach_cli::wants_attach(&argv0) {
         return attach_cli::run(&argv0).map_err(Into::into);
+    }
+
+    // `ssh`: manage the embedded SSH server that lets a phone attach to a pane with no
+    // hyperpanes software on it (docs/mux-backend-plan.md M3).
+    if ssh::wants_ssh(&argv0) {
+        return ssh::run(&argv0).map_err(Into::into);
     }
 
     // Extract the baked-in OFL fonts (Fira Code / JetBrains Mono) so they always resolve.
