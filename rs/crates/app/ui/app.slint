@@ -10,11 +10,12 @@
 // dispatched against the central `State` (see ARCHITECTURE.md).
 
 import { Theme } from "theme.slint";
-import { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, FramePaletteOption, KeybindingItem, MenuEntry, CtxTab, HistoryUi, ReminderItem, RemindersAdapter } from "types.slint";
+import { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, FramePaletteOption, KeybindingItem, MenuEntry, CtxTab, HistoryUi, ReminderItem, RemindersAdapter, LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSessionRow, LeftPanelAdapter } from "types.slint";
 import { TopBar } from "topbar.slint";
 import { PaneView } from "paneview.slint";
 import { OverlayLayer } from "overlays.slint";
 import { SidebarRail } from "sidebar.slint";
+import { LeftPanel } from "leftpanel.slint";
 import { ContextMenu, ReminderCustom } from "contextmenu.slint";
 import { KeyMsg, HiRect } from "@widgets";
 
@@ -23,7 +24,7 @@ import { KeyMsg, HiRect } from "@widgets";
 // here only so the Rust controller can reach it via `global::<RemindersAdapter>()`; all its
 // UI lives in sidebar.slint. ReminderCustom likewise (the pane menu's custom-duration
 // parser bridge; UI in contextmenu.slint).
-export { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, KeybindingItem, MenuEntry, CtxTab, KeyMsg, HiRect, HistoryUi, ReminderItem, RemindersAdapter, ReminderCustom }
+export { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, KeybindingItem, MenuEntry, CtxTab, KeyMsg, HiRect, HistoryUi, ReminderItem, RemindersAdapter, ReminderCustom, LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSessionRow, LeftPanelAdapter }
 
 export component AppWindow inherits Window {
     title: "hyperpanes";
@@ -314,12 +315,21 @@ export component AppWindow inherits Window {
             close-window => { root.close-window(); }
         }
 
-        // The pane area + the persistent right-edge sidebar rail sit side by side. The
-        // rail is a real sibling of the panes (not an overlay): it never dims them, and
-        // its projects flyout opens leftward over the pane area.
+        // The left panel + the pane area + the persistent right-edge sidebar rail sit
+        // side by side. Both flanks are real siblings of the panes (not overlays): they
+        // never dim them, they just take width away; the projects flyout opens leftward
+        // over the pane area.
         HorizontalLayout {
             vertical-stretch: 1;
             spacing: 0px;
+
+            // M5's left slide-out panel — workspace tree / library / detached sessions.
+            // Same sibling mechanic as the rail opposite: the width binding lives here,
+            // the PaneView shrinks to match, and `LeftPanelAdapter.open` is pushed by
+            // `paneview::resync` from `state.left_panel_open` (Seam #1).
+            if LeftPanelAdapter.open && !root.fullscreen : LeftPanel {
+                width: 300px;
+            }
 
             PaneView {
                 horizontal-stretch: 1;

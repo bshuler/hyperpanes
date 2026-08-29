@@ -22,7 +22,8 @@ use crate::state::{Overlay, PaneState, State};
 use crate::theme;
 use crate::{
     AppWindow, ClaudeSessionItem, CtxTab, DividerItem, FramePaletteOption, HiRect, KeybindingItem,
-    LayoutOption, MenuEntry, PaletteItem, PaneItem, PrefOption, ProjectItem, TabItem, WorktreeRow,
+    LayoutOption, LeftPaneRow, LeftPanelAdapter, LeftSessionRow, LeftTabRow, LeftWorkspaceRow,
+    MenuEntry, PaletteItem, PaneItem, PrefOption, ProjectItem, TabItem, WorktreeRow,
 };
 
 /// Thickness (logical px) of the draggable divider hit-area.
@@ -81,6 +82,18 @@ pub struct Ui {
     /// as `wt_models` (the resume-row repeater must not be rebuilt each frame, or an in-flight
     /// click on a session row would be dropped). Pruned to the live project set each resync.
     pub claude_models: RefCell<HashMap<String, Rc<VecModel<ClaudeSessionItem>>>>,
+    // ---- the left slide-out panel's three sections (mux plan M5) ----
+    /// The workspace tree's tab rows (each carrying its own pane rows).
+    pub lp_tabs: Rc<VecModel<LeftTabRow>>,
+    /// The saved-workspace library rows.
+    pub lp_workspaces: Rc<VecModel<LeftWorkspaceRow>>,
+    /// The detached (adoptable) session rows.
+    pub lp_detached: Rc<VecModel<LeftSessionRow>>,
+    /// Per-tab pane models for the tree, keyed by tab index and reused across ticks so each
+    /// `LeftTabRow.panes` keeps a STABLE model identity — the same reason `wt_models` exists:
+    /// rebuilding the inner repeater every frame would drop an in-flight click or, worse, the
+    /// pointer grab of a pane drag mid-flight. Pruned to the live tab count each resync.
+    pub lp_pane_models: RefCell<HashMap<usize, Rc<VecModel<LeftPaneRow>>>>,
 }
 
 impl Ui {
@@ -110,6 +123,10 @@ impl Ui {
             ctx_layouts: Rc::new(VecModel::default()),
             wt_models: RefCell::new(HashMap::new()),
             claude_models: RefCell::new(HashMap::new()),
+            lp_tabs: Rc::new(VecModel::default()),
+            lp_workspaces: Rc::new(VecModel::default()),
+            lp_detached: Rc::new(VecModel::default()),
+            lp_pane_models: RefCell::new(HashMap::new()),
         })
     }
 
@@ -136,6 +153,13 @@ impl Ui {
         app.set_ctx_swatches(ModelRc::from(self.ctx_swatches.clone()));
         app.set_ctx_tabs(ModelRc::from(self.ctx_tabs.clone()));
         app.set_ctx_layouts(ModelRc::from(self.ctx_layouts.clone()));
+        // The left panel is wired through a global (like RemindersAdapter) rather than new
+        // AppWindow properties, so the whole feature stays self-contained.
+        use slint::ComponentHandle as _;
+        let lp = app.global::<LeftPanelAdapter>();
+        lp.set_tabs(ModelRc::from(self.lp_tabs.clone()));
+        lp.set_workspaces(ModelRc::from(self.lp_workspaces.clone()));
+        lp.set_detached(ModelRc::from(self.lp_detached.clone()));
     }
 }
 
@@ -890,6 +914,97 @@ pub fn resync(
     }
     sync_model(&ui.projects, projects);
 
+    // ---- the left slide-out panel (mux plan M5) ----
+    // Three sections, all projected read-only out of `State` + the session manager:
+    //   1. the workspace tree — every tab and its panes (NOT just the active tab, which is
+    //      why the liveness/idle flags are recomputed here instead of read off
+    //      `PaneState::glow` — the pump only animates the active tab's glow);
+    //   2. the saved-workspace library, served from `leftpanel`'s cache (rescanned on the
+    //      panel's closed→open edge, never stat'ed per tick);
+    //   3. the detached sessions — live sessions this window isn't showing.
+    // The panel's `open` flag also gates the work: with the panel shut the sections are
+    // left exactly as they are, so a closed panel costs one bool write.
+    {
+        use slint::ComponentHandle as _;
+        let lp = app.global::<LeftPanelAdapter>();
+        let open = state.left_panel_open;
+        lp.set_open(open);
+        crate::leftpanel::note_panel_open(open);
+        if open {
+            let now_ms = crate::glow::now_epoch_ms();
+            let idle_on = state.settings.idle_alert;
+            let idle_threshold_ms = state.settings.idle_alert_seconds as u64 * 1000;
+            let active = state.active;
+            let tab_rows: Vec<LeftTabRow> = state
+                .tabs
+                .iter()
+                .enumerate()
+                .map(|(ti, t)| {
+                    let rows: Vec<LeftPaneRow> = t
+                        .panes
+                        .iter()
+                        .enumerate()
+                        .map(|(pi, p)| {
+                            let last = mgr.last_output_at(&p.uid);
+                            LeftPaneRow {
+                                uid: p.uid.as_str().into(),
+                                title: p.title.clone(),
+                                tint: p.accent,
+                                focused: ti == active && pi == t.focused,
+                                live: crate::leftpanel::liveness(last, now_ms),
+                                idle: crate::leftpanel::is_idle(
+                                    &p.shell_title,
+                                    last,
+                                    now_ms,
+                                    idle_on,
+                                    idle_threshold_ms,
+                                ),
+                            }
+                        })
+                        .collect();
+                    // Stable per-tab model identity (see `lp_pane_models`).
+                    let model = ui
+                        .lp_pane_models
+                        .borrow_mut()
+                        .entry(ti)
+                        .or_insert_with(|| Rc::new(VecModel::default()))
+                        .clone();
+                    sync_model(&model, rows);
+                    LeftTabRow {
+                        title: t.title.clone(),
+                        active: ti == active,
+                        panes: ModelRc::from(model),
+                    }
+                })
+                .collect();
+            let live_tabs = state.tabs.len();
+            ui.lp_pane_models.borrow_mut().retain(|k, _| *k < live_tabs);
+            sync_model(&ui.lp_tabs, tab_rows);
+
+            let ws_rows: Vec<LeftWorkspaceRow> = crate::leftpanel::library()
+                .into_iter()
+                .map(|e| LeftWorkspaceRow {
+                    name: e.name.into(),
+                    path: e.path.display().to_string().into(),
+                    detail: e.detail.into(),
+                })
+                .collect();
+            sync_model(&ui.lp_workspaces, ws_rows);
+
+            let claimed = state.claimed_uids();
+            let det_rows: Vec<LeftSessionRow> = crate::leftpanel::detached(mgr, &claimed)
+                .into_iter()
+                .map(|d| LeftSessionRow {
+                    uid: d.uid.into(),
+                    label: d.label.into(),
+                    detail: d.detail.into(),
+                    live: crate::leftpanel::liveness(d.last_output_at, now_ms),
+                })
+                .collect();
+            sync_model(&ui.lp_detached, det_rows);
+        }
+    }
+
     // ---- new-goal dialog: attached-image filenames ----
     let goal_image_names: Vec<slint::SharedString> = state
         .goal_draft_images
@@ -1102,6 +1217,15 @@ pub fn pump(
     // projection only ever reads the sidebar caches. When a finished scan lands, dirty the
     // state so the resync below re-projects the flyout with the fresh rows.
     if crate::history_scan::drain() {
+        state.dirty = true;
+    }
+
+    // ---- keep the left panel's liveness dots honest (M5) ----
+    // A dot's brightness fades with WALL-CLOCK time, and nothing else dirties the state when
+    // the workspace is quiet — the dots would freeze at whatever the last resync projected.
+    // While the panel is open, a ~1s heartbeat re-runs the projection (the same "dirty →
+    // resync" path everything else uses); closed, this costs one bool test per tick.
+    if state.left_panel_open && crate::leftpanel::heartbeat_due(Instant::now()) {
         state.dirty = true;
     }
 
