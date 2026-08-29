@@ -179,7 +179,7 @@ something real.
   guard blocks (`%begin`/`%end`/`%error`), `%output` escaping, `%layout-change` /
   `%window-add` / `%window-close` / `%window-renamed` / `%session-changed` / `%sessions-changed` /
   `%exit`, layout strings with tmux's checksum, the format-string expander (`#{…}`, `#{?…}`,
-  `#{E:…}`, `#{T:…}`), and the command dispatcher. No socket, no stdio — so M3's SSH channel drives
+  `#{E:…}`, `#{T:…}`), the scoped user-option store, and the command dispatcher. No socket, no stdio — so M3's SSH channel drives
   the identical code by supplying its own transport.
 * `app/src/control_mode_cli.rs` — the stdio transport (`hyperpanes control-mode`, alias `-CC`).
   Reuses M2's `session::attach::{connect, handshake, list_sessions}` rather than re-deriving any
@@ -195,6 +195,14 @@ from a fresh process reproduces exactly the same ids, and two clients attached a
 **Resize policy** matches M2's: `Observe` by default. `refresh-client -C` is always acknowledged
 (iTerm2 sends it unconditionally during attach and treats an error as fatal) but only reflows the
 pane under `--resize`.
+
+**User options are a real store.** `set -t $0 @affinities …` / `show -v -q -t $0 @affinities` (and
+`@origins`, `@hidden`, `@tabcolors`, `@iterm2_id`) round-trip through a scoped in-memory map,
+because that is where iTerm2 keeps its *entire* window model — which tmux windows share one iTerm2
+window and where they sit on screen. They are client scratch space that tmux itself never reads, so
+honouring them is honest; without them every reconnect re-opens the panes as ungrouped,
+unpositioned tabs. Every *other* option still errors — there is no hyperpanes setting behind
+`status` or `default-terminal` to change.
 
 **Anything not implemented returns `%error`, never a silent success** — every structure-changing
 command (`new-window`, `split-window`, `kill-*`, `break-pane`, `join-pane`, `swap-*`, …) is an

@@ -48,6 +48,14 @@
 //!   **empty line as a detach**. We also tolerate a trailing CR, because a client that
 //!   reaches us through a pty in ICRNL mode (tmux's own `-CC` client sets exactly that) or
 //!   over an SSH channel may send CRLF.
+//! * **User options** (`@name`) are a real store, not a stub: `cmd-set-option.c` lets a
+//!   client write arbitrary `@`-prefixed options and read them back, and iTerm2 keeps its
+//!   entire window model there (`@affinities` = which tmux windows share one iTerm2
+//!   window, `@origins` = their screen positions, `@hidden`, `@tabcolors`, `@iterm2_id`).
+//!   They are pure client scratch space — tmux itself never reads them — so honouring
+//!   them is honest, and without them a reconnect re-opens every pane as an ungrouped,
+//!   unpositioned tab. Every *other* option still errors: there is no hyperpanes setting
+//!   behind `status` or `default-terminal` to change.
 //! * **The commands a real client sends** were read out of iTerm2's own source
 //!   (`sources/tmux/TmuxController.m`, `TmuxGateway.m`, `TmuxWindowOpener.m`) rather than
 //!   guessed — see [`ControlServer::command`] for the list and where each one came from.
@@ -425,6 +433,12 @@ pub struct ControlServer {
     guard_depth: u32,
     /// Notifications produced while a guard block was open (`control.c`'s `cs->deferred`).
     deferred: Vec<Line>,
+    /// tmux **user options** (`@name`) the client has stored, keyed by
+    /// `(scope, name)` — see [`ControlServer::option_scope`]. iTerm2 keeps its whole
+    /// window model in here (`@affinities`, `@origins`, `@hidden`, `@iterm2_id`), writing
+    /// with `set -t $0 @… …` and reading it back with `show -v -q -t $0 @…`, so without a
+    /// store every reconnect re-opens the panes as ungrouped, unpositioned tabs.
+    options: BTreeMap<(String, String), String>,
     /// Last size the client asked for via `refresh-client -C`, reported as `#{client_width}`.
     client_size: (u16, u16),
     /// Reported as `#{client_name}`.
@@ -446,6 +460,7 @@ impl ControlServer {
             next_command: 1,
             guard_depth: 0,
             deferred: Vec::new(),
+            options: BTreeMap::new(),
             client_size: (80, 24),
             client_name: "hyperpanes".to_string(),
         };
@@ -571,7 +586,13 @@ impl ControlServer {
             out.push(format!("%window-add @{w}").into_bytes());
         }
         out.push(b"%sessions-changed".to_vec());
-        out.push(format!("%session-changed ${} {}", self.session_id, self.session_name).into_bytes());
+        out.push(
+            format!(
+                "%session-changed ${} {}",
+                self.session_id, self.session_name
+            )
+            .into_bytes(),
+        );
         out
     }
 
@@ -759,7 +780,11 @@ impl ControlServer {
     /// `TmuxController.m`; `send -lt`/`send -t 0xNN`/`send -H -t` and `detach` from
     /// `TmuxGateway.m`; `capture-pane -p -P -C` and `capture-pane -peqJN -t … -S -N` from
     /// `TmuxWindowOpener.m`; `refresh-client -C w,h` and `refresh-client -C @n:wxh` from
-    /// `TmuxController.m -commandListToSetWindowSizes:`.
+    /// `TmuxController.m -commandListToSetWindowSizes:`; and the user-option round trip
+    /// `set -t $0 @affinities …` / `show -v -q -t $0 @affinities` (also `@origins`,
+    /// `@hidden`, `@tabcolors`, `@iterm2_id`) from `TmuxController.m -saveAffinities`,
+    /// `-saveWindowOrigins` and `-saveHiddenWindows` — that store is how a client keeps
+    /// its tab grouping and window positions across a reconnect.
     ///
     /// **Anything else answers `%error`**, in tmux's exact shape — a `parse error: unknown
     /// command: <name>` body line closed by `%error` — rather than a silent `%end` that
@@ -794,7 +819,11 @@ impl ControlServer {
     }
 
     /// Run one parsed command. `Ok(body)` closes with `%end`, `Err(message)` with `%error`.
-    fn dispatch(&mut self, words: &[String], actions: &mut Vec<Action>) -> Result<Vec<String>, String> {
+    fn dispatch(
+        &mut self,
+        words: &[String],
+        actions: &mut Vec<Action>,
+    ) -> Result<Vec<String>, String> {
         let name = words[0].as_str();
         let rest = &words[1..];
         match name {
@@ -812,7 +841,12 @@ impl ControlServer {
             }
             "capture-pane" | "capturep" => self.cmd_capture_pane(rest),
             "select-pane" | "selectp" | "select-window" | "selectw" => self.cmd_select(rest),
-            "show-options" | "show" | "show-window-options" | "showw" => self.cmd_show_options(rest),
+            // The `-window-` spellings imply `-w` (`cmd-set-option.c` sets
+            // `CMD_SET_OPTION_WINDOW` from the entry, not from the flags).
+            "show-options" | "show" => self.cmd_show_options(rest, false),
+            "show-window-options" | "showw" => self.cmd_show_options(rest, true),
+            "set-option" | "set" => self.cmd_set_option(rest, false),
+            "set-window-option" | "setw" => self.cmd_set_option(rest, true),
             "has-session" | "has" => self.cmd_has_session(rest),
             "detach-client" | "detach" => {
                 actions.push(Action::Detach);
@@ -862,7 +896,9 @@ impl ControlServer {
         // `-a` (all sessions) is the same set for us, since there is only one session.
         let target = a.value('t');
         let narrow = target.map(|t| t.starts_with('@')).unwrap_or(false);
-        let uids: Vec<String> = match target.filter(|_| narrow).and_then(|t| self.resolve_target(t))
+        let uids: Vec<String> = match target
+            .filter(|_| narrow)
+            .and_then(|t| self.resolve_target(t))
         {
             Some(u) => vec![u],
             None => self.panes.keys().cloned().collect(),
@@ -967,8 +1003,7 @@ impl ControlServer {
             // `send -H -t %n 41 42 …` — each argument is one literal byte in hex.
             // (`TmuxGateway.m -numbersAsLiteralByteHexArguments:`.)
             for w in &a.positionals {
-                let b = u8::from_str_radix(w, 16)
-                    .map_err(|_| format!("invalid hex byte '{w}'"))?;
+                let b = u8::from_str_radix(w, 16).map_err(|_| format!("invalid hex byte '{w}'"))?;
                 data.push(b);
             }
         } else if a.flag('l') {
@@ -983,8 +1018,8 @@ impl ControlServer {
             // UTF-8 encode rather than being written raw.
             for w in &a.positionals {
                 if let Some(hex) = w.strip_prefix("0x").or_else(|| w.strip_prefix("0X")) {
-                    let cp = u32::from_str_radix(hex, 16)
-                        .map_err(|_| format!("invalid key '{w}'"))?;
+                    let cp =
+                        u32::from_str_radix(hex, 16).map_err(|_| format!("invalid key '{w}'"))?;
                     match char::from_u32(cp) {
                         Some(c) => {
                             let mut buf = [0u8; 4];
@@ -1028,7 +1063,7 @@ impl ControlServer {
             _ => (None, spec),
         };
         let (w, h) = dims
-            .split_once(|c| c == ',' || c == 'x')
+            .split_once([',', 'x'])
             .ok_or_else(|| format!("bad size '{spec}'"))?;
         let w: u16 = w.trim().parse().map_err(|_| format!("bad size '{spec}'"))?;
         let h: u16 = h.trim().parse().map_err(|_| format!("bad size '{spec}'"))?;
@@ -1130,24 +1165,133 @@ impl ControlServer {
         Ok(Vec::new())
     }
 
-    fn cmd_show_options(&mut self, args: &[String]) -> Result<Vec<String>, String> {
-        // iTerm2 probes a pile of options and user-options: `show -v -q -t $0 @iterm2_id`,
-        // `@affinities`, `@origins`, `show-options -v -s default-terminal`, and so on.
-        // We hold no tmux option store, so every lookup is "unset".
-        //
-        // `-q` means "do not error if it is unset", and iTerm2 passes it on the ones it
-        // cares about. Without `-q` tmux errors on an unknown option, so we do too rather
-        // than pretend the option exists. Note `-v` is a *boolean* here ("value only"), so
-        // it must stay out of the optstring or `show -v -q …` would eat `-q` as its value.
-        let a = Args::parse(args, "t:")?;
-        if a.flag('q') || a.positionals.is_empty() {
+    /// Which option store a `set`/`show` addresses.
+    ///
+    /// tmux has four scopes (server / session / window / pane) plus a "global" tier per
+    /// scope, and a real inheritance chain between them. We do not model the chain — we
+    /// only need writes and reads of the *same* option to land in the same bucket, which
+    /// is all iTerm2 does. So a scope is just a key string.
+    fn option_scope(&self, a: &Args) -> String {
+        if a.flag('s') {
+            return "server".to_string();
+        }
+        let pane = a.flag('p');
+        let window = a.flag('w');
+        if a.flag('g') {
+            return match (pane, window) {
+                (true, _) => "global-pane".to_string(),
+                (_, true) => "global-window".to_string(),
+                _ => "global".to_string(),
+            };
+        }
+        if pane || window {
+            let tier = if pane { "pane" } else { "window" };
+            // A `-t` we cannot resolve falls back to the global tier rather than minting a
+            // per-target bucket keyed on a string that names nothing.
+            return match a.value('t').and_then(|t| self.resolve_target(t)) {
+                Some(uid) => format!("{tier}:{uid}"),
+                None => format!("global-{tier}"),
+            };
+        }
+        // Session scope. M4 publishes exactly one session, so every `-t $n` lands here.
+        format!("${}", self.session_id)
+    }
+
+    /// `set-option` / `set` / `set-window-option` / `setw`.
+    ///
+    /// **Only user options (`@name`) are honoured.** Those are pure client-side scratch
+    /// storage — tmux itself never reads them — so storing one is honest. A real tmux
+    /// option (`status`, `default-terminal`, `mouse`, …) errors instead: hyperpanes has no
+    /// option store behind it, and a silent `%end` would tell the client a setting took
+    /// effect when nothing changed. Same rule as the lifecycle commands above.
+    fn cmd_set_option(
+        &mut self,
+        args: &[String],
+        window_scope: bool,
+    ) -> Result<Vec<String>, String> {
+        let mut a = Args::parse(args, "t:")?;
+        if window_scope {
+            a.flags.insert('w');
+        }
+        let name = a
+            .positionals
+            .first()
+            .cloned()
+            .ok_or("set-option: not enough arguments")?;
+        if !name.starts_with('@') {
+            return Err(format!(
+                "{name} is not supported by hyperpanes control mode: only user options \
+                 (@name) are stored — hyperpanes has no tmux option store behind the rest"
+            ));
+        }
+        let scope = self.option_scope(&a);
+        // `-u`/`-U` unset.
+        if a.flag('u') || a.flag('U') {
+            self.options.remove(&(scope, name));
             return Ok(Vec::new());
         }
-        let name = &a.positionals[0];
-        if a.flag('v') {
-            return Ok(Vec::new());
+        let value = a.positionals.get(1).cloned().unwrap_or_default();
+        // `-a` appends to the current value (`cmd-set-option.c`); iTerm2 does not use it,
+        // but a human at the socket reasonably expects tmux's semantics.
+        let value = if a.flag('a') {
+            let mut prev = self
+                .options
+                .get(&(scope.clone(), name.clone()))
+                .cloned()
+                .unwrap_or_default();
+            prev.push_str(&value);
+            prev
+        } else {
+            value
+        };
+        self.options.insert((scope, name), value);
+        Ok(Vec::new())
+    }
+
+    /// `show-options` / `show` / `show-window-options` / `showw`.
+    ///
+    /// iTerm2 probes a pile of options and user options: `show -v -q -t $0 @iterm2_id`,
+    /// `@affinities`, `@origins`, `@hidden`, `show-options -v -s default-terminal`, …
+    /// A user option someone `set` comes back; anything else is unset.
+    ///
+    /// `-q` means "do not error if it is unset", and iTerm2 passes it on the ones it cares
+    /// about. `-v` ("value only") is likewise answered with an empty successful block on a
+    /// miss rather than an error, because a client asking only for a value treats an error
+    /// block as a protocol failure. A bare `show <name>` on something unset errors, as
+    /// tmux does. Note `-v` and `-q` are **booleans**, so they must stay out of the
+    /// optstring or `show -v -q …` would eat `-q` as `-v`'s value.
+    fn cmd_show_options(
+        &mut self,
+        args: &[String],
+        window_scope: bool,
+    ) -> Result<Vec<String>, String> {
+        let mut a = Args::parse(args, "t:")?;
+        if window_scope {
+            a.flags.insert('w');
         }
-        Err(format!("unknown option: {name}"))
+        let scope = self.option_scope(&a);
+        let Some(name) = a.positionals.first().cloned() else {
+            // No name: tmux lists every option in scope. We hold only user options, so
+            // that is what comes back — in `name value` form, or bare values under `-v`.
+            return Ok(self
+                .options
+                .iter()
+                .filter(|((s, _), _)| *s == scope)
+                .map(|((_, n), v)| {
+                    if a.flag('v') {
+                        v.clone()
+                    } else {
+                        format!("{n} {}", quote_option_value(v))
+                    }
+                })
+                .collect());
+        };
+        match self.options.get(&(scope, name.clone())) {
+            Some(v) if a.flag('v') => Ok(vec![v.clone()]),
+            Some(v) => Ok(vec![format!("{name} {}", quote_option_value(v))]),
+            None if a.flag('q') || a.flag('v') => Ok(Vec::new()),
+            None => Err(format!("unknown option: {name}")),
+        }
     }
 
     fn cmd_has_session(&mut self, args: &[String]) -> Result<Vec<String>, String> {
@@ -1222,7 +1366,11 @@ impl ControlServer {
                     let v = self.expand_var(&parts[0], ctx);
                     !v.is_empty() && v != "0"
                 };
-                let branch = if truthy { &parts[1] } else { parts.get(2).map_or("", |s| s.as_str()) };
+                let branch = if truthy {
+                    &parts[1]
+                } else {
+                    parts.get(2).map_or("", |s| s.as_str())
+                };
                 return self.expand(branch, ctx);
             }
             return String::new();
@@ -1259,7 +1407,9 @@ impl ControlServer {
                 .and_then(|u| self.ids.window_id(u))
                 .map(|w| format!("@{w}"))
                 .unwrap_or_default(),
-            "window_index" => uid.map(|u| self.window_index(u).to_string()).unwrap_or_default(),
+            "window_index" => uid
+                .map(|u| self.window_index(u).to_string())
+                .unwrap_or_default(),
             "window_name" => pane.map(PaneInfo::name).unwrap_or_default(),
             "window_width" => pane.map(|p| p.width().to_string()).unwrap_or_default(),
             "window_height" => pane.map(|p| p.height().to_string()).unwrap_or_default(),
@@ -1287,12 +1437,22 @@ impl ControlServer {
             // `TmuxStateParser`'s per-pane VT state. We report a plausible reset state
             // rather than nothing: iTerm2 parses these into its own emulator, and an empty
             // string parses as 0 anyway. See the "unverified" note in the docs.
-            "cursor_x" | "cursor_y" | "scroll_region_upper" | "alternate_on"
-            | "alternate_saved_x" | "alternate_saved_y" | "insert_flag" | "keypad_cursor_flag"
-            | "keypad_flag" | "mouse_standard_flag" | "mouse_button_flag" | "mouse_any_flag"
-            | "mouse_utf8_flag" | "mouse_sgr_flag" | "bracket_paste_flag" | "pane_key_mode" => {
-                "0".to_string()
-            }
+            "cursor_x"
+            | "cursor_y"
+            | "scroll_region_upper"
+            | "alternate_on"
+            | "alternate_saved_x"
+            | "alternate_saved_y"
+            | "insert_flag"
+            | "keypad_cursor_flag"
+            | "keypad_flag"
+            | "mouse_standard_flag"
+            | "mouse_button_flag"
+            | "mouse_any_flag"
+            | "mouse_utf8_flag"
+            | "mouse_sgr_flag"
+            | "bracket_paste_flag"
+            | "pane_key_mode" => "0".to_string(),
             "cursor_flag" | "wrap_flag" => "1".to_string(),
             "scroll_region_lower" => pane
                 .map(|p| p.height().saturating_sub(1).to_string())
@@ -1303,6 +1463,30 @@ impl ControlServer {
             _ => String::new(),
         }
     }
+}
+
+/// How `show-options` (without `-v`) prints a value.
+///
+/// tmux quotes when the value is empty or holds anything the lexer would re-split
+/// (`options.c:options_to_string` → `args_escape`). Quoting only when it is needed keeps
+/// the common `@iterm2_id 1234` line byte-identical to real tmux.
+fn quote_option_value(v: &str) -> String {
+    let needs = v.is_empty()
+        || v.chars()
+            .any(|c| c.is_whitespace() || matches!(c, '"' | '\'' | '\\' | '$' | ';' | '#'));
+    if !needs {
+        return v.to_string();
+    }
+    let mut out = String::with_capacity(v.len() + 2);
+    out.push('"');
+    for c in v.chars() {
+        if matches!(c, '"' | '\\' | '$') {
+            out.push('\\');
+        }
+        out.push(c);
+    }
+    out.push('"');
+    out
 }
 
 /// tmux renders boolean formats as `1`/`0`.

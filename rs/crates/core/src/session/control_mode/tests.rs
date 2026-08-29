@@ -155,7 +155,10 @@ fn single_pane_layout_matches_real_tmux() {
 fn layout_checksum_is_not_a_plain_sum() {
     // Guards against the classic mis-port that drops the rotate: a plain byte sum would
     // make these two equal, since they are anagrams.
-    assert_ne!(layout_checksum("80x24,0,0,1"), layout_checksum("80x24,0,1,0"));
+    assert_ne!(
+        layout_checksum("80x24,0,0,1"),
+        layout_checksum("80x24,0,1,0")
+    );
 }
 
 // =====================================================================================
@@ -186,7 +189,7 @@ fn ids_survive_an_unrelated_pane_disappearing() {
     let a = "pane-aaaaaaaa-1111-4111-8111-111111111111".to_string();
     let b = "pane-bbbbbbbb-2222-4222-8222-222222222222".to_string();
     let both = IdMap::rebuild(&[a.clone(), b.clone()]);
-    let only_a = IdMap::rebuild(&[a.clone()]);
+    let only_a = IdMap::rebuild(std::slice::from_ref(&a));
     // `b` closing must not renumber `a` — the client is still drawing `a`'s tab.
     assert_eq!(both.pane_id(&a), only_a.pane_id(&a));
     assert_eq!(both.window_id(&a), only_a.window_id(&a));
@@ -194,7 +197,9 @@ fn ids_survive_an_unrelated_pane_disappearing() {
 
 #[test]
 fn ids_are_unique_and_fit_a_signed_int() {
-    let uids: Vec<String> = (0..500).map(|i| format!("pane-{i:08x}-dead-4bee-8000-000000000000")).collect();
+    let uids: Vec<String> = (0..500)
+        .map(|i| format!("pane-{i:08x}-dead-4bee-8000-000000000000"))
+        .collect();
     let map = IdMap::rebuild(&uids);
     let mut seen = HashSet::new();
     for u in &uids {
@@ -208,8 +213,10 @@ fn ids_are_unique_and_fit_a_signed_int() {
 #[test]
 fn id_reverse_lookup_round_trips() {
     let s = two_pane();
-    for uid in ["pane-aaaaaaaa-1111-4111-8111-111111111111",
-                "pane-bbbbbbbb-2222-4222-8222-222222222222"] {
+    for uid in [
+        "pane-aaaaaaaa-1111-4111-8111-111111111111",
+        "pane-bbbbbbbb-2222-4222-8222-222222222222",
+    ] {
         let p = s.ids().pane_id(uid).unwrap();
         let w = s.ids().window_id(uid).unwrap();
         assert_eq!(s.ids().uid_for_pane(p), Some(uid));
@@ -242,7 +249,10 @@ fn id_derivation_is_pinned() {
 fn greeting_matches_real_tmux_shape() {
     let mut s = srv();
     let g = s.greeting();
-    let w = s.ids().window_id("pane-aaaaaaaa-1111-4111-8111-111111111111").unwrap();
+    let w = s
+        .ids()
+        .window_id("pane-aaaaaaaa-1111-4111-8111-111111111111")
+        .unwrap();
     assert_eq!(g[0], DCS_OPEN);
     assert_eq!(
         text(&g[1..]),
@@ -260,7 +270,10 @@ fn greeting_matches_real_tmux_shape() {
 fn greeting_emits_one_window_add_per_pane() {
     let mut s = two_pane();
     let g = text(&s.greeting());
-    assert_eq!(g.iter().filter(|l| l.starts_with("%window-add ")).count(), 2);
+    assert_eq!(
+        g.iter().filter(|l| l.starts_with("%window-add ")).count(),
+        2
+    );
 }
 
 #[test]
@@ -379,12 +392,17 @@ fn notifications_are_flushed_after_the_block_not_inside_it() {
     let notes: Vec<usize> = lines
         .iter()
         .enumerate()
-        .filter(|(_, l)| l.starts_with("%session-window-changed") || l.starts_with("%window-pane-changed"))
+        .filter(|(_, l)| {
+            l.starts_with("%session-window-changed") || l.starts_with("%window-pane-changed")
+        })
         .map(|(i, _)| i)
         .collect();
     assert_eq!(notes.len(), 2, "expected both notifications: {lines:?}");
     for i in notes {
-        assert!(i > end, "notification at {i} landed inside the block: {lines:?}");
+        assert!(
+            i > end,
+            "notification at {i} landed inside the block: {lines:?}"
+        );
     }
 }
 
@@ -418,7 +436,9 @@ fn output_line_is_prefixed_with_the_pane_id() {
 fn output_for_an_unknown_pane_or_empty_chunk_emits_nothing() {
     let mut s = srv();
     assert!(s.output("pane-nope", b"hi").is_empty());
-    assert!(s.output("pane-aaaaaaaa-1111-4111-8111-111111111111", b"").is_empty());
+    assert!(s
+        .output("pane-aaaaaaaa-1111-4111-8111-111111111111", b"")
+        .is_empty());
 }
 
 /// A `%output` line must never contain a raw newline, or the client would read the tail of
@@ -474,7 +494,10 @@ fn list_windows_default_matches_real_tmux() {
 #[test]
 fn list_panes_default_matches_real_tmux() {
     let mut s = srv();
-    let p = s.ids().pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111").unwrap();
+    let p = s
+        .ids()
+        .pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111")
+        .unwrap();
     let lines = text(&s.command("list-panes").lines);
     assert_eq!(
         lines[1],
@@ -492,7 +515,10 @@ fn iterm2_format_strings_expand() {
     let (wa, pa) = (s.ids().window_id(a).unwrap(), s.ids().pane_id(a).unwrap());
     let (wb, pb) = (s.ids().window_id(b).unwrap(), s.ids().pane_id(b).unwrap());
 
-    let lines = text(&s.command(r##"list-sessions -F "#{session_id} #{session_name}""##).lines);
+    let lines = text(
+        &s.command(r##"list-sessions -F "#{session_id} #{session_name}""##)
+            .lines,
+    );
     assert_eq!(lines[1], "$0 cap");
 
     let lines = text(
@@ -501,7 +527,10 @@ fn iterm2_format_strings_expand() {
         )
         .lines,
     );
-    let (la, lb) = (single_pane_layout(80, 24, pa), single_pane_layout(100, 30, pb));
+    let (la, lb) = (
+        single_pane_layout(80, 24, pa),
+        single_pane_layout(100, 30, pb),
+    );
     assert_eq!(lines[1], format!("cap\t@{wa}\tzsh\t80\t24\t{la}\t1"));
     assert_eq!(lines[2], format!("cap\t@{wb}\tvim\t100\t30\t{lb}\t0"));
 
@@ -513,12 +542,18 @@ fn iterm2_format_strings_expand() {
 #[test]
 fn list_windows_narrows_on_a_window_target_but_not_a_session_target() {
     let mut s = two_pane();
-    let wb = s.ids().window_id("pane-bbbbbbbb-2222-4222-8222-222222222222").unwrap();
+    let wb = s
+        .ids()
+        .window_id("pane-bbbbbbbb-2222-4222-8222-222222222222")
+        .unwrap();
     // `-t $0` is a session: every window.
     let lines = text(&s.command(r##"list-windows -F "#{window_id}" -t $0"##).lines);
     assert_eq!(lines.len(), 4, "{lines:?}");
     // `-t @n` is one window.
-    let lines = text(&s.command(&format!(r##"list-windows -F "#{{window_id}}" -t @{wb}"##)).lines);
+    let lines = text(
+        &s.command(&format!(r##"list-windows -F "#{{window_id}}" -t @{wb}"##))
+            .lines,
+    );
     assert_eq!(lines[1], format!("@{wb}"));
     assert_eq!(lines.len(), 3, "{lines:?}");
 }
@@ -553,7 +588,10 @@ fn one_write(s: &mut ControlServer, cmd: &str) -> Vec<u8> {
 #[test]
 fn send_keys_literal_cluster() {
     let mut s = srv();
-    let p = s.ids().pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111").unwrap();
+    let p = s
+        .ids()
+        .pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111")
+        .unwrap();
     assert_eq!(one_write(&mut s, &format!("send -lt %{p} abc")), b"abc");
 }
 
@@ -561,10 +599,16 @@ fn send_keys_literal_cluster() {
 #[test]
 fn send_keys_hex_code_points_are_utf8_encoded() {
     let mut s = srv();
-    let p = s.ids().pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111").unwrap();
+    let p = s
+        .ids()
+        .pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111")
+        .unwrap();
     assert_eq!(one_write(&mut s, &format!("send -t %{p} 0x41 0x42")), b"AB");
     // U+20AC EURO SIGN -> three UTF-8 bytes, not one truncated one.
-    assert_eq!(one_write(&mut s, &format!("send -t %{p} 0x20ac")), "€".as_bytes());
+    assert_eq!(
+        one_write(&mut s, &format!("send -t %{p} 0x20ac")),
+        "€".as_bytes()
+    );
 }
 
 /// `send -H -t %n NN` — literal *bytes*, not code points. The distinction matters: the same
@@ -572,13 +616,19 @@ fn send_keys_hex_code_points_are_utf8_encoded() {
 #[test]
 fn send_keys_hex_bytes_are_literal() {
     let mut s = srv();
-    let p = s.ids().pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111").unwrap();
+    let p = s
+        .ids()
+        .pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111")
+        .unwrap();
     assert_eq!(
         one_write(&mut s, &format!("send -H -t %{p} 1b 5b 41")),
         b"\x1b[A"
     );
     // Contrast with the code-point path for the same digits.
-    assert_eq!(one_write(&mut s, &format!("send -t %{p} 0xe9")), "é".as_bytes());
+    assert_eq!(
+        one_write(&mut s, &format!("send -t %{p} 0xe9")),
+        "é".as_bytes()
+    );
     assert_eq!(one_write(&mut s, &format!("send -H -t %{p} e9")), &[0xe9u8]);
 }
 
@@ -586,7 +636,10 @@ fn send_keys_hex_bytes_are_literal() {
 #[test]
 fn send_keys_named_keys() {
     let mut s = srv();
-    let p = s.ids().pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111").unwrap();
+    let p = s
+        .ids()
+        .pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111")
+        .unwrap();
     for (name, want) in [
         ("Enter", &b"\r"[..]),
         ("Tab", b"\t"),
@@ -618,14 +671,23 @@ fn send_keys_named_keys() {
 #[test]
 fn send_keys_modifiers() {
     let mut s = srv();
-    let p = s.ids().pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111").unwrap();
+    let p = s
+        .ids()
+        .pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111")
+        .unwrap();
     assert_eq!(one_write(&mut s, &format!("send -t %{p} 'C-c'")), &[0x03]);
     assert_eq!(one_write(&mut s, &format!("send -t %{p} 'C-d'")), &[0x04]);
     assert_eq!(one_write(&mut s, &format!("send -t %{p} 'C-a'")), &[0x01]);
     assert_eq!(one_write(&mut s, &format!("send -t %{p} 'M-x'")), b"\x1bx");
     // Ctrl+Alt+A is ESC then 0x01 — both modifiers, not just the outermost one.
-    assert_eq!(one_write(&mut s, &format!("send -t %{p} 'C-M-a'")), b"\x1b\x01");
-    assert_eq!(one_write(&mut s, &format!("send -t %{p} 'M-C-a'")), b"\x1b\x01");
+    assert_eq!(
+        one_write(&mut s, &format!("send -t %{p} 'C-M-a'")),
+        b"\x1b\x01"
+    );
+    assert_eq!(
+        one_write(&mut s, &format!("send -t %{p} 'M-C-a'")),
+        b"\x1b\x01"
+    );
 }
 
 #[test]
@@ -636,7 +698,10 @@ fn send_keys_routes_to_the_targeted_pane() {
     let r = s.command(&format!("send -lt %{p} x"));
     assert_eq!(
         r.actions,
-        vec![Action::Write { uid: b.to_string(), data: b"x".to_vec() }]
+        vec![Action::Write {
+            uid: b.to_string(),
+            data: b"x".to_vec()
+        }]
     );
 }
 
@@ -646,13 +711,22 @@ fn send_keys_accepts_a_window_target_too() {
     let b = "pane-bbbbbbbb-2222-4222-8222-222222222222";
     let w = s.ids().window_id(b).unwrap();
     let r = s.command(&format!("send -lt @{w} x"));
-    assert_eq!(r.actions, vec![Action::Write { uid: b.to_string(), data: b"x".to_vec() }]);
+    assert_eq!(
+        r.actions,
+        vec![Action::Write {
+            uid: b.to_string(),
+            data: b"x".to_vec()
+        }]
+    );
 }
 
 #[test]
 fn send_keys_with_a_bad_hex_byte_errors() {
     let mut s = srv();
-    let p = s.ids().pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111").unwrap();
+    let p = s
+        .ids()
+        .pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111")
+        .unwrap();
     let r = s.command(&format!("send -H -t %{p} zz"));
     assert!(text(&r.lines).iter().any(|l| l.starts_with("%error")));
     assert!(r.actions.is_empty());
@@ -670,7 +744,10 @@ fn refresh_client_is_accepted_but_does_not_resize_under_observe() {
     let mut s = srv();
     for spec in ["refresh-client -C 100,30", "refresh-client -C 100x30"] {
         let r = s.command(spec);
-        assert!(text(&r.lines).iter().any(|l| l.starts_with("%end")), "{spec}");
+        assert!(
+            text(&r.lines).iter().any(|l| l.starts_with("%end")),
+            "{spec}"
+        );
         assert!(r.actions.is_empty(), "{spec} must not resize under Observe");
     }
 }
@@ -680,7 +757,14 @@ fn refresh_client_resizes_under_request_policy() {
     let mut s = srv().with_policy(ResizePolicy::Request);
     let uid = "pane-aaaaaaaa-1111-4111-8111-111111111111".to_string();
     let r = s.command("refresh-client -C 100,30");
-    assert_eq!(r.actions, vec![Action::Resize { uid, cols: 100, rows: 30 }]);
+    assert_eq!(
+        r.actions,
+        vec![Action::Resize {
+            uid,
+            cols: 100,
+            rows: 30
+        }]
+    );
 }
 
 /// The per-window spelling, `-C @n:WxH`, which newer iTerm2 uses.
@@ -692,7 +776,11 @@ fn refresh_client_per_window_form() {
     let r = s.command(&format!("refresh-client -C @{w}:120x40"));
     assert_eq!(
         r.actions,
-        vec![Action::Resize { uid: b.to_string(), cols: 120, rows: 40 }]
+        vec![Action::Resize {
+            uid: b.to_string(),
+            cols: 120,
+            rows: 40
+        }]
     );
 }
 
@@ -707,7 +795,10 @@ fn refresh_client_ignores_flags_we_do_not_implement() {
         "refresh-client -B 1:%0:#{pane_id}",
     ] {
         let r = s.command(cmd);
-        assert!(text(&r.lines).iter().any(|l| l.starts_with("%end")), "{cmd}");
+        assert!(
+            text(&r.lines).iter().any(|l| l.starts_with("%end")),
+            "{cmd}"
+        );
         assert!(r.actions.is_empty());
     }
 }
@@ -725,11 +816,21 @@ fn resize_window_requests_a_resize_only_under_request_policy() {
     let w = srv().ids().window_id(&uid).unwrap();
 
     let mut observe = srv();
-    assert!(observe.command(&format!("resize-window -x 90 -y 25 -t @{w}")).actions.is_empty());
+    assert!(observe
+        .command(&format!("resize-window -x 90 -y 25 -t @{w}"))
+        .actions
+        .is_empty());
 
     let mut request = srv().with_policy(ResizePolicy::Request);
     let r = request.command(&format!("resize-window -x 90 -y 25 -t @{w}"));
-    assert_eq!(r.actions, vec![Action::Resize { uid, cols: 90, rows: 25 }]);
+    assert_eq!(
+        r.actions,
+        vec![Action::Resize {
+            uid,
+            cols: 90,
+            rows: 25
+        }]
+    );
 }
 
 // =====================================================================================
@@ -755,7 +856,9 @@ fn pane_resize_emits_layout_change_matching_real_tmux() {
 #[test]
 fn a_no_op_resize_emits_nothing() {
     let mut s = srv();
-    assert!(s.pane_resized("pane-aaaaaaaa-1111-4111-8111-111111111111", 80, 24).is_empty());
+    assert!(s
+        .pane_resized("pane-aaaaaaaa-1111-4111-8111-111111111111", 80, 24)
+        .is_empty());
 }
 
 #[test]
@@ -783,7 +886,9 @@ fn pane_exit_closes_the_window_but_keeps_the_session() {
     // And the surviving pane keeps its ids.
     assert_eq!(
         s.ids().pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111"),
-        two_pane().ids().pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111")
+        two_pane()
+            .ids()
+            .pane_id("pane-aaaaaaaa-1111-4111-8111-111111111111")
     );
 }
 
@@ -802,7 +907,10 @@ fn pane_rename_emits_window_renamed() {
     let mut s = srv();
     let uid = "pane-aaaaaaaa-1111-4111-8111-111111111111";
     let w = s.ids().window_id(uid).unwrap();
-    assert_eq!(text(&s.pane_renamed(uid, "vim")), vec![format!("%window-renamed @{w} vim")]);
+    assert_eq!(
+        text(&s.pane_renamed(uid, "vim")),
+        vec![format!("%window-renamed @{w} vim")]
+    );
     // Idempotent.
     assert!(s.pane_renamed(uid, "vim").is_empty());
 }
@@ -810,7 +918,9 @@ fn pane_rename_emits_window_renamed() {
 #[test]
 fn adding_a_pane_that_already_exists_is_a_no_op() {
     let mut s = srv();
-    assert!(s.pane_added(PaneInfo::new("pane-aaaaaaaa-1111-4111-8111-111111111111")).is_empty());
+    assert!(s
+        .pane_added(PaneInfo::new("pane-aaaaaaaa-1111-4111-8111-111111111111"))
+        .is_empty());
 }
 
 // =====================================================================================
@@ -850,7 +960,10 @@ fn capture_pane_iterm2_scrollback_form_parses() {
     let uid = "pane-aaaaaaaa-1111-4111-8111-111111111111";
     let p = s.ids().pane_id(uid).unwrap();
     s.set_screen(uid, Some("line\n".to_string()));
-    let lines = text(&s.command(&format!("capture-pane -peqJN -t \"%{p}\" -S -100")).lines);
+    let lines = text(
+        &s.command(&format!("capture-pane -peqJN -t \"%{p}\" -S -100"))
+            .lines,
+    );
     assert_eq!(lines[1], "line");
 }
 
@@ -902,11 +1015,20 @@ fn a_trailing_cr_is_tolerated() {
 fn split_words_handles_tmux_quoting() {
     assert_eq!(split_words("a b  c").unwrap(), vec!["a", "b", "c"]);
     // Single quotes are fully literal — which is why iTerm2 uses them for key names.
-    assert_eq!(split_words("send -t %0 'C-c'").unwrap(), vec!["send", "-t", "%0", "C-c"]);
-    assert_eq!(split_words(r##"a "b c" d"##).unwrap(), vec!["a", "b c", "d"]);
+    assert_eq!(
+        split_words("send -t %0 'C-c'").unwrap(),
+        vec!["send", "-t", "%0", "C-c"]
+    );
+    assert_eq!(
+        split_words(r##"a "b c" d"##).unwrap(),
+        vec!["a", "b c", "d"]
+    );
     assert_eq!(split_words(r##""a\tb""##).unwrap(), vec!["a\tb"]);
     assert_eq!(split_words(r##"a\ b"##).unwrap(), vec!["a b"]);
-    assert_eq!(split_words(r##"'#{pane_id}'"##).unwrap(), vec!["#{pane_id}"]);
+    assert_eq!(
+        split_words(r##"'#{pane_id}'"##).unwrap(),
+        vec!["#{pane_id}"]
+    );
     assert!(split_words("'unterminated").is_err());
     assert!(split_words(r##""unterminated"##).is_err());
     assert!(split_words("trailing\\").is_err());
@@ -940,8 +1062,12 @@ fn args_parse_clusters_and_values() {
 #[test]
 fn format_conditionals_and_escapes() {
     let s = two_pane();
-    let a = FmtCtx { uid: Some("pane-aaaaaaaa-1111-4111-8111-111111111111".into()) };
-    let b = FmtCtx { uid: Some("pane-bbbbbbbb-2222-4222-8222-222222222222".into()) };
+    let a = FmtCtx {
+        uid: Some("pane-aaaaaaaa-1111-4111-8111-111111111111".into()),
+    };
+    let b = FmtCtx {
+        uid: Some("pane-bbbbbbbb-2222-4222-8222-222222222222".into()),
+    };
     assert_eq!(s.expand("#{?window_active,yes,no}", &a), "yes");
     assert_eq!(s.expand("#{?window_active,yes,no}", &b), "no");
     assert_eq!(s.expand("#{?window_active,1,0}", &b), "0");
@@ -965,14 +1091,23 @@ fn format_expansion_preserves_non_ascii() {
     let mut p = PaneInfo::new("pane-aaaaaaaa-1111-4111-8111-111111111111");
     p.cwd = Some("/Users/bshuler/Ünicode/日本語".into());
     let s = ControlServer::new("cap", vec![p]).with_clock(Clock::Fixed(T));
-    let ctx = FmtCtx { uid: Some("pane-aaaaaaaa-1111-4111-8111-111111111111".into()) };
-    assert_eq!(s.expand("→#{pane_current_path}←", &ctx), "→/Users/bshuler/Ünicode/日本語←");
+    let ctx = FmtCtx {
+        uid: Some("pane-aaaaaaaa-1111-4111-8111-111111111111".into()),
+    };
+    assert_eq!(
+        s.expand("→#{pane_current_path}←", &ctx),
+        "→/Users/bshuler/Ünicode/日本語←"
+    );
 }
 
 #[test]
 fn unknown_grid_falls_back_to_eighty_by_twenty_four() {
-    let mut s = ControlServer::new("cap", vec![PaneInfo::new("pane-x")]).with_clock(Clock::Fixed(T));
-    let lines = text(&s.command(r##"list-windows -F "#{window_width}x#{window_height}""##).lines);
+    let mut s =
+        ControlServer::new("cap", vec![PaneInfo::new("pane-x")]).with_clock(Clock::Fixed(T));
+    let lines = text(
+        &s.command(r##"list-windows -F "#{window_width}x#{window_height}""##)
+            .lines,
+    );
     assert_eq!(lines[1], "80x24");
 }
 
@@ -1122,7 +1257,9 @@ fn set_cwd_feeds_the_pane_current_path_format() {
     let mut s = srv();
     s.set_cwd(uid, Some("/tmp/wörk".into()));
     let pane = s.ids().pane_id(uid).unwrap();
-    let r = s.command(&format!("display-message -p -t %{pane} '#{{pane_current_path}}'"));
+    let r = s.command(&format!(
+        "display-message -p -t %{pane} '#{{pane_current_path}}'"
+    ));
     assert_eq!(text(&r.lines)[1], "/tmp/wörk");
     // An unknown uid is a silent no-op, not a panic — the daemon can report a pane this
     // client has not learned about yet.
@@ -1142,4 +1279,162 @@ fn has_pane_and_uids_track_the_published_set() {
     s.pane_exited(a);
     assert!(!s.has_pane(a));
     assert_eq!(s.uids(), vec![b.to_string()]);
+}
+
+// =====================================================================================
+// User options — where iTerm2 keeps its whole window model
+// =====================================================================================
+
+/// Body lines of a successful command block (everything between `%begin` and `%end`).
+fn ok_body(s: &mut ControlServer, cmd: &str) -> Vec<String> {
+    let lines = text(&s.command(cmd).lines);
+    assert!(
+        lines.last().is_some_and(|l| l.starts_with("%end")),
+        "{cmd} did not succeed: {lines:?}"
+    );
+    lines[1..lines.len() - 1].to_vec()
+}
+
+fn errored(s: &mut ControlServer, cmd: &str) -> bool {
+    text(&s.command(cmd).lines)
+        .last()
+        .is_some_and(|l| l.starts_with("%error"))
+}
+
+/// The exact round trip iTerm2 performs: it stores its window grouping, origins, hidden
+/// set and controller id as tmux **user options** on the session and reads them back with
+/// `show -v -q`. Without a store every value reads back empty and the client re-opens the
+/// panes as ungrouped, unpositioned tabs on every reconnect.
+#[test]
+fn iterm2_user_options_round_trip_on_the_session() {
+    let mut s = two_pane();
+    for (name, value) in [
+        ("@iterm2_id", "d9b1e2f0-0000-4000-8000-000000000001"),
+        ("@affinities", "1234,5678"),
+        ("@origins", "{1234,1235}"),
+        ("@hidden", ""),
+    ] {
+        assert_eq!(
+            ok_body(&mut s, &format!(r#"set -t $0 {name} "{value}""#)),
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            ok_body(&mut s, &format!("show -v -q -t $0 {name}")),
+            vec![value.to_string()],
+            "{name} did not come back"
+        );
+    }
+}
+
+/// A user option is unset until it is set, and `-q`/`-v` make that a success rather than
+/// an error — iTerm2 probes every one of them before it has written any.
+#[test]
+fn an_unset_user_option_is_an_empty_success_under_q_or_v() {
+    let mut s = srv();
+    assert_eq!(
+        ok_body(&mut s, "show -v -q -t $0 @affinities"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        ok_body(&mut s, "show -v -t $0 @affinities"),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        ok_body(&mut s, "show -q -t $0 @affinities"),
+        Vec::<String>::new()
+    );
+    // Bare, with neither flag, tmux errors — so do we.
+    assert!(errored(&mut s, "show -t $0 @affinities"));
+}
+
+/// Without `-v`, tmux prints `name value` and quotes a value the lexer would re-split.
+#[test]
+fn show_without_v_prints_name_and_a_quoted_value() {
+    let mut s = srv();
+    s.command("set -t $0 @plain abc");
+    s.command(r#"set -t $0 @spaced "a b""#);
+    s.command(r#"set -t $0 @empty """#);
+    assert_eq!(ok_body(&mut s, "show -t $0 @plain"), vec!["@plain abc"]);
+    assert_eq!(ok_body(&mut s, "show -t $0 @spaced"), [r#"@spaced "a b""#]);
+    assert_eq!(ok_body(&mut s, "show -t $0 @empty"), [r#"@empty """#]);
+}
+
+/// Scopes are distinct buckets: a session option and a global one with the same name do
+/// not alias, and `setw`/`show-window-options` land in the window tier.
+#[test]
+fn option_scopes_do_not_alias() {
+    let mut s = two_pane();
+    let w = s
+        .ids()
+        .window_id("pane-bbbbbbbb-2222-4222-8222-222222222222")
+        .unwrap();
+    s.command("set -t $0 @where session");
+    s.command("set -g @where global");
+    s.command(&format!("setw -t @{w} @where window"));
+    assert_eq!(ok_body(&mut s, "show -v -q -t $0 @where"), ["session"]);
+    assert_eq!(ok_body(&mut s, "show -v -q -g @where"), ["global"]);
+    assert_eq!(
+        ok_body(&mut s, &format!("showw -v -q -t @{w} @where")),
+        ["window"]
+    );
+    // A different window in the same tier is its own bucket.
+    let w2 = s
+        .ids()
+        .window_id("pane-aaaaaaaa-1111-4111-8111-111111111111")
+        .unwrap();
+    assert_eq!(
+        ok_body(&mut s, &format!("showw -v -q -t @{w2} @where")),
+        Vec::<String>::new()
+    );
+}
+
+/// `-u` unsets and `-a` appends, as tmux's own `set-option` does.
+#[test]
+fn set_supports_unset_and_append() {
+    let mut s = srv();
+    s.command("set -t $0 @acc one");
+    s.command("set -a -t $0 @acc ,two");
+    assert_eq!(ok_body(&mut s, "show -v -q -t $0 @acc"), ["one,two"]);
+    s.command("set -u -t $0 @acc");
+    assert_eq!(
+        ok_body(&mut s, "show -v -q -t $0 @acc"),
+        Vec::<String>::new()
+    );
+}
+
+/// A nameless `show` lists what the scope holds, which is only ever user options here.
+#[test]
+fn show_with_no_name_lists_the_scopes_user_options() {
+    let mut s = srv();
+    s.command("set -t $0 @b two");
+    s.command("set -t $0 @a one");
+    s.command("set -g @elsewhere nope");
+    assert_eq!(ok_body(&mut s, "show -t $0"), ["@a one", "@b two"]);
+}
+
+/// A *real* tmux option is not silently accepted: there is no option store behind it, and
+/// a `%end` would tell the client a setting took effect. Same rule as the lifecycle
+/// commands. Reading one still answers "unset" under `-v`/`-q` rather than erroring,
+/// because iTerm2 probes several before it can know.
+#[test]
+fn a_real_tmux_option_errors_on_set_but_reads_as_unset() {
+    let mut s = srv();
+    assert!(errored(&mut s, "set -g status off"));
+    assert!(errored(&mut s, "set -t $0 default-terminal xterm-256color"));
+    assert_eq!(
+        ok_body(&mut s, "show -v -s default-terminal"),
+        Vec::<String>::new()
+    );
+    assert!(errored(&mut s, "set"));
+}
+
+/// The store must not leak into the *format* namespace or the pane list — it is client
+/// scratch space, nothing more.
+#[test]
+fn user_options_do_not_change_the_published_structure() {
+    let mut s = two_pane();
+    // Bodies only: the guard block's command number legitimately advances between the two.
+    let before = ok_body(&mut s, "list-windows");
+    s.command(r#"set -t $0 @origins "{1,2}""#);
+    assert_eq!(ok_body(&mut s, "list-windows"), before);
 }

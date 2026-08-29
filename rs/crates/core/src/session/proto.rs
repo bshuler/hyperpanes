@@ -465,7 +465,8 @@ mod tests {
     // `ListSessions` fail against an older peer. This is the frozen-host-surface contract.
     #[test]
     fn session_meta_parses_a_payload_with_no_grid_fields() {
-        let legacy = r#"{"uid":"s1","cwd":null,"output_bytes":7,"last_output_at":null,"alive":true}"#;
+        let legacy =
+            r#"{"uid":"s1","cwd":null,"output_bytes":7,"last_output_at":null,"alive":true}"#;
         let meta: SessionMeta = serde_json::from_str(legacy).expect("legacy SessionMeta parses");
         assert_eq!(meta.uid, "s1");
         assert_eq!(meta.output_bytes, 7);

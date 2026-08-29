@@ -149,9 +149,11 @@ const SCREEN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150
 /// unix-only.
 #[cfg(not(unix))]
 pub fn run(_argv: &[String]) -> Result<(), String> {
-    Err("hyperpanes control-mode is not available on Windows yet (the GUI binary has no \
+    Err(
+        "hyperpanes control-mode is not available on Windows yet (the GUI binary has no \
          console subsystem). Run it from a unix host."
-        .to_string())
+            .to_string(),
+    )
 }
 
 /// One thing the loop can be woken by.
@@ -202,8 +204,9 @@ pub fn run(argv: &[String]) -> Result<(), String> {
     if sessions.is_empty() {
         // Refused rather than served empty: tmux clients treat a session with no windows as
         // a dead server and show an opaque failure, so a plain message on stderr is kinder.
-        return Err("no live hyperpanes sessions on this install — start hyperpanes first."
-            .to_string());
+        return Err(
+            "no live hyperpanes sessions on this install — start hyperpanes first.".to_string(),
+        );
     }
 
     let meta_to_pane = |m: &SessionMeta| {
@@ -286,7 +289,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
 
     // The greeting first, then attach to every pane. One connection carries them all: the
     // daemon keys its event fan-out on a per-connection `attached` set (M0).
-    let mut emit = |out: &mut dyn Write, lines: Vec<Vec<u8>>| -> std::io::Result<()> {
+    let emit = |out: &mut dyn Write, lines: Vec<Vec<u8>>| -> std::io::Result<()> {
         for line in lines {
             out.write_all(&line)?;
             if needs_newline(&line) {
@@ -323,8 +326,11 @@ pub fn run(argv: &[String]) -> Result<(), String> {
 
         match msg {
             Msg::DaemonEof => {
-                emit(&mut out, server.goodbye(Some("the hyperpanes daemon exited")))
-                    .map_err(|e| e.to_string())?;
+                emit(
+                    &mut out,
+                    server.goodbye(Some("the hyperpanes daemon exited")),
+                )
+                .map_err(|e| e.to_string())?;
                 return Ok(());
             }
             Msg::StdinEof => {
@@ -350,8 +356,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
                             let _ = write_frame(&mut sock, &ClientMsg::Write { uid, data });
                         }
                         Action::Resize { uid, cols, rows } => {
-                            let _ =
-                                write_frame(&mut sock, &ClientMsg::Resize { uid, cols, rows });
+                            let _ = write_frame(&mut sock, &ClientMsg::Resize { uid, cols, rows });
                         }
                         Action::Detach => {
                             emit(&mut out, server.goodbye(None)).map_err(|e| e.to_string())?;
@@ -475,7 +480,11 @@ fn diff_sessions(
             server.set_cwd(&m.uid, m.cwd.clone());
         }
     }
-    let gone: Vec<String> = seen.keys().filter(|u| !now.contains_key(*u)).cloned().collect();
+    let gone: Vec<String> = seen
+        .keys()
+        .filter(|u| !now.contains_key(*u))
+        .cloned()
+        .collect();
     for uid in gone {
         lines.extend(server.pane_exited(&uid));
     }
@@ -517,8 +526,8 @@ mod tests {
 
     #[test]
     fn flags_parse() {
-        let o = ControlOpts::parse(&argv(&["--resize", "--no-dcs", "--session-name", "work"]))
-            .unwrap();
+        let o =
+            ControlOpts::parse(&argv(&["--resize", "--no-dcs", "--session-name", "work"])).unwrap();
         assert_eq!(o.policy, ResizePolicy::Request);
         assert_eq!(o.mode, ControlMode::Plain);
         assert_eq!(o.session_name, "work");
