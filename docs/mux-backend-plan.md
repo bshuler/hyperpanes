@@ -205,8 +205,22 @@ click.
   revocable keys, and no password auth.
 * **Exit detection changes semantics** after handoff (pty EOF, not `waitpid`). Zombie/exit-code
   reporting needs a test.
-* **Mobile resize contention.** An attach client must not reflow the desktop; decide the policy
-  (attach at the desktop's grid and letterbox, vs. explicit resize request) before M2 ships.
+* ~~**Mobile resize contention.**~~ **Answered (M2): attach at the desktop's grid and letterbox;
+  resizing is an explicit, opt-in request.** `ResizePolicy::Observe` is the default and the client
+  emits no `Resize` at all — a test (`observe_policy_never_puts_a_resize_on_the_wire`) holds the
+  line. The reasoning: a pane is shared, and the desktop is the owner with a *visible* geometry
+  the user chose by dragging splits, while an attach client is a transient viewer that may be a
+  phone in portrait. Letting the small transient viewer win silently reflows every other viewer —
+  it rewraps scrollback, corrupts full-screen TUIs the desktop is showing, and does it invisibly
+  from another machine. Letterboxing's failure mode is strictly better: the pane renders top-left
+  and the remainder of the client's screen is blank, which is visible and self-explanatory.
+  `SIGWINCH` under `Observe` therefore triggers a **repaint** (re-request the replay seed and
+  redraw), not a reflow. `hyperpanes attach --resize` opts into `ResizePolicy::Request`, which
+  sends `Resize` on attach and on every window change; it prints a line saying it is changing the
+  pane for the desktop too. The one case letterboxing cannot render honestly is a client terminal
+  *smaller* than the pane — absolute cursor addressing gets clamped — so the client compares the
+  two grids up front (`SessionMeta::cols`/`rows`, added for this) and warns, pointing at
+  `--resize`.
 * **russh pulls in a crypto backend** (`aws-lc-rs` or `ring`) — a new dependency class for this repo.
 * **No Rust mosh implementation exists**, so mobile roaming/high-latency behaviour will be worse
   than mosh until someone writes one. Future item.
