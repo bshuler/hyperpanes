@@ -929,7 +929,7 @@ pub fn resync(
         let lp = app.global::<LeftPanelAdapter>();
         let open = state.left_panel_open;
         lp.set_open(open);
-        crate::leftpanel::note_panel_open(open);
+        crate::leftpanel::note_panel_open(&mut state.left_panel_seen_open, open);
         if open {
             let now_ms = crate::glow::now_epoch_ms();
             let idle_on = state.settings.idle_alert;
@@ -1225,7 +1225,9 @@ pub fn pump(
     // the workspace is quiet — the dots would freeze at whatever the last resync projected.
     // While the panel is open, a ~1s heartbeat re-runs the projection (the same "dirty →
     // resync" path everything else uses); closed, this costs one bool test per tick.
-    if state.left_panel_open && crate::leftpanel::heartbeat_due(Instant::now()) {
+    if state.left_panel_open
+        && crate::leftpanel::heartbeat_due(&mut state.left_panel_beat, Instant::now())
+    {
         state.dirty = true;
     }
 

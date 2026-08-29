@@ -71,24 +71,21 @@ pub fn is_idle(
 /// from freezing at its last projected brightness on an otherwise-quiet workspace.
 const HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(1000);
 
-thread_local! {
-    /// When the liveness heartbeat last fired (see [`heartbeat_due`]).
-    static LAST_BEAT: RefCell<Option<std::time::Instant>> = const { RefCell::new(None) };
-}
-
-/// Whether the panel's liveness heartbeat is due at `now` (and, if so, consume it). Called
-/// from the pump only while the panel is open.
-pub fn heartbeat_due(now: std::time::Instant) -> bool {
-    LAST_BEAT.with(|b| {
-        let mut b = b.borrow_mut();
-        match *b {
-            Some(t) if now.duration_since(t) < HEARTBEAT => false,
-            _ => {
-                *b = Some(now);
-                true
-            }
+/// Whether the panel's liveness heartbeat is due at `now` (and, if so, consume it by
+/// stamping `last`). Called from the pump only while the panel is open.
+///
+/// `last` is PER WINDOW (`State::left_panel_beat`), not a module-global: `pump` runs once
+/// per window, so a single shared stamp would be consumed by whichever window the app
+/// happens to pump first and every other window's dots would freeze at their last
+/// projected brightness.
+pub fn heartbeat_due(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    match *last {
+        Some(t) if now.duration_since(t) < HEARTBEAT => false,
+        _ => {
+            *last = Some(now);
+            true
         }
-    })
+    }
 }
 
 // ===================== the saved-workspace library =====================
@@ -115,24 +112,32 @@ pub struct LibraryEntry {
 thread_local! {
     /// The last scan of [`library_dir`], so the projection can hand the model rows every
     /// tick without touching the filesystem. Refreshed on the panel's closed→open edge and
-    /// after the panel itself writes a workspace.
+    /// after the panel itself writes a workspace. Process-wide on purpose: the library is
+    /// one directory on disk, so every window shows the same rows.
     static LIB_CACHE: RefCell<Vec<LibraryEntry>> = const { RefCell::new(Vec::new()) };
-    /// The panel's last-seen open state, for that edge detection (mirrors
-    /// `sidebar::WT_LAST_OPEN`).
-    static LIB_LAST_OPEN: RefCell<bool> = const { RefCell::new(false) };
 }
 
 /// Note the panel's current open state; on the closed→open transition rescan the library
 /// (files may have been added by another window — or by hand — while it was shut). Called
 /// from the projection each tick, exactly like `sidebar::note_flyout_open`.
-pub fn note_panel_open(open: bool) {
-    LIB_LAST_OPEN.with(|last| {
-        let mut last = last.borrow_mut();
-        if open && !*last {
-            refresh_library();
-        }
-        *last = open;
-    });
+///
+/// `seen` is the caller's PER-WINDOW memory of the last state (`State::left_panel_seen_open`).
+/// A module-global flag would be wrong here: `resync` runs once per window, so two windows
+/// disagreeing about the panel (one open, one shut) would flip a shared flag every tick and
+/// rescan the directory on every single frame — the exact per-tick disk hit the cache exists
+/// to avoid.
+pub fn note_panel_open(seen: &mut bool, open: bool) {
+    if rescan_due(seen, open) {
+        refresh_library();
+    }
+}
+
+/// The edge test behind [`note_panel_open`], split from the disk scan so it can be tested
+/// without reaching for the user's real data directory: true exactly on closed→open.
+fn rescan_due(seen: &mut bool, open: bool) -> bool {
+    let edge = open && !*seen;
+    *seen = open;
+    edge
 }
 
 /// Rescan [`library_dir`] into the cache. Cheap (one `read_dir` over a directory that
@@ -195,7 +200,7 @@ pub fn scan_library(dir: &Path) -> Vec<LibraryEntry> {
             },
         ));
     }
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
     rows.into_iter().map(|(_, e)| e).collect()
 }
 
@@ -340,14 +345,8 @@ pub fn claimed_by_other_processes() -> HashSet<String> {
 /// sessions this process spawned, which is the correct answer for a single-process run.
 pub fn detached(mgr: &SessionManager, claimed_here: &HashSet<String>) -> Vec<DetachedSession> {
     let now = crate::glow::now_epoch_ms();
-    let elsewhere = WINDOW_CLAIMS.with(|c| c.borrow().clone());
-    let other_procs = claimed_by_other_processes();
-    let mut rows: Vec<DetachedSession> = mgr
-        .uids()
+    let mut rows: Vec<DetachedSession> = adoptable_uids(mgr.uids(), claimed_here)
         .into_iter()
-        .filter(|uid| {
-            !claimed_here.contains(uid) && !elsewhere.contains(uid) && !other_procs.contains(uid)
-        })
         .map(|uid| {
             let last = mgr.last_output_at(&uid);
             DetachedSession {
@@ -359,8 +358,23 @@ pub fn detached(mgr: &SessionManager, claimed_here: &HashSet<String>) -> Vec<Det
         })
         .collect();
     // Most recently active first — the one you're most likely to be looking for.
-    rows.sort_by(|a, b| b.last_output_at.cmp(&a.last_output_at));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.last_output_at));
     rows
+}
+
+/// The subtraction behind [`detached`], split out so it can be tested without a live
+/// `SessionManager` (which can only be populated by actually spawning a PTY): `all` minus
+/// this window's own claims, minus every other window in this process
+/// ([`publish_window_claims`]), minus the M7 seam ([`claimed_by_other_processes`]). Input
+/// order is preserved; [`detached`] re-sorts by last output.
+pub fn adoptable_uids(all: Vec<String>, claimed_here: &HashSet<String>) -> Vec<String> {
+    let elsewhere = WINDOW_CLAIMS.with(|c| c.borrow().clone());
+    let other_procs = claimed_by_other_processes();
+    all.into_iter()
+        .filter(|uid| {
+            !claimed_here.contains(uid) && !elsewhere.contains(uid) && !other_procs.contains(uid)
+        })
+        .collect()
 }
 
 /// A session uid shortened for display (uids are long and opaque; the head is enough to
@@ -420,6 +434,73 @@ mod tests {
         assert!(!is_idle("claude", Some(now - 1_000), now, true, thr));
         // no output at all is not "idle" (the pane never started)
         assert!(!is_idle("claude", None, now, true, thr));
+    }
+
+    #[test]
+    fn heartbeat_is_per_window_and_rate_limited() {
+        let t0 = std::time::Instant::now();
+        // A window that has never beaten fires immediately, then not again inside the window.
+        let mut a: Option<std::time::Instant> = None;
+        assert!(heartbeat_due(&mut a, t0));
+        assert!(!heartbeat_due(&mut a, t0 + HEARTBEAT / 2));
+        assert!(heartbeat_due(&mut a, t0 + HEARTBEAT));
+        // A SECOND window keeps its own stamp: the first window consuming the beat must not
+        // starve it (the bug a module-global stamp had — window 2's dots froze forever).
+        let mut b: Option<std::time::Instant> = None;
+        assert!(heartbeat_due(&mut b, t0 + HEARTBEAT));
+        assert!(!heartbeat_due(&mut b, t0 + HEARTBEAT));
+    }
+
+    #[test]
+    fn library_rescans_only_on_the_closed_to_open_edge() {
+        let mut seen = false;
+        assert!(rescan_due(&mut seen, true), "closed → open rescans");
+        assert!(!rescan_due(&mut seen, true), "still open → no rescan");
+        assert!(!rescan_due(&mut seen, false), "open → closed → no rescan");
+        assert!(rescan_due(&mut seen, true), "and again on the next edge");
+        // Per-window memory: another window's panel state can't cancel this one's edge.
+        let mut other = false;
+        assert!(rescan_due(&mut other, true));
+        assert!(
+            !rescan_due(&mut seen, true),
+            "unaffected by the other window"
+        );
+    }
+
+    #[test]
+    fn adoptable_subtracts_this_window_and_the_others() {
+        let all = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
+
+        publish_window_claims(Vec::<String>::new());
+        // Nothing claimed → everything is adoptable, in the order given.
+        assert_eq!(
+            adoptable_uids(all(&["a", "b", "c"]), &set(&[])),
+            all(&["a", "b", "c"])
+        );
+        // This window's own panes are never offered back to it.
+        assert_eq!(
+            adoptable_uids(all(&["a", "b", "c"]), &set(&["b"])),
+            all(&["a", "c"])
+        );
+
+        // A pane sitting in the window next door is not detached either.
+        publish_window_claims(all(&["c"]));
+        assert_eq!(
+            adoptable_uids(all(&["a", "b", "c"]), &set(&["b"])),
+            all(&["a"])
+        );
+
+        // Republishing replaces (never accumulates) the cross-window claim set.
+        publish_window_claims(Vec::<String>::new());
+        assert_eq!(
+            adoptable_uids(all(&["a", "b", "c"]), &set(&["b"])),
+            all(&["a", "c"])
+        );
+
+        // The M7 seam is empty today — documented, and asserted so the day it stops being
+        // empty this test is the thing that says so.
+        assert!(claimed_by_other_processes().is_empty());
     }
 
     #[test]
@@ -486,11 +567,11 @@ mod tests {
 
         // a valid workspace, a valid one with no name, a non-workspace extension, and junk
         assert!(hyperpanes_core::workspace::io::write_workspace(
-            &dir.join("one.hyperpanes"),
+            dir.join("one.hyperpanes"),
             &wf(Some("alpha"), vec![2])
         ));
         assert!(hyperpanes_core::workspace::io::write_workspace(
-            &dir.join("two.json"),
+            dir.join("two.json"),
             &wf(None, vec![1, 1])
         ));
         std::fs::write(dir.join("notes.txt"), b"not a workspace").unwrap();
