@@ -192,6 +192,18 @@ pub fn build(state: &State) -> Vec<Entry> {
         "projects git folder rail",
         Command::ToggleSidebar,
     ));
+    cmds.push(Entry::new(
+        "Toggle left panel",
+        "Show/hide the workspace tree, library & detached sessions",
+        "left panel tree workspace library detached sessions adopt",
+        Command::ToggleLeftPanel,
+    ));
+    cmds.push(Entry::new(
+        "Save workspace to library",
+        "Save this tab into the left panel's workspace library",
+        "save workspace library snapshot",
+        Command::LeftSaveWorkspace,
+    ));
 
     // ---- layouts (automatic first, then the concrete presets) ----
     let cur = t.layout;

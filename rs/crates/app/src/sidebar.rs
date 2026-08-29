@@ -379,7 +379,7 @@ fn short_id(id: &str) -> String {
 
 /// A compact relative-time label for `started_at` (epoch ms) vs `now` (epoch ms). Empty when
 /// the timestamp is unknown. Coarse buckets — minutes → hours → days → weeks → months → years.
-fn relative_time(started_at: Option<u64>, now: u64) -> String {
+pub(crate) fn relative_time(started_at: Option<u64>, now: u64) -> String {
     let Some(t) = started_at else {
         return String::new();
     };

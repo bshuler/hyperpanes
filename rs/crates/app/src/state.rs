@@ -786,6 +786,11 @@ pub struct State {
     /// Whether the projects flyout (behind the 📁 icon) is currently expanded. The rail
     /// itself is gated by `settings.show_sidebar`; this is just the flyout panel state.
     pub sidebar_open: bool,
+    /// Whether the LEFT slide-out panel (workspace tree / library / detached sessions) is
+    /// open. Like `sidebar_open` this is pure window UI state — not persisted — and the
+    /// panel is a sibling of the pane area, so opening it shrinks the panes rather than
+    /// covering them. See `crate::leftpanel` + `ui/leftpanel.slint`.
+    pub left_panel_open: bool,
     // ---- command palette working state ----
     /// The registry snapshot built when the palette opened.
     palette_entries: Vec<Entry>,
@@ -970,6 +975,7 @@ impl State {
             pending_goals: Vec::new(),
             goal_account_cursor: 0,
             sidebar_open: false,
+            left_panel_open: false,
             palette_entries: Vec::new(),
             palette_view: Vec::new(),
             palette_sel: 0,
@@ -2862,6 +2868,92 @@ impl State {
         self.dirty = true;
     }
 
+    // ---- the left slide-out panel (mux plan M5) ----
+
+    /// Toggle the left panel; refresh the workspace library when opening it (the same
+    /// closed→open refresh the projects flyout does, so a workspace saved from another
+    /// window shows up without a restart).
+    pub fn toggle_left_panel(&mut self) {
+        self.left_panel_open = !self.left_panel_open;
+        if self.left_panel_open {
+            crate::leftpanel::refresh_library();
+        }
+        self.dirty = true;
+    }
+
+    /// Focus pane `idx` of tab `ti` from the panel's workspace tree: switch to that tab
+    /// first (a tree click on a background tab's pane means "take me there"), then focus.
+    /// Out-of-range indices are ignored — they arrive from a UI model snapshot.
+    pub fn focus_pane_in_tab(&mut self, ti: usize, idx: usize) {
+        if ti >= self.tabs.len() || idx >= self.tabs[ti].panes.len() {
+            return;
+        }
+        self.switch_tab(ti);
+        self.focus_pane(idx);
+    }
+
+    /// Every session uid THIS window is holding — laid out in any tab, or parked as a
+    /// reminder. The left panel subtracts these to decide which live sessions are detached.
+    /// (The per-uid version of [`Self::hosts_session`], for the whole-window question.)
+    pub fn claimed_uids(&self) -> std::collections::HashSet<String> {
+        let mut out: std::collections::HashSet<String> = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.iter())
+            .map(|p| p.uid.clone())
+            .collect();
+        out.extend(self.reminders.iter().map(|r| r.pane.uid.clone()));
+        out
+    }
+
+    /// Save the active tab into the panel's workspace library (no file dialog — that's what
+    /// the library is for). Named after the tab; a collision gets a numeric suffix rather
+    /// than overwriting the earlier snapshot.
+    pub fn save_workspace_to_library(&mut self) {
+        let file = self.to_workspace_file();
+        let name = self.active_tab().title.to_string();
+        if crate::leftpanel::save_to_library(&name, &file).is_none() {
+            eprintln!("[hyperpanes] failed to save workspace into the library");
+        }
+        self.dirty = true;
+    }
+
+    /// Load library row `i` (the panel's LIBRARY list order): read the file and append its
+    /// groups as new tabs, exactly as the "Open workspace…" dialog path does.
+    pub fn open_workspace_from_library(&mut self, i: usize, mgr: &SessionManager) {
+        let Some(entry) = crate::leftpanel::library().into_iter().nth(i) else {
+            return;
+        };
+        let Some(file) = read_workspace(&entry.path) else {
+            eprintln!(
+                "[hyperpanes] {} is not a valid workspace",
+                entry.path.display()
+            );
+            // The row is stale (deleted or corrupted since the scan) — rescan so it goes.
+            crate::leftpanel::refresh_library();
+            self.dirty = true;
+            return;
+        };
+        self.load_workspace(file, mgr);
+    }
+
+    /// Adopt detached session `uid` into the active tab: a re-attach, not a respawn — the
+    /// spec carries the uid, so `make_pane_from_spec` re-hosts the live session and seeds
+    /// the fresh grid from its replay buffer. Ignored if this window already hosts it.
+    pub fn adopt_detached_session(&mut self, uid: &str, mgr: &SessionManager) {
+        if uid.is_empty() || self.find_pane(uid).is_some() {
+            return;
+        }
+        self.attach_panes_from_specs(
+            mgr,
+            &[PaneSpec {
+                uid: Some(uid.to_string()),
+                ..Default::default()
+            }],
+        );
+        self.dirty = true;
+    }
+
     /// Reload the cached project rail from core after the control plane changed
     /// `projects.json` off the UI thread (an MCP `add_project` / rename / recolor / remove,
     /// or a project-opening pane bumping recency). Same refresh seam the in-app project
@@ -3767,7 +3859,13 @@ impl State {
     /// session stays alive centrally for replay-primed re-host). An emptied tab is dropped by
     /// [`Self::take_pane_in`], which also fixes the active index.
     fn detach_pane_idx(&mut self, idx: usize) -> Option<DetachedPane> {
-        let (ps, _alive) = self.take_pane_in(self.active, idx)?;
+        self.detach_pane_in(self.active, idx)
+    }
+
+    /// [`Self::detach_pane_idx`] for an arbitrary tab — the left panel's workspace tree can
+    /// drag a pane out of a BACKGROUND tab, which the active-tab-only path can't express.
+    fn detach_pane_in(&mut self, ti: usize, idx: usize) -> Option<DetachedPane> {
+        let (ps, _alive) = self.take_pane_in(ti, idx)?;
         Some(DetachedPane {
             uid: ps.uid,
             title: ps.title,
@@ -3890,6 +3988,49 @@ impl State {
         };
         let mut target = target;
         if self.tabs.len() < before && src < target {
+            target -= 1;
+        }
+        if target >= self.tabs.len() {
+            return;
+        }
+        self.adopt_into_tab(mgr, dp, target);
+    }
+
+    /// Move pane `idx` of tab `from` into tab `target` — the general form of
+    /// [`Self::move_pane_to_tab`], which can only move out of the ACTIVE tab. Used by the
+    /// left panel's workspace tree, where any pane of any tab can be dragged onto any other
+    /// tab. Like the menu path it neither switches tabs nor restarts the PTY (the session is
+    /// detached and re-hosted replay-primed), and it handles the source tab being dropped
+    /// when its last pane leaves (which shifts `target` when the source sat before it).
+    ///
+    /// Both indices are re-validated here because they arrive from a UI model snapshot: the
+    /// tree the user dragged in is whatever `resync` last projected, and a session could
+    /// have exited in between.
+    pub fn move_pane_between_tabs(
+        &mut self,
+        from: usize,
+        idx: usize,
+        target: usize,
+        mgr: &SessionManager,
+    ) {
+        if from >= self.tabs.len() || target >= self.tabs.len() || from == target {
+            return;
+        }
+        if idx >= self.tabs[from].panes.len() {
+            return;
+        }
+        // Moving out of the active tab is exactly the menu path — reuse it so the two can
+        // never drift apart.
+        if from == self.active {
+            self.move_pane_to_tab(idx, target, mgr);
+            return;
+        }
+        let before = self.tabs.len();
+        let Some(dp) = self.detach_pane_in(from, idx) else {
+            return;
+        };
+        let mut target = target;
+        if self.tabs.len() < before && from < target {
             target -= 1;
         }
         if target >= self.tabs.len() {
