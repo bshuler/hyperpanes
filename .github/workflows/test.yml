@@ -24,6 +24,10 @@ name: Test (Rust native)
 on:
   push:
   pull_request:
+  # On-demand run. The Windows leg is the only oracle for the ConPTY/pty-host tests
+  # (they cannot execute on a developer's Mac or Linux box), so it must be possible to
+  # ask for a run without inventing a commit.
+  workflow_dispatch:
 
 # Cancel superseded runs on the same ref to save CI minutes.
 concurrency:
