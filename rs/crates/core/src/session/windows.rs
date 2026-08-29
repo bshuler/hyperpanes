@@ -451,9 +451,13 @@ impl Daemon {
                     .await;
             }
             ClientMsg::Attach { uid } => {
+                // Subscribe first, then snapshot the buffer AND the output cursor together
+                // (`replay_with_cursor` reads both under the replay lock) so a client can
+                // splice the live stream onto the seed without painting the overlap twice —
+                // see the unix daemon's `Attach` arm and `DaemonMsg::Replay::cursor`.
                 attached.insert(uid.clone());
-                let data = self.sessions.replay(&uid).unwrap_or_default();
-                let _ = pc.write_msg(&DaemonMsg::Replay { uid, data }).await;
+                let (data, cursor) = self.sessions.replay_with_cursor(&uid).unwrap_or_default();
+                let _ = pc.write_msg(&DaemonMsg::Replay { uid, data, cursor }).await;
             }
             ClientMsg::Create(spec) => {
                 let uid = spec

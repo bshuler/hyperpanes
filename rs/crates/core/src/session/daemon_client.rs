@@ -494,7 +494,10 @@ fn reader_loop(
                     break;
                 }
             }
-            Ok(Some(DaemonMsg::Replay { uid, data })) => {
+            // `cursor` is for a mirror-less client splicing the live stream onto the seed
+            // (`session::attach`); the GUI has its own shadow and instead refuses to seed a
+            // non-empty one, which covers the same overlap.
+            Ok(Some(DaemonMsg::Replay { uid, data, .. })) => {
                 // The one-shot replay seed from an `Attach`: prime the mirror from the
                 // daemon's retained buffer so a re-attaching view restores history. Only
                 // seed when the local mirror is still empty (a fresh/just-reconnected

@@ -41,7 +41,13 @@ fn every_letter_of_a_bold_word_is_equally_bright() {
     let word: Vec<char> = "main".chars().collect();
     let cells: Vec<RenderCell> = word
         .iter()
-        .map(|&ch| RenderCell { ch, fg: FG, bg: BG, bold: true, ..Default::default() })
+        .map(|&ch| RenderCell {
+            ch,
+            fg: FG,
+            bg: BG,
+            bold: true,
+            ..Default::default()
+        })
         .collect();
     let grid = GridSnapshot {
         cols: word.len(),
@@ -54,7 +60,9 @@ fn every_letter_of_a_bold_word_is_equally_bright() {
     };
 
     let img = SoftwareRenderer::new().render(&grid, &mut f, &RenderOpts { cursor_on: false });
-    let buf = img.to_rgba8().expect("software renderer produces an rgba8 image");
+    let buf = img
+        .to_rgba8()
+        .expect("software renderer produces an rgba8 image");
     let (w, px) = (buf.width(), buf.as_bytes());
 
     let peaks: Vec<u32> = (0..word.len() as u32)
@@ -71,5 +79,8 @@ fn every_letter_of_a_bold_word_is_equally_bright() {
         );
     }
     // And the word really is drawn at the requested brightness, not merely uniformly dim.
-    assert!(brightest >= 200, "word peaked at {brightest}, expected ~214 — {peaks:?}");
+    assert!(
+        brightest >= 200,
+        "word peaked at {brightest}, expected ~214 — {peaks:?}"
+    );
 }

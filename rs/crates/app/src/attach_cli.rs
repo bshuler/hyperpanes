@@ -21,6 +21,13 @@
 //! reflowing a desktop pane is a destructive, invisible side effect, and letterboxing is not.
 //! `--resize` is the explicit opt-in for the other policy.
 //!
+//! Letterboxing is a *viewing* compromise, not a rendering one, and this client forwards
+//! bytes rather than running its own VTE: the pane emits for its own grid, and a local
+//! terminal of a different width puts autowrap in a different place. Narrower is the case
+//! that actually looks wrong, so that one is warned about up front; wider is harmless in
+//! practice (the pane simply does not use the extra columns) and neither is fixable without
+//! a local screen model, which is what the GUI is for.
+//!
 //! ## Restoring the terminal
 //! Raw mode must never survive this process, however it dies. Four covers:
 //! 1. normal return → [`RawGuard`]'s `Drop`;
@@ -213,8 +220,11 @@ mod tty {
         Some((ws.ws_col, ws.ws_row))
     }
 
-    /// Restore the saved termios. Async-signal-safe (`tcsetattr` is on POSIX's list), so a
-    /// fatal-signal handler can call it; also the body of [`RawGuard`]'s `Drop`.
+    /// Restore the termios published by the first [`RawGuard`]. Async-signal-safe
+    /// (`tcsetattr` is on POSIX's list), which is the whole reason it reads from statics:
+    /// it is called from the fatal-signal handler and from the panic hook, neither of which
+    /// may allocate, lock, or reach the guard on somebody's stack. Ordinary scope exit does
+    /// **not** come through here — [`RawGuard`]'s `Drop` restores from its own copy.
     pub fn restore() {
         let saved = SAVED.load(Ordering::SeqCst);
         let fd = SAVED_FD.load(Ordering::SeqCst);
@@ -227,7 +237,17 @@ mod tty {
 
     /// Puts the terminal in raw mode for its lifetime and restores it on drop — including
     /// while a panic unwinds.
-    pub struct RawGuard;
+    ///
+    /// The guard carries its **own** copy of the original `termios` and its own fd, and
+    /// restores from those rather than from the globals. The globals exist only so the
+    /// fatal-signal handler — which cannot allocate, lock, or reach a stack local — has
+    /// something to restore from; they are published once and never cleared, so a `Drop`
+    /// that trusted them would restore the wrong descriptor the moment there were two
+    /// guards (as there are in the tests, and as M3 will have with one client per channel).
+    pub struct RawGuard {
+        fd: RawFd,
+        original: libc::termios,
+    }
 
     impl RawGuard {
         pub fn enter(fd: RawFd) -> io::Result<Self> {
@@ -249,13 +269,14 @@ mod tty {
             if unsafe { libc::tcsetattr(fd, libc::TCSANOW, &raw) } != 0 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self)
+            Ok(Self { fd, original: term })
         }
     }
 
     impl Drop for RawGuard {
         fn drop(&mut self) {
-            restore();
+            // SAFETY: `original` is this guard's own copy of the settings read from `fd`.
+            unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
         }
     }
 
@@ -461,11 +482,23 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         std::thread::Builder::new()
             .name("hp-attach-input".into())
             .spawn(move || {
-                let mut filter = attach::DetachFilter::new(detach);
-                let _ = attach::pump_input(tty::FdReader(tty::STDIN), &writer, &mut filter);
                 // Both endings — the detach key and a closed stdin — mean this client is
                 // done. The SESSION is untouched: no Kill, no Shutdown, ever.
-                writer.disconnect();
+                //
+                // The disconnect runs from a `Drop`, not from a statement after the pump,
+                // because it is what unblocks `pump_output` on the main thread. A panic in
+                // here that skipped it would leave the process parked in a blocking read
+                // with the terminal still raw, and the `RawGuard` — owned by the main
+                // thread — never reached.
+                struct Disconnect(attach::AttachWriter);
+                impl Drop for Disconnect {
+                    fn drop(&mut self) {
+                        self.0.disconnect();
+                    }
+                }
+                let on_end = Disconnect(writer);
+                let mut filter = attach::DetachFilter::new(detach);
+                let _ = attach::pump_input(tty::FdReader(tty::STDIN), &on_end.0, &mut filter);
             })
             .map_err(|e| format!("input thread: {e}"))?;
     }
@@ -691,5 +724,134 @@ mod tests {
     fn the_clear_sequence_wipes_scrollback_too() {
         // ED 3 — without it a repaint stacks a second copy of the replay in the scrollback.
         assert_eq!(CLEAR_SCREEN, b"\x1b[H\x1b[2J\x1b[3J");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// raw-mode restoration
+// ---------------------------------------------------------------------------
+
+/// Restoring the terminal is the one failure in this client a user cannot recover from
+/// without `reset(1)`, so it gets a real pty rather than a mock.
+///
+/// Deliberately **one** test: [`tty::restore`] reads process-global state that the first
+/// [`tty::RawGuard`] publishes and nothing ever clears, so a second test constructing a
+/// guard in parallel would decide which descriptor the globals name. Everything that
+/// enters raw mode in this crate lives in this function, and it runs in order.
+#[cfg(all(test, unix))]
+mod raw_mode_tests {
+    use super::tty;
+    use std::os::unix::io::RawFd;
+
+    struct Pty {
+        master: RawFd,
+        slave: RawFd,
+    }
+
+    impl Drop for Pty {
+        fn drop(&mut self) {
+            // SAFETY: both descriptors were opened by `openpty` and are closed once.
+            unsafe {
+                libc::close(self.slave);
+                libc::close(self.master);
+            }
+        }
+    }
+
+    fn open_pty() -> Pty {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        // SAFETY: `openpty` writes the two descriptors; the three optional pointers are null.
+        // They are spelled `null_mut` and typed explicitly because the trailing two are
+        // `*mut` on Apple and `*const` on Linux — `*mut T` coerces to either.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut::<libc::c_char>(),
+                std::ptr::null_mut::<libc::termios>(),
+                std::ptr::null_mut::<libc::winsize>(),
+            )
+        };
+        assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+        Pty { master, slave }
+    }
+
+    fn attrs(fd: RawFd) -> libc::termios {
+        let mut t: libc::termios = unsafe { std::mem::zeroed() };
+        // SAFETY: `tcgetattr` fills the struct we own; `fd` is a pty.
+        assert_eq!(unsafe { libc::tcgetattr(fd, &mut t) }, 0);
+        t
+    }
+
+    /// `libc::termios` is a plain C struct with no `PartialEq`.
+    ///
+    /// `PENDIN`/`FLUSHO` are masked out of `c_lflag`: they are kernel *status* bits, not
+    /// settings — leaving canonical mode with input queued sets `PENDIN` behind our back —
+    /// and comparing them would fail a restore that is byte-for-byte correct.
+    fn same(a: &libc::termios, b: &libc::termios) -> bool {
+        let settings = |t: &libc::termios| t.c_lflag & !(libc::PENDIN | libc::FLUSHO);
+        a.c_iflag == b.c_iflag
+            && a.c_oflag == b.c_oflag
+            && a.c_cflag == b.c_cflag
+            && settings(a) == settings(b)
+            && a.c_cc == b.c_cc
+    }
+
+    /// Cooked-mode markers `cfmakeraw` clears. Checking these (rather than "not equal to
+    /// the original") proves the guard actually entered raw mode.
+    fn is_raw(t: &libc::termios) -> bool {
+        t.c_lflag & (libc::ICANON | libc::ECHO | libc::ISIG) == 0
+    }
+
+    #[test]
+    fn the_terminal_comes_back_on_every_exit_path() {
+        let pty = open_pty();
+        let fd = pty.slave;
+        let cooked = attrs(fd);
+        assert!(!is_raw(&cooked), "a fresh pty should start cooked");
+
+        // 1. Ordinary scope exit — the detach key, a daemon disconnect, an `?` early return.
+        {
+            let _raw = tty::RawGuard::enter(fd).expect("enter raw");
+            assert!(is_raw(&attrs(fd)), "guard did not enter raw mode");
+        }
+        assert!(
+            same(&attrs(fd), &cooked),
+            "drop did not restore the terminal"
+        );
+
+        // 2. A panic unwinding through the guard. `run` holds it across the output pump, so
+        //    this is the path a bug in the pump takes.
+        let hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let caught = std::panic::catch_unwind(|| {
+            let _raw = tty::RawGuard::enter(fd).expect("enter raw");
+            assert!(is_raw(&attrs(fd)));
+            panic!("output pump exploded");
+        });
+        std::panic::set_hook(hook);
+        assert!(caught.is_err(), "the panic should have propagated");
+        assert!(
+            same(&attrs(fd), &cooked),
+            "unwinding did not restore the terminal"
+        );
+
+        // 3. `SIGINT`/`SIGTERM`/`SIGHUP`/`SIGQUIT` and the panic hook, which cannot reach a
+        //    guard on another thread's stack and go through the globals instead. `on_fatal`
+        //    itself is `restore()` plus `_exit`, and `_exit` is not testable in-process.
+        //    The globals were published by the first `enter` above, for this fd.
+        let mut raw = cooked;
+        // SAFETY: plain field manipulation on a struct we own, then applied to our pty.
+        unsafe {
+            libc::cfmakeraw(&mut raw);
+            assert_eq!(libc::tcsetattr(fd, libc::TCSANOW, &raw), 0);
+        }
+        assert!(is_raw(&attrs(fd)));
+        tty::restore();
+        assert!(
+            same(&attrs(fd), &cooked),
+            "the signal-handler path did not restore the terminal"
+        );
     }
 }

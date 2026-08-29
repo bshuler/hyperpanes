@@ -8,6 +8,17 @@
 //! sink, then copy `Data` events out and keyboard bytes in until a detach key or the
 //! session exits.
 //!
+//! ## The seed/stream seam
+//! `Attach` subscribes the connection to the session's broadcast *before* it snapshots the
+//! replay buffer — it has to, or a chunk flushed between the two would be lost. The cost is
+//! an **overlap**: whatever is flushed in that window, plus anything already queued on the
+//! bus, is inside the seed *and* arrives as a live `Data` event. The GUI can ignore the seed
+//! because it keeps its own mirror; this client is the terminal itself and has nothing to
+//! compare against, so it splices the other way — the daemon reports the seed's output
+//! cursor ([`DaemonMsg::Replay::cursor`], read under the same lock that bumps it) and
+//! [`Attachment`] drops every `Data` at or below it. Without that, attaching to a busy pane
+//! paints its last chunk twice.
+//!
 //! Everything here is **pure protocol + policy**: no `termios`, no signals, no stdio. The
 //! tty glue lives in the app crate (`app/src/attach_cli.rs`), and M3's SSH channel will
 //! drive this same [`Attachment`] with the channel's reader/writer in place of stdin/stdout
@@ -216,6 +227,18 @@ pub struct Attachment {
     /// attached set *before* queueing `Replay`, so a broadcast already being forwarded can
     /// land first. Stashing them keeps the seam gapless: seed, then these, then the stream.
     pending: VecDeque<SessionEvent>,
+    /// The session's output cursor at the instant the seed was snapshotted
+    /// ([`DaemonMsg::Replay::cursor`]) — the **splice point**.
+    ///
+    /// `Attach` subscribes before it snapshots, so the seed and the live stream overlap by
+    /// however much was flushed (or was already sitting on the bus) in that window. A GUI
+    /// client can drop the seed instead, because it keeps its own mirror; this client *is*
+    /// the terminal and has nothing to compare against, so it drops the other side: every
+    /// `Data` whose own cursor is at or below this one is already painted.
+    ///
+    /// `0` means "the daemon did not report one" (a pre-`cursor` build) — no real chunk can
+    /// end at cursor 0, so that value disables the filter rather than eating live output.
+    seed_cursor: u64,
     /// Bytes written before a mid-stream `Replay` (a repaint — see
     /// [`AttachWriter::request_repaint`]). The caller supplies them because "clear the
     /// screen" is a terminal escape sequence and this module knows nothing about terminals;
@@ -245,8 +268,12 @@ impl Attachment {
         let deadline_end = std::time::Instant::now() + REQUEST_TIMEOUT;
         while std::time::Instant::now() < deadline_end {
             match transport::read_frame_deadline::<DaemonMsg>(&read, REQUEST_TIMEOUT)? {
-                Some(DaemonMsg::Replay { uid: got, data }) if got == uid => {
-                    seed = Some(data);
+                Some(DaemonMsg::Replay {
+                    uid: got,
+                    data,
+                    cursor,
+                }) if got == uid => {
+                    seed = Some((data, cursor));
                     break;
                 }
                 Some(DaemonMsg::Event(ev)) => pending.push_back(ev),
@@ -254,7 +281,7 @@ impl Attachment {
                 None => break,
             }
         }
-        let seed = seed.ok_or_else(|| {
+        let (seed, seed_cursor) = seed.ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::TimedOut,
                 format!("the session daemon did not answer Attach for '{uid}'"),
@@ -267,6 +294,7 @@ impl Attachment {
                 write,
                 uid: uid.to_string(),
                 pending,
+                seed_cursor,
                 repaint_prefix: Vec::new(),
             },
             seed,
@@ -300,7 +328,7 @@ impl Attachment {
     /// markers, agent state) carry no bytes for a dumb terminal and are dropped.
     pub fn pump_output<W: Write>(&mut self, out: &mut W) -> io::Result<PumpEnd> {
         while let Some(ev) = self.pending.pop_front() {
-            if let Some(end) = write_event(&self.uid, ev, out)? {
+            if let Some(end) = self.write_event(ev, out)? {
                 return Ok(end);
             }
         }
@@ -316,7 +344,7 @@ impl Attachment {
             };
             match frame {
                 DaemonMsg::Event(ev) => {
-                    if let Some(end) = write_event(&self.uid, ev, out)? {
+                    if let Some(end) = self.write_event(ev, out)? {
                         return Ok(end);
                     }
                 }
@@ -324,27 +352,60 @@ impl Attachment {
                 // typically after a `SIGWINCH` under `ResizePolicy::Observe`: the pane's grid
                 // did NOT change, so the honest response to the local terminal changing is to
                 // redraw what the pane already contains rather than reflow the pane.
-                DaemonMsg::Replay { uid: got, data } if got == self.uid => {
+                //
+                // The splice point moves with it. The screen now shows exactly the new
+                // snapshot, so any `Data` at or below its cursor is already painted —
+                // including chunks the daemon broadcast before the snapshot but the writer
+                // delivers after it (replies are drained ahead of the bus, so that reordering
+                // is the normal case, not the exotic one).
+                DaemonMsg::Replay {
+                    uid: got,
+                    data,
+                    cursor,
+                } if got == self.uid => {
                     out.write_all(&self.repaint_prefix)?;
                     out.write_all(data.as_bytes())?;
                     out.flush()?;
+                    self.seed_cursor = self.seed_cursor.max(cursor);
                 }
                 _ => {}
             }
         }
     }
-}
 
-/// Write one event's bytes to `out`, or report that the pump should stop.
-fn write_event<W: Write>(uid: &str, ev: SessionEvent, out: &mut W) -> io::Result<Option<PumpEnd>> {
-    match ev {
-        SessionEvent::Data { uid: got, data, .. } if got == uid => {
-            out.write_all(data.as_bytes())?;
-            out.flush()?;
-            Ok(None)
+    /// Write one event's bytes to `out`, or report that the pump should stop.
+    ///
+    /// `Data` already covered by the seed is dropped — see [`seed_cursor`](Self::seed_cursor).
+    /// Non-`Data` events (cwd, OSC 133 markers, agent state) carry no bytes for a dumb
+    /// terminal.
+    fn write_event<W: Write>(
+        &mut self,
+        ev: SessionEvent,
+        out: &mut W,
+    ) -> io::Result<Option<PumpEnd>> {
+        match ev {
+            SessionEvent::Data {
+                uid: got,
+                data,
+                cursor,
+            } if got == self.uid => {
+                // `cursor` is the value AFTER the chunk, and `flush_into` bumps it under the
+                // same lock `replay_with_cursor` snapshots under — so a chunk is wholly
+                // inside the seed or wholly outside it, never straddling. `cursor == 0` is
+                // the "not reported" sentinel from a pre-`cursor` peer; forward it rather
+                // than swallow live output.
+                if cursor != 0 && cursor <= self.seed_cursor {
+                    return Ok(None);
+                }
+                out.write_all(data.as_bytes())?;
+                out.flush()?;
+                Ok(None)
+            }
+            SessionEvent::Exit { uid: got, code } if got == self.uid => {
+                Ok(Some(PumpEnd::Exited(code)))
+            }
+            _ => Ok(None),
         }
-        SessionEvent::Exit { uid: got, code } if got == uid => Ok(Some(PumpEnd::Exited(code))),
-        _ => Ok(None),
     }
 }
 
@@ -777,16 +838,25 @@ mod tests {
             write: Arc::new(Mutex::new(client)),
             uid: uid.to_string(),
             pending: VecDeque::new(),
+            seed_cursor: 0,
             repaint_prefix: repaint_prefix.to_vec(),
         }
     }
 
+    /// A `Data` event with no cursor — what a daemon predating `DaemonMsg::Replay::cursor`
+    /// sends. The splice filter must pass these through untouched.
     #[cfg(unix)]
     fn data(uid: &str, s: &str) -> DaemonMsg {
+        at(uid, s, 0)
+    }
+
+    /// A `Data` event ending at `cursor` (the monotonic value AFTER the chunk).
+    #[cfg(unix)]
+    fn at(uid: &str, s: &str, cursor: u64) -> DaemonMsg {
         DaemonMsg::Event(SessionEvent::Data {
             uid: uid.into(),
             data: s.into(),
-            cursor: 0,
+            cursor,
         })
     }
 
@@ -802,6 +872,7 @@ mod tests {
             &DaemonMsg::Replay {
                 uid: "pane-1".into(),
                 data: "redrawn".into(),
+                cursor: 0,
             },
         )
         .expect("w");
@@ -819,6 +890,124 @@ mod tests {
         let mut out = Vec::new();
         assert_eq!(att.pump_output(&mut out).expect("pump"), PumpEnd::Exited(3));
         assert_eq!(String::from_utf8(out).expect("utf8"), "hi <CLR>redrawn");
+    }
+
+    // The attach seam. `ClientMsg::Attach` subscribes the connection BEFORE it snapshots the
+    // replay buffer, so a chunk flushed in that window (or already queued on the bus) is both
+    // inside the seed and delivered as a live event. Without the cursor splice the terminal
+    // paints it twice — the pane's last line duplicated on every attach of a busy shell.
+    #[cfg(unix)]
+    #[test]
+    fn data_already_inside_the_replay_seed_is_not_painted_twice() {
+        let (client, mut daemon) = pair();
+        let fake = std::thread::spawn(move || {
+            let _ = read_frame::<_, ClientMsg>(&mut daemon).expect("attach req");
+            // The seed covers everything up to cursor 10.
+            write_frame(
+                &mut daemon,
+                &DaemonMsg::Replay {
+                    uid: "pane-1".into(),
+                    data: "SEED".into(),
+                    cursor: 10,
+                },
+            )
+            .expect("w");
+            // The overlap: broadcast before the snapshot, delivered after it (the writer
+            // drains replies ahead of the bus, so this ordering is the normal one).
+            write_frame(&mut daemon, &at("pane-1", "SEED-tail", 10)).expect("w");
+            write_frame(&mut daemon, &at("pane-1", "older", 4)).expect("w");
+            // Strictly past the seed → genuinely new output.
+            write_frame(&mut daemon, &at("pane-1", "NEW", 13)).expect("w");
+            write_frame(
+                &mut daemon,
+                &DaemonMsg::Event(SessionEvent::Exit {
+                    uid: "pane-1".into(),
+                    code: 0,
+                }),
+            )
+            .expect("w");
+            daemon
+        });
+
+        let (mut att, seed) = Attachment::open(client, "pane-1").expect("open");
+        assert_eq!(seed, "SEED");
+        let mut out = Vec::new();
+        assert_eq!(att.pump_output(&mut out).expect("pump"), PumpEnd::Exited(0));
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "NEW",
+            "only output past the seed's cursor reaches the terminal"
+        );
+        let _ = fake.join();
+    }
+
+    // A repaint re-seeds the whole screen, so it moves the splice point too — otherwise the
+    // bus backlog it just overwrote gets painted again underneath it.
+    #[cfg(unix)]
+    #[test]
+    fn a_repaint_moves_the_splice_point_to_its_own_snapshot() {
+        let (client, mut daemon) = pair();
+        let mut att = attachment_over(client, "pane-1", b"<CLR>");
+        write_frame(
+            &mut daemon,
+            &DaemonMsg::Replay {
+                uid: "pane-1".into(),
+                data: "REDRAWN".into(),
+                cursor: 40,
+            },
+        )
+        .expect("w");
+        write_frame(&mut daemon, &at("pane-1", "already-drawn", 40)).expect("w");
+        write_frame(&mut daemon, &at("pane-1", "after", 45)).expect("w");
+        // A stale repaint must never rewind the splice point past output already dropped.
+        write_frame(
+            &mut daemon,
+            &DaemonMsg::Replay {
+                uid: "pane-1".into(),
+                data: "".into(),
+                cursor: 5,
+            },
+        )
+        .expect("w");
+        write_frame(&mut daemon, &at("pane-1", "stale", 20)).expect("w");
+        write_frame(
+            &mut daemon,
+            &DaemonMsg::Event(SessionEvent::Exit {
+                uid: "pane-1".into(),
+                code: 0,
+            }),
+        )
+        .expect("w");
+
+        let mut out = Vec::new();
+        assert_eq!(att.pump_output(&mut out).expect("pump"), PumpEnd::Exited(0));
+        assert_eq!(
+            String::from_utf8(out).expect("utf8"),
+            "<CLR>REDRAWNafter<CLR>"
+        );
+    }
+
+    // Against a daemon that predates `DaemonMsg::Replay::cursor`, every cursor on the wire is
+    // the `0` sentinel. The filter must degrade to "forward everything" rather than mistake
+    // live output for seeded output and show a frozen pane.
+    #[cfg(unix)]
+    #[test]
+    fn an_uncursored_daemon_still_gets_every_byte_forwarded() {
+        let (client, mut daemon) = pair();
+        let mut att = attachment_over(client, "pane-1", b"");
+        write_frame(&mut daemon, &data("pane-1", "one ")).expect("w");
+        write_frame(&mut daemon, &data("pane-1", "two")).expect("w");
+        write_frame(
+            &mut daemon,
+            &DaemonMsg::Event(SessionEvent::Exit {
+                uid: "pane-1".into(),
+                code: 0,
+            }),
+        )
+        .expect("w");
+        let mut out = Vec::new();
+        assert_eq!(att.pump_output(&mut out).expect("pump"), PumpEnd::Exited(0));
+        assert_eq!(String::from_utf8(out).expect("utf8"), "one two");
     }
 
     #[cfg(unix)]
@@ -849,6 +1038,7 @@ mod tests {
                 &DaemonMsg::Replay {
                     uid: "pane-1".into(),
                     data: "SEED".into(),
+                    cursor: 0,
                 },
             )
             .expect("w");
