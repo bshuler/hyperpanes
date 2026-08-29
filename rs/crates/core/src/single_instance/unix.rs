@@ -247,11 +247,22 @@ mod unix_tests {
         );
         drop(second);
         drop(first);
-        let third = acquire(&salt).unwrap();
-        assert!(
-            matches!(third, Instance::Primary(_)),
-            "after the primary drops, the lock is free again"
-        );
+        // Retry briefly. The flock lives on the open file description, so any process that
+        // forked from this test binary holds a copy of it until it execs — `O_CLOEXEC` only
+        // fires AT exec, not at fork. Other tests in this binary spawn real children (the
+        // pty handoff tests), so a concurrent fork/exec window can keep the lock alive for a
+        // few microseconds after the primary drops. Retrying tests the property that
+        // matters — the lock does free — without racing an unrelated test's spawn.
+        let third = (0..50)
+            .find_map(|_| match acquire(&salt).unwrap() {
+                inst @ Instance::Primary(_) => Some(inst),
+                Instance::Secondary(_) => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    None
+                }
+            })
+            .expect("after the primary drops, the lock is free again");
+        assert!(matches!(third, Instance::Primary(_)));
     }
 
     // A stale lock file (dead pid inside, no flock held) must not block a new launch.

@@ -62,6 +62,21 @@ pub struct PtySpec {
     pub rows: u16,
 }
 
+/// What a live pty must surrender for the daemon **live upgrade** (`handoff`): the master
+/// descriptor the successor will adopt, and the child's process-group leader so the adopted
+/// pty can still signal it. Unix only — the handoff is `SCM_RIGHTS`-based.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy)]
+pub struct HandoffInfo {
+    /// The pty master. **Borrowed, not owned** — valid only while the pty is alive, which is
+    /// the whole handoff window (the incumbent exits only after the descriptors are sent, and
+    /// `SCM_RIGHTS` duplicates rather than moves).
+    pub master_fd: std::os::fd::RawFd,
+    /// The child's session/process-group leader, if the platform reports one. The successor
+    /// cannot `waitpid` an adopted child (it is reparented to init), but it can signal this.
+    pub pgrp: Option<i32>,
+}
+
 /// A live pty handle. `Send + Sync` so a `Session` can be shared across the async
 /// runtime; all interior handles are mutex-guarded.
 pub trait Pty: Send + Sync {
@@ -71,6 +86,34 @@ pub trait Pty: Send + Sync {
     fn resize(&self, cols: u16, rows: u16) -> io::Result<()>;
     /// Terminate the child. The reader thread then observes EOF and emits `Exit`.
     fn kill(&self) -> io::Result<()>;
+
+    /// What this pty would hand to a successor daemon, or `None` if it cannot be handed over
+    /// (a test mock, or a platform/backend with no exposed descriptor). Defaults to `None` so
+    /// existing implementations — notably the test mocks — are unaffected; a session whose
+    /// pty answers `None` is simply not carried across a live upgrade.
+    #[cfg(unix)]
+    fn handoff_info(&self) -> Option<HandoffInfo> {
+        None
+    }
+
+    /// Give this pty up **without disturbing the child** — the outgoing half of a live
+    /// upgrade, called by the incumbent daemon once the successor has the descriptors.
+    ///
+    /// A plain drop is NOT safe here. `portable-pty`'s master writer deliberately transmits
+    /// `\n` followed by EOT (`^D`) when it is dropped (`portable_pty::unix`,
+    /// `impl Drop for UnixMasterWriter`) — a courtesy for the normal "this pty is finished"
+    /// case that, during a handoff, types Ctrl-D into a shell that is supposed to survive.
+    /// An interactive shell reads that as end-of-input and exits, so dropping the outgoing
+    /// ptys would kill exactly the sessions the upgrade exists to preserve.
+    ///
+    /// The default therefore **leaks** the handle: no destructor runs, so no EOT is sent and
+    /// the descriptors stay open until the process image goes away moments later. Leaking is
+    /// the correct move for a process that is about to exit, and this must only be called on
+    /// that path — anywhere else it is a genuine fd leak.
+    #[cfg(unix)]
+    fn relinquish(self: Box<Self>) {
+        std::mem::forget(self);
+    }
 }
 
 /// `portable-pty` (conpty) implementation of [`Pty`]. The writer is `Arc`-shared with
@@ -103,6 +146,16 @@ impl Pty for PortablePty {
 
     fn kill(&self) -> io::Result<()> {
         self.killer.lock().unwrap().kill()
+    }
+
+    /// `portable-pty` exposes both halves on unix, so a real session is always handoff-able.
+    #[cfg(unix)]
+    fn handoff_info(&self) -> Option<HandoffInfo> {
+        let master = self.master.lock().unwrap();
+        Some(HandoffInfo {
+            master_fd: master.as_raw_fd()?,
+            pgrp: master.process_group_leader(),
+        })
     }
 }
 
@@ -369,13 +422,18 @@ mod tests {
     // exits instantly may tear the pseudo-console down before its output is scraped,
     // so a short command's text can be lost. Driving an interactive shell — which is
     // exactly how the engine runs panes — keeps ConPTY alive long enough to observe.
+    //
+    // The cwd is pinned rather than left to inherit: `portable-pty` resolves an unset cwd
+    // from `$HOME`, and other tests in this binary overwrite `HOME` with a path that does
+    // not exist (`paths.rs`), which fails the spawn with ENOENT.
     fn interactive_spec() -> PtySpec {
         let env: EnvMap = std::env::vars().collect();
+        let cwd = Some(std::env::temp_dir().display().to_string());
         if cfg!(windows) {
             PtySpec {
                 file: "cmd.exe".into(),
                 args: vec![],
-                cwd: None,
+                cwd,
                 env,
                 cols: 80,
                 rows: 24,
@@ -384,7 +442,7 @@ mod tests {
             PtySpec {
                 file: "/bin/sh".into(),
                 args: vec!["-i".into()],
-                cwd: None,
+                cwd,
                 env,
                 cols: 80,
                 rows: 24,
@@ -472,5 +530,86 @@ mod tests {
 
         let (_, exit) = drain_until(&rx, Duration::from_secs(10), |_| false);
         assert!(exit.is_some(), "expected an Exit event after kill()");
+    }
+
+    /// Is `pgrp` still a live process group?
+    #[cfg(unix)]
+    fn group_is_alive(pgrp: i32) -> bool {
+        // SAFETY: signal 0 performs the permission/existence check without delivering.
+        unsafe { libc::killpg(pgrp, 0) == 0 }
+    }
+
+    /// Poll `f` until it holds or the deadline passes; returns what it last saw.
+    #[cfg(unix)]
+    fn settles_to(want: bool, mut f: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if f() == want {
+                return want;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        f()
+    }
+
+    /// **Why [`Pty::relinquish`] exists.** `portable-pty`'s master writer types `\n` + EOT
+    /// (`^D`) into the pty from its destructor, so a plain drop ends an interactive shell.
+    /// That is the right courtesy when a pane is closing and a silent catastrophe during a
+    /// live upgrade, where the whole point is that the shell does not notice. Pinned here so
+    /// the handoff path can never quietly regress to a drop.
+    #[cfg(unix)]
+    #[test]
+    fn a_plain_drop_types_ctrl_d_into_the_shell() {
+        let (tx, _rx) = mpsc::channel();
+        let pty = spawn_pty(&interactive_spec(), move |e| {
+            let _ = tx.send(e);
+        })
+        .expect("spawn");
+        let pgrp = pty
+            .handoff_info()
+            .expect("a real unix pty is handoff-able")
+            .pgrp
+            .expect("an interactive shell has a foreground group");
+        assert!(
+            settles_to(true, || group_is_alive(pgrp)),
+            "shell starts alive"
+        );
+
+        drop(pty);
+
+        assert!(
+            !settles_to(false, || group_is_alive(pgrp)),
+            "a plain drop sends EOT and the shell exits — this is the hazard relinquish avoids"
+        );
+    }
+
+    /// The other half of the contract: [`Pty::relinquish`] gives the pty up without any of
+    /// that — no destructor, no EOT, and the shell keeps running for the successor to adopt.
+    #[cfg(unix)]
+    #[test]
+    fn relinquish_leaves_the_shell_running_for_a_successor() {
+        let (tx, _rx) = mpsc::channel();
+        let pty = spawn_pty(&interactive_spec(), move |e| {
+            let _ = tx.send(e);
+        })
+        .expect("spawn");
+        let info = pty.handoff_info().expect("handoff-able");
+        let pgrp = info
+            .pgrp
+            .expect("an interactive shell has a foreground group");
+        // A successor would have taken a duplicate of the master by now; this stands in for
+        // it, so the descriptor the leaked pty holds is not the only thing keeping it alive.
+        let successor = crate::session::adopt::dup_cloexec(info.master_fd).expect("dup");
+
+        pty.relinquish();
+
+        assert!(
+            settles_to(true, || group_is_alive(pgrp)),
+            "the shell survives relinquish"
+        );
+        // Clean up: hang the terminal up the way the adopted pty's `kill` does.
+        // SAFETY: a plain signal send to a group we just observed alive.
+        unsafe { libc::killpg(pgrp, libc::SIGHUP) };
+        drop(successor);
     }
 }

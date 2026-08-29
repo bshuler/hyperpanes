@@ -2,6 +2,9 @@
 //! (this wave): `pty` / `spawn` / `batcher` / `replay` / `screen`. Plus the session
 //! **daemon** (M0): `proto` (the wire protocol) + `daemon` (a PTY-owning daemon over a
 //! UDS / named pipe, with a loopback client) — both headless-testable, no Slint.
+/// Adopting a pty master handed over by a predecessor daemon (unix only).
+#[cfg(unix)]
+pub mod adopt;
 pub mod batcher;
 pub mod cwd;
 pub mod daemon;
