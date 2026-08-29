@@ -81,7 +81,7 @@ outlive the GUI run and be re-attached by uid, and `daemon_client.rs:1291`
 (`daemon_fresh_uid_is_unique_across_runs`) asserts cross-run uniqueness. `PaneSpec.uid` carries it
 through the relaunch snapshot. Nothing to do.
 
-### M1 — daemon live upgrade via PTY fd handoff  ← *the headline, and the whole gap*
+### M1 — daemon live upgrade via PTY fd handoff ✅ *built (unix); Windows still declines*
 
 **The exact failure today.** Sessions already survive a *GUI* upgrade: quit with keep-alive on
 leaves the daemon running (`main.rs:575`) and a relaunch re-attaches. What they do not survive is a
@@ -100,8 +100,27 @@ closes*, not when its parent exits, so nothing downstream notices. One seam, one
 waitable, so **exit detection must move from `waitpid` to pty EOF**. Needs a test covering exit
 codes.
 
-Headless-testable end to end: start daemon, run a session, take over, assert the session still
-streams.
+**As built.** `PROTO_VER` is `2` and carries `ClientMsg::Takeover`. The successor daemon —
+spawned from the new binary by `DaemonClient::new`'s mismatch branch — finds the salt's flock
+held and, instead of bailing out, connects to the incumbent and asks for the handover. The
+incumbent's `SessionRegistry::hand_off` snapshots every session (replay buffer, byte cursor,
+grid size, cwd, pgrp), *relinquishes* rather than drops each pty (dropping one types EOT at the
+shell it is meant to preserve), and `sendmsg`s the masters back as `SCM_RIGHTS` in
+`HandoffPayload` chunks; then it unlinks its socket and exits, releasing the flock the successor
+is waiting on. The successor's `adopt_all` rebuilds each session around its descriptor with
+`SessionRegistry::adopt`. A pre-takeover incumbent cannot parse the request and drops the
+connection — zero messages — which is why the incumbent always sends at least one chunk even
+with no sessions: it makes "did not understand" distinguishable from "had nothing", and only the
+former falls back to the old session-killing tear-down.
+
+Tested by layer rather than end to end in one process: after `hand_off` the incumbent's reader
+threads are still alive and steal bytes the successor never sees. Production closes that window
+in microseconds by exiting; an in-process test daemon never exits, so the transfer is asserted at
+the socket (`takeover_transfers_live_sessions_and_stands_the_incumbent_down` — the shell's process
+group is still alive afterwards) and the re-creation in `session_manager`'s `adopt` tests.
+
+**Still open:** the Windows leg. `windows.rs` answers `Takeover` by closing the connection, so a
+Windows upgrade keeps the old tear-down until ConPTY handle transfer is proven (see Risks).
 
 ### M2 — `hyperpanes attach` terminal client
 A CLI that renders a pane into whatever terminal it is running in: seed from the replay buffer,
@@ -164,7 +183,7 @@ click.
 
 | Track | Branch | Depends on |
 |---|---|---|
-| M1 live upgrade | `mux/m1-takeover` | — |
+| M1 live upgrade ✅ | `mux/m1-takeover` | — |
 | M2 attach client | `mux/m2-attach` | — |
 | M3 embedded SSH | `mux/m3-ssh` | M2 |
 | M4 control mode | `mux/m4-ccmode` | M2 |
@@ -172,5 +191,5 @@ click.
 | M6 workspace sets | `mux/m6-sets` | — |
 | M7 orphan adoption | `mux/m7-adopt` | M5 |
 
-**Wave 1 (parallel now):** M1 ‖ M5 ‖ M6 — no shared files.
+**Wave 1 (parallel now):** M5 ‖ M6 — no shared files (M1 landed).
 **Wave 2:** M2 ‖ M7. **Wave 3:** M3 ‖ M4.

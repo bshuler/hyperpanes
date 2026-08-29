@@ -147,14 +147,21 @@ impl DaemonSessionManager {
             match probe_proto_version(&stream)? {
                 ProtoCheck::Match => return Self::from_stream(stream, events),
                 ProtoCheck::Mismatch { daemon_ver } => {
-                    // The daemon is a stale version of our own binary. Tear it down (Shutdown
-                    // → wait for the socket to drop) and respawn a fresh one on the next loop.
+                    // The daemon is a stale version of our own binary. Prefer the LIVE UPGRADE
+                    // (M1): spawn a daemon from the new binary and let it take the sessions —
+                    // pty masters and all — off the incumbent, which then exits. Every terminal
+                    // survives. Only if that does not produce a matching daemon (the incumbent
+                    // predates takeover, or is wedged) do we fall back to the old tear-down,
+                    // which kills every session.
                     dbg(&format!(
                         "daemon proto-version mismatch (client {PROTO_VER}, daemon {daemon_ver}); \
-                         tearing down stale daemon (attempt {attempt})"
+                         attempting live takeover (attempt {attempt})"
                     ));
                     drop(stream);
-                    tear_down_stale_daemon(&socket, salt);
+                    if !hand_over_stale_daemon(salt, &socket) {
+                        dbg("takeover did not yield a matching daemon; tearing down instead");
+                        tear_down_stale_daemon(&socket, salt);
+                    }
                     // Loop: connect_or_spawn will start a fresh daemon if none is now up.
                 }
             }
@@ -583,6 +590,44 @@ fn probe_proto_version(stream: &std::os::unix::net::UnixStream) -> io::Result<Pr
     Ok(check)
 }
 
+/// How long to wait for a spawned successor to take the incumbent's sessions and start
+/// serving. Covers the incumbent's handoff, its exit, and the successor's own cold start
+/// (Tokio runtime + adopting every pty), so it is looser than a plain spawn budget.
+#[cfg(unix)]
+const TAKEOVER_BUDGET: Duration = Duration::from_secs(8);
+
+/// Upgrade the daemon at `socket` **without killing its sessions**: spawn a daemon from the
+/// current (new) binary, which finds the salt's lock held, asks the incumbent to hand over
+/// every pty master, and binds once the incumbent exits (see `daemon::take_over`). Returns
+/// whether a daemon speaking our [`PROTO_VER`] is serving by the end of it.
+///
+/// `false` is the expected answer against an incumbent that predates the takeover protocol:
+/// it cannot parse the request and drops the connection, the successor declines to fight for
+/// the lock, and the caller falls back to [`tear_down_stale_daemon`]. That fallback is the
+/// old, session-destroying path — this function exists to avoid reaching it.
+#[cfg(unix)]
+fn hand_over_stale_daemon(salt: &str, socket: &Path) -> bool {
+    if spawn_daemon_detached(salt).is_err() {
+        return false;
+    }
+    let deadline = Instant::now() + TAKEOVER_BUDGET;
+    let mut backoff = Duration::from_millis(20);
+    loop {
+        // Only a version MATCH proves the successor won: while the incumbent still holds the
+        // socket, connecting succeeds and reports the stale version.
+        if let Ok(stream) = std::os::unix::net::UnixStream::connect(socket) {
+            if matches!(probe_proto_version(&stream), Ok(ProtoCheck::Match)) {
+                return true;
+            }
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(backoff);
+        backoff = (backoff * 2).min(Duration::from_millis(200));
+    }
+}
+
 /// Tear down a stale-version daemon at `socket`: connect, send `Shutdown`, then wait (briefly)
 /// for the socket to disappear (the daemon unlinks it on exit). Best-effort — if the connect
 /// fails the daemon is already gone, and if it lingers, `connect_or_spawn`'s `AddrInUse`
@@ -609,7 +654,7 @@ fn tear_down_stale_daemon(socket: &Path, _salt: &str) {
 /// Append a line to the daemon debug log when `HYPERPANES_DEBUG` is set (mirrors the app's
 /// `dbg_log`; core has no logger of its own). Inert otherwise.
 #[cfg(unix)]
-fn dbg(msg: &str) {
+pub(crate) fn dbg(msg: &str) {
     use std::io::Write;
     if std::env::var_os("HYPERPANES_DEBUG").is_none() {
         return;

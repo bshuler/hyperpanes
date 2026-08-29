@@ -373,6 +373,14 @@ impl Daemon {
             ClientMsg::Ping => {
                 let _ = pc.write_msg(&DaemonMsg::Pong).await;
             }
+            ClientMsg::Takeover => {
+                // The live upgrade (M1) is unix-only for now: it rides on `SCM_RIGHTS`, and
+                // whether ConPTY pseudoconsole ownership survives a `DuplicateHandle` across
+                // processes is still unverified (`docs/mux-backend-plan.md`). Until it is,
+                // a Windows daemon declines by closing, which the successor reads as "no
+                // takeover available" and falls back to the tear-down path.
+                return false;
+            }
             ClientMsg::Shutdown => {
                 if self.lifecycle.begin_shutdown() {
                     self.registry.kill_all();

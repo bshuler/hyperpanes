@@ -33,12 +33,16 @@ use std::io::{self, Read, Write};
 use serde::{Deserialize, Serialize};
 
 use crate::session::spawn::EnvMap;
-use crate::session_manager::{Integration, SessionEvent, SpawnOptions};
+use crate::session_manager::{Integration, SessionEvent, SessionSnapshot, SpawnOptions};
 
 /// Wire-protocol version, bumped on any incompatible change to the message shapes.
 /// Carried in the `Hello` handshake so a client can detect a stale daemon (M3 acts on
 /// the mismatch; M0 just transports it).
-pub const PROTO_VER: u32 = 1;
+///
+/// `2` adds [`ClientMsg::Takeover`] — the daemon live upgrade (M1). A version-1 daemon
+/// cannot parse that message and simply drops the connection, which is exactly how the
+/// successor detects a pre-takeover incumbent and falls back to the old tear-down.
+pub const PROTO_VER: u32 = 2;
 
 /// Hard cap on a single frame body, so a corrupt/hostile length prefix can't make a
 /// reader allocate unbounded memory. 64 MiB is far above any real replay/screen payload.
@@ -162,11 +166,38 @@ pub enum ClientMsg {
     RenderScreen { uid: String },
     /// Liveness probe (→ [`DaemonMsg::Pong`]).
     Ping,
+    /// Ask the daemon to **hand its sessions over** to the sender and exit — the daemon
+    /// live upgrade (M1, `docs/mux-backend-plan.md`). Unlike [`Shutdown`](Self::Shutdown),
+    /// the sessions are NOT killed: the daemon replies on this same socket with one or more
+    /// [`HandoffPayload`] messages carrying each session's state, with the pty master
+    /// descriptors attached as `SCM_RIGHTS` ancillary data
+    /// (`session::handoff`), then unlinks its socket and exits. The successor adopts the
+    /// descriptors and rebinds. A shell dies from `SIGHUP` when its *pty closes*, not when
+    /// its parent exits, so nothing downstream notices the swap.
+    ///
+    /// The reply does **not** use the [`write_frame`] framing — descriptor passing needs its
+    /// own message-oriented transport — so a connection that sends this must switch to
+    /// `handoff::recv_with_fds` and use the socket for nothing else. Sent only by another
+    /// daemon of this binary, never by the GUI.
+    Takeover,
     /// Ask the daemon to **shut down**: kill every session and exit the process cleanly,
     /// releasing the lock + socket (M3). Drives the app's `--kill-daemon` path and the
     /// quit-vs-keep-alive "OFF" branch. The daemon kills its sessions, then exits — so the
     /// connection simply drops (no reply frame; the EOF is the acknowledgement).
     Shutdown,
+}
+
+/// One chunk of a [`ClientMsg::Takeover`] response: the state of the sessions whose pty
+/// masters ride along as this message's descriptors.
+///
+/// Chunked because `SCM_RIGHTS` is bounded by the kernel's per-message descriptor limit
+/// (see [`handoff::MAX_FDS_PER_MSG`](crate::session::handoff::MAX_FDS_PER_MSG)); each
+/// snapshot's `fd_index` addresses the descriptor array of **its own** message. The
+/// incumbent always sends at least one chunk, even with zero sessions, so the successor can
+/// tell "handed over nothing" apart from "the peer never understood the request".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HandoffPayload {
+    pub snapshots: Vec<SessionSnapshot>,
 }
 
 /// A message from the daemon to a client: handshake/replies plus the streamed event feed.

@@ -53,6 +53,8 @@
 use std::collections::HashSet;
 use std::io;
 #[cfg(unix)]
+use std::os::fd::OwnedFd;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -62,10 +64,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 #[cfg(unix)]
+use crate::session::daemon_client::dbg;
+#[cfg(unix)]
+use crate::session::handoff::{recv_with_fds, send_with_fds, MAX_FDS_PER_MSG};
+#[cfg(unix)]
 use crate::session::proto::{
-    read_frame, write_frame, ClientMsg, DaemonMsg, SessionMeta, PROTO_VER,
+    read_frame, write_frame, ClientMsg, DaemonMsg, HandoffPayload, SessionMeta, PROTO_VER,
 };
 #[cfg(unix)]
+use crate::session_manager::SessionSnapshot;
 use crate::session_manager::{SessionEvent, SessionRegistry};
 
 /// How long the daemon stays alive after going fully idle (0 sessions AND 0 clients)
@@ -127,14 +134,38 @@ pub fn run(salt: &str) -> io::Result<()> {
         .create(true)
         .truncate(false)
         .open(&names.lock)?;
+    // Sessions inherited from an incumbent daemon (M1), adopted once the runtime is up.
+    let mut inherited: Vec<(SessionSnapshot, OwnedFd)> = Vec::new();
     match lock.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
-            // Another daemon already serves this salt — nothing to do.
-            return Err(io::Error::new(
-                io::ErrorKind::AddrInUse,
-                "a daemon already holds this salt",
-            ));
+            // Another daemon already serves this salt. Historically we bailed out here and
+            // the client tore that daemon down — killing every session. Instead, TAKE IT
+            // OVER: it hands us its pty masters and exits, and the shells never notice
+            // (M1, `docs/mux-backend-plan.md`).
+            inherited = match take_over(&names.socket) {
+                Ok(sessions) => sessions,
+                Err(e) => {
+                    // A pre-takeover incumbent (proto < 2 drops the connection), or one that
+                    // is wedged. Report the old error so the client's tear-down path still
+                    // resolves the upgrade, at the old cost.
+                    dbg(&format!(
+                        "takeover declined ({e}); leaving the incumbent alone"
+                    ));
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "a daemon already holds this salt",
+                    ));
+                }
+            };
+            // The incumbent releases the flock only by dying, and it unlinks its socket on
+            // the way out — so acquiring the lock here also proves the socket path is free.
+            if !acquire_when_released(&lock, TAKEOVER_LOCK_BUDGET) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    "the incumbent daemon handed over but did not exit",
+                ));
+            }
         }
         Err(std::fs::TryLockError::Error(e)) => return Err(e),
     }
@@ -160,6 +191,10 @@ pub fn run(salt: &str) -> io::Result<()> {
     // path unlinks it). The idle monitor watches it; `serve`'s accept loop checks it.
     let lifecycle = Arc::new(Lifecycle::new(names.socket.clone()));
     let daemon = Daemon::new(Arc::clone(&lifecycle));
+    // Re-create the incumbent's sessions around the descriptors it handed us, BEFORE the
+    // idle monitor starts — a daemon that looked idle for a beat here would arm its exit
+    // countdown against sessions it is in the middle of adopting.
+    daemon.adopt_all(inherited);
     daemon.start_idle_monitor(idle_grace());
 
     // Hold the lock for the daemon's whole lifetime (dropping it releases the salt). The
@@ -167,6 +202,83 @@ pub fn run(salt: &str) -> io::Result<()> {
     // socket, and the kernel releases the flock on process death.
     let _lock = lock;
     daemon.serve(listener)
+}
+
+/// How long a successor waits for the incumbent to exit (releasing the flock) after a
+/// completed handoff. Generous: the incumbent has nothing left to do but unlink and exit,
+/// so overrunning this means it is wedged, not slow.
+#[cfg(unix)]
+const TAKEOVER_LOCK_BUDGET: Duration = Duration::from_secs(5);
+
+/// How long the successor waits for each handoff message. Bounds a wedged or
+/// non-understanding incumbent so a takeover can never hang daemon startup.
+#[cfg(unix)]
+const TAKEOVER_RECV_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ask the daemon listening on `socket` to hand its sessions over ([`ClientMsg::Takeover`]),
+/// and collect them: each snapshot paired with the pty master descriptor that rode with it.
+///
+/// The incumbent answers with one or more [`HandoffPayload`] messages and then closes, so a
+/// clean EOF ends the loop. **Zero messages is an error**, not an empty handoff: a
+/// pre-takeover daemon (proto 1) cannot parse the request and just drops the connection,
+/// and that must be distinguishable from "there were no sessions" — the caller falls back to
+/// the old tear-down only in the former case.
+#[cfg(unix)]
+fn take_over(socket: &Path) -> io::Result<Vec<(SessionSnapshot, OwnedFd)>> {
+    let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
+    stream.set_read_timeout(Some(TAKEOVER_RECV_TIMEOUT))?;
+    write_frame(&mut stream, &ClientMsg::Takeover)?;
+
+    let mut out = Vec::new();
+    let mut messages = 0usize;
+    while let Some((payload, fds)) = recv_with_fds(&stream)? {
+        messages += 1;
+        let batch: HandoffPayload = serde_json::from_slice(&payload).map_err(io::Error::other)?;
+        // Descriptors are owned from the moment they arrive, so a malformed batch drops
+        // (closes) them rather than leaking. `fd_index` is per-message.
+        let mut fds: Vec<Option<OwnedFd>> = fds.into_iter().map(Some).collect();
+        for snap in batch.snapshots {
+            match fds.get_mut(snap.fd_index).and_then(Option::take) {
+                Some(fd) => out.push((snap, fd)),
+                None => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "session {} claims descriptor {} of {}",
+                            snap.uid,
+                            snap.fd_index,
+                            fds.len()
+                        ),
+                    ))
+                }
+            }
+        }
+    }
+    if messages == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::ConnectionAborted,
+            "the daemon holding this salt did not answer the takeover",
+        ));
+    }
+    dbg(&format!("takeover: adopted {} session(s)", out.len()));
+    Ok(out)
+}
+
+/// Poll `lock` until the flock is ours or `budget` elapses. The incumbent's lock is released
+/// by the kernel when it exits, which is strictly after it unlinks its socket — so success
+/// here is also the signal that the socket path is free to rebind.
+#[cfg(unix)]
+fn acquire_when_released(lock: &std::fs::File, budget: Duration) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if lock.try_lock().is_ok() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// Create the per-user runtime dir if absent and tighten it to owner-only (`0700`) so the
@@ -435,6 +547,35 @@ impl Daemon {
         }
     }
 
+    /// Re-create sessions handed over by a predecessor ([`take_over`]) — the receiving half
+    /// of the live upgrade. Each descriptor becomes an ordinary registry session driven by
+    /// the same pipeline as a spawned one; the only difference is invisible from here (an
+    /// adopted child cannot be `waitpid`ed, so its exit arrives as pty EOF — see
+    /// [`session::adopt`](crate::session::adopt)).
+    ///
+    /// Must run inside the daemon's Tokio runtime: adopting spawns a driver task.
+    ///
+    /// A session that fails to adopt is dropped with a log line rather than failing startup —
+    /// losing one pane to a bad descriptor must not cost the user every other pane.
+    fn adopt_all(&self, inherited: Vec<(SessionSnapshot, OwnedFd)>) {
+        for (snap, fd) in inherited {
+            let pgrp = snap.pgrp;
+            let sink_result = self.registry.adopt(&snap, move |sink| {
+                crate::session::adopt::adopt_pty(fd, pgrp, move |ev| sink(ev))
+            });
+            match sink_result {
+                Ok(()) => {
+                    // Carry the cwd cache too, so a `ListSessions` right after the upgrade
+                    // reports what it reported before it (the registry does not track cwd).
+                    if let Some(cwd) = snap.cwd {
+                        self.cwds.lock().unwrap().insert(snap.uid, cwd);
+                    }
+                }
+                Err(e) => dbg(&format!("takeover: adopting {} failed: {e}", snap.uid)),
+            }
+        }
+    }
+
     /// Start the **idle-exit monitor** on its own thread: once the daemon has 0 live sessions
     /// AND 0 connected clients, it arms a `grace` countdown and exits the process when the
     /// grace elapses while still idle. Any new connection or session resets the timer (the
@@ -552,8 +693,16 @@ impl Daemon {
             .spawn(move || writer_loop(write_half, out_rx, &mut bus_rx, attached_w));
 
         // Reader/dispatch loop: handle each ClientMsg against the registry.
+        let mut takeover = false;
         loop {
             match read_frame::<_, ClientMsg>(&mut read_half) {
+                Ok(Some(ClientMsg::Takeover)) => {
+                    // Handled out here rather than in `dispatch`: the descriptor handoff needs
+                    // the socket ITSELF (`sendmsg` with ancillary data), and it must be the
+                    // only thing on it — so the writer thread is wound down first, below.
+                    takeover = true;
+                    break;
+                }
                 Ok(Some(msg)) => {
                     if !self.dispatch(msg, &out_tx, &attached) {
                         break; // a control path asked to close the connection
@@ -570,6 +719,74 @@ impl Daemon {
         if let Ok(w) = writer {
             let _ = w.join();
         }
+
+        // The socket is now exclusively ours: no reply or broadcast frame can interleave
+        // with the descriptor messages.
+        if takeover {
+            self.hand_over(&read_half);
+        }
+    }
+
+    /// Hand every live session to the successor daemon on `sock`, then exit **without
+    /// killing anything** — the sending half of the live upgrade (M1).
+    ///
+    /// The registry surrenders each pty via [`Pty::relinquish`](crate::session::pty::Pty),
+    /// which deliberately does NOT drop it: `portable-pty`'s master writer types `\n` + EOT
+    /// from its destructor, and an interactive shell reads that as end-of-input. The
+    /// descriptors therefore stay open — duplicated into the successor by `SCM_RIGHTS`, and
+    /// released here only when the process image goes away moments later.
+    ///
+    /// Descriptors are chunked to [`MAX_FDS_PER_MSG`] per message (the kernel bounds
+    /// `SCM_RIGHTS`), and **at least one message is always sent**, so a successor can tell an
+    /// empty handoff from a peer that never understood the request.
+    ///
+    /// Teardown skips `kill_sessions` for the obvious reason, and still unlinks the socket so
+    /// the successor can rebind it. The successor waits for our flock — released by the
+    /// kernel when we exit, i.e. strictly after that unlink — before binding.
+    fn hand_over(&self, sock: &std::os::unix::net::UnixStream) {
+        let handed = self.registry.hand_off();
+        let cwds = self.cwds.lock().unwrap().clone();
+        dbg(&format!(
+            "takeover: handing over {} session(s)",
+            handed.len()
+        ));
+
+        // `chunks` on an empty slice yields nothing, so the empty case is sent explicitly.
+        let batches: Vec<&[(SessionSnapshot, std::os::fd::RawFd)]> = if handed.is_empty() {
+            vec![&[]]
+        } else {
+            handed.chunks(MAX_FDS_PER_MSG).collect()
+        };
+
+        for batch in batches {
+            let mut fds = Vec::with_capacity(batch.len());
+            let mut snapshots = Vec::with_capacity(batch.len());
+            for (snap, fd) in batch {
+                let mut snap = snap.clone();
+                // `fd_index` addresses THIS message's descriptor array, not the global list.
+                snap.fd_index = fds.len();
+                snap.cwd = cwds.get(&snap.uid).cloned();
+                snapshots.push(snap);
+                fds.push(*fd);
+            }
+            let payload = match serde_json::to_vec(&HandoffPayload { snapshots }) {
+                Ok(p) => p,
+                Err(e) => {
+                    dbg(&format!("takeover: payload encode failed: {e}"));
+                    break;
+                }
+            };
+            if let Err(e) = send_with_fds(sock, &payload, &fds) {
+                // The successor is gone or wedged. The sessions are already out of the
+                // registry and their ptys relinquished, so there is nothing to roll back to —
+                // exiting is still right, and the shells stay alive, parented to init, for the
+                // next daemon to discover.
+                dbg(&format!("takeover: send failed: {e}"));
+                break;
+            }
+        }
+
+        self.lifecycle.shutdown(|| {});
     }
 
     /// Handle one [`ClientMsg`]. Returns `false` to close the connection. Replies are sent
@@ -659,6 +876,13 @@ impl Daemon {
             }
             ClientMsg::Ping => {
                 let _ = out.send(DaemonMsg::Pong);
+            }
+            ClientMsg::Takeover => {
+                // Unreachable in practice: `handle_connection` intercepts `Takeover` before
+                // dispatch, because the handoff needs the socket itself. Reaching here would
+                // mean the interception was bypassed — close the connection rather than
+                // silently ignoring a request that the peer is waiting on.
+                return false;
             }
             ClientMsg::Shutdown => {
                 // Kill every session, unlink the socket, and exit the process cleanly (the
@@ -1513,5 +1737,117 @@ mod tests {
             idle_grace_from(Some("not-a-number")),
             Duration::from_millis(DEFAULT_IDLE_GRACE_MS)
         );
+    }
+
+    // TAKEOVER (M1): the incumbent hands every pty master to its successor and stands down —
+    // without killing a single shell. Asserted at the SOCKET layer, deliberately: an
+    // in-process end-to-end takeover would leave two live readers on one master (the
+    // incumbent's per-session reader threads outlive `hand_off` and stop only when the
+    // process exits), racing for the shell's output. Production has that same window but
+    // closes it in microseconds by exiting; a FlagOnly test daemon never exits. So the
+    // transfer is proved here and the re-creation in `session_manager`'s `adopt` test.
+    #[test]
+    fn takeover_transfers_live_sessions_and_stands_the_incumbent_down() {
+        use std::os::fd::AsRawFd;
+
+        let socket = temp_socket("takeover");
+        let daemon = spawn_in_process(&socket).expect("binds");
+
+        let c = DaemonClient::connect_path(&socket).expect("connect");
+        c.send(&ClientMsg::Create(SpawnSpec {
+            shell: Some("/bin/sh".into()),
+            args: Some(vec!["-i".into()]),
+            cwd: Some("/".into()),
+            ..Default::default()
+        }))
+        .unwrap();
+        let uid = match recv_until(&c, Duration::from_secs(2), |m| {
+            matches!(m, DaemonMsg::Created { .. })
+        }) {
+            Some(DaemonMsg::Created { uid }) => uid,
+            other => panic!("expected Created, got {other:?}"),
+        };
+        c.send(&ClientMsg::Attach { uid: uid.clone() }).unwrap();
+        c.send(&ClientMsg::Write {
+            uid: uid.clone(),
+            data: "echo HANDOFF_MARKER\n".into(),
+        })
+        .unwrap();
+        assert!(
+            recv_until(&c, Duration::from_secs(10), |m| {
+                matches!(m, DaemonMsg::Event(SessionEvent::Data { data, .. }) if data.contains("HANDOFF_MARKER"))
+            })
+            .is_some(),
+            "the session is live before the handoff"
+        );
+        drop(c);
+
+        let handed = take_over(&socket).expect("the incumbent hands over");
+        assert_eq!(handed.len(), 1, "every session comes across");
+        let (snap, fd) = &handed[0];
+        assert_eq!(snap.uid, uid, "under its original uid, so panes re-bind");
+        assert!(
+            snap.replay.contains("HANDOFF_MARKER"),
+            "the replay buffer rides along: {:?}",
+            snap.replay
+        );
+        assert!(
+            snap.cursor > 0,
+            "and the byte cursor, so the successor streams on rather than repeating history"
+        );
+        assert!(snap.cols > 0 && snap.rows > 0, "as does the grid size");
+        // A live descriptor, not a stale number: `relinquish` leaked the pty handle rather
+        // than dropping it — a drop would also have typed EOT at the shell it is preserving.
+        assert_ne!(
+            unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) },
+            -1,
+            "the pty master arrives open"
+        );
+        // And the shell is untouched, which is the entire point of the exercise.
+        let pgrp = snap.pgrp.expect("a real pty reports its process group");
+        assert_eq!(
+            unsafe { libc::killpg(pgrp, 0) },
+            0,
+            "the shell survives the handoff"
+        );
+
+        assert!(
+            wait_until(Duration::from_secs(3), || daemon.is_shutting_down()),
+            "the incumbent stands down once it has handed everything over"
+        );
+        assert!(
+            wait_until(Duration::from_secs(1), || !daemon.socket().exists()),
+            "and unlinks the socket, so the successor can bind"
+        );
+
+        // This test now owns the shell (in production a live successor would). Reap it.
+        unsafe { libc::killpg(pgrp, libc::SIGKILL) };
+    }
+
+    // A daemon predating the takeover protocol cannot parse the request and simply drops the
+    // connection. That must be an ERROR — and distinguishable from "handed over zero
+    // sessions" — because it is exactly what sends the client back to the old, session-killing
+    // tear-down.
+    #[test]
+    fn takeover_against_a_daemon_that_does_not_answer_is_an_error() {
+        let socket = temp_socket("takeover-old");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let stale = std::thread::spawn(move || {
+            // Read the request before closing, the way a proto-1 daemon does: it parses the
+            // frame, does not recognise `Takeover`, and drops the connection.
+            if let Ok((mut conn, _)) = listener.accept() {
+                use std::io::Read;
+                let _ = conn.read(&mut [0u8; 1024]);
+                drop(conn);
+            }
+        });
+
+        let err = take_over(&socket).expect_err("a silent incumbent is not a successful takeover");
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::ConnectionAborted,
+            "the caller reads this as 'fall back to the tear-down'"
+        );
+        let _ = stale.join();
     }
 }

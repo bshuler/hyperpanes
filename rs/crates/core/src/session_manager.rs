@@ -132,6 +132,45 @@ impl From<crate::session::osc133::AgentLiveness> for AgentLiveness {
     }
 }
 
+/// One live session's **transferable state** — everything a successor process needs to
+/// re-create the session around a pty it did not spawn. The payload of the daemon live
+/// upgrade (`docs/mux-backend-plan.md`, M1).
+///
+/// The pty itself cannot be serialized: its master descriptor travels *beside* this struct
+/// as `SCM_RIGHTS` ancillary data (see [`session::handoff`](crate::session::handoff)), and
+/// [`fd_index`](Self::fd_index) says which descriptor of that message belongs to this
+/// session.
+///
+/// Serde-clean and owned, like [`SessionEvent`] — the wire form is the in-process form.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub uid: String,
+    /// The rolling replay buffer verbatim. A client that re-attaches after the upgrade must
+    /// see the same scrollback it would have seen without one.
+    #[serde(default)]
+    pub replay: String,
+    /// The monotonic UTF-16 output cursor. This MUST carry across: a client holding a
+    /// `since` cursor minted before the upgrade would otherwise be handed a rewound stream
+    /// and would redraw output it has already drawn.
+    #[serde(default)]
+    pub cursor: u64,
+    pub cols: u16,
+    pub rows: u16,
+    /// Last sniffed cwd, when the sender tracks one. The registry does not (it accumulates
+    /// counters, not cwds — the daemon keeps that cache), so [`SessionRegistry::hand_off`]
+    /// leaves this `None` for its caller to fill in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Index into the descriptor array of the message that carried this snapshot.
+    #[serde(default)]
+    pub fd_index: usize,
+    /// The child's process-group leader at handoff time, when the platform reports one. The
+    /// successor cannot `waitpid` an adopted child (it is reparented to init) but it can
+    /// still signal this group. Advisory — see `session::adopt`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pgrp: Option<i32>,
+}
+
 /// Resolved shell-integration inputs for an interactive spawn: extra leading args and
 /// env. Supplied by the wiring layer (the `shell_integration` track owns *producing*
 /// these). Empty/`None` → a plain interactive shell.
@@ -215,6 +254,23 @@ pub struct Liveness {
 }
 
 impl Shared {
+    /// A blank read-state for a `cols`x`rows` grid — the starting point for both a freshly
+    /// spawned session and an adopted one (which then seeds replay/cursor on top).
+    fn fresh(cols: u16, rows: u16) -> Arc<Self> {
+        Arc::new(Shared {
+            replay: Mutex::new(Replay::new()),
+            screen: Mutex::new(Screen::new(cols, rows)),
+            screen_pending: Mutex::new(Vec::new()),
+            output_bytes: AtomicU64::new(0),
+            last_output_at: AtomicU64::new(0),
+            killed: AtomicBool::new(false),
+            prompt_ready: AtomicBool::new(false),
+            command_running: AtomicBool::new(false),
+            last_exit_code: AtomicI32::new(i32::MIN),
+            marker_seen: AtomicBool::new(false),
+        })
+    }
+
     /// Drain any buffered output into the screen mirror so a subsequent `screen.render()`
     /// reflects all flushed bytes. Cheap no-op when nothing is pending. Called on the
     /// read path (lazy) instead of on every flush (eager) — see `screen_pending`.
@@ -372,30 +428,144 @@ impl SessionRegistry {
         });
         let pty = factory(&spec, sink)?;
 
-        let shared = Arc::new(Shared {
-            replay: Mutex::new(Replay::new()),
-            screen: Mutex::new(Screen::new(spec.cols, spec.rows)),
-            screen_pending: Mutex::new(Vec::new()),
-            output_bytes: AtomicU64::new(0),
-            last_output_at: AtomicU64::new(0),
-            killed: AtomicBool::new(false),
-            prompt_ready: AtomicBool::new(false),
-            command_running: AtomicBool::new(false),
-            last_exit_code: AtomicI32::new(i32::MIN),
-            marker_seen: AtomicBool::new(false),
-        });
+        self.install(opts.uid, Shared::fresh(spec.cols, spec.rows), pty, prx);
+        Ok(())
+    }
 
-        let pipeline = SessionPipeline::new(opts.uid.clone(), Arc::clone(&shared));
+    /// Install `pty` under `uid` with the read-state `shared`, starting its driver task.
+    /// The one place a session enters the map — [`create_with`](Self::create_with) and
+    /// [`adopt`](Self::adopt) differ only in where the pty and the state come from.
+    fn install(
+        &self,
+        uid: String,
+        shared: Arc<Shared>,
+        pty: Box<dyn Pty>,
+        prx: UnboundedReceiver<PtyEvent>,
+    ) {
+        let pipeline = SessionPipeline::new(uid.clone(), Arc::clone(&shared));
         let sessions = Arc::clone(&self.sessions);
         let events = self.events.clone();
-        let uid = opts.uid.clone();
-        tokio::spawn(drive_session(pipeline, prx, events, sessions, uid));
+        tokio::spawn(drive_session(pipeline, prx, events, sessions, uid.clone()));
 
         self.sessions
             .lock()
             .unwrap()
-            .insert(opts.uid.clone(), Session { pty, shared });
+            .insert(uid, Session { pty, shared });
+    }
+
+    /// Re-create a session around a pty **inherited from a predecessor process** — the
+    /// receiving half of the daemon live upgrade. `build` is handed the event sink and
+    /// returns the pty wrapping the adopted descriptor
+    /// (`session::adopt::adopt_pty` in production, a mock in tests).
+    ///
+    /// The restored session is an ordinary one in every respect: same driver task, same
+    /// events, same accessors. What carries across is exactly what a client can observe —
+    /// the replay buffer, the output cursor and the grid. The screen mirror is rebuilt
+    /// lazily by replaying the buffer through it, so a `mode:"screen"` read after an
+    /// upgrade sees the pane as it was rather than an empty grid.
+    ///
+    /// What does NOT carry: the phase-4 liveness mirror (it re-learns itself from the next
+    /// marker the shell emits) and `last_output_at` (nothing has been flushed *by us* yet;
+    /// reporting a stale timestamp would misreport the pane as recently active).
+    pub fn adopt(
+        &self,
+        snap: &SessionSnapshot,
+        build: impl FnOnce(EventSink) -> io::Result<Box<dyn Pty>>,
+    ) -> io::Result<()> {
+        let (ptx, prx) = unbounded_channel::<PtyEvent>();
+        let sink: EventSink = Arc::new(move |ev| {
+            let _ = ptx.send(ev);
+        });
+        let pty = build(sink)?;
+
+        // Keep the uid source ahead of anything we inherit. A successor's counter starts at 1,
+        // so without this it would re-mint `s1` while an adopted `s1` was live and collide two
+        // sessions on one uid.
+        if let Some(n) = snap
+            .uid
+            .strip_prefix('s')
+            .and_then(|n| n.parse::<u64>().ok())
+        {
+            self.next_uid.fetch_max(n + 1, Ordering::Relaxed);
+        }
+
+        let shared = Shared::fresh(snap.cols.max(1), snap.rows.max(1));
+        if !snap.replay.is_empty() {
+            shared.replay.lock().unwrap().append(&snap.replay);
+            // Feed the same bytes to the LAZY screen path rather than parsing them now:
+            // an adopted session may never get a screen read, and `sync_screen` will bring
+            // the mirror up to date if one comes.
+            shared
+                .screen_pending
+                .lock()
+                .unwrap()
+                .extend_from_slice(snap.replay.as_bytes());
+        }
+        shared.output_bytes.store(snap.cursor, Ordering::Relaxed);
+
+        self.install(snap.uid.clone(), shared, pty, prx);
         Ok(())
+    }
+
+    /// Surrender **every** live session for a daemon live upgrade: snapshot each one's
+    /// transferable state and return it beside the master descriptor a successor must adopt.
+    /// The registry is empty afterwards.
+    ///
+    /// Each pty is released with [`Pty::relinquish`], NOT dropped — `portable-pty`'s master
+    /// writer transmits `\n` + EOT from its destructor, so dropping these would type Ctrl-D
+    /// into every shell the upgrade exists to preserve.
+    ///
+    /// A session whose pty cannot be handed over (`handoff_info() == None` — a mock, or a
+    /// backend that exposes no descriptor) is **killed** instead: leaving it behind would
+    /// strand a pty in a process that is about to exit.
+    ///
+    /// Descriptors come back in `fd_index` order, so the caller can pass them straight to
+    /// `handoff::send_with_fds` in `Vec` order.
+    ///
+    /// **The returned descriptors are borrowed from ptys that are now deliberately leaked.**
+    /// They stay open until the process image goes away, which is the whole contract: this
+    /// is only ever called on the way out. The per-session reader threads are also still
+    /// running, and until this process exits they keep consuming bytes the successor will
+    /// never see — the same brief window nginx accepts across a live binary upgrade, and the
+    /// reason the caller must exit immediately rather than linger.
+    #[cfg(unix)]
+    pub fn hand_off(&self) -> Vec<(SessionSnapshot, std::os::fd::RawFd)> {
+        let drained: Vec<(String, Session)> = {
+            let mut map = self.sessions.lock().unwrap();
+            map.drain().collect()
+        };
+
+        let mut out = Vec::new();
+        for (uid, session) in drained {
+            let Some(info) = session.pty.handoff_info() else {
+                session.shared.killed.store(true, Ordering::SeqCst);
+                let _ = session.pty.kill();
+                continue;
+            };
+            let (replay, cursor) = {
+                let replay = session.shared.replay.lock().unwrap();
+                let cursor = session.shared.output_bytes.load(Ordering::Relaxed);
+                (replay.get().to_string(), cursor)
+            };
+            let (cols, rows) = session.shared.screen.lock().unwrap().dims();
+            out.push((
+                SessionSnapshot {
+                    uid,
+                    replay,
+                    cursor,
+                    cols,
+                    rows,
+                    cwd: None,
+                    fd_index: out.len(),
+                    pgrp: info.pgrp,
+                },
+                info.master_fd,
+            ));
+            // Last: the descriptor above is only valid while the pty lives, and `relinquish`
+            // keeps it alive (by leaking the handle) rather than closing it.
+            session.pty.relinquish();
+        }
+        out
     }
 
     /// Whether a session with `uid` is currently live.
@@ -1355,6 +1525,246 @@ mod tests {
             self.killed.store(true, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// A mock that CAN be handed over: it reports a real descriptor (a `/dev/null` handle,
+    /// which is all `handoff_info` promises — an open fd the successor could receive) and
+    /// keeps the default `relinquish`, so a test can prove the pty was released rather than
+    /// killed or dropped.
+    #[cfg(unix)]
+    struct HandoffMockPty {
+        fd: std::fs::File,
+        killed: Arc<AtomicBool>,
+    }
+    #[cfg(unix)]
+    impl Pty for HandoffMockPty {
+        fn write(&self, _data: &[u8]) -> io::Result<()> {
+            Ok(())
+        }
+        fn resize(&self, _cols: u16, _rows: u16) -> io::Result<()> {
+            Ok(())
+        }
+        fn kill(&self) -> io::Result<()> {
+            self.killed.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn handoff_info(&self) -> Option<crate::session::pty::HandoffInfo> {
+            use std::os::fd::AsRawFd;
+            Some(crate::session::pty::HandoffInfo {
+                master_fd: self.fd.as_raw_fd(),
+                pgrp: Some(4242),
+            })
+        }
+    }
+
+    /// Is `fd` still an open descriptor in this process?
+    #[cfg(unix)]
+    fn fd_is_open(fd: std::os::fd::RawFd) -> bool {
+        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    }
+
+    /// A session in `reg` whose pty is handoff-capable; returns its sink and kill flag.
+    #[cfg(unix)]
+    fn make_handoff_session(reg: &SessionRegistry, uid: &str) -> (EventSink, Arc<AtomicBool>) {
+        let slot: Arc<Mutex<Option<EventSink>>> = Arc::new(Mutex::new(None));
+        let killed = Arc::new(AtomicBool::new(false));
+        let slot2 = Arc::clone(&slot);
+        let killed2 = Arc::clone(&killed);
+        let factory: SpawnFn = Box::new(move |_spec, sink| {
+            *slot2.lock().unwrap() = Some(sink);
+            Ok(Box::new(HandoffMockPty {
+                fd: std::fs::File::open("/dev/null")?,
+                killed: killed2,
+            }) as Box<dyn Pty>)
+        });
+        reg.create_with(
+            SpawnOptions {
+                uid: uid.into(),
+                cols: Some(100),
+                rows: Some(40),
+                ..Default::default()
+            },
+            factory,
+        )
+        .expect("create");
+        let sink = slot.lock().unwrap().clone().expect("sink captured");
+        (sink, killed)
+    }
+
+    /// Wait until `uid`'s output cursor reaches `want` (the 16 ms batch timer owns the flush).
+    async fn cursor_reaches(reg: &SessionRegistry, uid: &str, want: u64) -> u64 {
+        for _ in 0..100 {
+            match reg.output_bytes(uid) {
+                Some(n) if n >= want => return n,
+                _ => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        }
+        reg.output_bytes(uid).unwrap_or(0)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hand_off_snapshots_every_session_and_empties_the_registry() {
+        let (etx, _erx) = unbounded_channel::<SessionEvent>();
+        let reg = SessionRegistry::new(etx);
+        let (sink_a, killed_a) = make_handoff_session(&reg, "a");
+        let (_sink_b, _killed_b) = make_handoff_session(&reg, "b");
+
+        sink_a(PtyEvent::Data(b"hello".to_vec()));
+        cursor_reaches(&reg, "a", 5).await;
+
+        let mut handed = reg.hand_off();
+        handed.sort_by(|x, y| x.0.uid.cmp(&y.0.uid));
+        assert_eq!(handed.len(), 2, "both sessions are handed over");
+
+        let (snap_a, fd_a) = &handed[0];
+        assert_eq!(snap_a.uid, "a");
+        assert_eq!(snap_a.replay, "hello", "the scrollback carries across");
+        assert_eq!(snap_a.cursor, 5, "so does the output cursor");
+        assert_eq!((snap_a.cols, snap_a.rows), (100, 40), "and the grid");
+        assert_eq!(snap_a.pgrp, Some(4242));
+        assert!(
+            fd_is_open(*fd_a),
+            "the descriptor must still be open — the pty was relinquished, not dropped"
+        );
+        assert!(
+            !killed_a.load(Ordering::SeqCst),
+            "a handed-over session must NOT be killed: that is the whole point"
+        );
+
+        // fd_index addresses the descriptor array in returned order.
+        let idx: Vec<usize> = handed.iter().map(|(s, _)| s.fd_index).collect();
+        assert_eq!(idx.len(), 2);
+        assert!(idx.contains(&0) && idx.contains(&1));
+
+        assert!(reg.uids().is_empty(), "the registry hands over everything");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hand_off_kills_a_session_that_cannot_be_handed_over() {
+        let (etx, _erx) = unbounded_channel::<SessionEvent>();
+        let reg = SessionRegistry::new(etx);
+        let killed = Arc::new(AtomicBool::new(false));
+        let killed2 = Arc::clone(&killed);
+        // The plain mock answers `handoff_info() == None` (the trait default).
+        let factory: SpawnFn = Box::new(move |_spec, _sink| {
+            struct Unhandoffable(Arc<AtomicBool>);
+            impl Pty for Unhandoffable {
+                fn write(&self, _d: &[u8]) -> io::Result<()> {
+                    Ok(())
+                }
+                fn resize(&self, _c: u16, _r: u16) -> io::Result<()> {
+                    Ok(())
+                }
+                fn kill(&self) -> io::Result<()> {
+                    self.0.store(true, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+            Ok(Box::new(Unhandoffable(killed2)) as Box<dyn Pty>)
+        });
+        reg.create_with(
+            SpawnOptions {
+                uid: "stuck".into(),
+                ..Default::default()
+            },
+            factory,
+        )
+        .expect("create");
+
+        assert!(reg.hand_off().is_empty(), "nothing to hand over");
+        assert!(
+            killed.load(Ordering::SeqCst),
+            "a session that cannot cross must be killed, not stranded in a dying process"
+        );
+        assert!(reg.uids().is_empty());
+    }
+
+    #[tokio::test]
+    async fn adopt_restores_the_snapshot_and_streams_on_from_the_carried_cursor() {
+        let (etx, _erx) = unbounded_channel::<SessionEvent>();
+        let reg = SessionRegistry::new(etx);
+        let snap = SessionSnapshot {
+            uid: "s1".into(),
+            replay: "before-the-upgrade".into(),
+            cursor: 1000,
+            cols: 100,
+            rows: 40,
+            ..Default::default()
+        };
+
+        let slot: Arc<Mutex<Option<EventSink>>> = Arc::new(Mutex::new(None));
+        let slot2 = Arc::clone(&slot);
+        reg.adopt(&snap, move |sink| {
+            *slot2.lock().unwrap() = Some(sink);
+            Ok(Box::new(MockPty::default()) as Box<dyn Pty>)
+        })
+        .expect("adopt");
+        let sink = slot.lock().unwrap().clone().expect("sink captured");
+
+        assert!(reg.has("s1"));
+        assert_eq!(reg.replay("s1").as_deref(), Some("before-the-upgrade"));
+        assert_eq!(reg.output_bytes("s1"), Some(1000));
+        assert_eq!(reg.dims("s1"), Some((100, 40)));
+        assert!(
+            reg.render_screen("s1")
+                .expect("screen")
+                .contains("before-the-upgrade"),
+            "the screen mirror is rebuilt by replaying the carried buffer"
+        );
+
+        // Live output continues from the carried cursor rather than restarting at 0 — a
+        // client holding a pre-upgrade `since` value must not be handed a rewound stream.
+        sink(PtyEvent::Data(b"after".to_vec()));
+        assert_eq!(cursor_reaches(&reg, "s1", 1005).await, 1005);
+        assert_eq!(reg.replay("s1").as_deref(), Some("before-the-upgradeafter"));
+    }
+
+    // A successor's uid counter starts at 1, so without a floor it would re-mint `s3` while
+    // the `s3` it just adopted was still live — two sessions, one uid, and a pane bound to
+    // whichever won the map. Adopting must push the counter past anything it inherits.
+    #[tokio::test]
+    async fn adopting_pushes_the_uid_counter_past_the_inherited_uids() {
+        let (etx, _erx) = unbounded_channel::<SessionEvent>();
+        let reg = SessionRegistry::new(etx);
+        assert_eq!(
+            reg.mint_uid(),
+            "s1",
+            "a fresh registry starts at the bottom"
+        );
+
+        for uid in ["s3", "s2"] {
+            let snap = SessionSnapshot {
+                uid: uid.into(),
+                cols: 80,
+                rows: 24,
+                ..Default::default()
+            };
+            reg.adopt(&snap, |_sink| {
+                Ok(Box::new(MockPty::default()) as Box<dyn Pty>)
+            })
+            .expect("adopt");
+        }
+
+        assert_eq!(
+            reg.mint_uid(),
+            "s4",
+            "the counter clears the HIGHEST adopted uid, not merely the last one"
+        );
+
+        // Uids the daemon did not mint (the GUI pins its own) leave the counter alone.
+        let snap = SessionSnapshot {
+            uid: "pane-abc".into(),
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        };
+        reg.adopt(&snap, |_sink| {
+            Ok(Box::new(MockPty::default()) as Box<dyn Pty>)
+        })
+        .expect("adopt");
+        assert_eq!(reg.mint_uid(), "s5");
     }
 
     // Create a session whose pty is a mock; returns the manager event receiver and the
