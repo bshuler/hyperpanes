@@ -321,7 +321,8 @@ fn write_goals_settings_config() -> Option<std::path::PathBuf> {
     let src = std::path::Path::new(&home)
         .join(".claude")
         .join("settings.json");
-    let parsed: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(src).ok()?).ok()?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(src).ok()?).ok()?;
     let status_line = parsed.get("statusLine").filter(|v| !v.is_null())?;
     let json = goals_settings_json(status_line);
     let path = hyperpanes_core::persistence::paths::state_dir().join("goals-settings.json");
@@ -334,7 +335,9 @@ fn write_goals_settings_config() -> Option<std::path::PathBuf> {
     match std::fs::write(&path, json) {
         Ok(()) => Some(path),
         Err(e) => {
-            eprintln!("[goals] failed to write goals-settings.json: {e}; spawning without --settings");
+            eprintln!(
+                "[goals] failed to write goals-settings.json: {e}; spawning without --settings"
+            );
             None
         }
     }
@@ -350,10 +353,7 @@ mod goals_mcp_config_tests {
             serde_json::from_str(&json).expect("goals-mcp.json contents must parse as JSON");
         let hyperpanes = &parsed["mcpServers"]["hyperpanes"];
         assert_eq!(hyperpanes["command"], "npx");
-        assert_eq!(
-            hyperpanes["env"]["HYPERPANES_CONTROL_FILE"],
-            control_path
-        );
+        assert_eq!(hyperpanes["env"]["HYPERPANES_CONTROL_FILE"], control_path);
         assert!(json.contains(control_path));
         assert!(json.contains("hyperpanes"));
     }
@@ -367,7 +367,10 @@ mod goals_mcp_config_tests {
         let json = super::goals_settings_json(&status_line);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         // Only statusLine is carried — no behavior keys (model/effort/outputStyle) leak in.
-        assert_eq!(parsed.as_object().unwrap().keys().collect::<Vec<_>>(), vec!["statusLine"]);
+        assert_eq!(
+            parsed.as_object().unwrap().keys().collect::<Vec<_>>(),
+            vec!["statusLine"]
+        );
         assert_eq!(parsed["statusLine"], status_line);
     }
 }
@@ -380,7 +383,10 @@ mod goal_defaults_tests {
     fn valid_indices_pass_through() {
         // A saved selection within range survives a round-trip unchanged.
         assert_eq!(clamp_goal_model_sel([2, 0, 1]), [2, 0, 1]);
-        assert_eq!(clamp_goal_model_sel(GOAL_MODEL_SEL_DEFAULT), GOAL_MODEL_SEL_DEFAULT);
+        assert_eq!(
+            clamp_goal_model_sel(GOAL_MODEL_SEL_DEFAULT),
+            GOAL_MODEL_SEL_DEFAULT
+        );
     }
 
     #[test]
@@ -2339,7 +2345,11 @@ impl State {
         if text.is_empty() {
             return;
         }
-        let Some(path) = self.projects.get(self.goal_proj_sel).map(|p| p.path.clone()) else {
+        let Some(path) = self
+            .projects
+            .get(self.goal_proj_sel)
+            .map(|p| p.path.clone())
+        else {
             return;
         };
         let m = |i: usize| {
@@ -3132,7 +3142,11 @@ impl State {
         // the next tick — its Claude is already up, so the marker gate passes immediately) and
         // refresh its subtitle to the newest task.
         if let Some(uid) = self.goal_orchestrators.get(project_path).cloned() {
-            let alive = self.tabs.iter().flat_map(|t| &t.panes).any(|p| p.uid == uid);
+            let alive = self
+                .tabs
+                .iter()
+                .flat_map(|t| &t.panes)
+                .any(|p| p.uid == uid);
             if alive {
                 if let Some((ti, pi)) = self.find_pane(&uid) {
                     self.tabs[ti].panes[pi].subtitle = Some(subtitle.clone().into());
@@ -3162,7 +3176,13 @@ impl State {
             if let Some(dir) = &exe_dir {
                 candidates.push(dir.join(&rel));
                 if let Some(prefix) = dir.parent() {
-                    candidates.push(prefix.join("Resources").join("claude").join("goal-orchestrator").join("SKILL.md"));
+                    candidates.push(
+                        prefix
+                            .join("Resources")
+                            .join("claude")
+                            .join("goal-orchestrator")
+                            .join("SKILL.md"),
+                    );
                     candidates.push(prefix.join("share").join("hyperpanes").join(&rel));
                     candidates.push(prefix.join("lib").join("hyperpanes").join(&rel));
                 }
@@ -3170,7 +3190,9 @@ impl State {
             if let Some(home) = std::env::var_os("HOME") {
                 let h = std::path::Path::new(&home);
                 candidates.push(h.join(".claude/skills/goal-orchestrator/SKILL.md"));
-                candidates.push(h.join("dev/agent-orchestration-skills/skills/goal-orchestrator/SKILL.md"));
+                candidates.push(
+                    h.join("dev/agent-orchestration-skills/skills/goal-orchestrator/SKILL.md"),
+                );
             }
             candidates.into_iter().find(|p| p.is_file())
         };
@@ -3284,7 +3306,11 @@ impl State {
         // the app's own env so `fresh_env()` hands them to every pane unconditionally. The
         // goal/project-specific vars (models, project name/color, the rotated CLAUDE_CONFIG_DIR)
         // deliberately stay per-spawn — they must not leak process-wide across concurrent projects.
-        for key in ["HP_GOAL_PERSONA_DIR", "HP_GOAL_SETTINGS", "HP_GOAL_ACCOUNTS"] {
+        for key in [
+            "HP_GOAL_PERSONA_DIR",
+            "HP_GOAL_SETTINGS",
+            "HP_GOAL_ACCOUNTS",
+        ] {
             if let Some(val) = env.get(key) {
                 std::env::set_var(key, val);
             }
@@ -4653,7 +4679,12 @@ impl State {
                 .as_deref()
                 .map(|d| format!("CLAUDE_CONFIG_DIR='{d}' "))
                 .unwrap_or_default();
-            let head = spawn_command.as_deref().unwrap_or("").split_whitespace().next().unwrap_or("");
+            let head = spawn_command
+                .as_deref()
+                .unwrap_or("")
+                .split_whitespace()
+                .next()
+                .unwrap_or("");
             let head = head.rsplit(['/', '\\']).next().unwrap_or(head);
             if spawn_command.is_none() {
                 startup = Some(match &resume_cwd {

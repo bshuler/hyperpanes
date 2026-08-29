@@ -2195,9 +2195,11 @@ mod tests {
         client
             .send(&ClientMsg::Claim { uid: uid.clone() })
             .expect("child sends claim");
-        let reply = recv_until(&client, Duration::from_secs(10), |m| {
-            matches!(m, DaemonMsg::ClaimResult { uid: u, .. } if *u == uid)
-        });
+        let reply = recv_until(
+            &client,
+            Duration::from_secs(10),
+            |m| matches!(m, DaemonMsg::ClaimResult { uid: u, .. } if *u == uid),
+        );
         let code = match reply {
             Some(DaemonMsg::ClaimResult { granted: true, .. }) => EXIT_GRANTED,
             Some(DaemonMsg::ClaimResult { granted: false, .. }) => EXIT_DENIED,
@@ -2235,9 +2237,11 @@ mod tests {
         client
             .send(&ClientMsg::Claim { uid: uid.clone() })
             .expect("child sends claim");
-        let reply = recv_until(&client, Duration::from_secs(10), |m| {
-            matches!(m, DaemonMsg::ClaimResult { uid: u, .. } if *u == uid)
-        });
+        let reply = recv_until(
+            &client,
+            Duration::from_secs(10),
+            |m| matches!(m, DaemonMsg::ClaimResult { uid: u, .. } if *u == uid),
+        );
         assert!(
             matches!(reply, Some(DaemonMsg::ClaimResult { granted: true, .. })),
             "the holder must get the uncontested claim"
@@ -2310,14 +2314,18 @@ mod tests {
         }
         let children: Vec<std::process::Child> = (0..RACERS)
             .map(|i| {
-                child_role("session::daemon::tests::m7_child_race_for_one_claim", &socket, &uid)
-                    .env(ENV_AT, at.to_string())
-                    .env(ENV_READY, &verdicts[i])
-                    .env(ENV_RELEASE, &go)
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .spawn()
-                    .expect("racer process spawns")
+                child_role(
+                    "session::daemon::tests::m7_child_race_for_one_claim",
+                    &socket,
+                    &uid,
+                )
+                .env(ENV_AT, at.to_string())
+                .env(ENV_READY, &verdicts[i])
+                .env(ENV_RELEASE, &go)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("racer process spawns")
             })
             .collect();
 
@@ -2340,7 +2348,10 @@ mod tests {
             "one claim in the registry while six processes hold connections: {table:?}"
         );
         assert_eq!(table[0].uid, uid);
-        assert_ne!(table[0].owner, 0, "a claim always names its owning connection");
+        assert_ne!(
+            table[0].owner, 0,
+            "a claim always names its owning connection"
+        );
 
         // Release them and collect the verdicts they were holding.
         std::fs::write(&go, b"go").expect("release the racers");

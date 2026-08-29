@@ -47,11 +47,13 @@ use crate::session_manager::{Integration, SessionEvent, SessionSnapshot, SpawnOp
 /// [`ClientMsg::ListClaims`], the [`DaemonMsg::ClaimResult`] / [`DaemonMsg::Claims`]
 /// answers, the unsolicited [`DaemonMsg::SessionsChanged`] push, and `conn_id` on
 /// [`DaemonMsg::Hello`]. The bump matters for the same reason `2` did: a version-2 daemon
-/// cannot deserialize `Claim`, and an unknown frame drops the connection — so the client's
-/// lock-step handshake must upgrade the daemon (live takeover, M1) *before* any claim
-/// traffic is sent. The additions are otherwise purely additive, and `Hello.conn_id`
-/// carries `#[serde(default)]` so an older peer's reply still parses (as `0`, the
-/// "unknown owner" sentinel).
+/// cannot deserialize `Claim`, and an unknown frame drops the connection — so claim traffic
+/// must never reach a pre-3 daemon. Normally the lock-step handshake upgrades the daemon
+/// (live takeover, M1) first; when it *cannot* — a stale daemon holding live terminals is
+/// driven as it is rather than killed for an upgrade — the client suppresses claim traffic
+/// entirely instead (`daemon_client::MIN_CLAIM_DAEMON_VER`). The additions are otherwise
+/// purely additive, and `Hello.conn_id` carries `#[serde(default)]` so an older peer's reply
+/// still parses (as `0`, the "unknown owner" sentinel).
 pub const PROTO_VER: u32 = 3;
 
 /// Hard cap on a single frame body, so a corrupt/hostile length prefix can't make a

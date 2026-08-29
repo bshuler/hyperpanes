@@ -195,7 +195,7 @@ pub fn scan_library(dir: &Path) -> Vec<LibraryEntry> {
             },
         ));
     }
-    rows.sort_by(|a, b| b.0.cmp(&a.0));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
     rows.into_iter().map(|(_, e)| e).collect()
 }
 
@@ -389,7 +389,7 @@ pub fn detached(mgr: &SessionManager, claimed_here: &HashSet<String>) -> Vec<Det
         })
         .collect();
     // Most recently active first — the one you're most likely to be looking for.
-    rows.sort_by(|a, b| b.last_output_at.cmp(&a.last_output_at));
+    rows.sort_by_key(|r| std::cmp::Reverse(r.last_output_at));
     rows
 }
 
@@ -516,11 +516,11 @@ mod tests {
 
         // a valid workspace, a valid one with no name, a non-workspace extension, and junk
         assert!(hyperpanes_core::workspace::io::write_workspace(
-            &dir.join("one.hyperpanes"),
+            dir.join("one.hyperpanes"),
             &wf(Some("alpha"), vec![2])
         ));
         assert!(hyperpanes_core::workspace::io::write_workspace(
-            &dir.join("two.json"),
+            dir.join("two.json"),
             &wf(None, vec![1, 1])
         ));
         std::fs::write(dir.join("notes.txt"), b"not a workspace").unwrap();
