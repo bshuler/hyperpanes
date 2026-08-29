@@ -162,11 +162,44 @@ stream live output, forward stdin, handle `SIGWINCH`, and a detach key. This is 
 equivalent and the piece every mobile path depends on. Usable over a stock system sshd immediately,
 before M3 exists.
 
-### M3 — embedded SSH server (russh)
-Listener inside the daemon; per-device public keys reusing the existing `device-tokens.json` +
-`hyperpanes pair` QR flow. An opened channel runs the M2 client directly — no shell. A pane chooser
-when none is named. **Binds loopback by default**; remote exposure follows the Tailscale-first model
-already written down in `docs/mobile-client-plan.md`.
+### M3 — embedded SSH server (russh) ✅ *built*
+A phone with no hyperpanes software on it — Termius, Blink, or plain `ssh` — points at the port and
+lands in a live pane. `rs/crates/app/src/ssh/` holds it: `config.rs` (settings + on-disk layout,
+portable and tested on every leg), `keys.rs` (host key, client keys), `server.rs` (the russh
+listener and auth), `bridge.rs` (channel ↔ pane). An opened channel runs the **M2 attach client**
+(`hyperpanes_core::session::attach`) verbatim — no shell, no re-implemented protocol — so detaching
+over SSH leaves the pane running exactly as `hyperpanes attach` does, and a `ssh host list` command
+prints the session table. `bridge::pick` is the **pane chooser** shown when the command/username
+names no pane.
+
+**Every default is the conservative one, and each relaxation is a separate explicit act:** the
+server is *off* until `hyperpanes ssh enable`; it binds **127.0.0.1**, and any other bind needs
+`bind` *and* `allowRemote: true` together (`SshSettings::resolve_bind`) — the Tailscale-first model
+of `docs/mobile-client-plan.md`; auth is **public key only** (no password, no keyboard-interactive,
+no `none`, and russh's default *accept* for an offered key is overridden); the host key is
+generated once at `0600` and refused if group/other-readable; and the resize policy is `Observe`,
+so a phone cannot reflow the desktop's panes. Only fingerprints are ever printed.
+
+**Client keys come from two sources, both read on every attempt, failing closed if either is
+unreadable or badly permissioned** (`keys::Authorizer`). The plan asked to reuse `device-tokens.json`
++ `hyperpanes pair`; what is reusable there is the *device registry*, not the credential — a device
+token is a bearer secret, an SSH client proves possession of a key it never hands over. So the key
+rides *in* the device record: `hyperpanes pair --ssh-key ~/.ssh/id_ed25519.pub` stores the public key
+beside the bearer token (new optional `sshKey` field, additive — records written before M3 still
+load), and one `hyperpanes revoke <label>` shuts both doors under one label and one TTL. An expired
+pairing stops authenticating over SSH the same millisecond it stops authenticating over the control
+API. The second source is an operator-managed `authorized_keys`-format file
+(`hyperpanes ssh authorize|keys|revoke`), for the laptop-to-desktop case that never pairs a phone.
+
+The security claims are tested by real handshakes against the real listener on `127.0.0.1:0`, not by
+inspection: an authorized key gets in and an unlisted one does not (and a revoke takes effect on the
+next connection), a paired device key gets in until its pairing expires, the offered method list is
+`[PublicKey]` even with no keys installed, an unreadable key source locks *everybody* out, and the
+listener address comes from settings and defaults to loopback.
+
+`#[cfg(unix)]`: `AttachWriter::disconnect()` is a documented no-op on Windows (a named-pipe handle
+has no half-close), so an SSH client hanging up would leak a thread and a daemon client per session.
+`config` is portable and compiled on the Windows leg; the rest refuses with that reason.
 
 ### M4 — tmux control-mode surface *(optional)*
 Speak `-CC` on the SSH channel so Blink and iTerm2 render panes as **native tabs** rather than a
@@ -202,7 +235,10 @@ click.
   new daemon mis-talks to an old host. Changes to host-facing messages must stay additive.
 * **An embedded SSH server is a real security surface** — it owns every terminal and every
   credential typed into one. Loopback-only default, explicit opt-in to any wider bind, per-device
-  revocable keys, and no password auth.
+  revocable keys, and no password auth. **Held (M3):** off by default, loopback bind, a
+  non-loopback bind refused unless `allowRemote` is set too, public-key-only auth, per-device keys
+  revoked with their pairing, and a key set that fails closed — each with a test that completes a
+  real handshake rather than reading the code.
 * **Exit detection changes semantics** after handoff (pty EOF, not `waitpid`). Zombie/exit-code
   reporting needs a test.
 * ~~**Mobile resize contention.**~~ **Answered (M2): attach at the desktop's grid and letterbox;
@@ -234,7 +270,7 @@ click.
 |---|---|---|
 | M1 live upgrade ✅ | `mux/m1-takeover` | — |
 | M2 attach client | `mux/m2-attach` | — |
-| M3 embedded SSH | `mux/m3-ssh` | M2 |
+| M3 embedded SSH ✅ | `mux/m3-ssh` | M2 |
 | M4 control mode | `mux/m4-ccmode` | M2 |
 | M5 left panel | `mux/m5-panel` | — (adoption list needs M7) |
 | M6 workspace sets | `mux/m6-sets` | — |

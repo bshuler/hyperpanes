@@ -21,7 +21,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use hyperpanes_core::session::attach::{self, ResizePolicy};
@@ -40,8 +39,10 @@ use crate::ssh::keys;
 pub struct ServeOpts {
     /// Daemon salt — which hyperpanes workspace this port fronts.
     pub salt: String,
-    /// The authorized-keys file, re-read per connection.
-    pub authorized_keys: PathBuf,
+    /// Where the key sources live. Both the `ssh-authorized-keys` file and the `sshKey` column
+    /// of `device-tokens.json` are re-read per authentication attempt, so a revoke through
+    /// either door takes effect on the next connection without a restart.
+    pub paths: SshPaths,
     /// Whether an SSH client may reflow panes for everyone.
     pub policy: ResizePolicy,
     /// Detach prefix byte.
@@ -56,10 +57,10 @@ pub fn build_config(host_key: russh::keys::PrivateKey) -> server::Config {
     server::Config {
         // Identify honestly. A fake OpenSSH banner would only mislead the operator reading
         // their own logs.
-        server_id: russh::SshId::Standard(format!(
-            "SSH-2.0-hyperpanes_{}",
+        server_id: russh::SshId::Standard(std::borrow::Cow::Borrowed(concat!(
+            "SSH-2.0-hyperpanes_",
             env!("CARGO_PKG_VERSION")
-        )),
+        ))),
         // The whole auth policy, in one line: publickey and nothing else. A client that only
         // knows how to send a password is told there is no such method rather than being
         // given a prompt that can never succeed.
@@ -96,7 +97,8 @@ pub fn serve_blocking(paths: &SshPaths, salt: &str, verbose: bool) -> Result<(),
 
     let (host_key, fresh) = keys::load_or_create_host_key(&paths.host_key)?;
     let fp = keys::host_fingerprint(&host_key);
-    let allowed = keys::load_authorized(&paths.authorized_keys)?;
+    let allowed = keys::Authorizer::load(paths)?;
+    let live = allowed.live_len(keys::now_ms());
     for w in &allowed.warnings {
         let msg = format!("ssh: authorized keys: {w}");
         if verbose {
@@ -104,11 +106,12 @@ pub fn serve_blocking(paths: &SshPaths, salt: &str, verbose: bool) -> Result<(),
         }
         dbg_log(&msg);
     }
-    if allowed.is_empty() {
+    if live == 0 {
         // Not fatal: the operator may be about to authorize a key, and the running server
         // will pick it up on the next connection. But say so loudly.
         let msg = "ssh: no client keys are authorized — every connection will be rejected. \
-                   Add one with `hyperpanes ssh authorize <key>`.";
+                   Add one with `hyperpanes ssh authorize <key>`, or pair a device with \
+                   `hyperpanes pair --ssh-key <key>`.";
         if verbose {
             eprintln!("{msg}");
         }
@@ -118,7 +121,7 @@ pub fn serve_blocking(paths: &SshPaths, salt: &str, verbose: bool) -> Result<(),
     let banner = format!(
         "ssh: listening on {addr} (host key {fp}{}, {} authorized client key(s), {})",
         if fresh { ", newly generated" } else { "" },
-        allowed.len(),
+        live,
         match policy {
             ResizePolicy::Request => "clients may resize panes",
             ResizePolicy::Observe => "clients letterbox",
@@ -138,7 +141,7 @@ pub fn serve_blocking(paths: &SshPaths, salt: &str, verbose: bool) -> Result<(),
 
     let opts = ServeOpts {
         salt: salt.to_string(),
-        authorized_keys: paths.authorized_keys.clone(),
+        paths: paths.clone(),
         policy,
         detach,
     };
@@ -217,7 +220,13 @@ pub struct SshHandler {
 
 impl SshHandler {
     /// Start the attach bridge for `channel`, or explain on the channel why it cannot.
-    async fn start(&mut self, channel: ChannelId, query: Option<String>, list: bool, session: &mut Session) {
+    async fn start(
+        &mut self,
+        channel: ChannelId,
+        query: Option<String>,
+        list: bool,
+        session: &mut Session,
+    ) {
         let Some(state) = self.channels.get_mut(&channel) else {
             let _ = session.channel_failure(channel);
             return;
@@ -286,11 +295,23 @@ impl server::Handler for SshHandler {
     }
 
     /// Reject, always — same reason as `auth_password`.
-    async fn auth_keyboard_interactive(
-        &mut self,
+    async fn auth_keyboard_interactive<'a>(
+        &'a mut self,
         _user: &str,
         _submethods: &str,
-        _response: Option<server::Response<'async_trait>>,
+        _response: Option<server::Response<'a>>,
+    ) -> Result<Auth, Self::Error> {
+        Ok(reject())
+    }
+
+    /// Reject, always. An OpenSSH *certificate* authenticates against a CA, and hyperpanes
+    /// has no CA: the authorized-keys file lists key material, and only key material on that
+    /// list gets in. russh's default already rejects; this override keeps that true if the
+    /// default ever changes, the same reason `auth_none` is spelled out above.
+    async fn auth_openssh_certificate(
+        &mut self,
+        _user: &str,
+        _certificate: &russh::keys::Certificate,
     ) -> Result<Auth, Self::Error> {
         Ok(reject())
     }
@@ -483,14 +504,16 @@ impl server::Handler for SshHandler {
 }
 
 impl SshHandler {
-    /// Is this key authorized? Returns its label. Re-reads the file every call: the list is
-    /// tiny and a revoke that needs a restart is a revoke that does not work.
+    /// Is this key authorized? Returns its label and source. Re-reads both key sources every
+    /// call: the lists are tiny and a revoke that needs a restart is a revoke that does not work.
+    /// An expired device pairing is not authorized — the SSH door shuts on the same millisecond
+    /// as the control-API door.
     fn lookup(&self, key: &PublicKey) -> Option<String> {
-        match keys::load_authorized(&self.opts.authorized_keys) {
-            Ok(set) => set.authorize(key),
+        match keys::Authorizer::load(&self.opts.paths) {
+            Ok(set) => set.authorize(key, keys::now_ms()).map(|e| e.describe()),
             Err(e) => {
-                // Fail CLOSED. An unreadable or wrong-mode authorized-keys file rejects
-                // everyone rather than admitting them.
+                // Fail CLOSED. An unreadable or wrong-mode key file rejects everyone rather
+                // than admitting them.
                 dbg_log(&format!("ssh: refusing everyone — {e}"));
                 None
             }
@@ -551,6 +574,7 @@ pub fn query_from_user(user: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::ssh::testutil::tmpdir;
+    use russh::client::AuthResult;
 
     #[test]
     fn the_config_advertises_public_key_and_nothing_else() {
@@ -618,6 +642,248 @@ mod tests {
         for u in ["bert", "root", "mobile", "ubuntu", ""] {
             assert_eq!(query_from_user(u), None, "{u:?} is not a pane query");
         }
+    }
+
+    // ---- end-to-end authentication ------------------------------------------------------
+    //
+    // These stand up the REAL server (`serve_on` + `build_config`) on 127.0.0.1:0 and drive it
+    // with a real russh client. Nothing about authentication is asserted by inspection here:
+    // every claim below is a full SSH handshake against the same code path a phone hits.
+    //
+    // The salt points at an empty temp directory, so no channel can reach a live daemon even
+    // if one of these tests grew one — but none of them opens a channel: this is the door.
+
+    /// A client that trusts whatever host key it is shown. Fine here — the host key is not what
+    /// is under test, and the server is one we just started on loopback.
+    struct BlindClient;
+
+    impl russh::client::Handler for BlindClient {
+        type Error = russh::Error;
+
+        async fn check_server_key(
+            &mut self,
+            _server_public_key: &russh::keys::PublicKeyOrCertificate,
+        ) -> Result<bool, Self::Error> {
+            Ok(true)
+        }
+    }
+
+    fn a_client_key() -> russh::keys::PrivateKey {
+        russh::keys::PrivateKey::random(&mut rand::rng(), ssh_key::Algorithm::Ed25519).unwrap()
+    }
+
+    /// Start the real server on an ephemeral loopback port; returns its address.
+    async fn start(paths: &SshPaths) -> SocketAddr {
+        let (host_key, _) = keys::load_or_create_host_key(&paths.host_key).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let opts = ServeOpts {
+            // An empty directory: there is no daemon here, and no test below opens a channel.
+            salt: paths.settings.parent().unwrap().display().to_string(),
+            paths: paths.clone(),
+            policy: ResizePolicy::Observe,
+            detach: 0x1c,
+        };
+        let config = Arc::new(build_config(host_key));
+        tokio::spawn(async move {
+            let _ = serve_on(listener, config, opts).await;
+        });
+        addr
+    }
+
+    async fn connect(addr: SocketAddr) -> russh::client::Handle<BlindClient> {
+        russh::client::connect(
+            Arc::new(russh::client::Config::default()),
+            addr,
+            BlindClient,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// Does this key open the door? One fresh connection per attempt, as in real life.
+    async fn try_key(addr: SocketAddr, key: &russh::keys::PrivateKey) -> bool {
+        let mut session = connect(addr).await;
+        session
+            .authenticate_publickey(
+                "hyperpanes",
+                russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key.clone()), None),
+            )
+            .await
+            .unwrap()
+            .success()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_authorized_key_gets_in_and_an_unlisted_one_does_not() {
+        let dir = tmpdir("e2e-file-keys");
+        let paths = SshPaths::under(dir.path());
+        let allowed = a_client_key();
+        let stranger = a_client_key();
+        keys::authorize_key(
+            &paths.authorized_keys,
+            &allowed.public_key().to_openssh().unwrap(),
+            Some("laptop"),
+        )
+        .unwrap();
+        let addr = start(&paths).await;
+
+        assert!(
+            try_key(addr, &allowed).await,
+            "a key in ssh-authorized-keys must authenticate"
+        );
+        assert!(
+            !try_key(addr, &stranger).await,
+            "a key nobody authorized must NOT authenticate"
+        );
+
+        // Revoking takes effect on the very next connection — no restart, no reload command.
+        assert_eq!(
+            keys::revoke_key(&paths.authorized_keys, "laptop").unwrap(),
+            1
+        );
+        assert!(
+            !try_key(addr, &allowed).await,
+            "a revoked key must stop working immediately"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_paired_device_key_gets_in_until_its_pairing_expires() {
+        use hyperpanes_core::persistence::device_tokens::{save_to, DeviceRecord};
+
+        let dir = tmpdir("e2e-device-keys");
+        let paths = SshPaths::under(dir.path());
+        let phone = a_client_key();
+        let old_phone = a_client_key();
+        let no_key_device = a_client_key();
+        let now = keys::now_ms();
+
+        save_to(
+            &paths.device_tokens,
+            &[
+                DeviceRecord {
+                    label: "phone".into(),
+                    token: "t1".into(),
+                    expires_at: Some(now + 3_600_000),
+                    ssh_key: Some(phone.public_key().to_openssh().unwrap()),
+                },
+                DeviceRecord {
+                    label: "old-phone".into(),
+                    token: "t2".into(),
+                    expires_at: Some(now - 1),
+                    ssh_key: Some(old_phone.public_key().to_openssh().unwrap()),
+                },
+                DeviceRecord {
+                    label: "api-only".into(),
+                    token: "t3".into(),
+                    expires_at: None,
+                    ssh_key: None,
+                },
+            ],
+        )
+        .unwrap();
+        let addr = start(&paths).await;
+
+        // No ssh-authorized-keys file exists at all: the device table is the only source.
+        assert!(!paths.authorized_keys.exists());
+        assert!(
+            try_key(addr, &phone).await,
+            "a device paired with --ssh-key must authenticate"
+        );
+        assert!(
+            !try_key(addr, &old_phone).await,
+            "an expired pairing must not authenticate over SSH either"
+        );
+        assert!(
+            !try_key(addr, &no_key_device).await,
+            "a key that is on no list must not authenticate"
+        );
+
+        // `hyperpanes revoke <label>` rewrites this file without the record; the SSH door shuts
+        // with the control-API door, on the next connection.
+        save_to(&paths.device_tokens, &[]).unwrap();
+        assert!(
+            !try_key(addr, &phone).await,
+            "revoking the device must revoke its SSH key"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn there_is_no_password_and_no_none_auth_even_with_no_keys_installed() {
+        let dir = tmpdir("e2e-no-password");
+        let paths = SshPaths::under(dir.path());
+        let addr = start(&paths).await;
+
+        let mut session = connect(addr).await;
+        let none = session.authenticate_none("hyperpanes").await.unwrap();
+        assert!(!none.success(), "`none` auth must never succeed");
+        let AuthResult::Failure {
+            remaining_methods, ..
+        } = none
+        else {
+            unreachable!()
+        };
+        // What the server tells a client to try next is publickey, and only publickey — a
+        // password prompt that can never succeed is worse than no prompt at all.
+        assert_eq!(
+            remaining_methods.iter().collect::<Vec<_>>(),
+            vec![&MethodKind::PublicKey]
+        );
+
+        let mut session = connect(addr).await;
+        assert!(
+            !session
+                .authenticate_password("hyperpanes", "hunter2")
+                .await
+                .unwrap()
+                .success(),
+            "password auth must never succeed"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_unreadable_key_source_locks_everybody_out_rather_than_letting_them_in() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tmpdir("e2e-fail-closed");
+        let paths = SshPaths::under(dir.path());
+        let allowed = a_client_key();
+        keys::authorize_key(
+            &paths.authorized_keys,
+            &allowed.public_key().to_openssh().unwrap(),
+            Some("laptop"),
+        )
+        .unwrap();
+        let addr = start(&paths).await;
+        assert!(try_key(addr, &allowed).await);
+
+        // World-writable = anyone on the box can append their own key. Refusing to read the
+        // file must lock the door, not prop it open.
+        std::fs::set_permissions(
+            &paths.authorized_keys,
+            std::fs::Permissions::from_mode(0o666),
+        )
+        .unwrap();
+        assert!(
+            !try_key(addr, &allowed).await,
+            "a badly-permissioned key file must reject everyone"
+        );
+    }
+
+    #[test]
+    fn the_listener_address_comes_from_settings_and_defaults_to_loopback() {
+        // The bind policy lives in `config`, but this is the milestone's headline security
+        // claim, so it is asserted here too, on the value `serve_blocking` actually binds.
+        let dir = tmpdir("bind-default");
+        let paths = SshPaths::under(dir.path());
+        let settings = SshSettings::load(&paths.settings).unwrap();
+        let addr = settings.resolve_bind().unwrap();
+        assert!(
+            addr.ip().is_loopback(),
+            "the default bind must be loopback, got {addr}"
+        );
+        assert_eq!(addr.port(), crate::ssh::config::DEFAULT_PORT);
     }
 
     #[test]

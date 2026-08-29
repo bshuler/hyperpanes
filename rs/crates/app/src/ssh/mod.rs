@@ -30,15 +30,22 @@
 //! No secret is ever logged: the private host key is read and passed to russh as bytes and
 //! never rendered, and only *fingerprints* appear in output.
 //!
-//! # Divergence from the plan, stated plainly
+//! # Two ways a client key gets in
 //!
-//! `mux-backend-plan.md` proposes reusing `device-tokens.json` and the `hyperpanes pair` QR
-//! flow for SSH auth. That is not done here and should be reviewed as a deliberate change:
-//! those are *bearer tokens*, and an SSH client authenticates by proving possession of a
-//! private key it will not hand over — there is nothing to reuse but the UI. Client keys live
-//! in their own OpenSSH `authorized_keys`-format file instead
-//! ([`config::SshPaths::authorized_keys`]), managed by `hyperpanes ssh authorize|keys|revoke`.
-//! It also keeps this milestone out of `persistence/`, which another agent owns.
+//! `mux-backend-plan.md` asks for "per-device public keys reusing the existing
+//! `device-tokens.json` + `hyperpanes pair` flow". What is reusable there is the **device
+//! registry**, not the credential: a device token is a bearer secret, while an SSH client
+//! authenticates by proving possession of a private key it never hands over. So the key travels
+//! *in the device record* rather than being derived from it — `hyperpanes pair --ssh-key
+//! ~/.ssh/id_ed25519.pub` stores the public key alongside the bearer token in
+//! `device-tokens.json`, and one `hyperpanes revoke <label>` shuts both doors at once, under one
+//! label and one TTL. An expired pairing stops authenticating over SSH on the same millisecond it
+//! stops authenticating over the control API.
+//!
+//! The operator-managed `authorized_keys`-format file ([`config::SshPaths::authorized_keys`],
+//! driven by `hyperpanes ssh authorize|keys|revoke`) remains a second, independent source, for
+//! the laptop-to-desktop case that never pairs a phone. [`keys::Authorizer`] reads both on every
+//! authentication attempt and fails **closed** if either is unreadable or badly permissioned.
 //!
 //! # Windows
 //!
@@ -76,15 +83,19 @@ USAGE:
     hyperpanes ssh authorize <key|path> [--label NAME]
                                           Allow a client public key (an authorized_keys line,
                                           a .pub file's contents, or a path to one)
-    hyperpanes ssh keys                   List the allowed client keys
+    hyperpanes ssh keys                   List the allowed client keys (both sources)
     hyperpanes ssh revoke <label|fingerprint>
-                                          Remove an allowed client key
+                                          Remove a key from the authorized-keys FILE. A key that
+                                          came from a paired device is dropped with
+                                          `hyperpanes revoke <label>` instead.
     hyperpanes ssh serve                  Run the listener in the foreground (for testing)
 
 NOTES:
     The server binds 127.0.0.1 and is off until you enable it. Binding anything else needs
     BOTH \"bind\" and \"allowRemote\": true — prefer a Tailscale address over 0.0.0.0.
     Auth is public key only; there is no password auth and no shell behind the channel.
+    Keys come from two places: this file, and any device paired with
+    `hyperpanes pair --ssh-key <key>` (revoked together with its token by `hyperpanes revoke`).
 ";
 
 /// `hyperpanes ssh <subcommand>`.
@@ -173,11 +184,12 @@ fn run_inner(argv: &[String]) -> Result<(), String> {
                         s.bind
                     );
                 }
-                let allowed = keys::load_authorized(&paths.authorized_keys)?;
-                if allowed.is_empty() {
+                let allowed = keys::Authorizer::load(&paths)?;
+                if allowed.live_len(keys::now_ms()) == 0 {
                     println!(
                         "No client keys are authorized yet, so nobody can connect. Add one \
-                         with `hyperpanes ssh authorize ~/.ssh/id_ed25519.pub`."
+                         with `hyperpanes ssh authorize ~/.ssh/id_ed25519.pub`, or pair a \
+                         device with `hyperpanes pair --ssh-key ~/.ssh/id_ed25519.pub`."
                     );
                 }
             } else {
@@ -186,9 +198,9 @@ fn run_inner(argv: &[String]) -> Result<(), String> {
             Ok(())
         }
         "authorize" => {
-            let arg = rest.first().ok_or(
-                "usage: hyperpanes ssh authorize <key|path/to/key.pub> [--label NAME]",
-            )?;
+            let arg = rest
+                .first()
+                .ok_or("usage: hyperpanes ssh authorize <key|path/to/key.pub> [--label NAME]")?;
             let mut label = None;
             let mut i = 1;
             while i < rest.len() {
@@ -208,15 +220,8 @@ fn run_inner(argv: &[String]) -> Result<(), String> {
             Ok(())
         }
         "keys" => {
-            let set = keys::load_authorized(&paths.authorized_keys)?;
-            if set.is_empty() {
-                println!("No client keys are authorized. Nobody can connect over SSH.");
-            } else {
-                println!("Authorized client keys ({}):", set.len());
-                for k in &set.keys {
-                    println!("  {}  {}", keys::fingerprint(k), keys::label_for(k));
-                }
-            }
+            let set = keys::Authorizer::load(&paths)?;
+            print_keys(&set, |line| println!("{line}"));
             for w in &set.warnings {
                 eprintln!("  warning: {w}");
             }
@@ -228,7 +233,22 @@ fn run_inner(argv: &[String]) -> Result<(), String> {
                 .ok_or("usage: hyperpanes ssh revoke <label|fingerprint>")?;
             let n = keys::revoke_key(&paths.authorized_keys, needle)?;
             match n {
-                0 => println!("No authorized key matched {needle:?}."),
+                0 => {
+                    println!("No authorized key matched {needle:?}.");
+                    // The most likely reason is that the key belongs to a paired device, whose
+                    // record this command deliberately does not touch: dropping the key there
+                    // without the token would leave half a pairing standing.
+                    if keys::Authorizer::load(&paths)?
+                        .entries
+                        .iter()
+                        .any(|e| e.source == keys::KeySource::Device)
+                    {
+                        println!(
+                            "Some authorized keys belong to paired devices. Drop one (key and \
+                             token together) with `hyperpanes revoke <label>`."
+                        );
+                    }
+                }
                 1 => println!("Revoked 1 key."),
                 n => println!("Revoked {n} keys."),
             }
@@ -240,9 +260,7 @@ fn run_inner(argv: &[String]) -> Result<(), String> {
                 .into_owned();
             server::serve_blocking(&paths, &salt, true)
         }
-        other => Err(format!(
-            "unknown subcommand {other:?}\n\n{SSH_USAGE}"
-        )),
+        other => Err(format!("unknown subcommand {other:?}\n\n{SSH_USAGE}")),
     }
 }
 
@@ -272,21 +290,43 @@ fn status(paths: &config::SshPaths) -> Result<(), String> {
             Err(e) => println!("host key:   UNUSABLE — {e}"),
         }
     } else {
-        println!("host key:   not generated yet ({})", paths.host_key.display());
+        println!(
+            "host key:   not generated yet ({})",
+            paths.host_key.display()
+        );
     }
-    let set = keys::load_authorized(&paths.authorized_keys)?;
-    if set.is_empty() {
-        println!("client keys: none — nobody can connect");
-    } else {
-        println!("client keys ({}):", set.len());
-        for k in &set.keys {
-            println!("  {}  {}", keys::fingerprint(k), keys::label_for(k));
-        }
-    }
+    let set = keys::Authorizer::load(paths)?;
+    print_keys(&set, |line| println!("{line}"));
     for w in &set.warnings {
         println!("  warning: {w}");
     }
     Ok(())
+}
+
+/// Render the authorized-key list for `status` and `keys`, one line per key, naming the source
+/// so it is obvious which command takes each one away again. Takes a sink so the shape is
+/// testable without capturing stdout.
+#[cfg(unix)]
+fn print_keys(set: &keys::Authorizer, mut out: impl FnMut(&str)) {
+    let now = keys::now_ms();
+    let live = set.live_len(now);
+    if live == 0 {
+        out("client keys: none — nobody can connect over SSH");
+    } else {
+        out(&format!("client keys ({live}):"));
+    }
+    for e in &set.entries {
+        let expiry = match e.expires_at {
+            Some(_) if e.is_expired(now) => "  EXPIRED",
+            Some(_) => "  (expires)",
+            None => "",
+        };
+        out(&format!(
+            "  {}  {}{expiry}",
+            keys::fingerprint(&e.key),
+            e.describe()
+        ));
+    }
 }
 
 /// Start the listener alongside the session daemon, if the user turned it on.
@@ -379,6 +419,58 @@ mod tests {
         assert!(!wants_ssh(&argv(&["hyperpanes", "attach"])));
         // A pane running ssh must not be hijacked into our subcommand.
         assert!(!wants_ssh(&argv(&["hyperpanes", "-c", "ssh box"])));
+    }
+
+    /// `status`/`keys` must name where each key came from, because that is what tells a user
+    /// which command takes it away again — and must not quietly present a lapsed pairing as a
+    /// working one.
+    #[cfg(unix)]
+    #[test]
+    fn the_key_listing_names_each_source_and_flags_a_lapsed_pairing() {
+        use hyperpanes_core::persistence::device_tokens::{save_to, DeviceRecord};
+
+        let dir = testutil::tmpdir("print-keys");
+        let paths = config::SshPaths::under(dir.path());
+        let file_key = "ssh-ed25519 \
+                        AAAAC3NzaC1lZDI1NTE5AAAAIMuJ4gEQ0kPJHUZ5jK9BMhP+Uk6dEGXOtKqzTQVQvbUt \
+                        laptop";
+        keys::authorize_key(&paths.authorized_keys, file_key, None).unwrap();
+        let phone = keys::parse_public_key(file_key).unwrap();
+        save_to(
+            &paths.device_tokens,
+            &[DeviceRecord {
+                label: "old-phone".into(),
+                token: "not-a-real-token".into(),
+                expires_at: Some(1),
+                ssh_key: Some(phone.to_openssh().unwrap()),
+            }],
+        )
+        .unwrap();
+
+        let mut out = Vec::new();
+        print_keys(&keys::Authorizer::load(&paths).unwrap(), |l| {
+            out.push(l.to_string())
+        });
+        let text = out.join("\n");
+        assert!(text.contains("client keys (1)"), "{text}");
+        assert!(text.contains("laptop (file)"), "{text}");
+        assert!(text.contains("old-phone (device)"), "{text}");
+        assert!(text.contains("EXPIRED"), "{text}");
+    }
+
+    /// With nothing installed the listing must say so outright: an empty list is the state in
+    /// which the whole server rejects everyone, and silence would read like success.
+    #[cfg(unix)]
+    #[test]
+    fn an_empty_key_listing_says_nobody_can_connect() {
+        let dir = testutil::tmpdir("print-keys-empty");
+        let paths = config::SshPaths::under(dir.path());
+        let mut out = Vec::new();
+        print_keys(&keys::Authorizer::load(&paths).unwrap(), |l| {
+            out.push(l.to_string())
+        });
+        assert_eq!(out.len(), 1);
+        assert!(out[0].contains("none — nobody can connect"), "{:?}", out);
     }
 
     #[test]

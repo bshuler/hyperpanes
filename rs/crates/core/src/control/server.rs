@@ -458,7 +458,7 @@ pub async fn run_server(shared: Arc<Shared>) -> io::Result<()> {
         let path = shared.control_file.with_file_name("device-tokens.json");
         let mut tokens = shared.tokens.lock().unwrap();
         for rec in crate::persistence::device_tokens::load_from(&path) {
-            tokens.add_device(rec.token, rec.label, rec.expires_at);
+            tokens.add_device(rec.token, rec.label, rec.expires_at, rec.ssh_key);
         }
     }
     write_discovery(&shared)?;

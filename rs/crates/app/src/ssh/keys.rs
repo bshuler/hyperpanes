@@ -40,7 +40,12 @@ pub fn load_or_create_host_key(path: &Path) -> Result<(PrivateKey, bool), String
     for attempt in 0..2 {
         match std::fs::metadata(path) {
             Ok(meta) => {
-                check_mode(path, meta.permissions().mode(), PRIVATE_MODE_MASK, "private key")?;
+                check_mode(
+                    path,
+                    meta.permissions().mode(),
+                    PRIVATE_MODE_MASK,
+                    "private key",
+                )?;
                 let key = PrivateKey::read_openssh_file(path)
                     .map_err(|e| format!("{}: unreadable SSH host key: {e}", path.display()))?;
                 if key.is_encrypted() {
@@ -61,7 +66,10 @@ pub fn load_or_create_host_key(path: &Path) -> Result<(PrivateKey, bool), String
             // Lost the race with another hyperpanes process — go round and read theirs.
             Err(GenerateError::Exists) if attempt == 0 => continue,
             Err(GenerateError::Exists) => {
-                return Err(format!("{}: host key appeared and vanished", path.display()))
+                return Err(format!(
+                    "{}: host key appeared and vanished",
+                    path.display()
+                ))
             }
             Err(GenerateError::Other(m)) => return Err(m),
         }
@@ -142,7 +150,11 @@ fn check_mode(path: &Path, mode: u32, mask: u32, what: &str) -> Result<(), Strin
              other than the owner. Fix it with `chmod {} {}`.",
             path.display(),
             mode & 0o7777,
-            if mask == PRIVATE_MODE_MASK { "600" } else { "644" },
+            if mask == PRIVATE_MODE_MASK {
+                "600"
+            } else {
+                "644"
+            },
             path.display()
         ));
     }
@@ -193,12 +205,15 @@ impl AuthorizedKeySet {
             .map(label_for)
     }
 
-    /// How many keys are installed.
+    /// How many keys are installed. (Tests only — the server counts *live* entries across both
+    /// sources with [`Authorizer::live_len`].)
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.keys.len()
     }
 
-    /// Whether nobody can log in.
+    /// Whether nobody can log in. (Tests only — see [`Self::len`].)
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.keys.is_empty()
     }
@@ -209,7 +224,9 @@ impl AuthorizedKeySet {
 pub fn load_authorized(path: &Path) -> Result<AuthorizedKeySet, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AuthorizedKeySet::default()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AuthorizedKeySet::default())
+        }
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     let mode = std::fs::metadata(path)
@@ -233,9 +250,10 @@ pub fn parse_authorized(text: &str) -> AuthorizedKeySet {
         }
         match AuthorizedKeys::new(trimmed).next() {
             Some(Ok(entry)) => set.keys.push(entry.public_key().clone()),
-            Some(Err(e)) => set
-                .warnings
-                .push(format!("line {}: ignored, not a valid public key ({e})", i + 1)),
+            Some(Err(e)) => set.warnings.push(format!(
+                "line {}: ignored, not a valid public key ({e})",
+                i + 1
+            )),
             None => set
                 .warnings
                 .push(format!("line {}: ignored, not a valid public key", i + 1)),
@@ -330,16 +348,163 @@ pub fn parse_public_key(input: &str) -> Result<PublicKey, String> {
     }
     let as_path = Path::new(trimmed);
     if as_path.is_file() {
-        let text = std::fs::read_to_string(as_path)
-            .map_err(|e| format!("{}: {e}", as_path.display()))?;
+        let text =
+            std::fs::read_to_string(as_path).map_err(|e| format!("{}: {e}", as_path.display()))?;
         return PublicKey::from_openssh(text.trim())
             .map_err(|e| format!("{}: not an OpenSSH public key: {e}", as_path.display()));
     }
-    Err(
-        "not an OpenSSH public key. Expected something like \
+    Err("not an OpenSSH public key. Expected something like \
          `ssh-ed25519 AAAAC3Nz... you@phone`, or the path to a `.pub` file."
-            .to_string(),
-    )
+        .to_string())
+}
+
+/// Where an authorized key came from. Both sources are equal at the door; they differ in how a
+/// key gets added and, more importantly, in how it gets taken away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeySource {
+    /// The operator-managed `ssh-authorized-keys` file — added by `hyperpanes ssh authorize`,
+    /// removed by `hyperpanes ssh revoke`.
+    File,
+    /// A paired device in `device-tokens.json` that carries an `sshKey` — added by
+    /// `hyperpanes pair --ssh-key`, removed by `hyperpanes revoke <label>`, which drops the
+    /// bearer token and the SSH key together because they are one record.
+    Device,
+}
+
+impl KeySource {
+    /// One word for `hyperpanes ssh keys` / `status`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KeySource::File => "file",
+            KeySource::Device => "device",
+        }
+    }
+}
+
+/// One key that may open the door, with everything needed to explain the decision afterwards.
+#[derive(Debug, Clone)]
+pub struct AuthorizedEntry {
+    pub key: PublicKey,
+    /// The `authorized_keys` comment, or the device label — whatever a human would recognise.
+    pub label: String,
+    pub source: KeySource,
+    /// Ms-epoch expiry inherited from the device pairing. `None` = never (always so for file
+    /// keys, which have no TTL of their own).
+    pub expires_at: Option<i64>,
+}
+
+impl AuthorizedEntry {
+    /// Whether a paired device's TTL has run out at `now_ms`. Inclusive at the instant, matching
+    /// [`hyperpanes_core::persistence::device_tokens::DeviceRecord::is_expired`] so the SSH door
+    /// and the control-API door shut at exactly the same millisecond.
+    pub fn is_expired(&self, now_ms: i64) -> bool {
+        matches!(self.expires_at, Some(exp) if exp <= now_ms)
+    }
+
+    /// `label (source)` — how a key is named in output and in the audit line on a successful auth.
+    pub fn describe(&self) -> String {
+        format!("{} ({})", self.label, self.source.as_str())
+    }
+}
+
+/// Every key allowed to attach, from both sources, resolved together.
+///
+/// This is what the server consults on each `publickey` attempt. It is rebuilt per attempt (both
+/// files are small, and an authentication is rare and already expensive) so that revoking a key —
+/// by editing the file or by `hyperpanes revoke` — takes effect on the next connection with no
+/// restart. Any *error* reading a source is fatal to that load: an unreadable or badly-permissioned
+/// key file must deny everyone, never silently admit everyone.
+#[derive(Debug, Default, Clone)]
+pub struct Authorizer {
+    pub entries: Vec<AuthorizedEntry>,
+    /// Non-fatal complaints — a malformed line, a device whose key does not parse. Surfaced so a
+    /// user who pasted a broken key does not believe it is installed.
+    pub warnings: Vec<String>,
+}
+
+impl Authorizer {
+    /// Read both sources: `ssh-authorized-keys` and the `sshKey` column of `device-tokens.json`.
+    pub fn load(paths: &super::config::SshPaths) -> Result<Self, String> {
+        let file = load_authorized(&paths.authorized_keys)?;
+        let mut out = Self {
+            warnings: file.warnings,
+            entries: Vec::new(),
+        };
+        for key in file.keys {
+            out.entries.push(AuthorizedEntry {
+                label: label_for(&key),
+                key,
+                source: KeySource::File,
+                expires_at: None,
+            });
+        }
+        out.load_devices(&paths.device_tokens)?;
+        Ok(out)
+    }
+
+    /// Fold in the paired devices that carry an SSH key.
+    ///
+    /// The table's own loader is forgiving (a missing or corrupt file reads as *no devices*),
+    /// which is already the fail-closed answer. What is checked here is the file mode: anything
+    /// group- or other-writable is a way for another account to append its own key, so it is
+    /// refused outright, exactly as `authorized_keys` is.
+    fn load_devices(&mut self, path: &Path) -> Result<(), String> {
+        match std::fs::metadata(path) {
+            Ok(meta) => check_mode(
+                path,
+                meta.permissions().mode(),
+                AUTHORIZED_MODE_MASK,
+                "device-token file",
+            )?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        }
+        for rec in hyperpanes_core::persistence::device_tokens::load_from(path) {
+            let Some(text) = rec.ssh_key.as_deref() else {
+                continue; // paired for the control API only — no SSH key, no SSH access
+            };
+            match PublicKey::from_openssh(text.trim()) {
+                Ok(key) => self.entries.push(AuthorizedEntry {
+                    key,
+                    label: rec.label.clone(),
+                    source: KeySource::Device,
+                    expires_at: rec.expires_at,
+                }),
+                Err(e) => self.warnings.push(format!(
+                    "device {:?}: its stored SSH key is not usable and was ignored ({e})",
+                    rec.label
+                )),
+            }
+        }
+        Ok(())
+    }
+
+    /// The entry that authorizes `offered` at `now_ms`, if any.
+    ///
+    /// Compares [`PublicKey::key_data`] — the actual key material — so a client that reordered or
+    /// dropped the trailing comment still matches, and a comment alone can never authorize
+    /// anything. An expired device pairing matches nothing.
+    pub fn authorize(&self, offered: &PublicKey, now_ms: i64) -> Option<&AuthorizedEntry> {
+        self.entries
+            .iter()
+            .find(|e| e.key.key_data() == offered.key_data() && !e.is_expired(now_ms))
+    }
+
+    /// How many keys could open the door right now (expired pairings excluded).
+    pub fn live_len(&self, now_ms: i64) -> usize {
+        self.entries
+            .iter()
+            .filter(|e| !e.is_expired(now_ms))
+            .count()
+    }
+}
+
+/// Wall clock in ms since the epoch — the same clock the control server stamps device TTLs with.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -447,7 +612,10 @@ mod tests {
         )
         .unwrap());
         let set = load_authorized(&path).unwrap();
-        assert_eq!(set.authorize(allowed.public_key()).as_deref(), Some("phone"));
+        assert_eq!(
+            set.authorize(allowed.public_key()).as_deref(),
+            Some("phone")
+        );
         assert!(set.authorize(another_key().public_key()).is_none());
     }
 
@@ -486,8 +654,18 @@ mod tests {
         let path = dir.path().join("ssh-authorized-keys");
         let keep = a_key();
         let drop = another_key();
-        authorize_key(&path, &keep.public_key().to_openssh().unwrap(), Some("keep")).unwrap();
-        authorize_key(&path, &drop.public_key().to_openssh().unwrap(), Some("drop")).unwrap();
+        authorize_key(
+            &path,
+            &keep.public_key().to_openssh().unwrap(),
+            Some("keep"),
+        )
+        .unwrap();
+        authorize_key(
+            &path,
+            &drop.public_key().to_openssh().unwrap(),
+            Some("drop"),
+        )
+        .unwrap();
         assert_eq!(revoke_key(&path, "drop").unwrap(), 1);
         let set = load_authorized(&path).unwrap();
         assert_eq!(set.len(), 1);
@@ -530,7 +708,10 @@ mod tests {
         .unwrap();
         let mut impostor = another_key().public_key().clone();
         impostor.set_comment("phone");
-        assert!(load_authorized(&path).unwrap().authorize(&impostor).is_none());
+        assert!(load_authorized(&path)
+            .unwrap()
+            .authorize(&impostor)
+            .is_none());
     }
 
     #[test]
@@ -542,5 +723,164 @@ mod tests {
         let parsed = parse_public_key(p.to_str().unwrap()).unwrap();
         assert_eq!(parsed.key_data(), a_key().public_key().key_data());
         assert!(parse_public_key("hello").is_err());
+    }
+
+    // ---- Authorizer: the two key sources, resolved together --------------------------------
+
+    use crate::ssh::config::SshPaths;
+    use hyperpanes_core::persistence::device_tokens::{save_to, DeviceRecord};
+
+    fn device(label: &str, key: &PublicKey, expires_at: Option<i64>) -> DeviceRecord {
+        DeviceRecord {
+            label: label.to_string(),
+            token: "not-a-real-token".into(),
+            expires_at,
+            ssh_key: Some(key.to_openssh().unwrap()),
+        }
+    }
+
+    #[test]
+    fn a_paired_device_key_authorizes_and_names_its_source() {
+        let dir = tmpdir("authz-device");
+        let paths = SshPaths::under(dir.path());
+        let phone = a_key();
+        save_to(
+            &paths.device_tokens,
+            &[device("phone", phone.public_key(), None)],
+        )
+        .unwrap();
+
+        let authz = Authorizer::load(&paths).unwrap();
+        let hit = authz
+            .authorize(phone.public_key(), 10_000)
+            .expect("the paired key must authorize");
+        assert_eq!(hit.source, KeySource::Device);
+        // The DEVICE label names it, not the key's own comment — that is the label the user
+        // types into `hyperpanes revoke`.
+        assert_eq!(hit.label, "phone");
+        assert_eq!(hit.describe(), "phone (device)");
+        assert_eq!(authz.live_len(10_000), 1);
+    }
+
+    #[test]
+    fn an_expired_pairing_authorizes_nobody_but_is_still_listed() {
+        let dir = tmpdir("authz-expired");
+        let paths = SshPaths::under(dir.path());
+        let phone = a_key();
+        save_to(
+            &paths.device_tokens,
+            &[device("phone", phone.public_key(), Some(5_000))],
+        )
+        .unwrap();
+
+        let authz = Authorizer::load(&paths).unwrap();
+        assert!(authz.authorize(phone.public_key(), 4_999).is_some());
+        // Inclusive at the instant, exactly like the control API's own token expiry.
+        assert!(authz.authorize(phone.public_key(), 5_000).is_none());
+        assert_eq!(authz.live_len(5_000), 0);
+        // Still in `entries` so `hyperpanes ssh status` can say EXPIRED rather than go silent.
+        assert_eq!(authz.entries.len(), 1);
+    }
+
+    #[test]
+    fn both_sources_are_read_and_an_unlisted_key_matches_neither() {
+        let dir = tmpdir("authz-both");
+        let paths = SshPaths::under(dir.path());
+        let file_key = a_key();
+        let phone = another_key();
+        let stranger = PrivateKey::new(
+            KeypairData::Ed25519(Ed25519Keypair::from_seed(&[42u8; 32])),
+            "stranger",
+        )
+        .unwrap();
+        authorize_key(
+            &paths.authorized_keys,
+            &file_key.public_key().to_openssh().unwrap(),
+            Some("laptop"),
+        )
+        .unwrap();
+        save_to(
+            &paths.device_tokens,
+            &[device("phone", phone.public_key(), None)],
+        )
+        .unwrap();
+
+        let authz = Authorizer::load(&paths).unwrap();
+        assert_eq!(authz.live_len(0), 2);
+        assert_eq!(
+            authz.authorize(file_key.public_key(), 0).unwrap().source,
+            KeySource::File
+        );
+        assert_eq!(
+            authz.authorize(phone.public_key(), 0).unwrap().source,
+            KeySource::Device
+        );
+        assert!(authz.authorize(stranger.public_key(), 0).is_none());
+    }
+
+    #[test]
+    fn a_device_with_no_ssh_key_grants_no_ssh_access() {
+        let dir = tmpdir("authz-token-only");
+        let paths = SshPaths::under(dir.path());
+        save_to(
+            &paths.device_tokens,
+            &[DeviceRecord {
+                label: "api-only".into(),
+                token: "not-a-real-token".into(),
+                expires_at: None,
+                ssh_key: None,
+            }],
+        )
+        .unwrap();
+        let authz = Authorizer::load(&paths).unwrap();
+        assert!(authz.entries.is_empty(), "a bearer token is not an SSH key");
+        assert!(authz.warnings.is_empty(), "and it is not a problem either");
+    }
+
+    #[test]
+    fn a_device_carrying_garbage_is_reported_not_silently_dropped() {
+        let dir = tmpdir("authz-garbage");
+        let paths = SshPaths::under(dir.path());
+        save_to(
+            &paths.device_tokens,
+            &[DeviceRecord {
+                label: "typo-phone".into(),
+                token: "not-a-real-token".into(),
+                expires_at: None,
+                ssh_key: Some("ssh-ed25519 this-is-not-base64".into()),
+            }],
+        )
+        .unwrap();
+        let authz = Authorizer::load(&paths).unwrap();
+        assert!(authz.entries.is_empty());
+        assert_eq!(authz.warnings.len(), 1);
+        assert!(authz.warnings[0].contains("typo-phone"));
+    }
+
+    #[test]
+    fn a_world_writable_device_table_refuses_everyone() {
+        let dir = tmpdir("authz-mode");
+        let paths = SshPaths::under(dir.path());
+        let phone = a_key();
+        save_to(
+            &paths.device_tokens,
+            &[device("phone", phone.public_key(), None)],
+        )
+        .unwrap();
+        std::fs::set_permissions(&paths.device_tokens, std::fs::Permissions::from_mode(0o666))
+            .unwrap();
+        // Fail CLOSED: another account being able to append a device is a total compromise, so
+        // the whole load errors rather than yielding a set someone might treat as authoritative.
+        let err = Authorizer::load(&paths).expect_err("a writable device table must be refused");
+        assert!(err.contains("device-tokens.json"), "{err}");
+    }
+
+    #[test]
+    fn no_key_sources_at_all_is_an_empty_set_not_an_error() {
+        let dir = tmpdir("authz-empty");
+        let paths = SshPaths::under(dir.path());
+        let authz = Authorizer::load(&paths).unwrap();
+        assert_eq!(authz.live_len(now_ms()), 0);
+        assert!(authz.authorize(a_key().public_key(), 0).is_none());
     }
 }

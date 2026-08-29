@@ -371,7 +371,13 @@ fn render_list(sessions: &[SessionMeta]) -> String {
             _ => "?x?".to_string(),
         };
         let cwd = m.cwd.as_deref().unwrap_or("-");
-        s.push_str(&format!("  {:>2}. {}  {:>9}  {}\r\n", i + 1, m.uid, grid, cwd));
+        s.push_str(&format!(
+            "  {:>2}. {}  {:>9}  {}\r\n",
+            i + 1,
+            m.uid,
+            grid,
+            cwd
+        ));
     }
     s
 }
@@ -408,9 +414,9 @@ impl Write for ChannelSink {
             return Ok(());
         }
         let chunk = std::mem::take(&mut self.buf);
-        self.tx.blocking_send(Out::Data(chunk)).map_err(|_| {
-            io::Error::new(io::ErrorKind::BrokenPipe, "the SSH channel closed")
-        })
+        self.tx
+            .blocking_send(Out::Data(chunk))
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "the SSH channel closed"))
     }
 }
 
@@ -497,7 +503,11 @@ mod tests {
         assert_eq!(&buf, b"cd");
         assert_eq!(r.read(&mut buf).unwrap(), 2);
         assert_eq!(&buf, b"ef");
-        assert_eq!(r.read(&mut buf).unwrap(), 0, "closed queue must read as EOF");
+        assert_eq!(
+            r.read(&mut buf).unwrap(),
+            0,
+            "closed queue must read as EOF"
+        );
     }
 
     #[tokio::test]

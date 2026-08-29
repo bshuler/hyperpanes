@@ -129,10 +129,13 @@ pub struct SshPaths {
     pub settings: PathBuf,
     /// OpenSSH-format ed25519 private host key. Mode 0600, never logged.
     pub host_key: PathBuf,
-    /// The matching public host key, for showing the fingerprint.
-    pub host_key_pub: PathBuf,
     /// `authorized_keys`-format list of client keys allowed to attach.
     pub authorized_keys: PathBuf,
+    /// `device-tokens.json` — the paired-device table `hyperpanes pair` writes. Devices that
+    /// paired with `--ssh-key` carry a public key here, and the SSH server treats those as a
+    /// second source of authorized keys so that one pairing and one `hyperpanes revoke <label>`
+    /// cover both the mobile bearer token and the phone's SSH key.
+    pub device_tokens: PathBuf,
 }
 
 impl SshPaths {
@@ -145,18 +148,20 @@ impl SshPaths {
         Self {
             settings: cfg.join("ssh-settings.json"),
             host_key: state.join("host_ed25519_key"),
-            host_key_pub: state.join("host_ed25519_key.pub"),
             authorized_keys: cfg.join("ssh-authorized-keys"),
+            device_tokens: paths::device_tokens_json(),
         }
     }
 
-    /// The same layout rooted at `dir` — for tests.
+    /// The same layout rooted at `dir` — for tests only, so nothing in the suite can reach a
+    /// developer's real host key or paired devices.
+    #[cfg(test)]
     pub fn under(dir: &Path) -> Self {
         Self {
             settings: dir.join("ssh-settings.json"),
             host_key: dir.join("ssh").join("host_ed25519_key"),
-            host_key_pub: dir.join("ssh").join("host_ed25519_key.pub"),
             authorized_keys: dir.join("ssh-authorized-keys"),
+            device_tokens: dir.join("device-tokens.json"),
         }
     }
 }
