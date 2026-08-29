@@ -128,9 +128,11 @@ impl DaemonSessionManager {
     /// **Proto-version handshake (M3):** before building the manager, this does a bare
     /// `Hello` round-trip on the raw socket and compares the daemon's `proto_ver` against the
     /// client's [`PROTO_VER`]. On a MISMATCH the running daemon is a stale build of OUR binary
-    /// (lock-step upgrades — no third-party compat burden), so we tear it down
-    /// ([`tear_down_stale_daemon`]) and respawn a fresh one, then retry. Bounded retries
-    /// guard against a wedged respawn loop.
+    /// (lock-step upgrades — no third-party compat burden), so we upgrade it in place:
+    /// [`hand_over_stale_daemon`] spawns a successor that takes its sessions, descriptors and
+    /// all. If that cannot happen, what we do next depends on what the incumbent is holding
+    /// ([`stale_daemon_fallback`]) — an EMPTY daemon is torn down and replaced, but one with
+    /// live terminals is driven as it is. It is never killed to force an upgrade.
     pub fn new(events: UnboundedSender<SessionEvent>, salt: &str) -> io::Result<Self> {
         Self::new_with_policy(events, salt, VersionPolicy::LockStep)
     }
@@ -178,8 +180,40 @@ impl DaemonSessionManager {
                     ));
                     drop(stream);
                     if !hand_over_stale_daemon(salt, &endpoint) {
-                        dbg("takeover did not yield a matching daemon; tearing down instead");
-                        tear_down_stale_daemon(&endpoint, salt);
+                        // The takeover did not produce a matching daemon: the incumbent
+                        // predates the protocol (proto 1 cannot parse `Takeover`) or is
+                        // wedged. Historically we tore it down here — which KILLS every
+                        // terminal it holds, the exact loss this milestone exists to
+                        // prevent. A daemon with live sessions is never torn down to force
+                        // an upgrade; we drive it as it is and leave the upgrade for the
+                        // next time it is empty.
+                        match stale_daemon_fallback(&endpoint, daemon_ver) {
+                            StaleFallback::TearDown => {
+                                dbg("takeover failed on an EMPTY daemon; tearing down");
+                                tear_down_stale_daemon(&endpoint, salt);
+                            }
+                            StaleFallback::Drive => {
+                                dbg(&format!(
+                                    "takeover failed against a daemon holding live sessions \
+                                     (daemon {daemon_ver}, client {PROTO_VER}); driving it \
+                                     as-is — the terminals matter more than the upgrade"
+                                ));
+                                let stream = connect_or_spawn(&endpoint, salt)?;
+                                return Self::from_stream(stream, events);
+                            }
+                            StaleFallback::Refuse => {
+                                dbg(&format!(
+                                    "daemon {daemon_ver} is below the drivable floor \
+                                     {MIN_DRIVABLE_DAEMON_VER} and holds live sessions; \
+                                     leaving it alone"
+                                ));
+                                return Err(io::Error::new(
+                                    io::ErrorKind::Unsupported,
+                                    "a daemon too old to drive holds live sessions for this \
+                                     salt; it was left running rather than killed",
+                                ));
+                            }
+                        }
                     }
                     // Loop: connect_or_spawn will start a fresh daemon if none is now up.
                 }
@@ -635,10 +669,10 @@ const TAKEOVER_BUDGET: Duration = Duration::from_secs(8);
 /// `daemon::take_over` / `daemon::windows::take_over`). Returns whether a daemon speaking our
 /// [`PROTO_VER`] is serving by the end of it.
 ///
-/// `false` is the expected answer against an incumbent that predates the takeover protocol:
-/// it cannot parse the request and drops the connection, the successor declines to fight for
-/// the endpoint, and the caller falls back to [`tear_down_stale_daemon`]. That fallback is the
-/// old, session-destroying path — this function exists to avoid reaching it.
+/// `false` is the expected answer against an incumbent that predates the takeover protocol
+/// (proto 1): it cannot parse the request and drops the connection, and the successor
+/// declines to fight for the endpoint. The caller then asks [`stale_daemon_fallback`] what to
+/// do, which tears the incumbent down ONLY if it holds no live session.
 fn hand_over_stale_daemon(salt: &str, endpoint: &Endpoint) -> bool {
     if spawn_daemon_detached(salt).is_err() {
         return false;
@@ -659,6 +693,73 @@ fn hand_over_stale_daemon(salt: &str, endpoint: &Endpoint) -> bool {
         std::thread::sleep(backoff);
         backoff = (backoff * 2).min(Duration::from_millis(200));
     }
+}
+
+/// Oldest daemon proto version a client of THIS build can still drive rather than replace.
+///
+/// Version 2 added `ClientMsg::Takeover` and nothing else: `DaemonMsg` is byte-identical to
+/// version 1 and every request a GUI actually sends (`Attach`/`Create`/`Write`/`Resize`/
+/// `Kill`/`RenderScreen`/`ListSessions`) is unchanged. So a v2 client can drive a v1 daemon
+/// perfectly; it just cannot upgrade it in place. Raise this floor only when a bump breaks
+/// the *base* surface — and note what it costs: below the floor, a daemon holding live
+/// sessions is refused, not killed.
+const MIN_DRIVABLE_DAEMON_VER: u32 = 1;
+
+/// What to do with a stale-version daemon that would not hand its sessions over.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StaleFallback {
+    /// It holds live terminals and its surface is drivable: talk to it as it is. The upgrade
+    /// is deferred, which is strictly better than the terminals dying for it.
+    Drive,
+    /// It holds nothing. Tearing it down costs no session, so take the clean upgrade.
+    TearDown,
+    /// It holds live terminals and is too old to drive. Leave it running and fail the
+    /// connect — the GUI falls back to in-process sessions and the user's terminals live.
+    Refuse,
+}
+
+/// Decide the fallback for a stale daemon that declined (or could not complete) the takeover.
+///
+/// The safety rule is one-directional: **we never kill sessions we did not create to force an
+/// upgrade.** So "how many live sessions does it hold" is answered conservatively — an
+/// unreadable or unanswered `ListSessions` counts as "it holds some", because guessing
+/// "empty" wrongly destroys a user's work while guessing "occupied" wrongly only defers an
+/// upgrade.
+fn stale_daemon_fallback(endpoint: &Endpoint, daemon_ver: u32) -> StaleFallback {
+    match live_session_count(endpoint) {
+        Some(0) => StaleFallback::TearDown,
+        _ if daemon_ver >= MIN_DRIVABLE_DAEMON_VER => StaleFallback::Drive,
+        _ => StaleFallback::Refuse,
+    }
+}
+
+/// Live-session count reported by the daemon at `endpoint`, or `None` if it could not be
+/// established (no connect, no `Sessions` reply in time, a reply we could not parse). Opens
+/// its own short-lived connection so it never disturbs a stream the manager will own.
+fn live_session_count(endpoint: &Endpoint) -> Option<usize> {
+    let stream = transport::connect(endpoint).ok()?;
+    let mut w = transport::try_clone(&stream).ok()?;
+    write_frame(
+        &mut w,
+        &ClientMsg::Hello {
+            proto_ver: PROTO_VER,
+        },
+    )
+    .ok()?;
+    write_frame(&mut w, &ClientMsg::ListSessions).ok()?;
+    // The `Hello` reply (and any event that races us) precedes the answer we want, so read
+    // until `Sessions` shows up or the budget is spent.
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    while Instant::now() < deadline {
+        match transport::read_frame_deadline::<DaemonMsg>(&stream, PROBE_TIMEOUT) {
+            Ok(Some(DaemonMsg::Sessions(metas))) => {
+                return Some(metas.iter().filter(|m| m.alive).count())
+            }
+            Ok(Some(_)) => continue,
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Tear down a stale-version daemon at `endpoint`: connect, send `Shutdown`, then wait
@@ -1615,6 +1716,81 @@ mod tests {
         );
         drop(stream);
         let _ = server.join();
+    }
+
+    // ============== stale-daemon fallback: terminals outrank the upgrade ==============
+
+    // The regression this file exists for. On 2026-08-29 a proto-1 daemon holding eight live
+    // shells met a proto-2 client: the takeover was impossible (v1 cannot parse `Takeover`),
+    // the client fell back to `tear_down_stale_daemon`, and all eight terminals died to make
+    // room for the new build. A daemon holding live sessions must now be DRIVEN, never
+    // killed — the upgrade waits until it is empty.
+    #[test]
+    fn a_stale_daemon_holding_live_sessions_is_driven_not_torn_down() {
+        let socket = temp_socket("stale-occupied");
+        let daemon = spawn_in_process(&socket).expect("daemon binds");
+        let (mgr, mut rx) = connect_manager(&socket);
+        mgr.create(SpawnOptions {
+            uid: "keepme".into(),
+            shell: Some("/bin/sh".into()),
+            args: Some(vec!["-i".into()]),
+            ..Default::default()
+        })
+        .expect("create");
+        assert!(
+            recv_event_until(&mut rx, Dur::from_secs(10), |e| {
+                matches!(e, SessionEvent::Data { uid, .. } if uid == "keepme")
+            })
+            .is_some(),
+            "the session is live before the upgrade decision"
+        );
+
+        let endpoint = Endpoint::new(socket.to_string_lossy());
+        assert_eq!(live_session_count(&endpoint), Some(1), "one live session");
+        assert_eq!(
+            stale_daemon_fallback(&endpoint, PROTO_VER - 1),
+            StaleFallback::Drive,
+            "a stale daemon with a live terminal must be driven, not killed"
+        );
+        assert!(
+            !daemon.is_shutting_down(),
+            "deciding the fallback must not touch the daemon"
+        );
+        assert!(mgr.has("keepme"), "the terminal survives the decision");
+        mgr.kill("keepme");
+    }
+
+    // The other side of the rule: an EMPTY stale daemon costs nothing to replace, so the
+    // clean upgrade still happens — the fix must not strand every old daemon forever.
+    #[test]
+    fn an_empty_stale_daemon_is_still_torn_down_and_replaced() {
+        let socket = temp_socket("stale-empty");
+        let _daemon = spawn_in_process(&socket).expect("daemon binds");
+        let endpoint = Endpoint::new(socket.to_string_lossy());
+
+        assert_eq!(live_session_count(&endpoint), Some(0), "no sessions");
+        assert_eq!(
+            stale_daemon_fallback(&endpoint, PROTO_VER - 1),
+            StaleFallback::TearDown,
+            "an empty stale daemon is safe to replace"
+        );
+    }
+
+    // "How many sessions?" is answered conservatively: a daemon we cannot reach or that does
+    // not answer counts as OCCUPIED. Guessing "empty" wrongly destroys terminals; guessing
+    // "occupied" wrongly only defers an upgrade.
+    #[test]
+    fn an_unreadable_session_count_counts_as_occupied() {
+        let socket = temp_socket("stale-silent");
+        let _ = std::fs::remove_file(&socket);
+        let endpoint = Endpoint::new(socket.to_string_lossy());
+
+        assert_eq!(live_session_count(&endpoint), None, "nothing listening");
+        assert_ne!(
+            stale_daemon_fallback(&endpoint, PROTO_VER - 1),
+            StaleFallback::TearDown,
+            "an unconfirmed session count must never authorise a tear-down"
+        );
     }
 
     // tear_down_stale_daemon actually brings a running daemon down: after it returns, the
