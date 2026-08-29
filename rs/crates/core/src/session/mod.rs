@@ -7,6 +7,9 @@ pub mod cwd;
 pub mod daemon;
 pub mod daemon_client;
 pub mod env;
+/// Descriptor handoff for the daemon live upgrade (unix only).
+#[cfg(unix)]
+pub mod handoff;
 pub mod osc133;
 pub mod proto;
 pub mod pty;

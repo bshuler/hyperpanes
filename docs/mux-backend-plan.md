@@ -74,18 +74,34 @@ the pure-Rust decision), no sshd config, and — because we own the channel — 
 
 ## Milestones
 
-### M0 — durable pane ids + snapshot (prep)
-Pane ids are a process-global counter (`state.rs::PANE_UID`) today; nothing can be re-adopted or
-addressed from a phone until they are stable across restarts. Persist id + session identity in the
-snapshot (`PaneSpec` already carries a `uid` field as precedent). No dependencies — starts now.
+### M0 — durable pane ids ✅ *already built*
+An earlier draft listed this as prep work. It is done: `SessionManager::fresh_uid`
+(`session_manager.rs:605`) mints a `pane-<uuid>` on the daemon backend precisely so a session can
+outlive the GUI run and be re-attached by uid, and `daemon_client.rs:1291`
+(`daemon_fresh_uid_is_unique_across_runs`) asserts cross-run uniqueness. `PaneSpec.uid` carries it
+through the relaunch snapshot. Nothing to do.
 
-### M1 — daemon live upgrade via PTY fd handoff  ← *the headline*
-A `--takeover` handshake: the new binary starts, connects to the incumbent's socket, and receives
-every PTY master fd plus its session metadata (replay buffer, screen state, cwd, ids) over
-`SCM_RIGHTS`; the successor assumes ownership and the incumbent exits. **Exit detection must move
-from `waitpid` to pty EOF** — after handoff the children are reparented to init and are no longer
-waitable. Headless-testable end to end: start daemon, run a session, take over, assert the session
-still streams.
+### M1 — daemon live upgrade via PTY fd handoff  ← *the headline, and the whole gap*
+
+**The exact failure today.** Sessions already survive a *GUI* upgrade: quit with keep-alive on
+leaves the daemon running (`main.rs:575`) and a relaunch re-attaches. What they do not survive is a
+*daemon* upgrade. `DaemonClient::new` (`daemon_client.rs:147`) does a `Hello` probe and, when the
+running daemon's `PROTO_VER` differs from the new binary's, calls `tear_down_stale_daemon` — which
+sends `Shutdown`, **killing every session** — then respawns. The doc comment states the intent
+plainly: *"lock-step upgrades — no third-party compat burden."* So an upgrade drops every terminal
+the moment it bumps `PROTO_VER` (`proto.rs:41`, currently `1`).
+
+**The fix, at that same call site.** Replace the tear-down with a takeover: the incumbent daemon
+hands every PTY master fd plus its session metadata (replay buffer, screen state, cwd, uid) to the
+freshly spawned daemon over `SCM_RIGHTS`, then exits. A shell dies from `SIGHUP` when its *pty
+closes*, not when its parent exits, so nothing downstream notices. One seam, one replaced function.
+
+**Consequence to handle:** after handoff the children are reparented to init and are no longer
+waitable, so **exit detection must move from `waitpid` to pty EOF**. Needs a test covering exit
+codes.
+
+Headless-testable end to end: start daemon, run a session, take over, assert the session still
+streams.
 
 ### M2 — `hyperpanes attach` terminal client
 A CLI that renders a pane into whatever terminal it is running in: seed from the replay buffer,
@@ -117,10 +133,12 @@ A `WorkspaceSet` model (`sets/*.json`: a name plus member workspace references) 
 existing `WorkspaceFile`. `SaveWorkspaceAs` / `SaveSet` / `OpenSet`. Loading becomes
 **reattach-or-spawn** per pane, using the durable ids from M0.
 
-### M7 — discovery, adopt, default-on
-On launch, enumerate the daemon's live sessions, re-adopt those the snapshot knows, and surface the
-rest in M5's detached list. Wire the updater: snapshot → `--takeover` → relaunch. Flip on by
-default.
+### M7 — discovery and adopt *(mostly built)*
+Launch-time discovery and re-adoption already exist — `ListSessions` / `Attach` are in the protocol
+(`proto.rs:146,149`), `App::attach_panes_from_specs` (`app.rs:1451`) rebinds snapshot panes to
+surviving sessions, and the daemon backend is default-on. What remains is small: surface the
+sessions the snapshot does *not* claim in M5's detached list so an orphan can be adopted with one
+click.
 
 ## Risks and open questions
 
@@ -146,14 +164,13 @@ default.
 
 | Track | Branch | Depends on |
 |---|---|---|
-| M0 durable ids | `mux/m0-ids` | — |
 | M1 live upgrade | `mux/m1-takeover` | — |
-| M2 attach client | `mux/m2-attach` | M0 |
+| M2 attach client | `mux/m2-attach` | — |
 | M3 embedded SSH | `mux/m3-ssh` | M2 |
 | M4 control mode | `mux/m4-ccmode` | M2 |
 | M5 left panel | `mux/m5-panel` | — (adoption list needs M7) |
-| M6 workspace sets | `mux/m6-sets` | M0 |
-| M7 discovery + default-on | `mux/m7-default` | M1, M2 |
+| M6 workspace sets | `mux/m6-sets` | — |
+| M7 orphan adoption | `mux/m7-adopt` | M5 |
 
-**Wave 1 (parallel now):** M0 ‖ M1 ‖ M5 — no shared files.
-**Wave 2:** M2 ‖ M6. **Wave 3:** M3 ‖ M4 ‖ M7.
+**Wave 1 (parallel now):** M1 ‖ M5 ‖ M6 — no shared files.
+**Wave 2:** M2 ‖ M7. **Wave 3:** M3 ‖ M4.

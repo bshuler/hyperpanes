@@ -48,3 +48,10 @@ windows = { version = "0.62", features = [
   "Win32_Security",
   "Win32_System_IO",
 ] }
+
+# platform: SCM_RIGHTS descriptor passing for the daemon live-upgrade handoff
+# (session/handoff.rs). std's ancillary-data API is still unstable
+# (`unix_socket_ancillary_data`), so the sendmsg/recvmsg calls need raw libc.
+# Already in the tree via portable-pty; declared here because we call it directly.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
