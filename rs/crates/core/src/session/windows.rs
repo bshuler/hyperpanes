@@ -523,12 +523,22 @@ impl Daemon {
         self.sessions
             .uids()
             .into_iter()
-            .map(|uid| SessionMeta {
-                cwd: cwds.get(&uid).cloned(),
-                output_bytes: self.sessions.output_bytes(&uid).unwrap_or(0),
-                last_output_at: self.sessions.last_output_at(&uid),
-                alive: true,
-                uid,
+            .map(|uid| {
+                // The grid rides along so an attach client can letterbox at the desktop's
+                // size instead of reflowing the pane (mux-backend-plan M2).
+                let (cols, rows) = match self.sessions.dims(&uid) {
+                    Some((c, r)) => (Some(c), Some(r)),
+                    None => (None, None),
+                };
+                SessionMeta {
+                    cwd: cwds.get(&uid).cloned(),
+                    output_bytes: self.sessions.output_bytes(&uid).unwrap_or(0),
+                    last_output_at: self.sessions.last_output_at(&uid),
+                    alive: true,
+                    cols,
+                    rows,
+                    uid,
+                }
             })
             .collect()
     }

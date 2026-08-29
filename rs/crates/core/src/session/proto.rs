@@ -135,6 +135,20 @@ pub struct SessionMeta {
     /// Whether the session is still live (always `true` in a `ListSessions` reply; the
     /// field exists so a future cache of dead sessions can be expressed).
     pub alive: bool,
+    /// Current pty grid width (`SessionRegistry::dims`). The
+    /// [attach client](crate::session::attach) needs it to decide whether its own terminal
+    /// can show the pane without clipping — its resize policy is to letterbox at the
+    /// desktop's grid rather than reflow it (`docs/mux-backend-plan.md` M2).
+    ///
+    /// ADDITIVE, `#[serde(default)]`: a daemon that predates the field simply omits it and
+    /// the client reads `None` ("grid unknown, don't warn"). Serde ignores unknown fields in
+    /// the other direction, so no `PROTO_VER` bump is needed — and the Windows pty-host's
+    /// frozen-surface contract (only optional additions) is respected.
+    #[serde(default)]
+    pub cols: Option<u16>,
+    /// Current pty grid height — see [`cols`](Self::cols).
+    #[serde(default)]
+    pub rows: Option<u16>,
 }
 
 /// A request from a client to the daemon. Fire-and-forget for mutators; request/response
@@ -414,6 +428,8 @@ mod tests {
                 output_bytes: 12,
                 last_output_at: Some(1000),
                 alive: true,
+                cols: Some(120),
+                rows: Some(40),
             }]),
             DaemonMsg::Created { uid: "s9".into() },
             DaemonMsg::Replay {
@@ -442,6 +458,19 @@ mod tests {
         for m in &msgs {
             assert_eq!(&roundtrip_daemon(m), m);
         }
+    }
+
+    // The grid fields the attach client reads are ADDITIVE: a daemon that predates them
+    // omits them, and that payload must still parse (as "grid unknown") rather than making
+    // `ListSessions` fail against an older peer. This is the frozen-host-surface contract.
+    #[test]
+    fn session_meta_parses_a_payload_with_no_grid_fields() {
+        let legacy = r#"{"uid":"s1","cwd":null,"output_bytes":7,"last_output_at":null,"alive":true}"#;
+        let meta: SessionMeta = serde_json::from_str(legacy).expect("legacy SessionMeta parses");
+        assert_eq!(meta.uid, "s1");
+        assert_eq!(meta.output_bytes, 7);
+        assert_eq!(meta.cols, None, "an unreported grid is None, not a default");
+        assert_eq!(meta.rows, None);
     }
 
     #[test]
