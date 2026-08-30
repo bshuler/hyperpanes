@@ -9,6 +9,8 @@
 //! methods (usually via a [`crate::command::Command`]) and never touch the UI
 //! models directly.
 
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use hyperpanes_core::ai::service::AiProjectRef;
@@ -21,7 +23,7 @@ use hyperpanes_core::layout::sizes::{
 };
 use hyperpanes_core::persistence::{paths, projects};
 use hyperpanes_core::session_manager::{AgentLiveness, SessionManager, SpawnOptions};
-use hyperpanes_core::tools::PaneKind;
+use hyperpanes_core::tools::{PaneKind, ToolSessionMark};
 use hyperpanes_core::workspace::io::{read_workspace, windows_of, write_workspace};
 use hyperpanes_core::workspace::model::{GroupSpec, PaneSpec, WorkspaceFile};
 use hyperpanes_core::workspace::sets;
@@ -119,6 +121,9 @@ pub struct DetachedPane {
     /// non-pty views. Carried across a re-host so a Claude pane torn off into another
     /// window arrives as a Claude pane rather than reverting to a bare terminal.
     pub kind: PaneKind,
+    /// The conversation this pane was resumed into, carried across a re-host for the same
+    /// reason as `kind`: a pane moved to another window has to relaunch into the same chat.
+    pub tool_session: Option<ToolSessionMark>,
 }
 
 /// A whole tab detached for re-hosting (the tab menu's "Move to New Window") or parked on the
@@ -485,6 +490,11 @@ pub struct NewPaneOpts {
     /// An explicit pane kind. `None` ⇒ derived from `command` (so "New Claude Pane" and
     /// "run `claude`" land in the same place without the caller having to say so twice).
     pub kind: Option<PaneKind>,
+    /// The tool conversation id this pane is being opened into, when the caller knows it —
+    /// the left panel's session list does, because it just picked one row. Paired with
+    /// `cwd` (which the same caller sets) into the pane's [`ToolSessionMark`], so a relaunch
+    /// re-resumes this exact chat instead of starting a fresh one.
+    pub session: Option<String>,
 }
 
 /// The in-dialog draft of the **appearance** settings. While Preferences is open these edit
@@ -651,6 +661,12 @@ pub struct PaneState {
     /// Only [`PaneKind::is_pty`] kinds have a live session behind them; the views render
     /// into the same `surface` waist without a pty.
     pub kind: PaneKind,
+    /// Which tool conversation this pane is in, when it is known — set when the pane was
+    /// opened from the left panel's session list, and persisted through `PaneSpec`'s
+    /// `meta["tool.session"]` / `meta["tool.cwd"]` so a relaunch re-resumes the same chat.
+    ///
+    /// `kind` already says *which tool*, so the mark deliberately does not repeat it.
+    pub tool_session: Option<ToolSessionMark>,
 }
 
 impl PaneState {
@@ -900,6 +916,32 @@ pub struct State {
     /// The open cursor-anchored context menu (pane header / tab strip), if any. Built fresh on
     /// each right-click so its gating + checkmarks reflect the moment it opened.
     pub ctx: Option<crate::contextmenu::CtxMenu>,
+    // ---- left panel: Files mode (D14) ----
+    /// The Files explorer's root — the project the human is looking at, not the whole disk.
+    /// `None` until the mode is first opened, when it is derived from the focused pane's cwd.
+    pub files_root: Option<PathBuf>,
+    /// Which directories are expanded. Absolute paths, so an expansion survives the tree
+    /// being rebuilt from disk (which happens on every event that can change it).
+    pub files_expanded: BTreeSet<PathBuf>,
+    /// The selected row, kept as a path rather than an index: a rebuild reorders rows, and
+    /// an index would quietly come to mean a different file.
+    pub files_sel: Option<PathBuf>,
+    /// The finder query. Non-empty swaps the tree for a flat ranked match list.
+    pub files_query: String,
+    /// The stored projection the panel draws. Rebuilt by [`State::rebuild_files`] on a real
+    /// event only — never per frame, which is what listing directories in the resync would
+    /// have meant.
+    pub files_rows: Vec<crate::filetree::FileRow>,
+    /// The line/column a `file:line:col` click carried, held for whichever tool opens the
+    /// revealed file next. Cleared as soon as the selection moves to a different file, so a
+    /// stale line number can never ride along to an unrelated open.
+    pub files_target_line: Option<u32>,
+    pub files_target_col: Option<u32>,
+    /// A one-shot request to switch the left panel to a given mode, consumed by the resync.
+    /// The strip's selection lives in the UI as an `in-out` property (switching views is not
+    /// a `State` mutation), so a command that needs to change it leaves a note instead of
+    /// reaching into Slint from the middle of a borrow.
+    pub left_mode_request: Option<i32>,
     /// Most-recently-closed tabs (sessions kept alive centrally) for "Reopen Closed Tab",
     /// newest last. Capped — evicted entries' sessions are killed.
     pub closed_tabs: Vec<DetachedTab>,
@@ -1093,6 +1135,14 @@ impl State {
             esc_holding: false,
             esc_fired: false,
             ctx: None,
+            files_root: None,
+            files_expanded: BTreeSet::new(),
+            files_sel: None,
+            files_query: String::new(),
+            files_rows: Vec::new(),
+            files_target_line: None,
+            files_target_col: None,
+            left_mode_request: None,
             closed_tabs: Vec::new(),
             reminders: Vec::new(),
             reminders_open: false,
@@ -1309,6 +1359,14 @@ impl State {
         let palette = self.settings.frame_palette;
         let cwd = opts.cwd.filter(|c| !c.is_empty());
         let accent = opts.accent;
+        // The conversation this pane is being opened into, when the caller knew one. Built
+        // here, before `cwd` is moved into the pane, because the mark is the id AND the
+        // directory it belongs to — every provider-backed tool keys resume off both.
+        let tool_session = opts
+            .session
+            .as_deref()
+            .zip(cwd.as_deref())
+            .and_then(|(id, dir)| ToolSessionMark::new(id, dir));
         // A command to run instead of an interactive shell ("" → interactive).
         let command = opts.command.filter(|c| !c.is_empty());
         // What this pane IS is decided before anything else, because it decides the two
@@ -1455,6 +1513,7 @@ impl State {
             spawn_args: None,
             spawn_shell: kind.is_pty().then_some(shell).flatten(),
             kind,
+            tool_session,
         })
     }
 
@@ -1612,6 +1671,7 @@ impl State {
                 spawn_args: ps.spawn_args,
                 spawn_shell: ps.spawn_shell,
                 kind: ps.kind,
+                tool_session: ps.tool_session,
             },
             alive,
         ))
@@ -1685,6 +1745,7 @@ impl State {
             spawn_args: det.spawn_args,
             spawn_shell: det.spawn_shell,
             kind: det.kind,
+            tool_session: det.tool_session,
         };
         let auto = self.active_tab().layout == Layout::Auto;
         let t = self.active_tab_mut();
@@ -1733,6 +1794,7 @@ impl State {
                 spawn_args: ps.spawn_args,
                 spawn_shell: ps.spawn_shell,
                 kind: ps.kind,
+                tool_session: ps.tool_session,
             },
             alive,
         ))
@@ -3169,9 +3231,12 @@ impl State {
         }
     }
 
-    /// Activate the link under a click: open (plain) or copy (ctrl). Returns the action so
-    /// the caller can touch the OS (clipboard / launch). `None` when clickable paths are off
-    /// or the click missed a verified path. `idx` is an active-tab pane.
+    /// Activate the link under a click: reveal (plain) or copy (ctrl). Returns the action so
+    /// the caller can dispatch it — the widget can see neither the left file tree nor the
+    /// browser preference, so it hands the target back rather than acting on it. `None` when
+    /// clickable paths are off, or when a plain click missed a path that exists (a ctrl-click
+    /// is ungated: the token a human most wants off their screen is often one that does not
+    /// exist yet). `idx` is an active-tab pane.
     pub fn pane_link_activate(
         &mut self,
         idx: usize,
@@ -3182,10 +3247,170 @@ impl State {
         if !self.settings.clickable_paths {
             return None;
         }
-        let editor = self.settings.editor_command.clone();
         let p = self.active_tab_mut().panes.get_mut(idx)?;
         let (w, h) = p.surf;
-        p.pane.activate_link(x, y, w, h, ctrl, &editor)
+        p.pane.activate_link(x, y, w, h, ctrl)
+    }
+
+    // ---- left panel: Files mode (D14) ----
+    //
+    // The explorer is an ordinary IDE file tree: one root, directories you open a level at a
+    // time, and a query box that swaps the tree for a ranked flat list. Everything it draws
+    // is the stored `files_rows` projection, rebuilt only by the handful of methods below —
+    // see the module doc on [`crate::filetree`] for why that is not done in the resync.
+
+    /// Where the explorer should root itself when it has not been given a root yet: the
+    /// repository containing the focused pane's live cwd, that cwd if it is in no repo, and
+    /// only then the home directory. A tree rooted at `/` is technically the whole disk and
+    /// practically useless.
+    fn default_files_root(&self) -> PathBuf {
+        let cwd = self
+            .active_tab()
+            .panes
+            .get(self.active_tab().focused)
+            .and_then(|p| p.cwd.clone())
+            .filter(|c| !c.is_empty());
+        if let Some(cwd) = cwd {
+            if let Some(root) = crate::sidebar::git_root_of(&cwd) {
+                return root;
+            }
+            return PathBuf::from(cwd);
+        }
+        std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    }
+
+    /// The explorer's root, deriving and remembering one on first use.
+    pub fn files_root(&mut self) -> PathBuf {
+        if self.files_root.is_none() {
+            self.files_root = Some(self.default_files_root());
+        }
+        self.files_root.clone().unwrap_or_default()
+    }
+
+    /// Re-read the tree (or re-run the query) from disk and re-project the rows. Every
+    /// method below ends here, and nothing else does — one place reads the filesystem, so
+    /// "what the panel shows" and "what is on disk" can only differ for one event.
+    pub fn rebuild_files(&mut self) {
+        let root = self.files_root();
+        self.files_rows = if self.files_query.trim().is_empty() {
+            crate::filetree::flatten(&root, &self.files_expanded)
+        } else {
+            crate::filetree::find(&root, &self.files_query)
+        };
+        self.dirty = true;
+    }
+
+    /// Re-root the explorer. Collapsing everything is deliberate: expansions are paths under
+    /// the old root and would either vanish or, worse, half-apply.
+    pub fn files_set_root(&mut self, dir: PathBuf) {
+        self.files_root = Some(dir);
+        self.files_expanded.clear();
+        self.files_sel = None;
+        self.rebuild_files();
+    }
+
+    /// Root the explorer one directory higher — the tree's only navigation that leaves the
+    /// project, and the way out when the derived root guessed too narrowly.
+    pub fn files_go_up(&mut self) {
+        let root = self.files_root();
+        if let Some(parent) = root.parent().map(|p| p.to_path_buf()) {
+            if parent != root {
+                // The directory we came from stays open, so going up reads as zooming out
+                // rather than as losing your place.
+                self.files_set_root(parent);
+                self.files_expanded.insert(root);
+                self.rebuild_files();
+            }
+        }
+    }
+
+    /// Open or shut a directory row.
+    pub fn files_toggle(&mut self, path: &Path) {
+        if self.files_expanded.contains(path) {
+            self.files_expanded.remove(path);
+        } else {
+            self.files_expanded.insert(path.to_path_buf());
+        }
+        self.rebuild_files();
+    }
+
+    /// A single click on a row: a directory opens or shuts, a file is selected. Selecting is
+    /// all a click does to a file on purpose — the panel is where the human *chooses* how to
+    /// act on the path (double-click to preview, or the row menu for everything else), which
+    /// is the whole point of routing a clicked filename here instead of into the OS handler.
+    pub fn files_click(&mut self, path: &Path) {
+        if path.is_dir() {
+            self.files_toggle(path);
+            return;
+        }
+        // A different file means the line number a terminal click carried no longer belongs
+        // to what is selected.
+        if self.files_sel.as_deref() != Some(path) {
+            self.files_target_line = None;
+            self.files_target_col = None;
+        }
+        self.files_sel = Some(path.to_path_buf());
+        self.dirty = true;
+    }
+
+    /// Set the finder query. Empty restores the tree.
+    pub fn files_set_query(&mut self, q: String) {
+        if self.files_query == q {
+            return;
+        }
+        self.files_query = q;
+        self.rebuild_files();
+    }
+
+    /// Show `path` in the explorer: switch the panel to Files mode, re-root if the path is
+    /// outside the current root, expand exactly the directories that lead to it, and select
+    /// it. A directory reveals itself; a file reveals its parent and is selected inside it.
+    ///
+    /// `line`/`col` come from a `file:line:col` hit in a pane's output and are held for
+    /// whichever tool opens the file next — clicking a stack frame should land on the frame.
+    pub fn reveal_in_files(&mut self, path: &Path, line: Option<u32>, col: Option<u32>) {
+        let root = self.files_root();
+        if !path.starts_with(&root) {
+            // Re-root at the revealed path's own project rather than refusing: a click in a
+            // pane running somewhere else is exactly when the explorer should follow.
+            let base = if path.is_dir() {
+                path.to_path_buf()
+            } else {
+                path.parent().map(|p| p.to_path_buf()).unwrap_or_default()
+            };
+            let new_root = crate::sidebar::git_root_of(&base.to_string_lossy()).unwrap_or(base);
+            self.files_root = Some(new_root);
+            self.files_expanded.clear();
+        }
+        // A reveal is an answer to "where is this", so it must not arrive filtered.
+        self.files_query.clear();
+        let root = self.files_root();
+        for dir in crate::filetree::ancestors_within(&root, path) {
+            self.files_expanded.insert(dir);
+        }
+        if path.is_dir() {
+            self.files_expanded.insert(path.to_path_buf());
+        }
+        self.files_sel = Some(path.to_path_buf());
+        self.files_target_line = line;
+        self.files_target_col = col;
+        self.left_mode_request = Some(crate::paneview::LEFT_MODE_FILES);
+        self.left_panel_open = true;
+        self.rebuild_files();
+    }
+
+    /// Open the row menu for `path`, anchored at window-logical `(x, y)`. Selecting the row
+    /// first is what makes the menu's own "Open in…" rows agree with what is highlighted.
+    pub fn open_file_context(&mut self, path: &Path, x: f32, y: f32) {
+        if !path.is_dir() && self.files_sel.as_deref() != Some(path) {
+            self.files_click(path);
+        }
+        self.ctx = Some(crate::contextmenu::file_menu(self, path, x, y));
+        self.dirty = true;
     }
 
     // ---- sidebar / projects ----
@@ -4322,6 +4547,7 @@ impl State {
             spawn_args: ps.spawn_args,
             spawn_shell: ps.spawn_shell,
             kind: ps.kind,
+            tool_session: ps.tool_session,
         })
     }
 
@@ -4390,6 +4616,7 @@ impl State {
             spawn_args: det.spawn_args,
             spawn_shell: det.spawn_shell,
             kind: det.kind,
+            tool_session: det.tool_session,
         };
         let auto = self.tabs[ti].layout == Layout::Auto;
         let t = &mut self.tabs[ti];
@@ -4636,6 +4863,7 @@ impl State {
                 spawn_args: p.spawn_args,
                 spawn_shell: p.spawn_shell,
                 kind: p.kind,
+                tool_session: p.tool_session,
             })
             .collect();
         Some((
@@ -4812,6 +5040,11 @@ impl State {
                 // command alone would suggest once detection has upgraded it. `Terminal`
                 // writes nothing, so an ordinary pane's file stays byte-identical.
                 spec.set_pane_kind(&p.kind);
+                // …and it must reload into the same CONVERSATION, not a fresh one. The kind
+                // above already says which tool, so the mark records only which chat, where.
+                if let Some(m) = &p.tool_session {
+                    m.write_into(spec.meta.get_or_insert_with(Default::default));
+                }
                 spec
             })
             .collect();
@@ -4892,6 +5125,11 @@ impl State {
                         // restored Claude pane is branded before its first byte of output
                         // rather than waiting to be re-detected.
                         spec.set_pane_kind(&p.kind);
+                        // And the conversation with it, so a restarted tool pane resumes the
+                        // chat it was in instead of opening an empty one.
+                        if let Some(m) = &p.tool_session {
+                            m.write_into(spec.meta.get_or_insert_with(Default::default));
+                        }
                         spec
                     })
                     .collect();
@@ -5377,6 +5615,63 @@ impl State {
             }
         }
 
+        // ---- Every other tool's conversation resume ----
+        // Claude is resumed above from a hook-written marker; no other tool offers a hook.
+        // What every tool does have is the pane Hyperpanes itself opened out of the left
+        // panel's session list: that pane was handed one exact conversation, and the mark
+        // records which one, in which directory. A re-spawn puts the pane back into it.
+        //
+        // The mark is read even when it isn't used, so a pane that came back by re-attach
+        // still carries it into the NEXT snapshot instead of forgetting after one restart.
+        let tool_session = ToolSessionMark::read(spec.meta.as_ref());
+        if let Some(mark) = tool_session
+            .as_ref()
+            // A re-attached survivor is still IN the conversation, and the Claude block
+            // above has already resumed the panes it applies to.
+            .filter(|_| !reattach && resume_id.is_none())
+        {
+            // `kind` is the only record of WHICH tool (the mark deliberately doesn't repeat
+            // it) and `tools::resume_args` the only record of HOW. A tool with no verified
+            // resume flag starts fresh rather than being handed a guessed one.
+            let extra = match &kind {
+                PaneKind::Tool(tool) => {
+                    hyperpanes_core::tools::resume_args(tool, &mark.id).map(|a| (tool.clone(), a))
+                }
+                _ => None,
+            };
+            // A pane opened from the session list already persists `<tool> --resume <id>` as
+            // its command; appending a second `--resume` is a usage error, not a no-op.
+            let already = spawn_command.as_deref().is_some_and(|c| c.contains(&mark.id))
+                || spawn_args
+                    .as_ref()
+                    .is_some_and(|a| a.iter().any(|x| x == &mark.id));
+            if let Some((tool, extra)) = extra.filter(|_| !already) {
+                // Resume is directory-scoped for all three of them, so the conversation's
+                // own directory wins over the possibly-stale snapshot cwd — the same reason
+                // the Claude arm prefers `claude.cwd`.
+                spawn_cwd = Some(mark.cwd.clone());
+                match (&mut spawn_args, &mut spawn_command) {
+                    // Direct-argv spawn: extend the argv.
+                    (Some(a), _) => a.extend(extra),
+                    // Shell-string spawn: extend the command line.
+                    (None, Some(c)) => {
+                        *c = format!("{c} {}", extra.join(" "));
+                    }
+                    // A tool pane running an interactive shell: type the resume line at first
+                    // output, through the shell, so the user's own alias for the tool applies
+                    // (the same shape the Claude shell-pane arm uses).
+                    (None, None) => {
+                        let bin = hyperpanes_core::tools::by_id(&tool)
+                            .map(|t| t.bin)
+                            .unwrap_or(tool.as_str());
+                        let args = extra.join(" ");
+                        let cwd = &mark.cwd;
+                        startup = Some(format!("cd '{cwd}' && {bin} {args}\r"));
+                    }
+                }
+            }
+        }
+
         let mut pane = TerminalPane::new(
             cols as usize,
             rows as usize,
@@ -5427,6 +5722,7 @@ impl State {
         Some(PaneState {
             uid,
             kind,
+            tool_session,
             title: label.into(),
             subtitle: None,
             show_frame: Some(project),
@@ -5668,17 +5964,11 @@ fn color_hex(c: Color) -> String {
     format!("#{:02x}{:02x}{:02x}", c.red(), c.green(), c.blue())
 }
 
-/// Parse a workspace-file layout token (`"single"`/`"columns"`/… / `"main-stack"`) back to a
-/// [`Layout`], defaulting to `Auto` for an unknown/absent token.
+/// Parse a workspace-file layout token (`"single"`/`"columns"`/… / `"main-stack"`, or a
+/// `"grid-2x3"` shape) back to a [`Layout`], defaulting to `Auto` for an unknown/absent
+/// token — a file written by a newer build must still open here, minus the layout it names.
 fn layout_from_name(name: &str) -> Layout {
-    match name {
-        "single" => Layout::Single,
-        "columns" => Layout::Columns,
-        "rows" => Layout::Rows,
-        "grid" => Layout::Grid,
-        "main-stack" => Layout::MainStack,
-        _ => Layout::Auto,
-    }
+    Layout::from_token(name).unwrap_or(Layout::Auto)
 }
 
 /// Encode an `arboard` clipboard image (RGBA8) to PNG bytes. Returns `None` if the encoder
@@ -5929,6 +6219,7 @@ mod spawn_cells_tests {
             spawn_args: None,
             spawn_shell: None,
             kind: PaneKind::default(),
+            tool_session: None,
         }
     }
 
@@ -6015,6 +6306,7 @@ mod session_file_tests {
             spawn_args: None,
             spawn_shell: None,
             kind: PaneKind::default(),
+            tool_session: None,
         }
     }
 
@@ -6354,6 +6646,7 @@ mod reminder_tests {
             spawn_args: None,
             spawn_shell: None,
             kind: PaneKind::default(),
+            tool_session: None,
         }
     }
 
@@ -6714,6 +7007,210 @@ mod view_pane_tests {
 }
 
 #[cfg(test)]
+mod tool_session_tests {
+    //! H1/H2 — what a pane has to remember so a relaunch puts it back where it was.
+    //!
+    //! For a tool pane that is the *conversation*: the id alone is not enough, because
+    //! every provider resumes by id **within a project directory**, so the mark is the
+    //! pair. For a view pane it is the *target*, which rides along as the pane's cwd.
+    //!
+    //! The round trip these pin is the real one — `to_session_file()` out,
+    //! `attach_panes_from_specs()` back in — not a hand-built `PaneSpec`, because the
+    //! bug class here is a serializer and a restore path that disagree about a key.
+    use super::*;
+
+    fn mgr() -> SessionManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionManager::new(tx)
+    }
+
+    /// The panes of the first (only) group of a snapshot.
+    fn snapshot_panes(st: &State) -> Vec<PaneSpec> {
+        st.to_session_file()
+            .groups
+            .expect("a snapshot has groups")
+            .swap_remove(0)
+            .panes
+    }
+
+    fn spec_with(meta: &[(&str, &str)]) -> PaneSpec {
+        PaneSpec {
+            meta: Some(
+                meta.iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    // Spawns a real pty — a `Tool` pane is a terminal pane, that is the whole D1 premise.
+    #[tokio::test]
+    async fn a_pane_opened_into_a_conversation_records_which_one() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        st.add_pane_opts(
+            &m,
+            NewPaneOpts {
+                kind: Some(PaneKind::Tool("copilot".into())),
+                cwd: Some("/tmp".to_string()),
+                command: Some("/bin/cat".to_string()),
+                session: Some("aaaa-bbbb-cccc".to_string()),
+                ..Default::default()
+            },
+        );
+        let meta = snapshot_panes(&st)
+            .pop()
+            .expect("the pane is in the snapshot")
+            .meta
+            .expect("a tool pane carries meta");
+        // The kind is what says *which* tool to relaunch; the mark is what says which
+        // chat. Both, or the relaunch is a fresh copilot in the right directory.
+        assert_eq!(meta.get(hyperpanes_core::tools::kind::META_KIND_KEY).map(String::as_str), Some("copilot"));
+        assert_eq!(
+            meta.get(hyperpanes_core::tools::META_SESSION_KEY)
+                .map(String::as_str),
+            Some("aaaa-bbbb-cccc")
+        );
+        assert_eq!(
+            meta.get(hyperpanes_core::tools::META_SESSION_CWD_KEY)
+                .map(String::as_str),
+            Some("/tmp")
+        );
+    }
+
+    // Restoring a tool pane re-spawns its pty, so this one needs a runtime.
+    #[tokio::test]
+    async fn a_restarted_tool_pane_comes_back_in_the_same_conversation() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        // No `command`: the pane was an interactive shell the human ran the tool inside
+        // of, which is the shape the left panel's "resume" produces. The resume then has
+        // to be *typed*, since there is no argv to extend.
+        st.attach_panes_from_specs(
+            &m,
+            &[spec_with(&[
+                (hyperpanes_core::tools::kind::META_KIND_KEY, "copilot"),
+                (hyperpanes_core::tools::META_SESSION_KEY, "aaaa-bbbb-cccc"),
+                (hyperpanes_core::tools::META_SESSION_CWD_KEY, "/tmp"),
+            ])],
+        );
+        let p = st.active_tab().panes.last().unwrap();
+        assert_eq!(
+            p.startup.as_deref(),
+            Some("cd '/tmp' && copilot --resume aaaa-bbbb-cccc\r")
+        );
+        // And it still holds the mark, so the NEXT snapshot keeps it: a pane that
+        // forgets after one restart is a pane that only survives one restart.
+        assert_eq!(
+            p.tool_session.as_ref().map(|m| m.id.as_str()),
+            Some("aaaa-bbbb-cccc")
+        );
+    }
+
+    // Restoring a tool pane re-spawns its pty, so this one needs a runtime.
+    #[tokio::test]
+    async fn a_command_that_already_names_the_conversation_is_not_resumed_twice() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        // The pane was spawned as `copilot --resume <id>` in the first place. Appending
+        // the flag again would hand copilot two `--resume` values.
+        st.attach_panes_from_specs(
+            &m,
+            &[PaneSpec {
+                command: Some("copilot --resume aaaa-bbbb-cccc".into()),
+                ..spec_with(&[
+                    (hyperpanes_core::tools::kind::META_KIND_KEY, "copilot"),
+                    (hyperpanes_core::tools::META_SESSION_KEY, "aaaa-bbbb-cccc"),
+                    (hyperpanes_core::tools::META_SESSION_CWD_KEY, "/tmp"),
+                ])
+            }],
+        );
+        let p = st.active_tab().panes.last().unwrap();
+        assert_eq!(p.startup, None);
+    }
+
+    // Restoring a tool pane re-spawns its pty, so this one needs a runtime.
+    #[tokio::test]
+    async fn a_tool_with_no_checked_resume_shape_starts_fresh() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        // `resume_args` is the one authority, and it only answers for tools whose flag was
+        // read off a real `--help`. Guessing at one would relaunch the pane into an
+        // argument error instead of a chat.
+        st.attach_panes_from_specs(
+            &m,
+            &[spec_with(&[
+                (hyperpanes_core::tools::kind::META_KIND_KEY, "aider"),
+                (hyperpanes_core::tools::META_SESSION_KEY, "aaaa-bbbb-cccc"),
+                (hyperpanes_core::tools::META_SESSION_CWD_KEY, "/tmp"),
+            ])],
+        );
+        assert_eq!(st.active_tab().panes.last().unwrap().startup, None);
+    }
+
+    // Restoring a tool pane re-spawns its pty, so this one needs a runtime.
+    #[tokio::test]
+    async fn half_a_mark_resumes_nothing() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        // An id with no directory cannot be resumed *anywhere* — every provider keys off
+        // the project too — so the pane must come back as a plain tool pane, not as a
+        // resume against whatever cwd happens to be current.
+        st.attach_panes_from_specs(
+            &m,
+            &[spec_with(&[
+                (hyperpanes_core::tools::kind::META_KIND_KEY, "copilot"),
+                (hyperpanes_core::tools::META_SESSION_KEY, "aaaa-bbbb-cccc"),
+            ])],
+        );
+        let p = st.active_tab().panes.last().unwrap();
+        assert_eq!(p.startup, None);
+        assert!(p.tool_session.is_none());
+        assert_eq!(p.kind, PaneKind::Tool("copilot".into()));
+    }
+
+    #[test]
+    fn a_view_panes_target_survives_a_real_snapshot_round_trip() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        let want = [
+            (PaneKind::FileBrowser, "/tmp"),
+            (PaneKind::FileViewer, "/tmp/notes.txt"),
+            (PaneKind::Markdown, "/tmp/README.md"),
+        ];
+        for (kind, target) in &want {
+            st.add_pane_opts(
+                &m,
+                NewPaneOpts {
+                    kind: Some(kind.clone()),
+                    cwd: Some((*target).to_string()),
+                    ..Default::default()
+                },
+            );
+        }
+        // Out through the real serializer and back through the real restore — the two
+        // halves that have to agree on `pane.kind` and on cwd-as-target.
+        let specs = snapshot_panes(&st);
+        let mut back = State::new(theme::load_font(1.0));
+        back.attach_panes_from_specs(&m, &specs);
+
+        let got: Vec<_> = back
+            .active_tab()
+            .panes
+            .iter()
+            .map(|p| (p.kind.clone(), p.cwd.clone().unwrap_or_default()))
+            .collect();
+        assert_eq!(
+            got,
+            want.iter()
+                .map(|(k, t)| (k.clone(), (*t).to_string()))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
 mod tool_identity_tests {
     //! T3 — the runtime half of tool detection: an OSC title upgrades a plain terminal's
     //! CHROME, and never what it relaunches as.
@@ -6748,6 +7245,7 @@ mod tool_identity_tests {
                 spawn_args: None,
                 spawn_shell: None,
                 kind: PaneKind::default(),
+                tool_session: None,
             },
         );
         st
@@ -6937,6 +7435,7 @@ mod left_panel_tests {
             spawn_args: None,
             spawn_shell: None,
             kind: PaneKind::default(),
+            tool_session: None,
         }
     }
 
@@ -7161,6 +7660,7 @@ mod set_tests {
             spawn_args: None,
             spawn_shell: None,
             kind: PaneKind::default(),
+            tool_session: None,
         }
     }
 

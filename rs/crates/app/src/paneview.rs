@@ -23,7 +23,8 @@ use crate::state::{Overlay, PaneState, State};
 use crate::theme;
 use crate::{
     AppWindow, ClaudeSessionItem, CtxTab, DividerItem, FramePaletteOption, HiRect, KeybindingItem,
-    LayoutOption, LeftModeRow, LeftPaneRow, LeftPanelAdapter, LeftSessionItem, LeftSessionRow,
+    LayoutOption, LeftFileRow, LeftModeRow, LeftPaneRow, LeftPanelAdapter, LeftSessionItem,
+    LeftSessionRow,
     LeftSetRow, LeftTabRow,
     PaneViewRow,
     LeftWorkspaceRow, MenuEntry, PaletteItem, PaneItem, PrefBrowserRow, PrefOption, PrefToolRow,
@@ -99,6 +100,7 @@ pub struct Ui {
     pub lp_modes: Rc<VecModel<LeftModeRow>>,
     /// The current tool mode's resumable sessions, pre-sorted by (project, recency).
     pub lp_sessions: Rc<VecModel<LeftSessionItem>>,
+    pub lp_files: Rc<VecModel<LeftFileRow>>,
     /// Per-tab pane models for the tree, keyed by tab index and reused across ticks so each
     /// `LeftTabRow.panes` keeps a STABLE model identity — the same reason `wt_models` exists:
     /// rebuilding the inner repeater every frame would drop an in-flight click or, worse, the
@@ -156,6 +158,7 @@ impl Ui {
             lp_detached: Rc::new(VecModel::default()),
             lp_modes: Rc::new(VecModel::default()),
             lp_sessions: Rc::new(VecModel::default()),
+            lp_files: Rc::new(VecModel::default()),
             lp_pane_models: RefCell::new(HashMap::new()),
             pref_tools: Rc::new(VecModel::default()),
             pref_browsers: Rc::new(VecModel::default()),
@@ -201,6 +204,7 @@ impl Ui {
         lp.set_detached(ModelRc::from(self.lp_detached.clone()));
         lp.set_modes(ModelRc::from(self.lp_modes.clone()));
         lp.set_sessions(ModelRc::from(self.lp_sessions.clone()));
+        lp.set_files(ModelRc::from(self.lp_files.clone()));
     }
 }
 
@@ -532,6 +536,18 @@ fn build_dividers(state: &State, area: (f32, f32)) -> Vec<DividerItem> {
 
 /// Rebuild every UI model + scalar from `State` (the resync step). Called when
 /// `state.dirty` is set.
+/// Left-panel mode indices. WORKSPACE and FILES are fixed slots that no settings change
+/// can move: the favourited tools start at [`LEFT_MODE_TOOL_BASE`], so a mode index and
+/// `mode_tools[mode - LEFT_MODE_TOOL_BASE]` mean the same thing in Rust and in Slint.
+pub const LEFT_MODE_WORKSPACE: i32 = 0;
+pub const LEFT_MODE_FILES: i32 = 1;
+pub const LEFT_MODE_TOOL_BASE: i32 = 2;
+
+/// The FILES row's icon number. `LeftModeRow::icon` is a registry icon id when positive and
+/// 0 already means "the workspace grid", so the folder glyph needs a value of its own —
+/// negative, because the registry will only ever grow upward.
+pub const LEFT_MODE_FILES_ICON: i32 = -1;
+
 pub fn resync(
     state: &mut State,
     app: &AppWindow,
@@ -561,7 +577,7 @@ pub fn resync(
         .iter()
         .map(|l| LayoutOption {
             id: theme::layout_id(*l),
-            label: theme::layout_label(*l).into(),
+            label: theme::layout_label(*l).as_ref().into(),
             active: *l == cur,
             hint: SharedString::new(),
         })
@@ -1140,14 +1156,24 @@ pub fn resync(
             // user's own favourite order (not the registry's), because the strip is theirs.
             // A favourite id this build doesn't know is skipped rather than dropped from
             // settings — a downgrade must not silently un-favourite a tool.
-            let mut mode_rows = vec![LeftModeRow {
-                label: "Workspace".into(),
-                // 0 means "not a tool": the strip draws its own grid glyph for this one.
-                icon: 0,
-                brand: crate::theme::accent_for(0, palette),
-            }];
+            let mut mode_rows = vec![
+                LeftModeRow {
+                    label: "Workspace".into(),
+                    // 0 means "not a tool": the strip draws its own grid glyph for this one.
+                    icon: 0,
+                    brand: crate::theme::accent_for(0, palette),
+                },
+                LeftModeRow {
+                    label: "Files".into(),
+                    // Negative is the second "not a tool" sentinel — a folder glyph. It has
+                    // to be distinguishable from 0 rather than sharing it, because the strip
+                    // switches on this number to pick which geometry it draws.
+                    icon: LEFT_MODE_FILES_ICON,
+                    brand: crate::theme::accent_for(0, palette),
+                },
+            ];
             // The strip and this list are built from ONE filtered pass, so mode index n
-            // and `mode_tools[n - 1]` can never disagree — filtering twice is exactly how a
+            // and `mode_tools[n - 2]` can never disagree — filtering twice is exactly how a
             // skipped unknown favourite would make the panel resume the wrong tool.
             let mode_tools: Vec<&'static str> = state
                 .settings
@@ -1169,15 +1195,57 @@ pub fn resync(
             // Un-favouriting the tool you were looking at must not leave the panel showing
             // a mode that no longer exists — fall back to the workspace tree.
             if lp.get_mode() as usize >= mode_rows.len() {
-                lp.set_mode(0);
+                lp.set_mode(LEFT_MODE_WORKSPACE);
             }
+            let mode_row_count = mode_rows.len();
             sync_model(&ui.lp_modes, mode_rows);
+
+            // ---- the mode the Rust side asked for ----
+            // `mode` is `in-out` and the strip writes it directly, so Rust normally has no
+            // say. A reveal (clicking a filename in a pane) is the exception: it has to put
+            // the panel into FILES itself. Taken before the session list is computed so the
+            // whole frame agrees about which mode it is drawing.
+            if let Some(m) = state.left_mode_request.take() {
+                if (m as usize) < mode_row_count {
+                    lp.set_mode(m);
+                }
+            }
+
+            // ---- mode 1: the explorer ----
+            // The rows are a stored projection, rebuilt only when something asks the
+            // filesystem a question (see [`crate::filetree`]); the resync just ships them.
+            if lp.get_mode() == LEFT_MODE_FILES {
+                let root = state.files_root();
+                lp.set_files_root(
+                    root.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| root.display().to_string())
+                        .into(),
+                );
+                if state.files_rows.is_empty() && state.files_query.trim().is_empty() {
+                    state.rebuild_files();
+                }
+                let file_rows: Vec<LeftFileRow> = state
+                    .files_rows
+                    .iter()
+                    .map(|r| LeftFileRow {
+                        depth: r.depth,
+                        kind: r.kind,
+                        expanded: r.expanded,
+                        label: r.label.as_str().into(),
+                        detail: r.detail.as_str().into(),
+                        path: r.path.display().to_string().into(),
+                        selected: state.files_sel.as_deref() == Some(r.path.as_path()),
+                    })
+                    .collect();
+                sync_model(&ui.lp_files, file_rows);
+            }
 
             // ---- the current mode's session list ----
             // Mode 0 is the workspace tree and asks the providers nothing: a human who never
             // opens a tool mode never pays for a transcript scan. Everything below is served
             // from `leftpanel`'s cache — the scan itself runs on the history-scan thread.
-            let mode_tool = mode_tools.get((lp.get_mode() as usize).wrapping_sub(1));
+            let mode_tool = mode_tools.get((lp.get_mode() as usize).wrapping_sub(LEFT_MODE_TOOL_BASE as usize));
             // An empty list while the scan is still running is not "this tool has no
             // history" — the panel says so rather than reporting a verdict early.
             lp.set_sessions_scanning(
@@ -1256,6 +1324,9 @@ pub fn resync(
             CtxKind::Pane => 1,
             CtxKind::Tab => 2,
             CtxKind::App => 3,
+            // The Files-row menu draws as a plain list — no swatches, no submenus — so it
+            // shares the App shape rather than claiming a kind of its own in the UI.
+            CtxKind::File => 3,
         },
     };
     app.set_ctx_kind(ctx_kind);
@@ -1336,7 +1407,7 @@ pub fn resync(
                     .iter()
                     .map(|l| LayoutOption {
                         id: theme::layout_id(*l),
-                        label: theme::layout_label(*l).into(),
+                        label: theme::layout_label(*l).as_ref().into(),
                         active: *l == cur,
                         hint: SharedString::new(),
                     })
@@ -1356,7 +1427,7 @@ pub fn resync(
                     .iter()
                     .map(|l| LayoutOption {
                         id: theme::layout_id(*l),
-                        label: theme::layout_label(*l).into(),
+                        label: theme::layout_label(*l).as_ref().into(),
                         active: *l == cur,
                         hint: if *l == Layout::Auto {
                             format!("— {}", theme::layout_name(auto_resolved)).into()
@@ -1366,6 +1437,13 @@ pub fn resync(
                     })
                     .collect();
                 sync_model(&ui.ctx_layouts, layouts);
+                sync_model(&ui.ctx_swatches, Vec::new());
+                sync_model(&ui.ctx_tabs, Vec::new());
+            }
+            // Every row of the file menu carries its own command; there is no submenu, no
+            // swatch and no radio set, so all three auxiliary models are cleared.
+            CtxKind::File => {
+                sync_model(&ui.ctx_layouts, Vec::new());
                 sync_model(&ui.ctx_swatches, Vec::new());
                 sync_model(&ui.ctx_tabs, Vec::new());
             }

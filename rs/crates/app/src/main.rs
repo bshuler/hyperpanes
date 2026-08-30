@@ -30,6 +30,7 @@ mod control_mode_cli;
 mod crash;
 mod devices;
 mod drag;
+mod filetree;
 mod glow;
 mod history_scan;
 mod keybindings;

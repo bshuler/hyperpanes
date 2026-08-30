@@ -11,8 +11,6 @@
 //!   * [`build`] mirrors `buildCommands` — rebuilt from current state each open so the
 //!     pane-focus / active-layout entries stay fresh.
 
-use hyperpanes_core::layout::presets::Layout;
-
 use crate::command::Command;
 use crate::state::State;
 use crate::theme;
@@ -74,16 +72,6 @@ pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
     }
     Some(score)
 }
-
-/// The layouts offered in the palette, automatic first (mirrors the TS order).
-const PALETTE_LAYOUTS: [Layout; 6] = [
-    Layout::Auto,
-    Layout::Single,
-    Layout::Columns,
-    Layout::Rows,
-    Layout::Grid,
-    Layout::MainStack,
-];
 
 /// Build the command list from current state. Rebuilt each open so the pane-focus
 /// entries + the active-layout `current` marker stay fresh (mirrors `buildCommands`).
@@ -225,13 +213,15 @@ pub fn build(state: &State) -> Vec<Entry> {
         Command::LeftSaveWorkspace,
     ));
 
-    // ---- layouts (automatic first, then the concrete presets) ----
+    // ---- layouts (automatic first, then the concrete presets, then the fixed grids) ----
+    // The same list the menus show, so a shape added there is typeable here without a
+    // second table to keep in step.
     let cur = t.layout;
-    for l in PALETTE_LAYOUTS {
+    for &l in theme::LAYOUT_MENU {
         cmds.push(Entry::new(
             &format!("Layout: {}", theme::layout_name(l)),
             if l == cur { "current" } else { "" },
-            "arrange tile split automatic",
+            "arrange tile split automatic grid",
             Command::SetLayout(l),
         ));
     }

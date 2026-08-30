@@ -414,6 +414,23 @@ export struct LeftSessionRow {
     live: float,
 }
 
+// One row of the FILES mode's tree, already flattened into draw order by
+// `crate::filetree`. `depth` is the indent level, `kind` is 0 dir / 1 file / 2 an inert
+// note ("Empty directory", "… more matches"), and `path` is the absolute path the row
+// stands for — the row's identity, because the list is rebuilt from disk by the very
+// clicks that dispatch from it and an index would name a different file afterwards.
+export struct LeftFileRow {
+    depth: int,
+    kind: int,
+    expanded: bool,
+    label: string,
+    // The finder's second line (the match's directory, relative to the root). Empty in the
+    // tree, where the indent already says where a row sits.
+    detail: string,
+    path: string,
+    selected: bool,
+}
+
 // One entry in the panel's MODE strip. Mode 0 is always WORKSPACE (the tab/pane tree);
 // every further mode is one favourited CLI tool, showing that tool's locally resumable
 // sessions. `icon` is the registry icon kind the shared `ToolIcon` switches on (0 for the
@@ -488,8 +505,10 @@ export global LeftPanelAdapter {
     callback adopt-session(string);
 
     // ---- panel modes ----
-    // Which view the panel is showing: 0 = WORKSPACE (the tree above), n = `modes[n]`, a
-    // favourited tool's resumable-session list. `in-out` because the strip sets it directly
+    // Which view the panel is showing: 0 = WORKSPACE (the tree above), 1 = FILES (the
+    // project explorer), n >= 2 = `modes[n]`, a favourited tool's resumable-session list.
+    // Files sits at a fixed index rather than after the favourites because it is not a tool
+    // and cannot be un-starred away. `in-out` because the strip sets it directly
     // — switching views is pure UI state, not a `State` mutation, so it does not go through
     // Seam #2 (the mode does not survive a restart, and should not: the panel always opens
     // on the workspace tree).
@@ -507,4 +526,29 @@ export global LeftPanelAdapter {
     in property <bool> sessions-scanning;
     // A session row clicked → resume session `0` of the current mode's tool.
     callback resume-session(string);
+    // The strip was clicked. `mode` is already set (it is `in-out`); this only tells Rust,
+    // which needs to know because entering FILES has to read the filesystem and nothing
+    // else in this adapter is allowed to.
+    callback mode-changed(int);
+
+    // ---- mode 1: the file explorer ----
+    // The flattened tree, or the finder's ranked matches when `files-query` is non-empty.
+    in property <[LeftFileRow]> files;
+    // The tree's root, for the header. Absolute; the view shows the tail.
+    in property <string> files-root;
+    // The finder box. `in-out` so a reveal (which clears the filter) reaches the box, while
+    // typing still writes it before the callback fires.
+    in-out property <string> files-query;
+    // A row clicked once → a directory opens/shuts, a file is selected.
+    callback files-click(string);
+    // A row double-clicked → open it (a view pane for a file, a re-root for a directory).
+    callback files-open(string);
+    // A row right-clicked at window-logical (`1`, `2`) → the row menu.
+    callback files-context(string, length, length);
+    // The finder box changed.
+    callback files-query-changed(string);
+    // Re-root one directory higher.
+    callback files-up();
+    // Re-read the tree from disk (nothing watches the filesystem).
+    callback files-refresh();
 }

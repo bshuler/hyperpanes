@@ -2417,6 +2417,8 @@ impl App {
                             // the kind from that command, so a user who types `claude` here
                             // gets a Claude pane without the dialog knowing tools exist.
                             kind: None,
+                            // A hand-typed program names no conversation.
+                            session: None,
                         };
                         app.run_command(&w, Command::SubmitNewPane(opts));
                     }
@@ -2583,7 +2585,15 @@ impl App {
                         Some(hyperpanes_terminal_widget::LinkAction::OpenUrl(url)) => {
                             app.run_command(&win, Command::OpenLink(url));
                         }
-                        _ => {}
+                        // A clicked FILE path does not open anything by itself: it reveals
+                        // the file in the left panel's explorer, and the human decides
+                        // there what happens to it (viewer, markdown preview, vim, …).
+                        // That choice is the whole point of routing through the panel
+                        // instead of handing the path to the OS.
+                        Some(hyperpanes_terminal_widget::LinkAction::Reveal { path, line, col }) => {
+                            app.run_command(&win, Command::RevealInFiles { path, line, col });
+                        }
+                        None => {}
                     }
                 }
             });
@@ -2740,6 +2750,8 @@ impl App {
                     // Markdown gets the preview, everything else the plain viewer —
                     // decided by extension so the same click never means two things.
                     kind: Some(crate::viewpane::kind_for_file(&r.path)),
+                    // A view pane holds a file, not a conversation.
+                    session: None,
                 };
                 app.run_command(&w, Command::SubmitNewPane(opts));
             });
@@ -3133,7 +3145,10 @@ impl App {
                             .iter()
                             .filter_map(|f| hyperpanes_core::tools::by_id(f))
                             .map(|t| t.id)
-                            .nth((mode as usize).wrapping_sub(1))
+                            .nth(
+                                (mode as usize)
+                                    .wrapping_sub(crate::paneview::LEFT_MODE_TOOL_BASE as usize),
+                            )
                     };
                     let Some(tool_id) = tool_id else { return };
                     let Some(row) = crate::leftpanel::tool_session(tool_id, &sid) else {
@@ -3155,8 +3170,104 @@ impl App {
                         // possibly a human's own override), which is exactly the shape
                         // `PaneKind::for_command` cannot be relied on to recognise.
                         kind: Some(hyperpanes_core::tools::PaneKind::Tool(tool_id.to_string())),
+                        // The one place the conversation id is known for certain — the human
+                        // just picked this row. Recording it here is what lets a relaunch
+                        // re-resume THIS chat rather than starting the tool fresh; sniffing it
+                        // back out of the command line later would be a guess.
+                        session: Some(sid.to_string()),
                     };
                     app.run_command(&w, Command::SubmitNewPane(opts));
+                });
+        }
+
+        // ---- the left panel's FILES mode (D14) ----
+        // Every one of these carries the row's PATH rather than its index: the row list is
+        // rebuilt from disk by the very clicks that dispatch from it, so an index would name
+        // a different row by the time the command ran.
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_files_click(move |path| {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::FilesClick(path.to_string()));
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_files_open(move |path| {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::FilesOpen(path.to_string()));
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_files_context(move |path, x, y| {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(
+                            &w,
+                            Command::OpenFileContext(path.to_string(), x, y),
+                        );
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_files_query_changed(move |q| {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::FilesSetQuery(q.to_string()));
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_files_up(move || {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::FilesUp);
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_files_refresh(move || {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::FilesRefresh);
+                    }
+                });
+        }
+        // `mode` is `in-out` and the strip writes it in Slint, so Rust would otherwise never
+        // learn the panel had been switched. Entering FILES has to read the filesystem, so
+        // the strip says so rather than leaving the resync to notice a mode it can't see.
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_mode_changed(move |mode| {
+                    if mode != crate::paneview::LEFT_MODE_FILES {
+                        return;
+                    }
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::FilesRefresh);
+                    }
                 });
         }
 
@@ -3373,6 +3484,9 @@ impl App {
                     // The command is `claude --resume …`, so the derived kind is already
                     // Tool("claude") — no need to say it twice.
                     kind: None,
+                    // …but the id itself still has to be recorded, or the pane comes back
+                    // from a relaunch as a fresh claude.
+                    session: Some(sid.to_string()),
                 };
                 app.run_command(&w, Command::SubmitNewPane(opts));
             });

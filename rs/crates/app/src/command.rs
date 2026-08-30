@@ -80,6 +80,50 @@ pub enum Command {
     /// in a pane instead of the OS file explorer. This is the only way a human can reach
     /// a non-PTY view pane, so it is deliberately next to "Open Folder" in the pane menu.
     OpenFileBrowser(usize),
+
+    // ---- left panel: Files mode (D14/D15) ----
+    //
+    // Every row of the explorer dispatches one of these. They carry a **path**, never a row
+    // index, because the row list is rebuilt from disk on each of these commands and an index
+    // captured before the rebuild would name a different file after it.
+    /// Show `path` in the left panel's Files tree: switch the panel to Files mode, re-root if
+    /// the path lies outside the current root, open the directories leading to it, and select
+    /// it. `line`/`col` come from a `file:line:col` hit in a pane's output and are held for
+    /// whichever tool opens the file next.
+    ///
+    /// This is where a plain click on a filename in a pane lands. It deliberately opens
+    /// nothing: the human picks the tool from the row menu, which is the whole reason a
+    /// clicked path goes to the panel instead of straight to the OS handler.
+    RevealInFiles {
+        path: String,
+        line: Option<u32>,
+        col: Option<u32>,
+    },
+    /// Single click on an explorer row: a directory opens/shuts, a file is selected.
+    FilesClick(String),
+    OpenFileContext(String, f32, f32),
+    /// Open or shut an explorer directory without selecting anything (the chevron).
+    /// Double click on an explorer file: open it in a read-only view pane — the Markdown
+    /// renderer for `.md`, the plain file viewer otherwise.
+    FilesOpen(String),
+    /// The finder box changed. A non-empty query replaces the tree with ranked matches.
+    FilesSetQuery(String),
+    /// Re-root the explorer at `0` (the row menu's "Browse Containing Folder", and a
+    /// double-click on a directory).
+    FilesSetRoot(String),
+    /// Re-root one directory higher — the way out when the derived root guessed too narrowly.
+    FilesUp,
+    /// Re-read the tree from disk. Nothing watches the filesystem, so this is how a human
+    /// says "I changed something outside the app".
+    FilesRefresh,
+    /// Open `path` in a terminal pane running tool `tool` — "open in a terminal with vi".
+    /// The pane is a `Tool` pane, so it gets the tool's brand and icon like any other.
+    OpenPathWith { path: String, tool: String },
+    /// Copy an arbitrary path to the clipboard (the row menu). Goes through the focused
+    /// pane's clipboard so it raises the same "Copied …" toast as a Ctrl+click does.
+    CopyPathText(String),
+    /// Show `path` in the OS file explorer (the row menu's "Reveal in Finder").
+    RevealPath(String),
     FocusPane(usize),
     FocusDir(Direction),
     // layout
@@ -495,8 +539,113 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
                     env: None,
                     startup: None,
                     kind: Some(hyperpanes_core::tools::kind::PaneKind::FileBrowser),
+                    // A view pane holds a directory, not a conversation.
+                    session: None,
                 },
             );
+        }
+
+        // ---- left panel: Files mode (D14/D15) ----
+        Command::RevealInFiles { path, line, col } => {
+            state.reveal_in_files(std::path::Path::new(&path), line, col);
+        }
+        Command::FilesClick(path) => state.files_click(std::path::Path::new(&path)),
+        Command::OpenFileContext(path, x, y) => {
+            state.open_file_context(std::path::Path::new(&path), x, y)
+        }
+        Command::FilesSetQuery(q) => state.files_set_query(q),
+        Command::FilesSetRoot(dir) => state.files_set_root(std::path::PathBuf::from(dir)),
+        Command::FilesUp => state.files_go_up(),
+        Command::FilesRefresh => state.rebuild_files(),
+        Command::FilesOpen(path) => {
+            let p = std::path::PathBuf::from(&path);
+            if p.is_dir() {
+                state.files_set_root(p);
+                return Effect::None;
+            }
+            // `.md` gets the renderer, everything else the plain viewer — the same split the
+            // pane menu makes, so a file opens the same way however it was reached.
+            let md = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"));
+            let kind = if md {
+                hyperpanes_core::tools::kind::PaneKind::Markdown
+            } else {
+                hyperpanes_core::tools::kind::PaneKind::FileViewer
+            };
+            let label = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .or_else(|| Some("File".to_string()));
+            state.add_pane_opts(
+                mgr,
+                NewPaneOpts {
+                    label,
+                    // A view pane's target IS its cwd — see `State::view_navigate`.
+                    cwd: Some(path),
+                    command: None,
+                    shell: None,
+                    accent: None,
+                    show_frame: None,
+                    show_dot: None,
+                    env: None,
+                    startup: None,
+                    kind: Some(kind),
+                    // A view pane holds a file, not a conversation.
+                    session: None,
+                },
+            );
+        }
+        Command::OpenPathWith { path, tool } => {
+            // The tool's resolved binary, so a user override in Preferences → Tools is what
+            // actually runs. Falling back to the registry's bare bin name lets PATH decide,
+            // which is right when the override was cleared but the tool is still installed.
+            let Some(def) = hyperpanes_core::tools::registry::by_id(&tool) else {
+                crate::dbg_log(&format!("OpenPathWith: unknown tool {tool}"));
+                return Effect::None;
+            };
+            let bin = hyperpanes_core::tools::detect::resolve(def, &state.settings.tool_paths)
+                .map(|r| r.path.display().to_string())
+                .unwrap_or_else(|| def.bin.to_string());
+            let p = std::path::PathBuf::from(&path);
+            // The editor runs *in* the file's directory, so its own file-relative commands
+            // (`:e ../other`, a project search) mean what the human expects.
+            let cwd = p
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.display().to_string());
+            let label = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .or_else(|| Some(def.name.to_string()));
+            state.add_pane_opts(
+                mgr,
+                NewPaneOpts {
+                    label,
+                    cwd,
+                    command: Some(format!("{} {}", quote_arg(&bin), quote_arg(&path))),
+                    shell: None,
+                    accent: None,
+                    show_frame: None,
+                    show_dot: None,
+                    env: None,
+                    startup: None,
+                    kind: Some(hyperpanes_core::tools::kind::PaneKind::Tool(tool)),
+                    // "Open this file in vim" starts an editor on a file — there is no
+                    // conversation to come back to.
+                    session: None,
+                },
+            );
+        }
+        Command::CopyPathText(path) => {
+            let f = state.active_tab().focused;
+            state.copy_link_text(f, &path);
+        }
+        Command::RevealPath(path) => {
+            if let Err(e) = hyperpanes_core::open::reveal_path(std::path::Path::new(&path)) {
+                crate::dbg_log(&format!("RevealPath {path}: {e}"));
+            }
         }
         Command::SearchPane(i) => state.open_search(i),
         Command::SearchFocused => {
@@ -613,4 +762,43 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
 /// Map a layout menu id (from the Slint picker) to a `SetLayout` command.
 pub fn set_layout_from_id(id: i32) -> Command {
     Command::SetLayout(theme::layout_from_id(id))
+}
+
+/// Wrap a path (or a program path) for the shell that runs a pane's `command`. Single quotes
+/// with `'\''` for an embedded quote — the one form that is literal for every character in
+/// POSIX shells, which matters here because filenames chosen by humans contain spaces,
+/// parentheses and `$` far more often than they contain apostrophes.
+///
+/// A bare word is left alone so the common case reads as itself in the pane header.
+fn quote_arg(s: &str) -> String {
+    let plain = !s.is_empty()
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '=' | ':' | '~'));
+    if plain {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::quote_arg;
+
+    #[test]
+    fn an_ordinary_path_is_left_as_it_reads() {
+        assert_eq!(quote_arg("/usr/bin/vim"), "/usr/bin/vim");
+        assert_eq!(quote_arg("src/state.rs"), "src/state.rs");
+    }
+
+    #[test]
+    fn a_path_with_shell_metacharacters_is_quoted_whole() {
+        assert_eq!(quote_arg("/tmp/my notes.md"), "'/tmp/my notes.md'");
+        assert_eq!(quote_arg("/tmp/$HOME (1).txt"), "'/tmp/$HOME (1).txt'");
+    }
+
+    #[test]
+    fn an_apostrophe_closes_and_reopens_the_quoting() {
+        // The classic: 'it'\''s' — four tokens the shell concatenates back into `it's`.
+        assert_eq!(quote_arg("it's"), r"'it'\''s'");
+    }
 }

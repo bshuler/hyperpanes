@@ -27,7 +27,7 @@ use crate::links::{extract_path_candidates, extract_url_candidates, UrlCandidate
 use crate::render::{PaneRenderer, RenderOpts};
 use crate::search::{self, Match};
 use crate::selection::{self, Selection};
-use hyperpanes_core::paths::{self, OpenResult, ResolveResult};
+use hyperpanes_core::paths::{self, ResolveResult};
 use slint::Image;
 use std::collections::HashMap;
 use std::time::Instant;
@@ -100,37 +100,50 @@ const SCROLLBAR_MIN_THUMB_PX: f32 = 24.0;
 /// to collapse a notch back to one mouse-wheel report when forwarding to a mouse-grabbing app.
 const WHEEL_LINES_PER_NOTCH: i32 = 3;
 
-/// A link under the cursor — an on-disk-verified path or an http/https URL: where to draw the
-/// hover underline (in the pane's *logical* pixel space) plus the target. Returned by
-/// [`TerminalPane::link_at`].
+/// A link under the cursor — a path or an http/https URL: where to draw the hover underline (in
+/// the pane's *logical* pixel space) plus the target. Returned by [`TerminalPane::link_at`], which
+/// only ever hands back paths that exist, and by [`TerminalPane::link_target_at`], which does not.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkHit {
     /// Underline rect in logical px within the pane surface.
     pub x: f32,
     pub y: f32,
     pub w: f32,
-    /// Absolute, verified path the link points at — or the URL itself when [`is_url`](Self::is_url).
+    /// Absolute path the link points at — or the URL itself when [`is_url`](Self::is_url).
     pub abs_path: String,
     pub line: Option<u32>,
     pub col: Option<u32>,
     /// Tooltip label (`abs_path` with any `:line[:col]` suffix appended; the URL verbatim).
     pub tip: String,
-    /// `true` for an http/https URL (opens in the default browser, never disk-verified).
+    /// `true` for an http/https URL (routed by the app, never disk-verified).
     pub is_url: bool,
+    /// Whether the path was found on disk. Always `true` for a hover hit and for a URL; only a
+    /// [`link_target_at`](TerminalPane::link_target_at) lookup can report `false`. Copying a path
+    /// works either way — a build log naming a file that failed to generate is exactly when the
+    /// path is worth having — but revealing one that isn't there has nothing to show.
+    pub exists: bool,
 }
 
-/// The outcome of activating (clicking) a link. Mirrors the Electron split: a plain click opens
-/// (editor / OS default / browser for URLs), Ctrl/Cmd-click copies the target.
+/// The outcome of activating (clicking) a link: a plain click reveals the target (the left file
+/// tree for a path, the app's browser preference for a URL), Ctrl/Cmd-click copies it.
+///
+/// Every variant hands the target *back* rather than acting on it. The widget cannot see the
+/// left panel or the browser preference, and a widget that shelled out to the OS default would
+/// silently bypass both.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LinkAction {
     /// Ctrl/Cmd-click — the caller should copy this absolute path (or URL) to the clipboard.
     Copy(String),
-    /// Plain click on a file/dir — it was opened (the result carries blocked/err detail).
-    Opened(OpenResult),
-    /// Plain click on a URL — the caller should route it. The widget deliberately does NOT
-    /// open URLs itself: *which* browser gets the link is an app-level preference
-    /// (Preferences → Browser, including the "ask each time" chooser) that this crate can't
-    /// see, and a widget that launched the OS default directly would silently bypass it.
+    /// Plain click on a path — the caller should reveal it in the left file tree, from where the
+    /// human picks what to do with it (open in an editor pane, a terminal, a viewer). Opening it
+    /// straight into whatever the OS thinks owns the extension takes that choice away.
+    Reveal {
+        path: String,
+        line: Option<u32>,
+        col: Option<u32>,
+    },
+    /// Plain click on a URL — the caller should route it through Preferences → Browser (the OS
+    /// default, one chosen browser, or the "ask each time" chooser).
     OpenUrl(String),
 }
 
@@ -329,15 +342,21 @@ impl TerminalPane {
         format!("{}\u{1f}{}", self.cwd.as_deref().unwrap_or(""), token)
     }
 
-    /// Find a verified path token under the (logical-px) point, returning the resolved record,
-    /// the candidate's column span, and the cell metrics. Resolution is cached per (cwd, token);
+    /// Find a path token under the (logical-px) point, returning the resolved record, the
+    /// candidate's column span, and the cell metrics. Resolution is cached per (cwd, token);
     /// only existing paths are cached, so freshly-created files linkify on a later hover.
+    ///
+    /// `require_exists` is what separates the two callers. Hovering underlines a path only when
+    /// it is really there, because an underline is a promise. Copying makes no such promise, and
+    /// the token a human most wants off their screen is often one that does *not* exist yet — a
+    /// compiler naming the output it failed to write, a traceback from another machine.
     fn locate(
         &mut self,
         x: f32,
         y: f32,
         surf_w: f32,
         surf_h: f32,
+        require_exists: bool,
     ) -> Option<(ResolveResult, Option<u32>, Option<u32>, usize, usize, usize, f32, f32)> {
         let (cell_w, cell_h, cols, rows) = self.cell_logical(surf_w, surf_h)?;
         if x < 0.0 || y < 0.0 {
@@ -360,10 +379,13 @@ impl TerminalPane {
             hit.clone()
         } else {
             let r = paths::resolve_path(self.cwd.as_deref(), &cand.path);
-            if !r.exists {
-                return None; // negatives aren't cached (a later hover re-checks)
+            if r.exists {
+                self.verified.insert(key, r.clone());
+            } else if require_exists {
+                return None;
             }
-            self.verified.insert(key, r.clone());
+            // A miss is never cached: a file that appears a second later has to linkify on the
+            // next hover rather than stay dark for the life of the pane.
             r
         };
         // The candidate's line/col rides out with it: re-extracting to recover them would have
@@ -419,10 +441,51 @@ impl TerminalPane {
                 line: None,
                 col: None,
                 is_url: true,
+                exists: true,
             });
         }
+        self.path_hit(x, y, surf_w, surf_h, true)
+    }
+
+    /// Hit-test for a link the human has *asked about* — a Ctrl/Cmd-click or a context menu —
+    /// rather than merely hovered. Same geometry as [`link_at`](Self::link_at), minus the
+    /// on-disk requirement: the returned [`LinkHit::exists`] says which kind it is, so a caller
+    /// can copy any path-shaped token while still refusing to reveal one that isn't there.
+    pub fn link_target_at(
+        &mut self,
+        x: f32,
+        y: f32,
+        surf_w: f32,
+        surf_h: f32,
+    ) -> Option<LinkHit> {
+        if let Some((cand, start, end, row, cell_w, cell_h)) = self.url_under(x, y, surf_w, surf_h)
+        {
+            return Some(LinkHit {
+                x: start as f32 * cell_w,
+                y: (row as f32 + 1.0) * cell_h - 1.0,
+                w: (end - start) as f32 * cell_w,
+                tip: cand.url.clone(),
+                abs_path: cand.url,
+                line: None,
+                col: None,
+                is_url: true,
+                exists: true,
+            });
+        }
+        self.path_hit(x, y, surf_w, surf_h, false)
+    }
+
+    /// The path half of both hit-tests, differing only in whether a missing file still counts.
+    fn path_hit(
+        &mut self,
+        x: f32,
+        y: f32,
+        surf_w: f32,
+        surf_h: f32,
+        require_exists: bool,
+    ) -> Option<LinkHit> {
         let (r, line, col, start, end, row, cell_w, cell_h) =
-            self.locate(x, y, surf_w, surf_h)?;
+            self.locate(x, y, surf_w, surf_h, require_exists)?;
 
         let tip = match (line, col) {
             (Some(l), Some(c)) => format!("{}:{}:{}", r.abs_path, l, c),
@@ -438,13 +501,14 @@ impl TerminalPane {
             col,
             tip,
             is_url: false,
+            exists: r.exists,
         })
     }
 
     /// Activate the link under a (logical-px) click. `ctrl` (Ctrl or Cmd held) copies the
-    /// absolute path; otherwise the file/dir is opened via [`hyperpanes_core::paths`] using
-    /// `editor_command` (empty → VS Code if present, else the guarded OS default). `None` when
-    /// the click wasn't over a verified path.
+    /// absolute path — whether or not it exists — while a plain click asks the caller to reveal
+    /// it, which only a path that is really there can satisfy. `None` when the click wasn't over
+    /// a link at all.
     pub fn activate_link(
         &mut self,
         x: f32,
@@ -452,7 +516,6 @@ impl TerminalPane {
         surf_w: f32,
         surf_h: f32,
         ctrl: bool,
-        editor_command: &str,
     ) -> Option<LinkAction> {
         // Suppress link open/copy at the end of a drag-selection. The widget fires
         // `selection-end` then `link-activated` on the same left-button release, and a dragged
@@ -462,7 +525,13 @@ impl TerminalPane {
         if self.selection_is_drag() {
             return None;
         }
-        let hit = self.link_at(x, y, surf_w, surf_h)?;
+        // Ctrl/Cmd-click looks up the ungated way: a path that failed to exist never underlined,
+        // but the human aimed at it deliberately and wants the text.
+        let hit = if ctrl {
+            self.link_target_at(x, y, surf_w, surf_h)?
+        } else {
+            self.link_at(x, y, surf_w, surf_h)?
+        };
         if ctrl {
             // Copy here with the pane's own (arboard) clipboard handle — the proven path the
             // selection copy uses — instead of relying on the caller: the app shell's `clip`
@@ -480,8 +549,11 @@ impl TerminalPane {
             // Handed back, not opened — see `LinkAction::OpenUrl`.
             return Some(LinkAction::OpenUrl(hit.abs_path));
         }
-        let res = paths::open_resolved_path(&hit.abs_path, hit.line, hit.col, editor_command);
-        Some(LinkAction::Opened(res))
+        Some(LinkAction::Reveal {
+            path: hit.abs_path,
+            line: hit.line,
+            col: hit.col,
+        })
     }
 
     // ---- Text selection ---------------------------------------------------------------------
@@ -1337,12 +1409,63 @@ mod tests {
         let mut p = unit_pane(20, 2);
         p.set_cwd(Some(dir.to_string_lossy().into_owned()));
         p.feed("a.txt"); // cols 0..5
-        match p.activate_link(2.5, 0.5, 20.0, 2.0, true, "") {
+        match p.activate_link(2.5, 0.5, 20.0, 2.0, true) {
             Some(LinkAction::Copy(path)) => {
                 assert!(path.replace('\\', "/").ends_with("a.txt"));
             }
             other => panic!("ctrl+click should copy, got {other:?}"),
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plain click hands the path back for the left file tree rather than opening it: the
+    /// human picked the file, not what should happen to it.
+    #[test]
+    fn plain_click_reveals_the_path_rather_than_opening_it() {
+        let dir = std::env::temp_dir().join(format!("hp_pane_reveal_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        let mut p = unit_pane(20, 2);
+        p.set_cwd(Some(dir.to_string_lossy().into_owned()));
+        p.feed("a.txt:12:4"); // cols 0..10
+        match p.activate_link(2.5, 0.5, 20.0, 2.0, false) {
+            Some(LinkAction::Reveal { path, line, col }) => {
+                assert!(path.replace('\\', "/").ends_with("a.txt"));
+                // The location rides along so whichever tool opens it lands on the right line.
+                assert_eq!((line, col), (Some(12), Some(4)));
+            }
+            other => panic!("a plain click should reveal, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The asymmetry D14 asks for: a path that isn't on disk still copies, but has nothing to
+    /// reveal — and it never underlines, so it is only ever reached deliberately.
+    #[test]
+    fn a_missing_path_copies_but_neither_underlines_nor_reveals() {
+        let dir = std::env::temp_dir().join(format!("hp_pane_missing_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut p = unit_pane(20, 2);
+        p.set_cwd(Some(dir.to_string_lossy().into_owned()));
+        p.feed("gone.txt"); // never created
+
+        assert!(p.link_at(2.5, 0.5, 20.0, 2.0).is_none(), "no hover underline");
+        let hit = p
+            .link_target_at(2.5, 0.5, 20.0, 2.0)
+            .expect("a deliberate lookup still finds it");
+        assert!(!hit.exists);
+        assert!(hit.abs_path.replace('\\', "/").ends_with("gone.txt"));
+
+        match p.activate_link(2.5, 0.5, 20.0, 2.0, true) {
+            Some(LinkAction::Copy(path)) => {
+                assert!(path.replace('\\', "/").ends_with("gone.txt"));
+            }
+            other => panic!("ctrl+click should copy a missing path, got {other:?}"),
+        }
+        assert!(
+            p.activate_link(2.5, 0.5, 20.0, 2.0, false).is_none(),
+            "there is nothing to reveal"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1361,13 +1484,13 @@ mod tests {
         p.selection_update(5.5, 0.5, 20.0, 2.0); // 5px move > DRAG_THRESHOLD_PX
         assert!(p.selection_is_drag());
         // Activation over the path is suppressed while the drag selection stands — both a plain
-        // click (would open) and Ctrl+click (would re-copy and clobber the just-copied selection).
-        assert!(p.activate_link(2.5, 0.5, 20.0, 2.0, false, "").is_none());
-        assert!(p.activate_link(2.5, 0.5, 20.0, 2.0, true, "").is_none());
+        // click (would reveal) and Ctrl+click (would re-copy, clobbering the just-copied selection).
+        assert!(p.activate_link(2.5, 0.5, 20.0, 2.0, false).is_none());
+        assert!(p.activate_link(2.5, 0.5, 20.0, 2.0, true).is_none());
         // Once the selection is cleared, a click activates the link normally again.
         p.selection_clear();
         assert!(matches!(
-            p.activate_link(2.5, 0.5, 20.0, 2.0, true, ""),
+            p.activate_link(2.5, 0.5, 20.0, 2.0, true),
             Some(LinkAction::Copy(_))
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1450,7 +1573,7 @@ mod tests {
     fn ctrl_click_copies_the_url() {
         let mut p = unit_pane(30, 2);
         p.feed("https://a.com/x"); // cols 0..15
-        match p.activate_link(5.5, 0.5, 30.0, 2.0, true, "") {
+        match p.activate_link(5.5, 0.5, 30.0, 2.0, true) {
             Some(LinkAction::Copy(url)) => assert_eq!(url, "https://a.com/x"),
             other => panic!("ctrl+click on a URL should copy it, got {other:?}"),
         }
@@ -1463,7 +1586,7 @@ mod tests {
     fn plain_click_hands_the_url_back_unopened() {
         let mut p = unit_pane(30, 2);
         p.feed("https://a.com/x");
-        match p.activate_link(5.5, 0.5, 30.0, 2.0, false, "") {
+        match p.activate_link(5.5, 0.5, 30.0, 2.0, false) {
             Some(LinkAction::OpenUrl(url)) => assert_eq!(url, "https://a.com/x"),
             other => panic!("a clicked URL should come back as OpenUrl, got {other:?}"),
         }
@@ -1477,11 +1600,11 @@ mod tests {
         p.selection_begin(0.5, 0.5, 30.0, 2.0);
         p.selection_update(8.5, 0.5, 30.0, 2.0); // 8px move > DRAG_THRESHOLD_PX
         assert!(p.selection_is_drag());
-        assert!(p.activate_link(5.5, 0.5, 30.0, 2.0, false, "").is_none());
-        assert!(p.activate_link(5.5, 0.5, 30.0, 2.0, true, "").is_none());
+        assert!(p.activate_link(5.5, 0.5, 30.0, 2.0, false).is_none());
+        assert!(p.activate_link(5.5, 0.5, 30.0, 2.0, true).is_none());
         p.selection_clear();
         assert!(matches!(
-            p.activate_link(5.5, 0.5, 30.0, 2.0, true, ""),
+            p.activate_link(5.5, 0.5, 30.0, 2.0, true),
             Some(LinkAction::Copy(_))
         ));
     }

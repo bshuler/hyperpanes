@@ -23,6 +23,10 @@ pub enum CtxKind {
     /// just below the top-bar hamburger, so it shares the items/submenu/separator/shortcut/
     /// checkmark/glyph styling rather than duplicating a popup. See [`app_menu`].
     App,
+    /// A row of the left panel's Files tree. Unlike the others this menu carries no index:
+    /// each row bakes its own path into its [`Command`], so nothing has to survive the
+    /// rebuild that a click on any of these rows triggers. See [`file_menu`].
+    File,
 }
 
 /// A submenu kind a row can open (`0` = none, a plain item/separator).
@@ -390,6 +394,85 @@ pub fn pane_menu(state: &State, idx: usize, x: f32, y: f32, in_taskbar: bool) ->
 }
 
 /// Build the tab-strip menu for tab `idx`.
+/// Build the row menu for a file or directory in the left panel's Files tree.
+///
+/// **Flat, no submenus.** The whole reason a clicked filename lands in the panel instead of
+/// the OS handler is so the human can choose what happens next; hiding that choice one level
+/// down would undo it. The "Open in …" rows are therefore one per *installed* editor —
+/// resolved here, at open time, so an editor installed since launch appears and one that was
+/// never installed never does. That costs a handful of filesystem probes per right-click,
+/// which is the same bargain every other builder in this file already makes by rebuilding
+/// from scratch.
+///
+/// Each row carries its own fully-formed [`Command`] with the path baked in, so unlike the
+/// pane and tab menus this one needs no target index — which is what lets the row list be
+/// rebuilt from disk by the very click that dispatches from it.
+pub fn file_menu(state: &State, path: &std::path::Path, x: f32, y: f32) -> CtxMenu {
+    let mut b = Build::new();
+    let p = path.display().to_string();
+    let is_dir = path.is_dir();
+    let is_md = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"));
+
+    if is_dir {
+        b.item("Open as Root", Command::FilesSetRoot(p.clone()));
+        b.item(
+            "New File Browser Pane",
+            Command::FilesOpen(p.clone()),
+        );
+    } else {
+        if is_md {
+            // First, because for a `.md` the rendered view is what "open" means to a human.
+            b.item("Preview Markdown", Command::FilesOpen(p.clone()));
+        } else {
+            b.item("Open in Viewer", Command::FilesOpen(p.clone()));
+        }
+        for def in hyperpanes_core::tools::registry::editors() {
+            if hyperpanes_core::tools::detect::resolve(def, &state.settings.tool_paths).is_none() {
+                continue;
+            }
+            b.row(
+                &format!("Open in {}", def.name),
+                "",
+                def.icon as i32,
+                false,
+                false,
+                false,
+                false,
+                sub::NONE,
+                Some(Command::OpenPathWith {
+                    path: p.clone(),
+                    tool: def.id.to_string(),
+                }),
+            );
+        }
+        b.sep();
+        if let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            b.item(
+                "Browse Containing Folder",
+                Command::FilesSetRoot(parent.display().to_string()),
+            );
+        }
+    }
+    b.sep();
+    b.item("Copy Path", Command::CopyPathText(p.clone()));
+    b.item(reveal_label(), Command::RevealPath(p));
+    b.finish(CtxKind::File, 0, x, y)
+}
+
+/// What the OS calls "show me this file in the file manager".
+fn reveal_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Reveal in Finder"
+    } else if cfg!(target_os = "windows") {
+        "Show in Explorer"
+    } else {
+        "Show in File Manager"
+    }
+}
+
 pub fn tab_menu(state: &State, idx: usize, x: f32, y: f32) -> CtxMenu {
     let mut b = Build::new();
     let only = state.tabs.len() < 2;
@@ -525,7 +608,7 @@ pub fn app_menu(state: &State, x: f32, y: f32) -> CtxMenu {
     // the shortcut slot (mirrors Electron's "{current.label} ▸").
     b.row(
         "Layout",
-        crate::theme::layout_label(cur),
+        &crate::theme::layout_label(cur),
         crate::theme::layout_icon_kind(cur),
         false,
         false,

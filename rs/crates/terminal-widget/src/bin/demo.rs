@@ -309,21 +309,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return;
             }
             let (w, h) = geom.borrow().get(idx).copied().unwrap_or((0.0, 0.0));
-            // Empty editor command → core picks VS Code (if on PATH) else the guarded OS default.
-            match st.panes[idx].pane.activate_link(x, y, w, h, ctrl, "") {
+            match st.panes[idx].pane.activate_link(x, y, w, h, ctrl) {
                 Some(LinkAction::Copy(p)) => eprintln!("[demo] Ctrl+click → copy: {p}"),
                 // The demo has no Preferences, so it does what "System default" would.
                 Some(LinkAction::OpenUrl(u)) => {
                     eprintln!("[demo] click → url {u}: {:?}", hyperpanes_core::open::open_url(&u));
                 }
-                Some(LinkAction::Opened(res)) => {
-                    if res.ok {
-                        eprintln!("[demo] click → opened");
-                    } else if res.blocked {
-                        eprintln!("[demo] click → refused to auto-open ({:?})", res.error);
-                    } else {
-                        eprintln!("[demo] click → open failed ({:?})", res.error);
-                    }
+                // The shell reveals the path in its left file tree; the demo has no panel, so it
+                // reports what it was handed.
+                Some(LinkAction::Reveal { path, line, col }) => {
+                    eprintln!("[demo] click → reveal {path} (line {line:?}, col {col:?})");
                 }
                 None => {}
             }

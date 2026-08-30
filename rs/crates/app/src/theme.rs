@@ -1,6 +1,8 @@
 //! Palette, layout metadata, and font loading — the small presentation helpers the
 //! controller reaches for. No state here; pure look-up tables + `load_font`.
 
+use std::borrow::Cow;
+
 use hyperpanes_core::layout::presets::Layout;
 use hyperpanes_terminal_widget::Font;
 use slint::Color;
@@ -192,39 +194,62 @@ pub fn accent_for(i: usize, palette: usize) -> Color {
 
 /// The full set of user-selectable layouts, in menu order. `Auto` leads (the
 /// smart default); the four concrete presets follow. `Single` is reachable via
-/// this menu too so every preset is selectable per the Wave-1 spec.
-pub const LAYOUT_MENU: [Layout; 6] = [
+/// this menu too so every preset is selectable per the Wave-1 spec. The explicit
+/// grid shapes come last, after the presets, so the ids of the rows that existed
+/// before them do not move (see [`layout_id`]).
+///
+/// A slice rather than an array: the set of offered shapes is open — a 4x3 is one
+/// entry away — and a `[Layout; N]` would make every call site carry the count.
+pub const LAYOUT_MENU: &[Layout] = &[
     Layout::Auto,
     Layout::Single,
     Layout::Columns,
     Layout::Rows,
     Layout::Grid,
     Layout::MainStack,
+    Layout::GridFixed(2, 2),
+    Layout::GridFixed(2, 3),
+    Layout::GridFixed(3, 2),
+    Layout::GridFixed(3, 3),
 ];
 
 /// Stable order index used to round-trip a `Layout` through the Slint menu (which
-/// passes an `int` id). Matches [`LAYOUT_MENU`].
+/// passes an `int` id). Positional in [`LAYOUT_MENU`], so rows are only ever
+/// appended: the id doubles as the drawn-mini selector in `IconLayout`
+/// (`ui/contextmenu.slint`, via [`layout_icon_kind`]), and reordering the menu
+/// would silently repaint every layout icon. Ids are never persisted — the
+/// workspace file stores the token from [`layout_name`] — so growing the menu
+/// costs nothing on disk.
 pub fn layout_id(l: Layout) -> i32 {
-    LAYOUT_MENU.iter().position(|x| *x == l).unwrap_or(0) as i32
+    if let Some(i) = menu_position(l) {
+        return i;
+    }
+    // A grid shape the menu does not offer: `grid-4x3` in a hand-edited workspace file is a
+    // valid layout with no row of its own. Borrowing the square grid's id puts the checkmark
+    // and the drawn lattice on the nearest thing we have, rather than on Automatic.
+    if matches!(l, Layout::GridFixed(..)) {
+        return menu_position(Layout::Grid).unwrap_or(0);
+    }
+    0
+}
+
+fn menu_position(l: Layout) -> Option<i32> {
+    LAYOUT_MENU.iter().position(|x| *x == l).map(|i| i as i32)
 }
 
 /// Resolve a menu id back to a `Layout` (defaults to `Auto` on an out-of-range id).
 pub fn layout_from_id(id: i32) -> Layout {
-    LAYOUT_MENU
-        .get(id as usize)
+    usize::try_from(id)
+        .ok()
+        .and_then(|i| LAYOUT_MENU.get(i))
         .copied()
         .unwrap_or(Layout::Auto)
 }
 
-pub fn layout_name(l: Layout) -> &'static str {
-    match l {
-        Layout::Auto => "auto",
-        Layout::Single => "single",
-        Layout::Columns => "columns",
-        Layout::Rows => "rows",
-        Layout::Grid => "grid",
-        Layout::MainStack => "main-stack",
-    }
+/// The serialization token for a layout — borrowed for every preset, owned only for the
+/// explicit `grid-CxR` shapes, which have no fixed string to point at.
+pub fn layout_name(l: Layout) -> Cow<'static, str> {
+    l.token()
 }
 
 /// Drawn-icon kinds for the application (hamburger) menu's action rows. Icons used to be
@@ -268,14 +293,18 @@ pub fn layout_icon_kind(l: Layout) -> i32 {
 /// The human display label for each layout, matching Electron's `LAYOUTS[].label` /
 /// `AUTO_LAYOUT.label` (Title Case). Used in the menus; the HUD/serialization keep the
 /// lowercase token from [`layout_name`].
-pub fn layout_label(l: Layout) -> &'static str {
+pub fn layout_label(l: Layout) -> Cow<'static, str> {
     match l {
-        Layout::Auto => "Automatic",
-        Layout::Single => "Single",
-        Layout::Columns => "Columns",
-        Layout::Rows => "Rows",
-        Layout::Grid => "Grid",
-        Layout::MainStack => "Main + Stack",
+        Layout::Auto => Cow::Borrowed("Automatic"),
+        Layout::Single => Cow::Borrowed("Single"),
+        Layout::Columns => Cow::Borrowed("Columns"),
+        Layout::Rows => Cow::Borrowed("Rows"),
+        Layout::Grid => Cow::Borrowed("Grid"),
+        Layout::MainStack => Cow::Borrowed("Main + Stack"),
+        // Spaced around the ×: "2 x 2" reads as a shape at menu size, where "2x2" reads as a
+        // token. The plain `x` (not `×`) is deliberate — the menu font is resolved per
+        // platform and a missing glyph draws a hollow box (see `menu_icon`).
+        Layout::GridFixed(cols, rows) => Cow::Owned(format!("{cols} x {rows}")),
     }
 }
 
@@ -331,6 +360,69 @@ mod tests {
         assert_eq!(
             super::menu_icon::TOOL_BASE as u32,
             hyperpanes_core::tools::registry::TOOL_ICON_BASE
+        );
+    }
+
+    /// Every menu row must survive the trip out through Slint's `int` and back, or picking a
+    /// layout would set a different one.
+    #[test]
+    fn every_menu_layout_round_trips_through_its_id() {
+        for l in super::LAYOUT_MENU {
+            assert_eq!(super::layout_from_id(super::layout_id(*l)), *l);
+        }
+    }
+
+    /// The ids of the rows that predate the explicit grids must not move: the same number
+    /// selects the drawn mini in `ui/contextmenu.slint`, which is matched by literal.
+    #[test]
+    fn the_original_menu_ids_are_unchanged() {
+        use hyperpanes_core::layout::presets::Layout;
+        for (i, l) in [
+            Layout::Auto,
+            Layout::Single,
+            Layout::Columns,
+            Layout::Rows,
+            Layout::Grid,
+            Layout::MainStack,
+        ]
+        .iter()
+        .enumerate()
+        {
+            assert_eq!(super::layout_id(*l), i as i32);
+        }
+    }
+
+    /// Every id the menu hands out must stay inside the block reserved for layout minis
+    /// (`LAYOUT_BASE`..`TOOL_BASE`), or a layout row would draw a tool's mark.
+    #[test]
+    fn layout_icon_kinds_stay_inside_their_reserved_block() {
+        for l in super::LAYOUT_MENU {
+            let kind = super::layout_icon_kind(*l);
+            assert!(kind >= super::menu_icon::LAYOUT_BASE && kind < super::menu_icon::TOOL_BASE);
+        }
+    }
+
+    /// A grid shape no menu row offers (a hand-edited workspace file may name any of them)
+    /// still reads as a grid rather than falling all the way back to Automatic.
+    #[test]
+    fn an_off_menu_grid_shape_borrows_the_square_grids_row() {
+        use hyperpanes_core::layout::presets::Layout;
+        assert_eq!(
+            super::layout_id(Layout::GridFixed(4, 3)),
+            super::layout_id(Layout::Grid)
+        );
+    }
+
+    /// The menu label and the on-disk token are different strings for the same layout; the
+    /// token is what a workspace file must be able to read back.
+    #[test]
+    fn fixed_grids_label_and_serialize_distinctly() {
+        use hyperpanes_core::layout::presets::Layout;
+        assert_eq!(super::layout_label(Layout::GridFixed(2, 3)), "2 x 3");
+        assert_eq!(super::layout_name(Layout::GridFixed(2, 3)), "grid-2x3");
+        assert_eq!(
+            Layout::from_token(&super::layout_name(Layout::GridFixed(2, 3))),
+            Some(Layout::GridFixed(2, 3))
         );
     }
 }

@@ -121,10 +121,17 @@ component IconPanel inherits Rectangle {
 // A layout mini: an outlined frame whose inner dividers evoke the preset (the drawn
 // replacement for the ⊞ □ ▥ ▤ ▦ ▧ chars). `which` = MenuEntry.icon - 10 (the layout id):
 // 0 auto (2×2 cross) · 1 single (empty) · 2 columns (2 vertical) · 3 rows (2 horizontal) ·
-// 4 grid (3×3 lattice) · 5 main-stack (main pane + split stack).
+// 4 grid (3×3 lattice) · 5 main-stack (main pane + split stack) ·
+// 6..9 the explicit shapes 2×2 · 2×3 · 3×2 · 3×3, each drawn as the shape it names.
 component IconLayout inherits Rectangle {
     in property <color> ink;
     in property <int> which;
+    // The explicit shapes are one family rather than four cases: the id carries the shape,
+    // so the same four dividers draw all of them (the second on an axis only when that axis
+    // is 3 wide). Adding a 4×3 row means widening these three expressions, not four more.
+    property <bool> fixed-grid: root.which >= 6 && root.which <= 9;
+    property <int> gcols: (root.which == 6 || root.which == 7) ? 2 : 3;
+    property <int> grows: (root.which == 6 || root.which == 8) ? 2 : 3;
     width: 14px;
     height: 14px;
     Rectangle {
@@ -155,6 +162,11 @@ component IconLayout inherits Rectangle {
         // main-stack: a main pane left, a 2-way stack right
         if root.which == 5 : Rectangle { x: parent.width * 0.55; y: parent.inner-y; width: 1.2px; height: parent.inner-h; background: ink; }
         if root.which == 5 : Rectangle { x: parent.width * 0.55; y: (parent.height - 1.2px) / 2; width: parent.width * 0.45 - 1.2px; height: 1.2px; background: ink; }
+        // the explicit shapes: `gcols`-1 vertical and `grows`-1 horizontal dividers
+        if root.fixed-grid : Rectangle { x: parent.width / root.gcols; y: parent.inner-y; width: 1.2px; height: parent.inner-h; background: ink; }
+        if root.fixed-grid && root.gcols == 3 : Rectangle { x: parent.width * 2 / root.gcols; y: parent.inner-y; width: 1.2px; height: parent.inner-h; background: ink; }
+        if root.fixed-grid : Rectangle { x: parent.inner-x; y: parent.height / root.grows; width: parent.inner-w; height: 1.2px; background: ink; }
+        if root.fixed-grid && root.grows == 3 : Rectangle { x: parent.inner-x; y: parent.height * 2 / root.grows; width: parent.inner-w; height: 1.2px; background: ink; }
     }
 }
 
@@ -170,7 +182,12 @@ component MenuIcon inherits Rectangle {
     if root.kind == 4 : IconSave    { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; }
     if root.kind == 5 : IconSliders { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; }
     if root.kind == 6 : IconPanel   { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; }
-    if root.kind >= 10 : IconLayout { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; which: root.kind - 10; }
+    if root.kind >= 10 && root.kind < 40 : IconLayout { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; which: root.kind - 10; }
+    // 40+ is a registry tool icon (TOOL_ICON_BASE) — the Files row menu's "Open in Vim"
+    // rows. Drawn in the row's own ink rather than the tool brand: a menu is a list of
+    // actions, and four saturated logos down its left edge read as decoration, not as the
+    // one thing the eye should land on.
+    if root.kind >= 40 : ToolIcon { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; kind: root.kind; }
 }
 
 // One menu row: icon · label · shortcut · trailing (✓ / ›). Honors disabled + danger.

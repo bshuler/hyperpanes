@@ -895,6 +895,9 @@ impl ControlHost {
             // answer, not a lossy one: detection upgrades the pane the moment the adopted
             // session's output shows a known tool running in it.
             kind: PaneKind::Terminal,
+            // Likewise no conversation mark: the control model records none, and inventing
+            // one would resume a chat this pane was never in.
+            tool_session: None,
         };
 
         // Resolve the GUI tab index this pane belongs in (None ⇒ it needs a brand-new tab).
