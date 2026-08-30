@@ -143,6 +143,14 @@ pub fn run(salt: &str) -> io::Result<()> {
         .create(true)
         .truncate(false)
         .open(&names.lock)?;
+
+    // The pty drivers spawned by `SessionRegistry::create` need a Tokio runtime in scope.
+    // Built BEFORE the takeover deliberately: everything between `take_over` and `adopt_all`
+    // holds the incumbent's pty masters, and a fallible step in that window costs the user's
+    // terminals. Nothing that can fail belongs there if it can be done here instead.
+    let rt = tokio::runtime::Runtime::new()?;
+    let _guard = rt.enter();
+
     // Sessions inherited from an incumbent daemon (M1), adopted once the runtime is up.
     let mut inherited: Vec<(SessionSnapshot, OwnedFd)> = Vec::new();
     match lock.try_lock() {
@@ -181,10 +189,22 @@ pub fn run(salt: &str) -> io::Result<()> {
                 TAKEOVER_LOCK_BUDGET_HOLDING
             };
             if !acquire_when_released(&lock, budget) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    "the incumbent daemon handed over but did not exit",
-                ));
+                if inherited.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "the incumbent daemon handed over but did not exit",
+                    ));
+                }
+                // We are holding the incumbent's pty masters. Returning here would drop
+                // them — closing every master and SIGHUPing every shell the incumbent just
+                // entrusted to us, with no one left to hand them back to. The flock only
+                // excludes a COMPETING daemon, and the incumbent has already surrendered its
+                // sessions, so a lock we cannot take is worth strictly less than the user's
+                // terminals. Serve without it and say so.
+                dbg(
+                    "takeover: the incumbent handed over but never released the flock; \
+                     serving without it rather than dropping live sessions",
+                );
             }
         }
         Err(std::fs::TryLockError::Error(e)) => return Err(e),
@@ -204,10 +224,6 @@ pub fn run(salt: &str) -> io::Result<()> {
     // incumbent's unlink racing our remove) must not become session loss.
     let listener = bind_with_retry(&names.socket, !inherited.is_empty())?;
     restrict_socket_perms(&names.socket);
-
-    // The pty drivers spawned by `SessionRegistry::create` need a Tokio runtime in scope.
-    let rt = tokio::runtime::Runtime::new()?;
-    let _guard = rt.enter();
 
     // M3 lifecycle: shared shutdown flag + connection counter + the socket path (so the exit
     // path unlinks it). The idle monitor watches it; `serve`'s accept loop checks it.
@@ -245,21 +261,28 @@ fn bind_with_retry(
     socket: &Path,
     holding_sessions: bool,
 ) -> io::Result<std::os::unix::net::UnixListener> {
-    let deadline = Instant::now()
-        + if holding_sessions {
-            TAKEOVER_LOCK_BUDGET_HOLDING
-        } else {
-            Duration::from_millis(0)
-        };
+    let mut tries = 0u64;
     loop {
         match std::os::unix::net::UnixListener::bind(socket) {
             Ok(l) => return Ok(l),
-            Err(e) if Instant::now() < deadline => {
-                dbg(&format!("bind retry after {e}"));
+            // Not holding anything yet: a bind failure is just a failed start.
+            Err(e) if !holding_sessions => return Err(e),
+            // Holding the incumbent's pty masters. There is no error path here that is
+            // better than retrying: returning drops the descriptors and SIGHUPs every
+            // shell, and no caller can hand them back. So keep trying, indefinitely, and
+            // log once a second — a daemon stuck retrying a bind is recoverable by hand,
+            // a closed master is not.
+            Err(e) => {
+                if tries % 20 == 0 {
+                    dbg(&format!(
+                        "bind retry after {e} ({}s, holding handed-over sessions)",
+                        tries / 20
+                    ));
+                }
+                tries += 1;
                 let _ = std::fs::remove_file(socket);
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(e),
         }
     }
 }
@@ -285,26 +308,42 @@ fn take_over(socket: &Path) -> io::Result<Vec<(SessionSnapshot, OwnedFd)>> {
 
     let mut out = Vec::new();
     let mut messages = 0usize;
-    while let Some((payload, fds)) = recv_with_fds(&stream)? {
+    // A failure PART WAY THROUGH must not discard the sessions already in hand: the
+    // incumbent has relinquished them and is exiting, so every pair we drop here is a shell
+    // that dies. On any error we stop reading and keep what we have — a partial handoff
+    // beats a total loss, and the incumbent's remaining shells survive as adoptable orphans.
+    loop {
+        let (payload, fds) = match recv_with_fds(&stream) {
+            Ok(Some(m)) => m,
+            Ok(None) => break, // clean EOF: the incumbent sent everything
+            Err(e) => {
+                dbg(&format!(
+                    "takeover: handoff read failed after {} session(s): {e}",
+                    out.len()
+                ));
+                break;
+            }
+        };
         messages += 1;
-        let batch: HandoffPayload = serde_json::from_slice(&payload).map_err(io::Error::other)?;
+        let batch: HandoffPayload = match serde_json::from_slice(&payload) {
+            Ok(b) => b,
+            Err(e) => {
+                dbg(&format!("takeover: undecodable batch dropped: {e}"));
+                break;
+            }
+        };
         // Descriptors are owned from the moment they arrive, so a malformed batch drops
         // (closes) them rather than leaking. `fd_index` is per-message.
         let mut fds: Vec<Option<OwnedFd>> = fds.into_iter().map(Some).collect();
         for snap in batch.snapshots {
             match fds.get_mut(snap.fd_index).and_then(Option::take) {
                 Some(fd) => out.push((snap, fd)),
-                None => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "session {} claims descriptor {} of {}",
-                            snap.uid,
-                            snap.fd_index,
-                            fds.len()
-                        ),
-                    ))
-                }
+                None => dbg(&format!(
+                    "takeover: session {} claims descriptor {} of {}; skipped",
+                    snap.uid,
+                    snap.fd_index,
+                    fds.len()
+                )),
             }
         }
     }
