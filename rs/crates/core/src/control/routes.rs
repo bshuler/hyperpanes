@@ -330,6 +330,11 @@ struct DeviceMintOut {
 struct DeviceListItem {
     label: String,
     expires_at: Option<i64>,
+    /// The device's SSH public key, when it paired one. A public key is not a credential, so
+    /// unlike the bearer token it is safe to echo back — `hyperpanes devices` shows which
+    /// devices can also reach the embedded SSH server.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh_key: Option<String>,
 }
 
 /// Rewrite `device-tokens.json` from the live store (best-effort — the in-memory table is
@@ -343,10 +348,11 @@ fn persist_devices(shared: &Arc<Shared>) {
         .list_devices()
         .into_iter()
         .map(
-            |(token, label, expires_at)| crate::persistence::device_tokens::DeviceRecord {
-                label,
+            |(token, info)| crate::persistence::device_tokens::DeviceRecord {
+                label: info.label,
                 token,
-                expires_at,
+                expires_at: info.expires_at,
+                ssh_key: info.ssh_key,
             },
         )
         .collect();
@@ -356,8 +362,13 @@ fn persist_devices(shared: &Arc<Shared>) {
     }
 }
 
-/// POST /devices — mint a device token. Body: `{ label?, ttlMs? }` (label defaults to `device`,
-/// ttl omitted = never expires). Returns the token + reachable port/events for the QR.
+/// POST /devices — mint a device token. Body: `{ label?, ttlMs?, sshKey? }` (label defaults to
+/// `device`, ttl omitted = never expires). Returns the token + reachable port/events for the QR.
+///
+/// `sshKey` is an optional `authorized_keys`-form public key for the same device: it rides in the
+/// same record so the embedded SSH server accepts that key, and so one `hyperpanes revoke <label>`
+/// drops both doors at once. It is validated by the caller (`hyperpanes pair --ssh-key`); the
+/// server only stores what it is given, exactly as it does the label.
 async fn devices_mint(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -384,12 +395,19 @@ async fn devices_mint(
         .and_then(|b| b.get("ttlMs"))
         .and_then(Value::as_i64)
         .filter(|&t| t > 0);
+    let ssh_key = parsed
+        .as_ref()
+        .and_then(|b| b.get("sshKey"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
     let (token, expires_at) =
         shared
             .tokens
             .lock()
             .unwrap()
-            .mint_device(label.clone(), ttl, now_ms());
+            .mint_device(label.clone(), ttl, now_ms(), ssh_key);
     persist_devices(&shared);
     let port = shared.port();
     let (port_field, events) = if port != 0 {
@@ -425,7 +443,11 @@ async fn devices_list(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> 
         .unwrap()
         .list_devices()
         .into_iter()
-        .map(|(_token, label, expires_at)| DeviceListItem { label, expires_at })
+        .map(|(_token, info)| DeviceListItem {
+            label: info.label,
+            expires_at: info.expires_at,
+            ssh_key: info.ssh_key,
+        })
         .collect();
     items.sort_by(|a, b| a.label.cmp(&b.label));
     ok_json(json!({ "ok": true, "devices": items }))
@@ -1756,10 +1778,22 @@ mod golden {
     }
 
     async fn boot(allow_input: bool) -> Server {
+        boot_with_control_tag(allow_input, "golden").await
+    }
+
+    /// Same server, but with its `control.json` in its own directory — and therefore its own
+    /// `device-tokens.json`, which lives beside it (`persist_devices` derives the path with
+    /// `with_file_name`, so only a distinct *directory* isolates it). Any test that touches the
+    /// device table needs this: the tests run in parallel, and a shared table means one test
+    /// revoking — or two atomic rewrites racing over the same scratch file — is another test's
+    /// flake.
+    async fn boot_with_control_tag(allow_input: bool, tag: &str) -> Server {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         tokio::spawn(async move { while rx.recv().await.is_some() {} });
         let sessions = Arc::new(SessionManager::new(tx));
-        let control_file = std::env::temp_dir().join("hp-golden-control.json");
+        let dir = std::env::temp_dir().join(format!("hp-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("test scratch dir");
+        let control_file = dir.join("control.json");
         let speech_settings = std::env::temp_dir().join("hp-golden-speech.json");
         let shared = Shared::new(
             sessions,
@@ -1887,7 +1921,7 @@ mod golden {
 
     #[tokio::test]
     async fn devices_mint_list_revoke_full_authority_and_master_only() {
-        let s = boot(true).await;
+        let s = boot_with_control_tag(true, "devices-crud").await;
 
         // Master mints a device token; it comes back and carries full (unscoped) authority.
         let mint: Value = client()
@@ -1984,6 +2018,61 @@ mod golden {
         assert_eq!(list["devices"].as_array().unwrap().len(), 0);
 
         let _ = std::fs::remove_file(s.shared.control_file.with_file_name("device-tokens.json"));
+    }
+
+    #[tokio::test]
+    async fn a_paired_ssh_key_persists_with_the_device_and_dies_with_it() {
+        let s = boot_with_control_tag(true, "devices-sshkey").await;
+        let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIH0lTeStPhoNe phone";
+        let path = s.shared.control_file.with_file_name("device-tokens.json");
+        let _ = std::fs::remove_file(&path);
+
+        let mint: Value = client()
+            .post(format!("{}/devices", s.base))
+            .header("authorization", format!("Bearer {}", s.token))
+            .json(&json!({ "label": "iphone", "sshKey": key }))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(mint["ok"], json!(true));
+
+        // The key lands in the same on-disk record as the bearer token — that file IS the SSH
+        // server's per-device key list, so this is the whole of "one pairing, both doors".
+        let records = crate::persistence::device_tokens::load_from(&path);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].label, "iphone");
+        assert_eq!(records[0].ssh_key.as_deref(), Some(key));
+
+        // A public key is not a credential, so the listing may echo it (the token still may not).
+        let list: Value = client()
+            .get(format!("{}/devices", s.base))
+            .header("authorization", format!("Bearer {}", s.token))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(list["devices"][0]["sshKey"], json!(key));
+        assert!(list["devices"][0].get("token").is_none());
+
+        // One revocation closes both doors: the record, and with it the key, leaves the file.
+        let revoked: Value = client()
+            .delete(format!("{}/devices?label=iphone", s.base))
+            .header("authorization", format!("Bearer {}", s.token))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(revoked["revoked"], json!(1));
+        assert!(crate::persistence::device_tokens::load_from(&path).is_empty());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

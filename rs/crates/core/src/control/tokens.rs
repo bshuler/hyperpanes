@@ -53,10 +53,16 @@ fn to_hex(bytes: &[u8]) -> String {
 /// tokens these are PERSISTED (`device-tokens.json`) and reloaded on start, so a phone paired
 /// via `hyperpanes pair` survives a host restart — mirroring how the master token is itself
 /// persisted for remote binds.
+///
+/// `ssh_key` carries the same device's SSH public key when it paired one — see
+/// [`crate::persistence::device_tokens::DeviceRecord`]. The control server never authenticates
+/// with it; it only keeps it in the table so that persisting the table does not lose it and so
+/// that revoking the device revokes both credentials at once.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceInfo {
     pub label: String,
     pub expires_at: Option<i64>,
+    pub ssh_key: Option<String>,
 }
 
 /// The control server's token table: the unscoped master (written to `control.json`), any minted
@@ -160,22 +166,45 @@ impl TokenStore {
     /// Mint + register a persisted device token (unscoped, full authority), optionally TTL'd.
     /// Returns the token and its expiry (`now + ttl_ms` for a positive TTL, else `None`). The
     /// caller persists the table via [`Self::list_devices`] → `device-tokens.json`.
+    ///
+    /// `ssh_key`, when given, pairs the same device's SSH public key in the same record, so the
+    /// embedded SSH server (M3) accepts it and `revoke_device` drops both credentials together.
     pub fn mint_device(
         &mut self,
         label: String,
         ttl_ms: Option<i64>,
         now: i64,
+        ssh_key: Option<String>,
     ) -> (String, Option<i64>) {
         let token = random_token();
         let expires_at = ttl_ms.filter(|&t| t > 0).map(|t| now + t);
-        self.devices
-            .insert(token.clone(), DeviceInfo { label, expires_at });
+        self.devices.insert(
+            token.clone(),
+            DeviceInfo {
+                label,
+                expires_at,
+                ssh_key,
+            },
+        );
         (token, expires_at)
     }
 
     /// Register a device token loaded from `device-tokens.json` on start (mints nothing new).
-    pub fn add_device(&mut self, token: String, label: String, expires_at: Option<i64>) {
-        self.devices.insert(token, DeviceInfo { label, expires_at });
+    pub fn add_device(
+        &mut self,
+        token: String,
+        label: String,
+        expires_at: Option<i64>,
+        ssh_key: Option<String>,
+    ) {
+        self.devices.insert(
+            token,
+            DeviceInfo {
+                label,
+                expires_at,
+                ssh_key,
+            },
+        );
     }
 
     /// Revoke every device token carrying `label`. Returns how many were dropped (0 = no such
@@ -186,12 +215,13 @@ impl TokenStore {
         before - self.devices.len()
     }
 
-    /// Snapshot of paired devices as `(token, label, expires_at)`, for listing (`hyperpanes
-    /// devices`) and for persisting the table to `device-tokens.json`.
-    pub fn list_devices(&self) -> Vec<(String, String, Option<i64>)> {
+    /// Snapshot of paired devices as `(token, info)`, for listing (`hyperpanes devices`) and for
+    /// persisting the table to `device-tokens.json`. Every field of the record round-trips —
+    /// dropping one here would silently un-pair whatever it held on the next rewrite.
+    pub fn list_devices(&self) -> Vec<(String, DeviceInfo)> {
         self.devices
             .iter()
-            .map(|(tok, d)| (tok.clone(), d.label.clone(), d.expires_at))
+            .map(|(tok, d)| (tok.clone(), d.clone()))
             .collect()
     }
 }
@@ -283,7 +313,7 @@ mod tests {
     #[test]
     fn device_token_resolves_unscoped_full_authority() {
         let mut store = TokenStore::new();
-        let (tok, exp) = store.mint_device("iphone".into(), None, 0);
+        let (tok, exp) = store.mint_device("iphone".into(), None, 0, None);
         assert_eq!(exp, None);
         // A device token resolves like the master: unscoped (scope None) = full authority.
         let info = store.resolve(Some(&tok), 1000).expect("device resolves");
@@ -294,7 +324,7 @@ mod tests {
     #[test]
     fn device_token_ttl_expires_and_is_pruned() {
         let mut store = TokenStore::new();
-        let (tok, exp) = store.mint_device("ipad".into(), Some(500), 1000);
+        let (tok, exp) = store.mint_device("ipad".into(), Some(500), 1000, None);
         assert_eq!(exp, Some(1500));
         assert!(store.resolve(Some(&tok), 1499).is_some());
         assert!(store.resolve(Some(&tok), 1500).is_none()); // pruned on access at expiry
@@ -304,7 +334,7 @@ mod tests {
     #[test]
     fn add_device_reloads_a_persisted_token() {
         let mut store = TokenStore::new();
-        store.add_device("a".repeat(64), "restored".into(), None);
+        store.add_device("a".repeat(64), "restored".into(), None, None);
         let info = store
             .resolve(Some(&"a".repeat(64)), 0)
             .expect("reloaded resolves");
@@ -314,9 +344,9 @@ mod tests {
     #[test]
     fn revoke_device_drops_all_matching_labels_and_reports_count() {
         let mut store = TokenStore::new();
-        let (t1, _) = store.mint_device("phone".into(), None, 0);
-        let (t2, _) = store.mint_device("phone".into(), None, 0); // same label, re-paired
-        let (t3, _) = store.mint_device("laptop".into(), None, 0);
+        let (t1, _) = store.mint_device("phone".into(), None, 0, None);
+        let (t2, _) = store.mint_device("phone".into(), None, 0, None); // same label, re-paired
+        let (t3, _) = store.mint_device("laptop".into(), None, 0, None);
         assert_eq!(store.revoke_device("phone"), 2);
         assert_eq!(store.revoke_device("phone"), 0); // idempotent
         assert!(store.resolve(Some(&t1), 0).is_none());
@@ -325,21 +355,29 @@ mod tests {
     }
 
     #[test]
-    fn list_devices_snapshots_label_and_expiry() {
+    fn list_devices_snapshots_every_field_including_the_ssh_key() {
         let mut store = TokenStore::new();
-        let (tok, _) = store.mint_device("iphone".into(), Some(500), 1000);
+        let (tok, _) = store.mint_device(
+            "iphone".into(),
+            Some(500),
+            1000,
+            Some("ssh-ed25519 AAAAC3Nz phone".into()),
+        );
         let listed = store.list_devices();
         assert_eq!(listed.len(), 1);
-        let (t, label, expires_at) = &listed[0];
+        let (t, info) = &listed[0];
         assert_eq!(t, &tok);
-        assert_eq!(label, "iphone");
-        assert_eq!(*expires_at, Some(1500));
+        assert_eq!(info.label, "iphone");
+        assert_eq!(info.expires_at, Some(1500));
+        // The key must survive the round trip: `persist_devices` rewrites the whole file from
+        // this snapshot, so a field dropped here would silently un-pair the phone's SSH key.
+        assert_eq!(info.ssh_key.as_deref(), Some("ssh-ed25519 AAAAC3Nz phone"));
     }
 
     #[test]
     fn clear_also_forgets_devices() {
         let mut store = TokenStore::new();
-        let (tok, _) = store.mint_device("iphone".into(), None, 0);
+        let (tok, _) = store.mint_device("iphone".into(), None, 0, None);
         store.clear();
         assert!(store.resolve(Some(&tok), 0).is_none());
         assert!(store.list_devices().is_empty());
