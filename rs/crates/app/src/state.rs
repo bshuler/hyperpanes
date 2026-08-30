@@ -5860,6 +5860,11 @@ impl State {
         // The mark is read even when it isn't used, so a pane that came back by re-attach
         // still carries it into the NEXT snapshot instead of forgetting after one restart.
         let tool_session = ToolSessionMark::read(spec.meta.as_ref());
+        // Kept for the `PaneState` below: a tool pane never re-learns its directory the way
+        // a shell does — a process parked in a TUI stops emitting OSC 7 — so without this
+        // the pane's cwd stays empty, the next snapshot writes `cwd: null`, and the pane
+        // reads as belonging to no project at all.
+        let mut resume_cwd: Option<String> = None;
         if let Some(mark) = tool_session
             .as_ref()
             // A re-attached survivor is still IN the conversation, and the Claude block
@@ -5883,11 +5888,21 @@ impl State {
                 || spawn_args
                     .as_ref()
                     .is_some_and(|a| a.iter().any(|x| x == &mark.id));
-            if let Some((tool, extra)) = extra.filter(|_| !already) {
-                // Resume is directory-scoped for all three of them, so the conversation's
-                // own directory wins over the possibly-stale snapshot cwd — the same reason
-                // the Claude arm prefers `claude.cwd`.
+            // Resume is directory-scoped for all three of them, so the conversation's own
+            // directory wins over the possibly-stale snapshot cwd — the same reason the
+            // Claude arm prefers `claude.cwd`. Outside the `already` gate deliberately: that
+            // gate exists to stop a SECOND `--resume` being appended, and a pane opened from
+            // the session list is exactly the pane that trips it. Directing the cwd from the
+            // same `if` put every such pane back in `$HOME` on the next launch, where
+            // `--resume <id>` finds no project and the conversation is gone.
+            //
+            // Only for a tool that HAS a verified resume shape: one that starts fresh is an
+            // ordinary new pane and belongs wherever the snapshot put it.
+            if extra.is_some() {
                 spawn_cwd = Some(mark.cwd.clone());
+                resume_cwd = Some(mark.cwd.clone());
+            }
+            if let Some((tool, extra)) = extra.filter(|_| !already) {
                 match (&mut spawn_args, &mut spawn_command) {
                     // Direct-argv spawn: extend the argv.
                     (Some(a), _) => a.extend(extra),
@@ -5999,7 +6014,10 @@ impl State {
             font_dirty: false,
             // Restored view panes get their target back the same way (2); a restored pty pane
             // re-learns its cwd from the shell it just respawned.
-            cwd: is_view.then(|| spec.cwd.clone()).flatten(),
+            cwd: is_view
+                .then(|| spec.cwd.clone())
+                .flatten()
+                .or(resume_cwd),
             env: None,
             // The resolved shell program → its short header badge (computed once here);
             // suppressed for a view pane for the same reason as in `make_pane`.
@@ -7382,6 +7400,37 @@ mod tool_session_tests {
         );
         let p = st.active_tab().panes.last().unwrap();
         assert_eq!(p.startup, None);
+        // ...and it still comes back in the conversation's own directory. This is the pane
+        // the `already` gate is written for, so a cwd decision made inside that gate never
+        // runs for it: the pane relaunched in `$HOME`, where `--resume <id>` finds no
+        // project and the chat is gone. The snapshot cannot cover for it either — a tool
+        // parked in a TUI never emits OSC 7, so `spec.cwd` is `None`.
+        assert_eq!(p.cwd.as_deref(), Some("/tmp"));
+    }
+
+    // Restoring a tool pane re-spawns its pty, so this one needs a runtime.
+    #[tokio::test]
+    async fn a_resumed_pane_is_directed_at_the_conversations_directory_not_the_snapshots() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        // The snapshot disagrees with the mark. The mark wins: the id only resolves inside
+        // the project it was recorded in, and a stale tracked cwd is exactly the failure
+        // the pair was introduced to survive.
+        st.attach_panes_from_specs(
+            &m,
+            &[PaneSpec {
+                cwd: Some("/var".into()),
+                ..spec_with(&[
+                    (hyperpanes_core::tools::kind::META_KIND_KEY, "copilot"),
+                    (hyperpanes_core::tools::META_SESSION_KEY, "aaaa-bbbb-cccc"),
+                    (hyperpanes_core::tools::META_SESSION_CWD_KEY, "/tmp"),
+                ])
+            }],
+        );
+        assert_eq!(
+            st.active_tab().panes.last().unwrap().cwd.as_deref(),
+            Some("/tmp")
+        );
     }
 
     // Restoring a tool pane re-spawns its pty, so this one needs a runtime.
@@ -7400,7 +7449,11 @@ mod tool_session_tests {
                 (hyperpanes_core::tools::META_SESSION_CWD_KEY, "/tmp"),
             ])],
         );
-        assert_eq!(st.active_tab().panes.last().unwrap().startup, None);
+        let p = st.active_tab().panes.last().unwrap();
+        assert_eq!(p.startup, None);
+        // And it is NOT redirected into the mark's directory: nothing was resumed, so this
+        // is an ordinary new `aider` pane and belongs where the snapshot put it.
+        assert_eq!(p.cwd, None);
     }
 
     // Restoring a tool pane re-spawns its pty, so this one needs a runtime.
