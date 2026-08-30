@@ -595,7 +595,12 @@ export component LeftPanel inherits Rectangle {
         }
 
         if root.tree-open : Rectangle {
-            vertical-stretch: 1;
+            // The tree is the panel's primary view, so it carries twice the weight of a
+            // drawer and a floor of one whole tab group. Without the floor, four sections
+            // sharing the leftover space squeeze it under a single row's height, and
+            // `clip` then hides the tree entirely.
+            vertical-stretch: 2;
+            min-height: LeftPanelAdapter.tabs.length > 0 ? 88px : 0px;
             clip: true;
             Flickable {
                 width: 100%;
@@ -652,14 +657,15 @@ export component LeftPanel inherits Rectangle {
         }
 
         if root.lib-open && LeftPanelAdapter.workspaces.length == 0 : Text {
-            text: "No saved workspaces yet — the save button above writes this tab into the library.";
+            text: "No saved workspaces yet — save this tab with the button above.";
             color: Theme.subtext;
             font-size: 11px;
             wrap: word-wrap;
         }
 
-        if root.lib-open : Rectangle {
+        if root.lib-open && LeftPanelAdapter.workspaces.length > 0 : Rectangle {
             vertical-stretch: 1;
+            min-height: 44px;
             clip: true;
             Flickable {
                 width: 100%;
@@ -689,14 +695,15 @@ export component LeftPanel inherits Rectangle {
         }
 
         if root.sets-open && LeftPanelAdapter.sets.length == 0 : Text {
-            text: "No saved sets yet — the save button above stores every tab in this window as one group you can reopen together.";
+            text: "No saved sets yet — save every tab in this window as one group.";
             color: Theme.subtext;
             font-size: 11px;
             wrap: word-wrap;
         }
 
-        if root.sets-open : Rectangle {
+        if root.sets-open && LeftPanelAdapter.sets.length > 0 : Rectangle {
             vertical-stretch: 1;
+            min-height: 44px;
             clip: true;
             Flickable {
                 width: 100%;
@@ -723,14 +730,15 @@ export component LeftPanel inherits Rectangle {
         }
 
         if root.det-open && LeftPanelAdapter.detached.length == 0 : Text {
-            text: "No orphaned sessions. A session that outlives its window lands here, one click from being adopted back.";
+            text: "No orphaned sessions. A session that outlives its window lands here.";
             color: Theme.subtext;
             font-size: 11px;
             wrap: word-wrap;
         }
 
-        if root.det-open : Rectangle {
+        if root.det-open && LeftPanelAdapter.detached.length > 0 : Rectangle {
             vertical-stretch: 1;
+            min-height: 44px;
             clip: true;
             Flickable {
                 width: 100%;
