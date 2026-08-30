@@ -24,7 +24,7 @@
 //! feeds all land in `command::dispatch` (Seam #2).
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use hyperpanes_core::persistence::paths::{self as paths, data_dir};
@@ -532,6 +532,157 @@ fn describe_session(bytes: u64, last: Option<u64>, now: u64) -> String {
     }
 }
 
+// ===== the tool modes: one tool's resumable sessions, across every project =====
+//
+// The panel's non-workspace modes (D9). Unlike the sidebar's per-project Claude list, this
+// scans the tool's WHOLE store, so it is far too expensive for the UI thread — it goes
+// through `history_scan`'s thread like the other two enumerations, and this module only
+// caches and shapes what comes back.
+//
+// The resumability verdict is decided on that thread, once per scan, and travels with the
+// row. The alternative — asking the provider on every frame — would re-run binary detection
+// and a `stat` per row per tick, and the answer would still be the same one.
+
+/// One row of a tool mode, already answered: what it is, and whether a click can act on it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScannedSession {
+    /// The tool's own resume key (a Claude session uuid) — what the UI sends back on click.
+    pub id: String,
+    /// The project heading this row sits under (the full path; the view shortens it).
+    pub project: PathBuf,
+    /// One-line summary of the conversation.
+    pub summary: String,
+    /// The branch the conversation was on, its message count, its age — the detail line.
+    /// Replaced by the blocked reason when there is one, so a row always says something true.
+    pub detail: String,
+    /// `Some(shell line)` when a click can resume it; `None` when the row is blocked.
+    pub command: Option<String>,
+    /// The cwd that shell line must run in. Empty when blocked.
+    pub cwd: PathBuf,
+}
+
+impl ScannedSession {
+    /// Whether a click on this row does anything.
+    pub fn resumable(&self) -> bool {
+        self.command.is_some()
+    }
+}
+
+thread_local! {
+    /// The last completed scan per tool id, plus when it landed (epoch ms) so
+    /// [`tool_sessions`] can age it out. Process-wide for the same reason [`LIB_CACHE`] is:
+    /// a tool's history is one store on disk and every window sees the same rows.
+    static TOOL_CACHE: RefCell<HashMap<String, (u64, Vec<ScannedSession>)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// How long a completed scan is served before the projection asks for a fresh one. A warm
+/// re-scan re-parses only changed transcripts (~8ms on a 132-session store), so this is
+/// about not spamming the scan thread, not about the cost of the scan itself. Long enough
+/// that switching modes back and forth is free; short enough that a conversation you just
+/// had shows up without restarting the app.
+pub const TOOL_SCAN_TTL_MS: u64 = 20_000;
+
+/// Run one provider's scan and shape every row, deciding resumability as it goes. Called on
+/// the scan thread (`history_scan`), never on the UI thread — it walks a whole transcript
+/// store and stats every project directory. The provider carries the human's binary
+/// overrides (it was built with them), so the verdict here honours them.
+pub fn scan_with(
+    provider: &mut dyn hyperpanes_core::tools::history::SessionProvider,
+) -> Vec<ScannedSession> {
+    use hyperpanes_core::tools::history::ResumePlan;
+    let now = crate::glow::now_epoch_ms();
+    let sessions = provider.scan();
+    sessions
+        .iter()
+        .map(|s| {
+            let (detail, command, cwd) = match provider.resume(s) {
+                ResumePlan::Ready(cmd) => (session_detail(s, now), Some(cmd.shell_line()), cmd.cwd),
+                // The reason REPLACES the detail line rather than being appended to it: a
+                // row that cannot be resumed has one thing worth saying, and the panel is
+                // narrow enough that a second clause would elide it away.
+                ResumePlan::Blocked(b) => (b.reason(), None, PathBuf::new()),
+            };
+            ScannedSession {
+                id: s.id.clone(),
+                project: s.project.clone(),
+                summary: session_label(s),
+                detail,
+                command,
+                cwd,
+            }
+        })
+        .collect()
+}
+
+/// The row's first line: the transcript's summary, its first user message, or — when a
+/// transcript carries neither — the head of its id, so a row is never blank.
+fn session_label(s: &hyperpanes_core::tools::history::ToolSession) -> String {
+    for candidate in [s.summary.trim(), s.first_user.trim()] {
+        if !candidate.is_empty() {
+            return candidate.chars().take(120).collect();
+        }
+    }
+    format!("session {}", s.id.chars().take(8).collect::<String>())
+}
+
+/// The row's second line for a resumable session: branch · messages · age. Each part is
+/// dropped when unknown rather than shown empty.
+fn session_detail(s: &hyperpanes_core::tools::history::ToolSession, now: u64) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(b) = s.branch.as_deref().filter(|b| !b.is_empty()) {
+        parts.push(b.to_string());
+    }
+    if s.message_count > 0 {
+        parts.push(format!(
+            "{} message{}",
+            s.message_count,
+            if s.message_count == 1 { "" } else { "s" }
+        ));
+    }
+    let rel = crate::sidebar::relative_time(s.started_at, now);
+    if !rel.is_empty() {
+        parts.push(rel);
+    }
+    parts.join(" · ")
+}
+
+/// Store a finished tool scan (called from `history_scan::drain`).
+pub fn apply_tool_sessions(tool_id: &str, rows: Vec<ScannedSession>) {
+    let now = crate::glow::now_epoch_ms();
+    TOOL_CACHE.with(|c| {
+        c.borrow_mut().insert(tool_id.to_string(), (now, rows));
+    });
+}
+
+/// The cached rows for `tool_id`, requesting a background (re-)scan when there are none yet
+/// or the last one has aged past [`TOOL_SCAN_TTL_MS`]. Never touches the disk itself: a miss
+/// returns empty and the rows appear a tick after the scan lands.
+pub fn tool_sessions(
+    tool_id: &str,
+    overrides: &std::collections::BTreeMap<String, String>,
+    now_ms: u64,
+) -> Vec<ScannedSession> {
+    let (stale, rows) = TOOL_CACHE.with(|c| match c.borrow().get(tool_id) {
+        Some((at, rows)) => (now_ms.saturating_sub(*at) > TOOL_SCAN_TTL_MS, rows.clone()),
+        None => (true, Vec::new()),
+    });
+    if stale {
+        crate::history_scan::request_tool_sessions(tool_id, overrides.clone());
+    }
+    rows
+}
+
+/// One cached row by (tool, resume id) — what the resume click looks up. By id rather than
+/// by index so a click can never act on the wrong row after a re-scan reorders the list.
+pub fn tool_session(tool_id: &str, id: &str) -> Option<ScannedSession> {
+    TOOL_CACHE.with(|c| {
+        c.borrow()
+            .get(tool_id)
+            .and_then(|(_, rows)| rows.iter().find(|r| r.id == id).cloned())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -775,5 +926,174 @@ mod tests {
         // a directory that doesn't exist is empty, not a panic
         assert!(scan_sets(&dir.join("nope")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- tool modes: the per-tool resumable-session list -------------------------------
+
+    use hyperpanes_core::claude_history::{HistorySource, ProjectOrigin};
+    use hyperpanes_core::tools::history::{
+        ResumeBlocked, ResumeCommand, ResumePlan, SessionProvider, ToolSession,
+    };
+
+    /// A session with everything blank but the fields a test names. `started_at` stays `None`
+    /// so the detail line is deterministic — the age part is dropped rather than moving with
+    /// the wall clock `scan_with` reads.
+    fn sess(id: &str, project: &str) -> ToolSession {
+        ToolSession {
+            id: id.to_string(),
+            source: HistorySource::Claude,
+            project: PathBuf::from(project),
+            project_origin: ProjectOrigin::TranscriptExact,
+            branch: None,
+            started_at: None,
+            summary: String::new(),
+            first_user: String::new(),
+            message_count: 0,
+            full_text: String::new(),
+        }
+    }
+
+    /// Answers `scan` from a fixed list and `resume` from a fixed verdict per id, so the
+    /// shaping in `scan_with` can be checked without a transcript store on disk.
+    struct FakeProvider {
+        rows: Vec<ToolSession>,
+        blocked: Vec<String>,
+    }
+
+    impl SessionProvider for FakeProvider {
+        fn id(&self) -> &'static str {
+            "fake"
+        }
+        fn scan(&mut self) -> Vec<ToolSession> {
+            self.rows.clone()
+        }
+        fn resume(&self, session: &ToolSession) -> ResumePlan {
+            if self.blocked.contains(&session.id) {
+                return ResumePlan::Blocked(ResumeBlocked::ToolNotInstalled { tool_id: "fake" });
+            }
+            ResumePlan::Ready(ResumeCommand {
+                program: PathBuf::from("/opt/bin/fake"),
+                args: vec!["--resume".into(), session.id.clone()],
+                cwd: session.project.clone(),
+            })
+        }
+    }
+
+    #[test]
+    fn session_label_falls_back_summary_then_prompt_then_id() {
+        let mut s = sess("abcdef0123456789", "/p");
+        s.summary = "  Fix the parser  ".into();
+        s.first_user = "hello".into();
+        assert_eq!(session_label(&s), "Fix the parser");
+
+        // no summary → the opening prompt
+        s.summary = "   ".into();
+        assert_eq!(session_label(&s), "hello");
+
+        // neither → a row is still never blank
+        s.first_user = String::new();
+        assert_eq!(session_label(&s), "session abcdef01");
+    }
+
+    #[test]
+    fn session_detail_drops_unknown_parts_and_agrees_on_number() {
+        let now = 10_000_000u64;
+        let mut s = sess("id", "/p");
+
+        // nothing known at all → an empty line rather than " ·  · "
+        assert_eq!(session_detail(&s, now), "");
+
+        s.message_count = 1;
+        assert_eq!(session_detail(&s, now), "1 message");
+
+        s.message_count = 4;
+        s.branch = Some("main".into());
+        assert_eq!(session_detail(&s, now), "main · 4 messages");
+
+        // an empty branch string is "unknown", not a blank leading part
+        s.branch = Some(String::new());
+        assert_eq!(session_detail(&s, now), "4 messages");
+
+        s.branch = Some("main".into());
+        s.started_at = Some(now - 2 * 60 * 60 * 1000);
+        assert_eq!(session_detail(&s, now), "main · 4 messages · 2h ago");
+    }
+
+    #[test]
+    fn scan_with_answers_resumability_once_per_row() {
+        let mut ready = sess("aaaa1111", "/work/app");
+        ready.summary = "ship it".into();
+        ready.branch = Some("main".into());
+        ready.message_count = 3;
+        let mut gone = sess("bbbb2222", "/work/old");
+        gone.summary = "old thread".into();
+        gone.message_count = 9;
+
+        let mut p = FakeProvider {
+            rows: vec![ready, gone],
+            blocked: vec!["bbbb2222".into()],
+        };
+        let rows = scan_with(&mut p);
+        assert_eq!(rows.len(), 2);
+
+        // ready: keeps its own detail line, and gains a command to spawn
+        assert!(rows[0].resumable());
+        assert_eq!(rows[0].summary, "ship it");
+        assert_eq!(rows[0].detail, "main · 3 messages");
+        assert_eq!(
+            rows[0].command.as_deref(),
+            Some("/opt/bin/fake --resume aaaa1111")
+        );
+        assert_eq!(rows[0].cwd, PathBuf::from("/work/app"));
+
+        // blocked: the reason REPLACES the detail, and there is nothing to click
+        assert!(!rows[1].resumable());
+        assert_eq!(rows[1].command, None);
+        assert_eq!(rows[1].cwd, PathBuf::new());
+        assert_ne!(rows[1].detail, "9 messages");
+        assert_eq!(
+            rows[1].detail,
+            ResumeBlocked::ToolNotInstalled { tool_id: "fake" }.reason()
+        );
+    }
+
+    #[test]
+    fn applied_rows_are_served_from_cache_and_looked_up_by_id() {
+        let rows = vec![
+            ScannedSession {
+                id: "one".into(),
+                project: PathBuf::from("/work/app"),
+                summary: "first".into(),
+                detail: "main".into(),
+                command: Some("/opt/bin/fake --resume one".into()),
+                cwd: PathBuf::from("/work/app"),
+            },
+            ScannedSession {
+                id: "two".into(),
+                project: PathBuf::from("/work/app"),
+                summary: "second".into(),
+                detail: "gone".into(),
+                command: None,
+                cwd: PathBuf::new(),
+            },
+        ];
+        apply_tool_sessions("cachetest", rows.clone());
+
+        // Served from the cache: `now` is read back off the entry, so asking inside the TTL
+        // must not enqueue a scan (this test would otherwise start the scan thread).
+        let at = TOOL_CACHE.with(|c| c.borrow().get("cachetest").map(|(at, _)| *at).unwrap());
+        let overrides = std::collections::BTreeMap::new();
+        assert_eq!(tool_sessions("cachetest", &overrides, at), rows);
+        assert_eq!(
+            tool_sessions("cachetest", &overrides, at + TOOL_SCAN_TTL_MS),
+            rows
+        );
+
+        // By id, never by index — a re-scan reorders rows and a click must still land right.
+        assert_eq!(tool_session("cachetest", "two").unwrap().summary, "second");
+        assert!(!tool_session("cachetest", "two").unwrap().resumable());
+        assert!(tool_session("cachetest", "one").unwrap().resumable());
+        assert!(tool_session("cachetest", "nope").is_none());
+        assert!(tool_session("othertool", "one").is_none());
     }
 }

@@ -3035,6 +3035,60 @@ impl App {
                 });
         }
 
+        // Resume a session from a TOOL mode of the left panel (D9). The row carries the
+        // tool's own resume key, so this is a pure cache lookup: the shell line, the cwd and
+        // the "can this even be resumed" verdict were all decided on the scan thread, and
+        // this handler never touches the disk. A blocked row cannot be clicked in the UI,
+        // and `command == None` here refuses it a second time — the two sides of that gate
+        // are far apart, and a click racing a re-scan must not spawn a shell in a directory
+        // we could not verify.
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_resume_session(move |sid| {
+                    let Some(w) = app.window_by_id(id) else {
+                        return;
+                    };
+                    // Which tool's list is showing. Read from the same one-pass filter the
+                    // projection builds the strip from (paneview::resync), under a read-only
+                    // borrow dropped before dispatch (borrow rule #18).
+                    let mode = w.app.global::<crate::LeftPanelAdapter>().get_mode();
+                    let tool_id = {
+                        let st = w.state.borrow();
+                        st.settings
+                            .tool_favorites
+                            .iter()
+                            .filter_map(|f| hyperpanes_core::tools::by_id(f))
+                            .map(|t| t.id)
+                            .nth((mode as usize).wrapping_sub(1))
+                    };
+                    let Some(tool_id) = tool_id else { return };
+                    let Some(row) = crate::leftpanel::tool_session(tool_id, &sid) else {
+                        return;
+                    };
+                    let Some(command) = row.command else { return };
+                    let opts = NewPaneOpts {
+                        label: Some(tool_id.to_string()),
+                        cwd: Some(row.cwd.display().to_string()),
+                        command: Some(command),
+                        shell: None,
+                        accent: None,
+                        show_frame: None,
+                        show_dot: None,
+                        env: None,
+                        startup: None,
+                        // Said outright rather than sniffed back out of the command: the
+                        // shell line starts with an ABSOLUTE path (the resolved binary,
+                        // possibly a human's own override), which is exactly the shape
+                        // `PaneKind::for_command` cannot be relied on to recognise.
+                        kind: Some(hyperpanes_core::tools::PaneKind::Tool(tool_id.to_string())),
+                    };
+                    app.run_command(&w, Command::SubmitNewPane(opts));
+                });
+        }
+
         // The Reminder flyout's Custom-duration parser — a PURE bridge (no state access,
         // no borrows): the inline input validates per keystroke and, on Enter, encodes the
         // minutes through the frozen `pick(int)` channel (decoded in `State::ctx_command`).

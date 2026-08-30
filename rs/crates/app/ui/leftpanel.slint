@@ -600,9 +600,12 @@ component SessionItemView inherits Rectangle {
             border-radius: 5px;
             background: ia.has-hover ? Theme.surface2 : transparent;
             ia := TipArea {
-                tip: "Resume this session";
-                mouse-cursor: pointer;
-                clicked => { root.activate(); }
+                // A blocked row explains itself instead of pretending it will work: the
+                // reason is already on the detail line, and the tip repeats it because the
+                // detail elides in a narrow panel.
+                tip: root.item.blocked ? root.item.detail : "Resume this session";
+                mouse-cursor: root.item.blocked ? default : pointer;
+                clicked => { if (!root.item.blocked) { root.activate(); } }
             }
             HorizontalLayout {
                 padding-left: 8px;
@@ -616,14 +619,16 @@ component SessionItemView inherits Rectangle {
                         width: 6px;
                         height: 6px;
                         border-radius: 3px;
-                        background: ia.has-hover ? root.brand : Theme.faint;
+                        background: root.item.blocked
+                            ? Theme.faint
+                            : (ia.has-hover ? root.brand : Theme.faint);
                     }
                 }
                 VerticalLayout {
                     alignment: center;
                     Text {
                         text: root.item.label;
-                        color: Theme.text;
+                        color: root.item.blocked ? Theme.subtext : Theme.text;
                         font-size: 12px;
                         overflow: elide;
                     }

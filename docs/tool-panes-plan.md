@@ -786,3 +786,62 @@ nothing. The ambiguity test needs two tokens naming two different tools (`"claud
 **Gate: MET.** `cargo check --manifest-path rs/crates/app/Cargo.toml --bins` green;
 `cargo test --bins` 258 passed / 0 failed (T3 added 8, plus the glow widening). Landed as
 `5222ed6` and the glow follow-up.
+
+### Wave 1 · A4 (D9 `SessionProvider`) + the panel wiring — 2026-08-30
+
+**Status: landed, green.**
+
+`core/src/tools/history/` is the trait and the Claude reader behind it: `ToolSession`,
+`ResumeCommand` (+ `shell_line`), `ResumeBlocked` (+ `reason`), `ResumePlan`,
+`SessionProvider`, and the three shared helpers every provider needs — `sort_for_panel`,
+`resolve_program`, `check_project`. `claude_history.rs` grew the cross-project half
+(`all_projects`, `SessionCache::scan_all`, `HistorySource`, `ProjectOrigin`).
+
+Three things the plan had wrong or had not thought about, all of which changed the code:
+
+**The project path is not simply the transcript's `cwd`.** The Claude store encodes a
+project directory as `-Users-me-src-my-app`, and that encoding is *lossy* — a hyphen inside
+a directory name and a path separator encode identically, so it cannot be decoded back.
+The real path is recovered from the transcript's own `cwd` by *re-encoding* it and checking
+it matches the directory name, or by probing the filesystem. `ProjectOrigin` records which
+of those happened (`TranscriptExact` > `ProbedExact` > `TranscriptCwd` > `DecodedUnverified`
+— declaration order IS strength order), and `check_project` refuses to build a resume plan
+on anything that is not `is_exact()`. A greyed row beats a pane that resumes a conversation
+against the wrong tree. Also: the `cwd` can sit far past the summary scan window (line 187
+in one real transcript), so the reader cannot stop at `SUMMARY_SCAN_LINES`.
+
+**The scan cannot run on the UI thread, and cannot run per frame.** Measured on the real
+store (debug build, 40 project dirs / 37 with transcripts / 132 sessions / 109 resumable):
+cold **4.08 s**, warm **8.14 ms**. Cold rules out the UI thread; warm rules out asking every
+tick. So: `history_scan.rs` gained `Job::ToolSessions(tool_id, overrides)` and owns one
+long-lived provider per tool (its mtime/size fingerprints survive, so re-scans stay warm),
+keyed by the overrides it was built with and rebuilt when those change. `leftpanel.rs` owns
+a thread-local `TOOL_CACHE` with a 20 s TTL; the projection serves from it and only ever
+*requests* a rescan.
+
+**Resumability is decided once per scan, on the scan thread.** Asking the provider per row
+per frame would re-run binary detection and a `stat` per row for an answer that does not
+change. The verdict travels with the row as `command: Option<String>`, so the click handler
+is a pure cache lookup that never touches the disk. A blocked row's reason *replaces* its
+detail line rather than being appended — the panel is ~260 px, and a second clause elides
+the reason away. `LeftSessionItem` gained `blocked: bool`, and the row is refused twice
+(the Slint `clicked` guard, and the `command == None` check in `app.rs`) because those two
+gates are far apart and a click racing a rescan must not spawn a shell in an unverified
+directory. `tool_session` looks a row up **by id, never by index**, so a re-scan that
+reorders the list cannot make a click land on the wrong conversation.
+
+The resume dispatch sets `kind: Some(PaneKind::Tool(tool_id))` explicitly: the shell line
+starts with an absolute resolved path (`resolve_program` goes through `tools::detect` so a
+human's override wins), and `PaneKind::for_command` cannot be relied on to recognise that.
+
+Also fixed on the way through: the `rs` workspace's **test target had not compiled since
+Wave 0** — `PaneInfo` grew `pub kind` without updating `tests/control_parity.rs` and
+`tests/readmodel_publish.rs`, so `cargo test` failed to build the whole workspace. And
+`registry`'s "every tool has detect tokens" assertion was wrong for `edit`, whose name is an
+ordinary English word: a wrong badge on "Edit config" is worse than a missing one, so it is
+recognised by binary name only, with the exemption spelled out in `TOKENLESS_BY_DESIGN`
+so a *forgotten* token list still fails.
+
+**Gate: MET.** `cargo test --manifest-path rs/Cargo.toml` — 901 lib tests, all 10
+integration targets ok. `cargo test --manifest-path rs/crates/app/Cargo.toml --bins` green.
+Landed as `1351616` (test-target fixes), `5eb23a8` (the provider), and the panel wiring.

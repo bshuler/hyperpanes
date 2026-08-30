@@ -15,12 +15,14 @@
 //! enqueues a job.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 use hyperpanes_core::claude_history::{ClaudeSession, SessionCache};
+use hyperpanes_core::tools::history::SessionProvider;
 
+use crate::leftpanel::{self, ScannedSession};
 use crate::sidebar::{self, WorktreeRow};
 
 /// One scan request, sent UI → scanner thread.
@@ -29,12 +31,18 @@ enum Job {
     Sessions(String),
     /// Re-run `git worktree list --porcelain` in this repo.
     Worktrees(String),
+    /// Re-scan EVERY project for one tool's resumable sessions — the left panel's tool
+    /// modes, not the sidebar's per-project list. Carries the human's `tool id -> path`
+    /// overrides because the resumability verdict is decided here, on this thread, once
+    /// per scan rather than once per frame on the UI thread.
+    ToolSessions(String, BTreeMap<String, String>),
 }
 
 /// One finished scan, sent scanner thread → UI (drained by [`drain`]).
 enum ScanResult {
     Sessions(String, Vec<ClaudeSession>),
     Worktrees(String, Vec<WorktreeRow>),
+    ToolSessions(String, Vec<ScannedSession>),
 }
 
 /// The UI-thread handle: the job sender plus the result receiver the pump drains.
@@ -50,6 +58,8 @@ thread_local! {
     static PENDING_SESS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
     /// Repo paths with a worktree scan in flight.
     static PENDING_WT: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+    /// Tool ids with a whole-store session scan in flight.
+    static PENDING_TOOL: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 /// Spawn the scanner thread and return its UI-side handle. The thread owns one
@@ -62,6 +72,16 @@ fn spawn_scanner() -> Scanner {
         .name("history-scan".to_string())
         .spawn(move || {
             let mut caches: HashMap<String, SessionCache> = HashMap::new();
+            // One provider per tool, kept for the life of the thread: the mtime/size
+            // fingerprints live inside it, so a re-scan re-parses only the transcripts that
+            // changed. On this machine that is the difference between ~4s and ~8ms.
+            //
+            // Keyed with the overrides it was BUILT with, and rebuilt when they change: a
+            // provider decides resumability with the binary it was handed, so a human
+            // editing the path to their `claude` must not keep getting the old verdict. That
+            // costs one cold re-scan, which is the right price for a rare, deliberate edit.
+            type Cached = (BTreeMap<String, String>, Box<dyn SessionProvider>);
+            let mut providers: HashMap<String, Cached> = HashMap::new();
             while let Ok(job) = job_rx.recv() {
                 let res = match job {
                     Job::Sessions(root) => {
@@ -76,6 +96,25 @@ fn spawn_scanner() -> Scanner {
                         let rows = sidebar::enumerate_worktrees(&repo);
                         ScanResult::Worktrees(repo, rows)
                     }
+                    Job::ToolSessions(tool_id, overrides) => {
+                        let stale = providers
+                            .get(&tool_id)
+                            .is_some_and(|(built_with, _)| *built_with != overrides);
+                        if stale {
+                            providers.remove(&tool_id);
+                        }
+                        let entry = match providers.entry(tool_id.clone()) {
+                            std::collections::hash_map::Entry::Occupied(e) => Some(e.into_mut()),
+                            std::collections::hash_map::Entry::Vacant(e) => {
+                                provider_for(&tool_id, &overrides)
+                                    .map(|p| e.insert((overrides.clone(), p)))
+                            }
+                        };
+                        let rows = entry
+                            .map(|(_, p)| leftpanel::scan_with(p.as_mut()))
+                            .unwrap_or_default();
+                        ScanResult::ToolSessions(tool_id, rows)
+                    }
                 };
                 if res_tx.send(res).is_err() {
                     break;
@@ -86,6 +125,23 @@ fn spawn_scanner() -> Scanner {
     Scanner {
         tx: job_tx,
         rx: res_rx,
+    }
+}
+
+/// The provider serving `tool_id`, or `None` for a tool that has no history provider yet
+/// (it still gets a mode in the strip — the panel shows its empty state rather than the
+/// tool vanishing from a list the human curated).
+fn provider_for(
+    tool_id: &str,
+    overrides: &BTreeMap<String, String>,
+) -> Option<Box<dyn SessionProvider>> {
+    match tool_id {
+        hyperpanes_core::tools::history::claude::TOOL_ID => Some(Box::new(
+            hyperpanes_core::tools::history::claude::ClaudeProvider::with_overrides(
+                overrides.clone(),
+            ),
+        )),
+        _ => None,
     }
 }
 
@@ -110,6 +166,18 @@ pub fn request_worktrees(repo_path: &str) {
     }
 }
 
+/// Ask for a (re-)scan of `tool_id`'s resumable sessions across every project. No-op while
+/// one is already in flight for that tool — the projection asks on every dirty tick the
+/// panel is showing that mode, and only the first ask enqueues a job.
+pub fn request_tool_sessions(tool_id: &str, overrides: BTreeMap<String, String>) {
+    let fresh = PENDING_TOOL.with(|p| p.borrow_mut().insert(tool_id.to_string()));
+    if fresh {
+        SCANNER.with(|s| {
+            let _ = s.tx.send(Job::ToolSessions(tool_id.to_string(), overrides));
+        });
+    }
+}
+
 /// Drain every finished scan into the sidebar caches. Returns `true` when anything
 /// landed — the caller (the pump) marks the state dirty so the projection re-runs and
 /// the flyout refreshes. Called every tick; an empty channel is a cheap `try_recv` miss.
@@ -130,6 +198,12 @@ pub fn drain() -> bool {
                         p.borrow_mut().remove(&repo);
                     });
                     sidebar::apply_worktrees(&repo, rows);
+                }
+                ScanResult::ToolSessions(tool_id, rows) => {
+                    PENDING_TOOL.with(|p| {
+                        p.borrow_mut().remove(&tool_id);
+                    });
+                    leftpanel::apply_tool_sessions(&tool_id, rows);
                 }
             }
         }

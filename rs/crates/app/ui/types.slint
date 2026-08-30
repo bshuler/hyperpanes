@@ -409,6 +409,10 @@ export struct LeftSessionItem {
     group: string,
     label: string,
     detail: string,
+    // The row cannot be resumed (the project can't be verified, the tool isn't installed).
+    // `detail` carries the sentence saying why, so the row still teaches rather than just
+    // greying out. Decided once per scan on the background thread — never per frame.
+    blocked: bool,
 }
 
 // The controller ↔ left-panel bridge. A GLOBAL (not AppWindow props) so the feature stays
