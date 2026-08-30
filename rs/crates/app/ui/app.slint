@@ -16,6 +16,7 @@ import { PaneView } from "paneview.slint";
 import { OverlayLayer } from "overlays.slint";
 import { SidebarRail } from "sidebar.slint";
 import { ContextMenu, ReminderCustom } from "contextmenu.slint";
+import { TipHost, TipArea } from "tooltip.slint";
 import { KeyMsg, HiRect } from "@widgets";
 
 // Re-export the row structs so the Rust side (slint::include_modules!) can build them.
@@ -412,7 +413,7 @@ export component AppWindow inherits Window {
             drop-shadow-blur: 24px;
             drop-shadow-color: Theme.scrim;
             drop-shadow-offset-y: 8px;
-            tta := TouchArea { clicked => { RemindersAdapter.restore(t.uid); } }
+            tta := TipArea { tip: "Bring this parked pane back now"; clicked => { RemindersAdapter.restore(t.uid); } }
             tbody := HorizontalLayout {
                 padding: 12px;
                 spacing: 10px;
@@ -461,7 +462,10 @@ export component AppWindow inherits Window {
                             fill: transparent;
                             commands: "M 4 4 L 12 12 M 12 4 L 4 12";
                         }
-                        xta := TouchArea { clicked => { RemindersAdapter.toast-dismiss(t.uid); } }
+                        xta := TipArea {
+                            tip: "Dismiss — leave the pane parked";
+                            clicked => { RemindersAdapter.toast-dismiss(t.uid); }
+                        }
                     }
                 }
             }
@@ -697,4 +701,9 @@ export component AppWindow inherits Window {
             }
         }
     }
+
+    // ===== hover tooltips =====
+    // Last child, so the bubble paints over the panes, the sidebar and the overlays. It
+    // owns no TouchArea, so it never steals a click from what it is describing.
+    TipHost { }
 }

@@ -18,6 +18,7 @@ import { KeyMsg } from "@widgets";
 import { NewPaneDialog } from "newpane.slint";
 import { AddProjectDialog } from "addproject.slint";
 import { NewGoalDialog } from "newgoal.slint";
+import { TipArea } from "tooltip.slint";
 
 // A drawn checkmark (vector, so it renders regardless of the UI font's glyph coverage),
 // used to mark the active option in the pickers. Same Path-with-commands pattern the window
@@ -1151,7 +1152,10 @@ export component OverlayLayer inherits Rectangle {
                                                 IconUnbind {
                                                     ink: uta.has-hover ? Theme.danger : Theme.subtext;
                                                 }
-                                                uta := TouchArea { clicked => { root.pref-unbind(kb.id); } }
+                                                uta := TipArea {
+                                                    tip: "Unbind — leave this action with no shortcut";
+                                                    clicked => { root.pref-unbind(kb.id); }
+                                                }
                                             }
                                         }
                                         // ---- ✎ rebind / × cancel (editable rows only) ----
@@ -1168,7 +1172,8 @@ export component OverlayLayer inherits Rectangle {
                                                 if !kb.capturing : IconEdit {
                                                     ink: eta.has-hover ? Theme.text : Theme.subtext;
                                                 }
-                                                eta := TouchArea {
+                                                eta := TipArea {
+                                                    tip: kb.capturing ? "Cancel — keep the current shortcut" : "Rebind — press the new shortcut next";
                                                     clicked => {
                                                         if (kb.capturing) {
                                                             root.pref-cancel-rebind();
@@ -1190,7 +1195,10 @@ export component OverlayLayer inherits Rectangle {
                                                 IconReset {
                                                     ink: rta.has-hover ? Theme.text : Theme.subtext;
                                                 }
-                                                rta := TouchArea { clicked => { root.pref-reset-binding(kb.id); } }
+                                                rta := TipArea {
+                                                    tip: "Reset this shortcut to its default";
+                                                    clicked => { root.pref-reset-binding(kb.id); }
+                                                }
                                             }
                                         }
                                     }

@@ -21,6 +21,7 @@
 
 import { Theme } from "theme.slint";
 import { ProjectItem, WorktreeRow, ClaudeSessionItem, HistoryUi, ReminderItem, RemindersAdapter } from "types.slint";
+import { TipArea } from "tooltip.slint";
 
 // "+" quick-pane glyph (two crossed bars — font-independent). `bar` sets the cross size
 // (13px rail default; smaller for inline/submenu buttons like the PROJECTS-header ＋).
@@ -238,7 +239,10 @@ component WorktreeRowView inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                     ink: !root.deletable ? Theme.faint : (tta.has-hover ? #ffffff : Theme.subtext);
                 }
-                tta := TouchArea {
+                tta := TipArea {
+                    tip: root.deletable ? "Delete this worktree from disk"
+                       : root.wt.is-main ? "The main checkout can't be removed"
+                       : "This worktree is locked — unlock it in git first";
                     mouse-cursor: root.deletable ? pointer : not-allowed;
                     clicked => { if (root.deletable) { root.request-delete(); } }
                 }
@@ -411,7 +415,9 @@ component ClaudeSessionRowView inherits Rectangle {
         }
     }
 
-    sa := TouchArea {
+    sa := TipArea {
+        tip: "Resume this Claude session in a new pane";
+        side: 1;
         mouse-cursor: pointer;
         clicked => { root.resume(); }
     }
@@ -481,7 +487,8 @@ component ProjectRow inherits Rectangle {
                             ? "M 2.5 0.8 L 5 3.3 L 7.5 0.8 M 2.5 9.2 L 5 6.7 L 7.5 9.2"
                             : "M 2.5 3.3 L 5 0.8 L 7.5 3.3 M 2.5 6.7 L 5 9.2 L 7.5 6.7";
                     }
-                    cta := TouchArea {
+                    cta := TipArea {
+                        tip: root.expanded ? "Collapse this project" : "Expand this project — worktrees and Claude history";
                         mouse-cursor: pointer;
                         clicked => { root.expanded = !root.expanded; }
                     }
@@ -698,7 +705,9 @@ component ReminderRowView inherits Rectangle {
         }
     }
 
-    ra := TouchArea {
+    ra := TipArea {
+        tip: "Bring this parked pane back now";
+        side: 1;
         mouse-cursor: pointer;
         clicked => { root.restore(); }
     }
@@ -779,7 +788,9 @@ export component SidebarRail inherits Rectangle {
         // options dialog (mirrors Electron's Sidebar ＋). Shift is sampled on press and
         // consumed on the resulting click.
         property <bool> shift-down: false;
-        pa := TouchArea {
+        pa := TipArea {
+            tip: "New pane · Shift-click for shell, command and split options";
+            side: 1;
             mouse-cursor: pointer;
             clicked => {
                 if (parent.shift-down) { root.open-new-pane(); } else { root.new-pane(); }
@@ -821,7 +832,9 @@ export component SidebarRail inherits Rectangle {
                 y: (parent.height - self.height) / 2;
             }
         }
-        fa := TouchArea {
+        fa := TipArea {
+            tip: root.projects-open ? "Hide projects" : "Projects — open a repo or manage its git worktrees";
+            side: 1;
             mouse-cursor: pointer;
             // One expanded section at a time: opening Projects while Reminders is open
             // switches to it (the reverse direction lives in State::toggle_reminders,
@@ -871,7 +884,9 @@ export component SidebarRail inherits Rectangle {
                 y: (parent.height - self.height) / 2;
             }
         }
-        ba := TouchArea {
+        ba := TipArea {
+            tip: RemindersAdapter.open ? "Hide reminders" : "Reminders — panes you parked for later";
+            side: 1;
             mouse-cursor: pointer;
             clicked => { RemindersAdapter.toggle(); }
         }
@@ -984,7 +999,8 @@ export component SidebarRail inherits Rectangle {
                         bar: 8px;
                         ink: apa.has-hover ? Theme.text : Theme.subtext;
                     }
-                    apa := TouchArea {
+                    apa := TipArea {
+                        tip: "Add a project folder to this list";
                         mouse-cursor: pointer;
                         clicked => { root.add-project(); }
                     }

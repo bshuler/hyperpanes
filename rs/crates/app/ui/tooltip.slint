@@ -1,0 +1,120 @@
+// Hover tooltips for the icon-only controls.
+//
+// Every glyph in this UI is a drawn Path or Rectangle with no label, so nothing on
+// screen says what a button does until you press it. `TipArea` fixes that: swap a
+// control's `TouchArea` for one and give it `tip: "What clicking this does"`.
+//
+// Only one tooltip is ever visible, so the state is a singleton (`Tip`) and a single
+// `TipHost` at the app root draws the bubble. Drawing at the root — rather than beside
+// the control — keeps the bubble clear of every clip and stacking context between the
+// control and the window edge; the context menu lives at the root for the same reason.
+
+import { Theme } from "theme.slint";
+
+export global Tip {
+    // The hovered control's text, or "" when nothing is hovered.
+    in-out property <string> text;
+    // …and its rect, in window coordinates.
+    in-out property <length> ax;
+    in-out property <length> ay;
+    in-out property <length> aw;
+    in-out property <length> ah;
+    // 0 = below the control (flipped above when there is no room below);
+    // 1 = to its left, for the right-edge rail, where "below" would run off screen.
+    in-out property <int> side: 0;
+    // Raised by TipHost once the dwell timer fires; dropped the moment the pointer leaves.
+    in-out property <bool> shown: false;
+}
+
+// A TouchArea that explains itself. Drop-in replacement wherever an icon-only control
+// already uses a bare `TouchArea` — `clicked`, `pointer-event`, `has-hover` and
+// `mouse-cursor` all still work, since this only adds to TouchArea.
+export component TipArea inherits TouchArea {
+    in property <string> tip;
+    in property <int> side: 0;
+
+    changed has-hover => {
+        if (root.has-hover && root.tip != "") {
+            Tip.text = root.tip;
+            Tip.ax = root.absolute-position.x;
+            Tip.ay = root.absolute-position.y;
+            Tip.aw = root.width;
+            Tip.ah = root.height;
+            Tip.side = root.side;
+        } else if (Tip.ax == root.absolute-position.x && Tip.ay == root.absolute-position.y) {
+            // Retract only our OWN tip. Sliding the pointer straight onto a neighbouring
+            // icon fires that one's enter and this one's leave in an unspecified order, so
+            // an unconditional clear here would blank a tip the neighbour just claimed.
+            // The anchor rect identifies the owner (two controls can share tip text).
+            Tip.text = "";
+            Tip.shown = false;
+        }
+    }
+}
+
+// The bubble itself. Place once, as the LAST child of the app window, so it paints over
+// everything else; it has no TouchArea, so it never intercepts a click.
+export component TipHost inherits Rectangle {
+    width: 100%;
+    height: 100%;
+
+    // Dwell before showing: long enough that crossing a rail doesn't strobe, short enough
+    // to read as an answer to "what is this?".
+    Timer {
+        interval: 450ms;
+        running: Tip.text != "" && !Tip.shown;
+        triggered => { Tip.shown = true; }
+    }
+
+    // Auto-retract, the way the platform tooltips do. This is also the safety net for a
+    // control that is REMOVED while hovered (a toast dismissing itself, a row leaving a
+    // model): its leave event never fires, so without this the bubble would hang there
+    // describing something that is no longer on screen.
+    Timer {
+        interval: 6s;
+        running: Tip.shown;
+        triggered => { Tip.text = ""; Tip.shown = false; }
+    }
+
+    if Tip.shown && Tip.text != "" : Rectangle {
+        property <length> gap: 6px;
+        property <length> edge: 6px;      // keep this far off the window edges
+
+        width: label.preferred-width + 16px;
+        height: label.preferred-height + 8px;
+
+        property <length> want-x: Tip.side == 1
+            ? Tip.ax - self.width - self.gap
+            : Tip.ax + Tip.aw / 2 - self.width / 2;
+        // Below by default; above when the bubble would hang off the bottom.
+        property <length> want-y: Tip.side == 1
+            ? Tip.ay + Tip.ah / 2 - self.height / 2
+            : (Tip.ay + Tip.ah + self.gap + self.height + self.edge > parent.height
+               ? Tip.ay - self.height - self.gap
+               : Tip.ay + Tip.ah + self.gap);
+
+        x: max(self.edge, min(self.want-x, max(self.edge, parent.width - self.width - self.edge)));
+        y: max(self.edge, min(self.want-y, max(self.edge, parent.height - self.height - self.edge)));
+
+        background: Theme.surface2;
+        border-radius: 6px;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 16px;
+        drop-shadow-color: Theme.scrim;
+        drop-shadow-offset-y: 4px;
+
+        opacity: 0;
+        init => { self.opacity = 1; }
+        animate opacity { duration: 90ms; }
+
+        label := Text {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            text: Tip.text;
+            color: Theme.text;
+            font-size: 11px;
+            wrap: no-wrap;
+        }
+    }
+}

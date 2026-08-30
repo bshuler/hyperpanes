@@ -9,6 +9,7 @@
 // resets every field; the color seeds from `default-color` (the next palette-rotation slot).
 
 import { Theme } from "theme.slint";
+import { TipArea } from "tooltip.slint";
 import { PrefOption } from "types.slint";
 
 // A drawn checkmark (vector, font-independent) — mirrors overlays.slint's `Check`.
@@ -299,7 +300,8 @@ export component NewPaneDialog inherits Rectangle {
                             stroke-width: 1.6px;
                             commands: "M 5 17 L 17 5";
                         }
-                        TouchArea {
+                        TipArea {
+                            tip: "No colour — hide the new pane's frame and dot";
                             clicked => { root.frame-on = false; root.dot-on = false; }
                         }
                     }
@@ -310,7 +312,8 @@ export component NewPaneDialog inherits Rectangle {
                         background: c;
                         border-width: (!root.none-selected && ci == root.color-idx) ? 2px : 0px;
                         border-color: Theme.text;
-                        TouchArea {
+                        TipArea {
+                            tip: "Tint the new pane's frame and dot";
                             // picking a color shows it (frame + dot on), like ColorSwatches.pickColor.
                             clicked => { root.color-idx = ci; root.frame-on = true; root.dot-on = true; }
                         }

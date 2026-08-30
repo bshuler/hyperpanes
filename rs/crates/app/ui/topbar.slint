@@ -8,6 +8,7 @@
 
 import { Theme } from "theme.slint";
 import { TabItem, LayoutOption } from "types.slint";
+import { TipArea } from "tooltip.slint";
 
 // ---- stroked icons (match the Electron SVGs: 1.7px rounded strokes) ----
 
@@ -168,7 +169,7 @@ component TabChip inherits Rectangle {
                 sz: 12px;
                 ink: xa.has-hover ? Theme.text : Theme.subtext;
             }
-            xa := TouchArea { clicked => { root.close(); } }
+            xa := TipArea { tip: "Close this tab"; clicked => { root.close(); } }
         }
     }
 
@@ -280,7 +281,8 @@ export component TopBar inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                     ink: mta.has-hover ? Theme.text : Theme.subtext;
                 }
-                mta := TouchArea {
+                mta := TipArea {
+                    tip: "Application menu — new tab or pane, layouts, preferences";
                     clicked => {
                         root.open-app-menu(menu-btn.absolute-position.x,
                                            menu-btn.absolute-position.y + menu-btn.height);
@@ -325,7 +327,7 @@ export component TopBar inherits Rectangle {
                             y: (parent.height - self.height) / 2;
                             ink: nta.has-hover ? Theme.text : Theme.subtext;
                         }
-                        nta := TouchArea { clicked => { root.new-tab(); } }
+                        nta := TipArea { tip: "New tab"; clicked => { root.new-tab(); } }
                     }
                 }
 
@@ -356,7 +358,7 @@ export component TopBar inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                     ink: minh.has-hover ? Theme.text : Theme.subtext;
                 }
-                minh := TouchArea { clicked => { root.min-window(); } }
+                minh := TipArea { tip: "Minimize the window"; clicked => { root.min-window(); } }
             }
             Rectangle {
                 width: 44px;
@@ -371,7 +373,10 @@ export component TopBar inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                     ink: maxh.has-hover ? Theme.text : Theme.subtext;
                 }
-                maxh := TouchArea { clicked => { root.max-window(); } }
+                maxh := TipArea {
+                    tip: root.maximized ? "Restore the window to its previous size" : "Maximize the window";
+                    clicked => { root.max-window(); }
+                }
             }
             Rectangle {
                 width: 44px;
@@ -381,7 +386,7 @@ export component TopBar inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                     ink: closh.has-hover ? #ffffff : Theme.subtext;
                 }
-                closh := TouchArea { clicked => { root.close-window(); } }
+                closh := TipArea { tip: "Close the window"; clicked => { root.close-window(); } }
             }
         }
     }

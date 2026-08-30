@@ -16,6 +16,7 @@
 // history row); Esc collapse options then close; click outside dismisses. Routing: `goal_key`.
 
 import { Theme } from "theme.slint";
+import { TipArea } from "tooltip.slint";
 import { PaletteItem } from "types.slint";
 import { KeyMsg } from "@widgets";
 
@@ -49,12 +50,13 @@ component EnterGlyph inherits Path {
 
 // A clickable icon slot (hover background) hosting a drawn glyph.
 component IconSlot inherits Rectangle {
+    in property <string> tip;
     callback clicked;
     width: 28px;
     height: 28px;
     border-radius: 6px;
     background: ta.has-hover ? Theme.surface2 : transparent;
-    ta := TouchArea { clicked => { root.clicked(); } }
+    ta := TipArea { tip: root.tip; clicked => { root.clicked(); } }
 }
 
 export component NewGoalDialog inherits Rectangle {
@@ -201,6 +203,7 @@ export component NewGoalDialog inherits Rectangle {
                     VerticalLayout {
                         alignment: center;
                         IconSlot {
+                            tip: "Attach an image to this goal";
                             clicked => { gi.focus(); root.attach-image(); }
                             AttachGlyph { }
                         }
@@ -209,6 +212,7 @@ export component NewGoalDialog inherits Rectangle {
                     VerticalLayout {
                         alignment: center;
                         IconSlot {
+                            tip: "Send this goal (Enter)";
                             clicked => { gi.focus(); root.submit(); }
                             EnterGlyph { ink: gi.text == "" ? Theme.faint : Theme.accent; }
                         }
@@ -281,7 +285,10 @@ export component NewGoalDialog inherits Rectangle {
                                 horizontal-alignment: center;
                                 vertical-alignment: center;
                             }
-                            rmta := TouchArea { clicked => { root.remove-image(i); } }
+                            rmta := TipArea {
+                                tip: "Remove this attachment";
+                                clicked => { root.remove-image(i); }
+                            }
                         }
                     }
                 }

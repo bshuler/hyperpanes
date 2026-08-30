@@ -5,6 +5,7 @@
 import { Theme } from "theme.slint";
 import { PaneItem, DividerItem, PaletteItem, PrefOption, FramePaletteOption } from "types.slint";
 import { TerminalPane, KeyMsg } from "@widgets";
+import { TipArea } from "tooltip.slint";
 
 // A draggable resize seam. Reports the cursor's offset from the seam centre each
 // move; the controller converts that to a size-fraction delta and re-tiles, which
@@ -80,6 +81,7 @@ component PaneBtn inherits Rectangle {
     in property <int> kind;
     in property <bool> active: false;
     in property <bool> danger: false;
+    in property <string> tip;
     callback clicked;
     width: 18px;
     height: 18px;
@@ -102,7 +104,7 @@ component PaneBtn inherits Rectangle {
         x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink;
     }
 
-    ta := TouchArea { clicked => { root.clicked(); } }
+    ta := TipArea { tip: root.tip; clicked => { root.clicked(); } }
 }
 
 // ---- single-layout pane taskbar (the native port of PaneTaskbar.tsx) ----
@@ -496,6 +498,9 @@ export component PaneView inherits Rectangle {
                             PaneBtn {
                                 kind: 0;
                                 active: root.zoomed && pane.focused;
+                                tip: (root.zoomed && pane.focused)
+                                    ? "Unzoom — restore the other panes in this tab"
+                                    : "Zoom this pane to fill the tab";
                                 clicked => { root.pane-zoom(idx); }
                             }
                         }
@@ -504,6 +509,9 @@ export component PaneView inherits Rectangle {
                             PaneBtn {
                                 kind: 1;
                                 active: root.fullscreen && pane.focused;
+                                tip: (root.fullscreen && pane.focused)
+                                    ? "Leave fullscreen (or hold Esc)"
+                                    : "Fullscreen this pane — the whole window, no chrome";
                                 clicked => { root.pane-fullscreen(idx); }
                             }
                         }
@@ -512,6 +520,7 @@ export component PaneView inherits Rectangle {
                             PaneBtn {
                                 kind: 2;
                                 danger: true;
+                                tip: "Close this pane and end its shell";
                                 clicked => { root.pane-close(idx); }
                             }
                         }

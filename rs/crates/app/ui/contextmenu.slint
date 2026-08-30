@@ -9,6 +9,7 @@
 // right edge). The whole component fills the window: clicks outside the card dismiss it.
 
 import { Theme } from "theme.slint";
+import { TipArea } from "tooltip.slint";
 import { MenuEntry, CtxTab, LayoutOption } from "types.slint";
 
 // The Reminder flyout's Custom-duration bridge: a PURE parser implemented in Rust (app.rs
@@ -420,7 +421,7 @@ export component ContextMenu inherits Rectangle {
                                     stroke-width: 1.6px;
                                     commands: "M 4 16 L 16 4";
                                 }
-                                TouchArea { clicked => { root.swatch-none(); } }
+                                TipArea { tip: "No colour — hide this pane's frame and dot"; clicked => { root.swatch-none(); } }
                             }
                             for c[ci] in root.swatches : Rectangle {
                                 width: 20px;
@@ -429,7 +430,7 @@ export component ContextMenu inherits Rectangle {
                                 background: c;
                                 border-width: (ci == root.cur-swatch && root.frame-on) ? 2px : 0px;
                                 border-color: Theme.text;
-                                TouchArea { clicked => { root.swatch(ci); } }
+                                TipArea { tip: "Tint this pane's frame and dot"; clicked => { root.swatch(ci); } }
                             }
                         }
                         CtxToggle { label: "Show Frame"; on: root.frame-on; toggled(v) => { root.set-frame(v); } }
