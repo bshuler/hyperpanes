@@ -21,6 +21,7 @@
 
 mod ai;
 mod app;
+mod attach_cli;
 mod command;
 mod contextmenu;
 mod control_cli;
@@ -276,6 +277,8 @@ USAGE:
                                    Mint a per-device token and print pairing URLs + a QR code
     hyperpanes devices             List paired mobile devices
     hyperpanes revoke <label>      Revoke a paired device by label
+    hyperpanes attach [<pane>] [--resize] [--detach-key <key>]
+                                   Render a live pane in THIS terminal (--list to see them)
 
 FLAGS:
     --kill-daemon                  Shut down the running session daemon for this install, then exit
@@ -406,6 +409,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if devices::wants_revoke(&argv0) {
         return devices::run_revoke(&argv0).map_err(Into::into);
+    }
+
+    // `attach`: render a live pane into this terminal — the tmux-client half of the mux
+    // backend (docs/mux-backend-plan.md M2). Talks to the running daemon over the same
+    // salted socket the GUI uses and returns without launching a GUI.
+    if attach_cli::wants_attach(&argv0) {
+        return attach_cli::run(&argv0).map_err(Into::into);
     }
 
     // Extract the baked-in OFL fonts (Fira Code / JetBrains Mono) so they always resolve.
@@ -997,10 +1007,7 @@ mod tests {
             None
         );
         assert_eq!(cli_info_mode(&argv(&["hyperpanes", "pair"])), None);
-        assert_eq!(
-            cli_info_mode(&argv(&["hyperpanes", "--kill-daemon"])),
-            None
-        );
+        assert_eq!(cli_info_mode(&argv(&["hyperpanes", "--kill-daemon"])), None);
         // Only argv[1] is checked, not flags/args elsewhere on the line.
         assert_eq!(
             cli_info_mode(&argv(&["hyperpanes", "-c", "echo --help"])),

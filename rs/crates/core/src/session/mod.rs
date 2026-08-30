@@ -5,6 +5,9 @@
 /// Adopting a pty master handed over by a predecessor daemon (unix only).
 #[cfg(unix)]
 pub mod adopt;
+/// The `hyperpanes attach` client core (M2): protocol + detach-key + resize policy, with no
+/// tty or stdio in it — the app crate supplies those, and M3's SSH channel will supply its own.
+pub mod attach;
 pub mod batcher;
 pub mod cwd;
 pub mod daemon;

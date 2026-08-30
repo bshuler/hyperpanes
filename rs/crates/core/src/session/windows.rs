@@ -451,9 +451,13 @@ impl Daemon {
                     .await;
             }
             ClientMsg::Attach { uid } => {
+                // Subscribe first, then snapshot the buffer AND the output cursor together
+                // (`replay_with_cursor` reads both under the replay lock) so a client can
+                // splice the live stream onto the seed without painting the overlap twice —
+                // see the unix daemon's `Attach` arm and `DaemonMsg::Replay::cursor`.
                 attached.insert(uid.clone());
-                let data = self.sessions.replay(&uid).unwrap_or_default();
-                let _ = pc.write_msg(&DaemonMsg::Replay { uid, data }).await;
+                let (data, cursor) = self.sessions.replay_with_cursor(&uid).unwrap_or_default();
+                let _ = pc.write_msg(&DaemonMsg::Replay { uid, data, cursor }).await;
             }
             ClientMsg::Create(spec) => {
                 let uid = spec
@@ -523,12 +527,22 @@ impl Daemon {
         self.sessions
             .uids()
             .into_iter()
-            .map(|uid| SessionMeta {
-                cwd: cwds.get(&uid).cloned(),
-                output_bytes: self.sessions.output_bytes(&uid).unwrap_or(0),
-                last_output_at: self.sessions.last_output_at(&uid),
-                alive: true,
-                uid,
+            .map(|uid| {
+                // The grid rides along so an attach client can letterbox at the desktop's
+                // size instead of reflowing the pane (mux-backend-plan M2).
+                let (cols, rows) = match self.sessions.dims(&uid) {
+                    Some((c, r)) => (Some(c), Some(r)),
+                    None => (None, None),
+                };
+                SessionMeta {
+                    cwd: cwds.get(&uid).cloned(),
+                    output_bytes: self.sessions.output_bytes(&uid).unwrap_or(0),
+                    last_output_at: self.sessions.last_output_at(&uid),
+                    alive: true,
+                    cols,
+                    rows,
+                    uid,
+                }
             })
             .collect()
     }

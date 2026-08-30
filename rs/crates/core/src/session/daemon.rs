@@ -868,9 +868,19 @@ impl Daemon {
             ClientMsg::Attach { uid } => {
                 // Subscribe this connection to the uid's live events, then return its
                 // replay ONCE to seed a fresh grid (an empty string if it has none yet).
+                //
+                // The subscription MUST come first (a chunk flushed between the two would
+                // otherwise be lost), which means the seed and the live stream overlap:
+                // anything flushed in that window — or already queued on the bus — is both
+                // inside the snapshot and delivered as a `Data` event. So the snapshot is
+                // taken with `replay_with_cursor`, which reads the buffer and the output
+                // cursor under the same lock `flush_into` holds, and the cursor rides along
+                // in the reply. A client with no mirror of its own (`session::attach`)
+                // splices on it by dropping every `Data` at or below it. Untorn is the whole
+                // point: a torn pair would drop or duplicate bytes at the seam.
                 attached.lock().unwrap().insert(uid.clone());
-                let data = self.registry.replay(&uid).unwrap_or_default();
-                let _ = out.send(DaemonMsg::Replay { uid, data });
+                let (data, cursor) = self.registry.replay_with_cursor(&uid).unwrap_or_default();
+                let _ = out.send(DaemonMsg::Replay { uid, data, cursor });
             }
             ClientMsg::Create(spec) => {
                 // The daemon is the uid source of truth: honor a pinned uid, else mint one.
@@ -957,12 +967,22 @@ impl Daemon {
         self.registry
             .uids()
             .into_iter()
-            .map(|uid| SessionMeta {
-                cwd: cwds.get(&uid).cloned(),
-                output_bytes: self.registry.output_bytes(&uid).unwrap_or(0),
-                last_output_at: self.registry.last_output_at(&uid),
-                alive: true,
-                uid,
+            .map(|uid| {
+                // The grid rides along so an attach client can letterbox at the desktop's
+                // size instead of reflowing the pane (mux-backend-plan M2).
+                let (cols, rows) = match self.registry.dims(&uid) {
+                    Some((c, r)) => (Some(c), Some(r)),
+                    None => (None, None),
+                };
+                SessionMeta {
+                    cwd: cwds.get(&uid).cloned(),
+                    output_bytes: self.registry.output_bytes(&uid).unwrap_or(0),
+                    last_output_at: self.registry.last_output_at(&uid),
+                    alive: true,
+                    cols,
+                    rows,
+                    uid,
+                }
             })
             .collect()
     }

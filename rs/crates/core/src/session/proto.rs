@@ -135,6 +135,20 @@ pub struct SessionMeta {
     /// Whether the session is still live (always `true` in a `ListSessions` reply; the
     /// field exists so a future cache of dead sessions can be expressed).
     pub alive: bool,
+    /// Current pty grid width (`SessionRegistry::dims`). The
+    /// [attach client](crate::session::attach) needs it to decide whether its own terminal
+    /// can show the pane without clipping — its resize policy is to letterbox at the
+    /// desktop's grid rather than reflow it (`docs/mux-backend-plan.md` M2).
+    ///
+    /// ADDITIVE, `#[serde(default)]`: a daemon that predates the field simply omits it and
+    /// the client reads `None` ("grid unknown, don't warn"). Serde ignores unknown fields in
+    /// the other direction, so no `PROTO_VER` bump is needed — and the Windows pty-host's
+    /// frozen-surface contract (only optional additions) is respected.
+    #[serde(default)]
+    pub cols: Option<u16>,
+    /// Current pty grid height — see [`cols`](Self::cols).
+    #[serde(default)]
+    pub rows: Option<u16>,
 }
 
 /// A request from a client to the daemon. Fire-and-forget for mutators; request/response
@@ -213,7 +227,25 @@ pub enum DaemonMsg {
     Created { uid: String },
     /// Reply to [`ClientMsg::Attach`]: the session's replay buffer, to seed a fresh grid
     /// exactly once. Empty string when the session has produced nothing yet.
-    Replay { uid: String, data: String },
+    ///
+    /// `cursor` is the session's monotonic UTF-16 output cursor **at the instant the
+    /// buffer was snapshotted** (`SessionRegistry::replay_with_cursor` reads the pair under
+    /// the replay lock, so it can never be torn). It exists because `Attach` subscribes the
+    /// connection to the session's broadcast *before* snapshotting: without it, a chunk
+    /// flushed in that window — or one already queued on the bus — is both inside the seed
+    /// and delivered as a live [`SessionEvent::Data`], and a client with no mirror of its
+    /// own (the M2 attach client) paints it twice. A client splices by dropping every
+    /// `Data` whose own `cursor` is `<= ` this one.
+    ///
+    /// ADDITIVE, `#[serde(default)]`: a daemon that predates the field sends `0`, which
+    /// means "not reported" — no real chunk can end at cursor 0, so a client reading 0
+    /// simply keeps the old (duplicating) behaviour instead of dropping live output.
+    Replay {
+        uid: String,
+        data: String,
+        #[serde(default)]
+        cursor: u64,
+    },
     /// Reply to [`ClientMsg::RenderScreen`]: the serialized screen, or `None` if the
     /// session is gone.
     Screen { uid: String, text: Option<String> },
@@ -414,11 +446,14 @@ mod tests {
                 output_bytes: 12,
                 last_output_at: Some(1000),
                 alive: true,
+                cols: Some(120),
+                rows: Some(40),
             }]),
             DaemonMsg::Created { uid: "s9".into() },
             DaemonMsg::Replay {
                 uid: "s1".into(),
                 data: "recent output".into(),
+                cursor: 13,
             },
             DaemonMsg::Screen {
                 uid: "s1".into(),
@@ -442,6 +477,38 @@ mod tests {
         for m in &msgs {
             assert_eq!(&roundtrip_daemon(m), m);
         }
+    }
+
+    // The grid fields the attach client reads are ADDITIVE: a daemon that predates them
+    // omits them, and that payload must still parse (as "grid unknown") rather than making
+    // `ListSessions` fail against an older peer. This is the frozen-host-surface contract.
+    #[test]
+    fn session_meta_parses_a_payload_with_no_grid_fields() {
+        let legacy =
+            r#"{"uid":"s1","cwd":null,"output_bytes":7,"last_output_at":null,"alive":true}"#;
+        let meta: SessionMeta = serde_json::from_str(legacy).expect("legacy SessionMeta parses");
+        assert_eq!(meta.uid, "s1");
+        assert_eq!(meta.output_bytes, 7);
+        assert_eq!(meta.cols, None, "an unreported grid is None, not a default");
+        assert_eq!(meta.rows, None);
+    }
+
+    // `Replay.cursor` is ADDITIVE for the same reason: a daemon that predates it omits the
+    // key, and the payload must still parse. `0` is the "not reported" sentinel — no real
+    // chunk ends at cursor 0 — so an attach client reading it disables its splice filter
+    // instead of mistaking live output for already-seeded output.
+    #[test]
+    fn replay_parses_a_payload_with_no_cursor() {
+        let legacy = r#"{"Replay":{"uid":"s1","data":"recent output"}}"#;
+        let msg: DaemonMsg = serde_json::from_str(legacy).expect("legacy Replay parses");
+        assert_eq!(
+            msg,
+            DaemonMsg::Replay {
+                uid: "s1".into(),
+                data: "recent output".into(),
+                cursor: 0,
+            }
+        );
     }
 
     #[test]
@@ -512,6 +579,7 @@ mod tests {
         let msg = DaemonMsg::Replay {
             uid: "s1".into(),
             data: "a".repeat(500),
+            cursor: 500,
         };
         write_frame(&mut buf, &msg).unwrap();
         // One byte at a time: the length prefix AND the body both arrive piecemeal.

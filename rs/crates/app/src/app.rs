@@ -269,7 +269,9 @@ impl App {
         };
         for g in groups {
             for p in &mut g.panes {
-                let Some(uid) = p.uid.as_deref() else { continue };
+                let Some(uid) = p.uid.as_deref() else {
+                    continue;
+                };
                 let pane_id = self
                     .control
                     .pane_id_for_uid(uid)
@@ -288,10 +290,7 @@ impl App {
                     // restore re-sets it so `claude --resume` finds the right transcript
                     // store. Absent/invalid ⇒ the default account, so record nothing.
                     if claude_panes::valid_config_dir(&s.config_dir) {
-                        meta.insert(
-                            claude_panes::META_CONFIG_DIR_KEY.to_string(),
-                            s.config_dir,
-                        );
+                        meta.insert(claude_panes::META_CONFIG_DIR_KEY.to_string(), s.config_dir);
                     }
                 }
             }
@@ -318,10 +317,14 @@ impl App {
             return;
         }
         let dir = hyperpanes_core::persistence::paths::claude_sessions_dir();
-        let Ok(entries) = std::fs::read_dir(&dir) else { return };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
-            let Some(pane_id) = path.file_stem().and_then(|s| s.to_str()) else { continue };
+            let Some(pane_id) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
             let Some(marker) = hyperpanes_core::claude_panes::read_pane_session(pane_id) else {
                 continue;
             };
@@ -500,8 +503,16 @@ impl App {
             let systemd_run = which_systemd_run();
             let mut cmd = if let Some(sr) = &systemd_run {
                 let mut c = std::process::Command::new(sr);
-                c.args(["--user", "--quiet", "--collect", "--scope", "--", "/bin/sh", "-c"])
-                    .arg(&relaunch);
+                c.args([
+                    "--user",
+                    "--quiet",
+                    "--collect",
+                    "--scope",
+                    "--",
+                    "/bin/sh",
+                    "-c",
+                ])
+                .arg(&relaunch);
                 c
             } else {
                 let mut c = std::process::Command::new("/bin/sh");
@@ -3348,7 +3359,8 @@ mod option_form_tests {
     #[test]
     fn detects_claude_style_selectors() {
         // Trust-folder prompt (pointer on the highlighted row, numbered options).
-        let trust = "Do you trust the files in this folder?\n\n ❯ 1. Yes, proceed\n   2. No, exit\n";
+        let trust =
+            "Do you trust the files in this folder?\n\n ❯ 1. Yes, proceed\n   2. No, exit\n";
         assert!(screen_shows_option_form(trust));
         // Boxed permission dialog (rows inside a │ border).
         let boxed = "│ Do you want to proceed?      │\n│ ❯ 1. Yes                     │\n│   2. No, and tell Claude why │\n";
@@ -3358,7 +3370,8 @@ mod option_form_tests {
     #[test]
     fn ignores_the_ordinary_input_box_and_plain_output() {
         // Claude's normal prompt box — a `>` prompt, no `❯` pointer.
-        let prompt = "╭─────────────────╮\n│ > Try \"help\"    │\n╰─────────────────╯\n  ? for shortcuts\n";
+        let prompt =
+            "╭─────────────────╮\n│ > Try \"help\"    │\n╰─────────────────╯\n  ? for shortcuts\n";
         assert!(!screen_shows_option_form(prompt));
         // A numbered list in ordinary output (no pointer) is not a form.
         let list = "Plan:\n 1. do a thing\n 2. do another\n";
