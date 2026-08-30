@@ -1499,11 +1499,17 @@ pub fn pump(
         // output-quiet past the threshold (the agent finished + is waiting); the alpha
         // animates while idle and resets to 0 otherwise.
         let prev_glow = ps.glow.alpha;
-        // Only AGENT panes glow (an agent CLI sets the shell title) — a plain quiet shell
-        // never does, matching the Electron `isAiPane && idle` gate.
+        // Only AGENT panes glow — a plain quiet shell never does, matching the Electron
+        // `isAiPane && idle` gate. "Is this an agent" now has two answers and either will
+        // do: the pane's merged tool identity (authoritative for a pane spawned AS a tool,
+        // which may never print a title at all) or the title sniff (which catches the
+        // agents that do). Before the first, a `hyperpanes claude` pane sat there quiet and
+        // unglowing because nothing had written a title for it to match.
+        let is_agent = !matches!(tool_row[i].0, PaneKind::Terminal)
+            || crate::glow::is_ai_pane(&ps.shell_title);
         let idle = idle_on
             && ps.visible
-            && crate::glow::is_ai_pane(&ps.shell_title)
+            && is_agent
             && match mgr.last_output_at(&ps.uid) {
                 Some(ms) => glow_now_ms.saturating_sub(ms) >= idle_threshold_ms,
                 None => false,

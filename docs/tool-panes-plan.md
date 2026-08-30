@@ -731,3 +731,58 @@ checkpoint, not a unilateral edit.
 **Wave 0 gate: MET.** `cargo check --manifest-path rs/crates/app/Cargo.toml --bins`
 green; `cargo test --bins` 249 passed / 0 failed; `cargo test` on `rs` 883 passed / 0
 failed / 5 ignored. Landed as `fc067e3`.
+
+### Wave 1 · A2 (T3 + F5) — 2026-08-30
+
+**Status: landed. A terminal pane that starts running `claude` now wears the Claude mark
+and drops it again at the next prompt.**
+
+The whole of T3 hangs on one structural choice: **the sniff never touches `PaneState`.**
+Detection lives in two runtime-only side maps on `State` — `sniffed_tool: HashMap<uid,
+tool-id>` and `agent_live: HashMap<uid, AgentLiveness>` — which are not fields of a pane,
+are not serialized, and cannot round-trip through the session store. The two identities
+meet in exactly one place, `State::effective_kind(&PaneState)`, which the UI projection
+reads. That makes D5's rule ("a sniff may upgrade the chrome; it must never rewrite
+`spawn_command`/`spawn_args` or the persisted `PaneKind`") true *by construction* rather
+than by everyone remembering it — there is no code path from a title frame to anything
+that survives a restart.
+
+Landed:
+
+- `state.rs` — the side maps plus `note_pane_title`, `note_agent_state`, `note_agent_idle`,
+  `forget_pane_runtime`, `effective_kind`, `liveness_ui`. `note_pane_title` is a no-op on a
+  pane whose `kind` is already explicit, so a pane *spawned* as a tool can never be
+  re-labelled by whatever it prints.
+- `app.rs` — `route_event` feeds the OSC title it was already sniffing for the glow to
+  `note_pane_title` as well (hoisted out of the pane borrow), and the four
+  previously-discarded arms now land: `CommandStart` → `Busy`, `CommandEnd`/`PromptReady` →
+  idle (the downgrade signal — the mark is dropped, not kept forever), `AgentState` → the
+  reported state.
+- `paneview.rs` — both projection sites precompute `Vec<(PaneKind, i32)>` *before* taking
+  `&mut state.tabs[..]`, because the side maps are unreachable once that borrow is held.
+  Moving the data onto `PaneState` would have solved the borrow and re-opened the
+  persistence risk; the vec was the cheaper trade.
+- `types.slint` / `theme.slint` / `paneview.slint` — `agent-live: int` on `PaneItem`, the
+  `ok`/`warn` tokens, and a 6px liveness dot in the pane header. The dot is gated on
+  `kind != 0`, not on `tool-icon`, so a tool with no glyph still reports and a plain shell
+  running `make` never grows one.
+- The idle glow now accepts *either* signal — the merged identity or the title sniff.
+  Gating on the title alone meant a pane spawned as `claude` that never printed an OSC
+  title sat there quiet and unglowing.
+
+Map growth is handled at the three exits, not sprinkled: `take_pane_in` was split around
+`take_pane_inner` so every removal path drops the entries, and the two removals that do
+*not* flow through it — the pane-restart site (which mints a new uid, stranding the old
+key) and the parked-reminder `Exit` path — forget explicitly.
+
+`control/readmodel.rs` needed nothing: Wave 0 already put `kind` on `PaneOut` and its
+tests already assert both halves (omitted for a shell, `"claude"` for a tool pane).
+
+Worth carrying forward: `registry::by_title` returns `None` when two *different* tools
+match, and `vim` is itself a registered tool (D15). So `"vim claude-vs-codex.md"` resolves
+to `Tool("vim")` — the tokenizer keeps `-`, making `claude-vs-codex` one token that matches
+nothing. The ambiguity test needs two tokens naming two different tools (`"claude · codex"`).
+
+**Gate: MET.** `cargo check --manifest-path rs/crates/app/Cargo.toml --bins` green;
+`cargo test --bins` 258 passed / 0 failed (T3 added 8, plus the glow widening). Landed as
+`5222ed6` and the glow follow-up.
