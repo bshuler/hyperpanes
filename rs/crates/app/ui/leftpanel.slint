@@ -228,6 +228,7 @@ component TabRowView inherits Rectangle {
 
     changed drag-y => { root.refresh-drop-hover(); }
     changed drag-active => { root.refresh-drop-hover(); }
+    changed is-source => { root.refresh-drop-hover(); }
     changed drop-hover => { root.hover-changed(root.drop-hover); }
 
     border-radius: 6px;
