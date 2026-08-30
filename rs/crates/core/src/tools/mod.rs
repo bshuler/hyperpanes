@@ -8,6 +8,9 @@
 //! See `docs/tool-panes-plan.md` for the decisions behind this module.
 
 pub mod detect;
+/// Session history: one [`history::SessionProvider`] per tool that keeps resumable
+/// conversations on disk, all feeding the same row shape.
+pub mod history;
 pub mod kind;
 pub mod registry;
 

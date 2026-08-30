@@ -38,14 +38,19 @@ const FULL_TEXT_MAX: usize = 32 * 1024;
 /// transcript that is mostly tool traffic (little message text per record) stays cheap.
 const FULL_TEXT_SCAN_LINES: usize = 2000;
 
-/// Which agent harness a history entry comes from. Claude Code is the only source today;
-/// the enum exists so UI-facing rows carry a generic `source` label instead of hard-wiring
-/// "claude", letting other harnesses (their own readers feeding the same session shape)
-/// plug in later.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Which agent harness a history entry comes from. Claude Code is the only source with a
+/// reader today; the other variants exist so the generic session view
+/// ([`crate::tools::history`]) can carry a source label from the moment their readers land,
+/// without a second enum shadowing this one. A variant here is a *claim about provenance*,
+/// not a promise that a provider exists — [`crate::tools::registry::HistoryKind`] is where
+/// "we have verified this tool's on-disk layout" is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
 pub enum HistorySource {
     #[default]
     Claude,
+    Cursor,
+    Copilot,
+    Codex,
 }
 
 impl HistorySource {
@@ -53,6 +58,21 @@ impl HistorySource {
     pub fn label(self) -> &'static str {
         match self {
             HistorySource::Claude => "Claude",
+            HistorySource::Cursor => "Cursor",
+            HistorySource::Copilot => "Copilot",
+            HistorySource::Codex => "Codex",
+        }
+    }
+
+    /// The [`crate::tools::registry::TOOLS`] id this source's transcripts belong to — the
+    /// join back to the catalogue, so a session row can resolve the binary that resumes it
+    /// without a second table mapping sources to tools.
+    pub fn tool_id(self) -> &'static str {
+        match self {
+            HistorySource::Claude => "claude",
+            HistorySource::Cursor => "cursor-agent",
+            HistorySource::Copilot => "copilot",
+            HistorySource::Codex => "codex",
         }
     }
 }
@@ -83,6 +103,18 @@ pub struct ClaudeSession {
     /// records so a huge transcript stays bounded. Used by [`session_matches`] as the
     /// slow path when the summary / opening prompt didn't match.
     pub full_text: String,
+    /// The working directory the session ran in, read out of the transcript's own records
+    /// (`cwd`), or `None` when the scanned prefix carried none.
+    ///
+    /// This is the *only* trustworthy way to learn a session's project path. The directory
+    /// name transcripts are filed under is an encoding that maps `/`, `.`, `_` and spaces
+    /// all to `-` without collapsing runs, so it cannot be inverted — see this module's
+    /// header. Resuming needs a real directory to spawn in, so it needs this.
+    pub cwd: Option<PathBuf>,
+    /// The git branch recorded alongside `cwd` (`gitBranch`), when the record carried a
+    /// non-empty one. `HEAD` here means a detached checkout, which is what a worktree
+    /// created at a bare commit looks like — it is passed through, not normalised.
+    pub git_branch: Option<String>,
 }
 
 /// Does `session` match the (case-insensitive, substring) search `query`? An empty/blank
@@ -196,6 +228,258 @@ pub fn sessions_in_dir(session_dir: &Path) -> Vec<ClaudeSession> {
     out
 }
 
+// ===== global enumeration: every project, not just a known root =====
+
+/// How much a [`ProjectSessions::project`] path can be trusted.
+///
+/// Needed because the whole store is keyed by an encoding that **cannot be inverted**: the
+/// directory name maps `/`, `.`, `_`, spaces and `:` all onto `-` and does not collapse
+/// runs, so `-Users-bshuler--pane` has at least the readings `/Users/bshuler/.pane` (the
+/// truth on this machine) and `/Users/bshuler//pane`. Enumerating *every* project means
+/// naming directories we were never given a root for, so each answer has to carry how it
+/// was reached rather than all looking equally authoritative in the UI.
+///
+/// Variants are declared strongest-first and the derived `Ord` is used as that strength
+/// order, so merging two readings of the same project is `min`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ProjectOrigin {
+    /// A `cwd` read out of a transcript that re-encodes to exactly the directory holding
+    /// it. Encoding is a function, so this is proof, not a guess.
+    TranscriptExact,
+    /// No transcript `cwd` matched, but walking the real filesystem found an existing
+    /// directory that re-encodes to this name. Exact unless two sibling directories encode
+    /// alike (`what_is_light` and `what-is-light` do).
+    ProbedExact,
+    /// A `cwd` from the transcript that does *not* re-encode to its own directory — seen
+    /// when the opening record carries the shell's launch directory and the session later
+    /// `cd`s into a worktree. A real directory, but not provably this project's.
+    TranscriptCwd,
+    /// Nothing but the lossy substitution of the directory name. Show it as a hint, never
+    /// as a path to spawn in.
+    DecodedUnverified,
+}
+
+impl ProjectOrigin {
+    /// Whether the path re-encodes to the directory it was found in — the only two ways of
+    /// arriving at a path we would stand behind.
+    pub fn is_exact(self) -> bool {
+        matches!(
+            self,
+            ProjectOrigin::TranscriptExact | ProjectOrigin::ProbedExact
+        )
+    }
+}
+
+/// One project directory's transcripts, plus the project path we managed to recover for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectSessions {
+    /// The recovered project path — read [`origin`](Self::origin) before trusting it.
+    pub project: PathBuf,
+    /// How `project` was arrived at.
+    pub origin: ProjectOrigin,
+    /// The encoded directory the transcripts actually live in. Kept because it, not
+    /// `project`, is the store's real identity: it is what a re-scan re-reads.
+    pub dir: PathBuf,
+    /// This project's sessions, newest-first.
+    pub sessions: Vec<ClaudeSession>,
+}
+
+/// How many directories a filesystem probe may read before giving up. Ambiguous segments
+/// make the walk a search, so it needs a ceiling; real project paths are a handful of
+/// segments deep and resolve in well under this.
+const PROBE_BUDGET: usize = 64;
+
+/// The naive inverse of [`encode_project_dir`]: every `-` becomes a path separator. Wrong
+/// wherever the original had a `.`, `_` or space (so: often) — only ever a last resort,
+/// and always reported as [`ProjectOrigin::DecodedUnverified`].
+pub fn decode_project_dir(encoded: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        // `C--foo-bar` came from `C:\foo\bar`; the drive letter is recoverable, the rest is not.
+        let b = encoded.as_bytes();
+        if b.len() >= 3 && b[0].is_ascii_alphanumeric() && &encoded[1..3] == "--" {
+            let rest = encoded[3..].replace('-', "\\");
+            return PathBuf::from(format!("{}:\\{rest}", &encoded[..1]));
+        }
+    }
+    PathBuf::from(encoded.replace('-', std::path::MAIN_SEPARATOR_STR))
+}
+
+/// Recover the real path behind an encoded directory name by walking the filesystem: at
+/// each level, look for a child directory whose own encoding is the next chunk of the name.
+///
+/// This is the honest inverse — it never invents a separator, it only accepts a directory
+/// that actually exists and re-encodes correctly, so a hit is as exact as a transcript
+/// `cwd`. It resolves `-Users-bshuler--pane` to `/Users/bshuler/.pane` and
+/// `-Users-bshuler-code-what-is-light` to `/Users/bshuler/code/what_is_light`, neither of
+/// which any substitution rule could produce. Returns `None` when the project has been
+/// deleted or moved (common — worktrees outlive nothing) or the budget runs out.
+pub fn decode_by_probing(encoded: &str) -> Option<PathBuf> {
+    let (root, rest) = probe_root(encoded)?;
+    let mut budget = PROBE_BUDGET;
+    probe_from(&root, rest, &mut budget)
+}
+
+/// Split an encoded name into the filesystem root it started at and the rest. A leading `-`
+/// is the encoding of a leading `/`; `C--` is a Windows drive.
+fn probe_root(encoded: &str) -> Option<(PathBuf, &str)> {
+    let b = encoded.as_bytes();
+    if b.first() == Some(&b'-') {
+        return Some((PathBuf::from(std::path::MAIN_SEPARATOR_STR), &encoded[1..]));
+    }
+    if b.len() >= 3 && b[0].is_ascii_alphanumeric() && &encoded[1..3] == "--" {
+        return Some((
+            PathBuf::from(format!("{}:\\", &encoded[..1])),
+            &encoded[3..],
+        ));
+    }
+    None
+}
+
+/// One level of [`decode_by_probing`]: consume the longest prefix of `rest` that some child
+/// directory of `dir` encodes to, then recurse. Children are tried in sorted order so an
+/// ambiguous name resolves the same way on every scan.
+fn probe_from(dir: &Path, rest: &str, budget: &mut usize) -> Option<PathBuf> {
+    if rest.is_empty() {
+        return Some(dir.to_path_buf());
+    }
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+    // `is_dir()` on the path, not on the DirEntry's file type: the latter does not follow
+    // symlinks, and a symlinked component is ordinary on macOS (`/var` -> `/private/var`) and
+    // in the home directories people keep their code in. The budget is what stops a loop.
+    let mut names: Vec<std::ffi::OsString> = fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .map(|e| e.file_name())
+        .collect();
+    names.sort();
+    for name in names {
+        let enc = encode_path_str(&name.to_string_lossy());
+        if enc.is_empty() {
+            continue;
+        }
+        if rest == enc {
+            return Some(dir.join(name));
+        }
+        // The separator that followed this segment encoded to exactly one `-`.
+        if rest.len() > enc.len() && rest.starts_with(&enc) && rest.as_bytes()[enc.len()] == b'-' {
+            if let Some(hit) = probe_from(&dir.join(&name), &rest[enc.len() + 1..], budget) {
+                return Some(hit);
+            }
+        }
+    }
+    None
+}
+
+/// Name the project behind `dir`, given the sessions found in it. Prefers a transcript
+/// `cwd` that proves itself against the directory name, then a filesystem probe, then a
+/// transcript `cwd` that does not prove itself, then the lossy decode — see
+/// [`ProjectOrigin`] for why the caller is told which.
+pub fn resolve_project(dir: &Path, sessions: &[ClaudeSession]) -> (PathBuf, ProjectOrigin) {
+    let encoded = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let mut fallback: Option<&PathBuf> = None;
+    for cwd in sessions.iter().filter_map(|s| s.cwd.as_ref()) {
+        if encode_project_dir(cwd) == encoded {
+            return (cwd.clone(), ProjectOrigin::TranscriptExact);
+        }
+        fallback.get_or_insert(cwd);
+    }
+    if let Some(probed) = decode_by_probing(&encoded) {
+        return (probed, ProjectOrigin::ProbedExact);
+    }
+    match fallback {
+        Some(cwd) => (cwd.clone(), ProjectOrigin::TranscriptCwd),
+        None => (
+            decode_project_dir(&encoded),
+            ProjectOrigin::DecodedUnverified,
+        ),
+    }
+}
+
+/// The per-project subdirectories directly inside `projects_root`, sorted by name. Files and
+/// unreadable roots yield nothing.
+pub fn project_dirs_in(projects_root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(projects_root) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .map(|e| e.path())
+        .collect();
+    dirs.sort();
+    dirs
+}
+
+/// Wrap one directory's sessions in a [`ProjectSessions`], or `None` when it held no
+/// transcripts (Claude Code leaves behind directories holding only a `memory/` subtree).
+fn project_sessions(dir: &Path, sessions: Vec<ClaudeSession>) -> Option<ProjectSessions> {
+    if sessions.is_empty() {
+        return None;
+    }
+    let (project, origin) = resolve_project(dir, &sessions);
+    Some(ProjectSessions {
+        project,
+        origin,
+        dir: dir.to_path_buf(),
+        sessions,
+    })
+}
+
+/// Merge per-directory results that resolved to the same project path (two accounts, or a
+/// project reachable through more than one encoding), and order by project path so the
+/// caller's grouping is a property of the order, not of a second pass.
+fn merge_projects(mut found: Vec<ProjectSessions>) -> Vec<ProjectSessions> {
+    found.sort_by(|a, b| a.project.cmp(&b.project).then_with(|| a.dir.cmp(&b.dir)));
+    let mut out: Vec<ProjectSessions> = Vec::new();
+    for p in found.drain(..) {
+        match out.last_mut() {
+            Some(prev) if prev.project == p.project => {
+                prev.sessions.extend(p.sessions);
+                sort_newest_first(&mut prev.sessions);
+                // Keep the stronger provenance of the two.
+                if p.origin < prev.origin {
+                    prev.origin = p.origin;
+                }
+            }
+            _ => out.push(p),
+        }
+    }
+    out
+}
+
+/// Every project under `projects_root`, ordered by project path, each project's sessions
+/// newest-first. The un-cached seam — [`SessionCache::scan_all_in`] is the one to use when
+/// this runs more than once.
+pub fn all_projects_in(projects_root: &Path) -> Vec<ProjectSessions> {
+    let found = project_dirs_in(projects_root)
+        .into_iter()
+        .filter_map(|d| project_sessions(&d, sessions_in_dir(&d)))
+        .collect();
+    merge_projects(found)
+}
+
+/// Every project across every account's transcript store ([`claude_projects_roots`]) —
+/// "every locally resumable conversation", which is what the session view asks for.
+pub fn all_projects() -> Vec<ProjectSessions> {
+    let found = claude_projects_roots()
+        .iter()
+        .flat_map(|root| {
+            project_dirs_in(root)
+                .into_iter()
+                .filter_map(|d| project_sessions(&d, sessions_in_dir(&d)))
+        })
+        .collect();
+    merge_projects(found)
+}
+
 /// Read one `*.jsonl` transcript into a [`ClaudeSession`] (id from the filename stem,
 /// `started_at` from the file mtime, summary/first-user/full-text from a bounded parse).
 /// `None` for non-`.jsonl` paths or a stem-less filename — the per-file seam shared by
@@ -209,15 +493,17 @@ pub fn read_session_file(path: &Path) -> Option<ClaudeSession> {
     }
     let id = path.file_stem().map(|s| s.to_string_lossy().into_owned())?;
     let started_at = file_fingerprint(path).map(|(mtime, _)| mtime);
-    let (summary, first_user, full_text, message_count) = summarize_file(path);
+    let p = summarize_file(path);
     Some(ClaudeSession {
         id,
         source: HistorySource::Claude,
         started_at,
-        summary,
-        first_user,
-        message_count,
-        full_text,
+        summary: p.summary,
+        first_user: p.first_user,
+        message_count: p.message_count,
+        full_text: p.full_text,
+        cwd: p.cwd,
+        git_branch: p.git_branch,
     })
 }
 
@@ -243,36 +529,76 @@ fn sort_newest_first(v: &mut [ClaudeSession]) {
     });
 }
 
+/// What one bounded prefix read recovers. A struct rather than a tuple only because the
+/// tuple had already reached four fields before `cwd`/`git_branch` were added.
+#[derive(Default)]
+struct Prefix {
+    summary: String,
+    first_user: String,
+    full_text: String,
+    message_count: usize,
+    cwd: Option<PathBuf>,
+    git_branch: Option<String>,
+}
+
 /// Read `path` once: count every record (cheaply) and, within a bounded prefix, recover
 /// (a) a summary — preferring a `summary`-type record, else the first `user` message's
 /// text — scanned over the first [`SUMMARY_SCAN_LINES`] records; (b) the first user
-/// message itself (kept for search); and (c) the lowercased full-conversation text of
+/// message itself (kept for search); (c) the lowercased full-conversation text of
 /// user + assistant messages, capped at [`FULL_TEXT_MAX`] bytes and
-/// [`FULL_TEXT_SCAN_LINES`] records. Records past both bounds are counted blind, never
-/// JSON-parsed. Returns `(summary, first_user, full_text, line_count)`.
-fn summarize_file(path: &Path) -> (String, String, String, usize) {
+/// [`FULL_TEXT_SCAN_LINES`] records; and (d) the session's `cwd` / `gitBranch`. Records
+/// past every bound are counted blind, never JSON-parsed.
+///
+/// The `cwd` search is deliberately **type-agnostic** — the field rides on whatever record
+/// happens to open the conversation, and across the 131 transcripts on the machine this was
+/// written against that was a `user` record 66 times, an `attachment` 59 times and a
+/// `system` record 6 times. Line 1 is usually a `mode` / `summary` record with no `cwd` at
+/// all; the first one carrying it landed by line 9 in every case, comfortably inside
+/// [`SUMMARY_SCAN_LINES`], so this rides along on the existing pass for free.
+fn summarize_file(path: &Path) -> Prefix {
     use std::io::{BufRead, BufReader};
     let Ok(file) = fs::File::open(path) else {
-        return (String::new(), String::new(), String::new(), 0);
+        return Prefix::default();
     };
     let reader = BufReader::new(file);
     let mut count = 0usize;
     let mut summary: Option<String> = None;
     let mut first_user: Option<String> = None;
     let mut full = String::new();
+    let mut cwd: Option<PathBuf> = None;
+    let mut git_branch: Option<String> = None;
 
     for (i, line) in reader.lines().enumerate() {
         let Ok(line) = line else { break };
         count += 1;
         let summary_done = i >= SUMMARY_SCAN_LINES || (summary.is_some() && first_user.is_some());
         let full_done = i >= FULL_TEXT_SCAN_LINES || full.len() >= FULL_TEXT_MAX;
-        // Only the bounded prefix is JSON-parsed; the rest is counted blind.
-        if summary_done && full_done {
+        let cwd_done = i >= SUMMARY_SCAN_LINES || cwd.is_some();
+        // Only the bounded prefix is JSON-parsed; the rest is counted blind. `cwd_done` has
+        // to be part of this or a transcript that opens with one enormous message (full text
+        // capped on line 2, summary settled) would stop parsing before the `cwd` record.
+        if summary_done && full_done && cwd_done {
             continue;
         }
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
             continue;
         };
+        if !cwd_done {
+            if let Some(dir) = v
+                .get("cwd")
+                .and_then(|c| c.as_str())
+                .filter(|c| !c.is_empty())
+            {
+                cwd = Some(PathBuf::from(dir));
+                // Taken from the same record: a `gitBranch` elsewhere in the transcript
+                // could belong to a different checkout after a `cd`.
+                git_branch = v
+                    .get("gitBranch")
+                    .and_then(|b| b.as_str())
+                    .filter(|b| !b.is_empty())
+                    .map(str::to_string);
+            }
+        }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("summary") if !summary_done => {
                 if let Some(s) = v.get("summary").and_then(|s| s.as_str()) {
@@ -303,12 +629,14 @@ fn summarize_file(path: &Path) -> (String, String, String, usize) {
     }
 
     let first_user = first_user.unwrap_or_default();
-    (
-        summary.unwrap_or_else(|| first_user.clone()),
+    Prefix {
+        summary: summary.unwrap_or_else(|| first_user.clone()),
         first_user,
-        full,
-        count,
-    )
+        full_text: full,
+        message_count: count,
+        cwd,
+        git_branch,
+    }
 }
 
 /// Append one message's text to the accumulated full-text extract: whitespace-collapsed,
@@ -442,6 +770,42 @@ impl SessionCache {
         self.last_scan_parsed = parsed;
         sort_newest_first(&mut out);
         out
+    }
+
+    /// Every project under `projects_root`, cache-backed — the global scan
+    /// ([`all_projects_in`]) with the per-file `(mtime, size)` reuse, so after the first
+    /// index a refresh costs one `read_dir` per project plus a stat per transcript and is
+    /// O(new files), not O(transcripts). Ordered by project path, sessions newest-first.
+    pub fn scan_all_in(&mut self, projects_root: &Path) -> Vec<ProjectSessions> {
+        let mut found: Vec<ProjectSessions> = Vec::new();
+        let mut parsed = 0usize;
+        for dir in project_dirs_in(projects_root) {
+            let sessions = self.scan_dir(&dir);
+            parsed += self.last_scan_parsed;
+            if let Some(p) = project_sessions(&dir, sessions) {
+                found.push(p);
+            }
+        }
+        self.last_scan_parsed = parsed;
+        merge_projects(found)
+    }
+
+    /// [`scan_all_in`](Self::scan_all_in) across every account's transcript store
+    /// ([`claude_projects_roots`]) — what a "all my Claude sessions" view scans.
+    pub fn scan_all(&mut self) -> Vec<ProjectSessions> {
+        let mut found: Vec<ProjectSessions> = Vec::new();
+        let mut parsed = 0usize;
+        for root in claude_projects_roots() {
+            for dir in project_dirs_in(&root) {
+                let sessions = self.scan_dir(&dir);
+                parsed += self.last_scan_parsed;
+                if let Some(p) = project_sessions(&dir, sessions) {
+                    found.push(p);
+                }
+            }
+        }
+        self.last_scan_parsed = parsed;
+        merge_projects(found)
     }
 
     /// List `session_dir`, re-parsing only new/changed transcripts (by mtime+size) and
@@ -645,6 +1009,8 @@ mod tests {
             first_user: first_user.into(),
             message_count: 0,
             full_text: String::new(),
+            cwd: None,
+            git_branch: None,
         }
     }
 
