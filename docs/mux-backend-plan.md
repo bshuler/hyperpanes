@@ -201,10 +201,45 @@ listener address comes from settings and defaults to loopback.
 has no half-close), so an SSH client hanging up would leak a thread and a daemon client per session.
 `config` is portable and compiled on the Windows leg; the rest refuses with that reason.
 
-### M4 — tmux control-mode surface *(optional)*
-Speak `-CC` on the SSH channel so Blink and iTerm2 render panes as **native tabs** rather than a
-full-screen terminal. It is a simple line-based text protocol — the one place literal tmux
-compatibility is cheap and buys something real.
+### M4 — tmux control-mode surface — **DONE** (`mux/m4-control-mode`)
+Speak `-CC` so Blink and iTerm2 render panes as **native tabs** rather than a full-screen terminal.
+It is a simple line-based text protocol — the one place literal tmux compatibility is cheap and buys
+something real.
+
+**Shipped as two pieces**, split the same way M2 was:
+
+* `core/src/session/control_mode.rs` — the whole protocol as a **pure, I/O-free state machine**:
+  guard blocks (`%begin`/`%end`/`%error`), `%output` escaping, `%layout-change` /
+  `%window-add` / `%window-close` / `%window-renamed` / `%session-changed` / `%sessions-changed` /
+  `%exit`, layout strings with tmux's checksum, the format-string expander (`#{…}`, `#{?…}`,
+  `#{E:…}`, `#{T:…}`), the scoped user-option store, and the command dispatcher. No socket, no stdio — so M3's SSH channel drives
+  the identical code by supplying its own transport.
+* `app/src/control_mode_cli.rs` — the stdio transport (`hyperpanes control-mode`, alias `-CC`).
+  Reuses M2's `session::attach::{connect, handshake, list_sessions}` rather than re-deriving any
+  protocol, attaches to **every** pane on one connection, and turns `SessionEvent`s into calls on
+  the state machine.
+
+**Id mapping (clients cache these — it is a contract).** One tmux **window** per hyperpanes pane,
+each holding exactly one pane, all inside a single tmux session `$0`. The window/pane ids are a
+pure function of the *sorted set of live pane uids*: FNV-1a over a domain tag plus the uid, folded
+to 31 bits (signed-`int` safe — iTerm2 parses ids as `int`). Nothing is persisted, so a reconnect
+from a fresh process reproduces exactly the same ids, and two clients attached at once agree.
+
+**Resize policy** matches M2's: `Observe` by default. `refresh-client -C` is always acknowledged
+(iTerm2 sends it unconditionally during attach and treats an error as fatal) but only reflows the
+pane under `--resize`.
+
+**User options are a real store.** `set -t $0 @affinities …` / `show -v -q -t $0 @affinities` (and
+`@origins`, `@hidden`, `@tabcolors`, `@iterm2_id`) round-trip through a scoped in-memory map,
+because that is where iTerm2 keeps its *entire* window model — which tmux windows share one iTerm2
+window and where they sit on screen. They are client scratch space that tmux itself never reads, so
+honouring them is honest; without them every reconnect re-opens the panes as ungrouped,
+unpositioned tabs. Every *other* option still errors — there is no hyperpanes setting behind
+`status` or `default-terminal` to change.
+
+**Anything not implemented returns `%error`, never a silent success** — every structure-changing
+command (`new-window`, `split-window`, `kill-*`, `break-pane`, `join-pane`, `swap-*`, …) is an
+explicit error, because hyperpanes' pane structure is owned by the desktop app.
 
 ### M5 — left slide-out panel
 `ui/leftpanel.slint` + `app/src/leftpanel.rs`, mounted as a **sibling** of the pane area like the
@@ -271,7 +306,7 @@ click.
 | M1 live upgrade ✅ | `mux/m1-takeover` | — |
 | M2 attach client | `mux/m2-attach` | — |
 | M3 embedded SSH ✅ | `mux/m3-ssh` | M2 |
-| M4 control mode | `mux/m4-ccmode` | M2 |
+| M4 control mode ✅ | `mux/m4-control-mode` | M2 |
 | M5 left panel | `mux/m5-panel` | — (adoption list needs M7) |
 | M6 workspace sets | `mux/m6-sets` | — |
 | M7 orphan adoption | `mux/m7-adopt` | M5 |

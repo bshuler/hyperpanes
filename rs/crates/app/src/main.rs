@@ -26,6 +26,7 @@ mod command;
 mod contextmenu;
 mod control_cli;
 mod control_host;
+mod control_mode_cli;
 mod crash;
 mod devices;
 mod drag;
@@ -285,6 +286,9 @@ USAGE:
                                    Manage the embedded SSH server, so a phone running Termius,
                                    Blink or plain ssh can attach to a pane (off by default,
                                    loopback-only, public-key auth; `ssh --help` for details)
+    hyperpanes control-mode [--session-name <n>] [--resize] [--no-dcs]
+                                   Serve the panes over tmux control mode (`tmux -CC`), for
+                                   iTerm2 and the mobile tmux clients
 
 FLAGS:
     --kill-daemon                  Shut down the running session daemon for this install, then exit
@@ -432,6 +436,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // hyperpanes software on it (docs/mux-backend-plan.md M3).
     if ssh::wants_ssh(&argv0) {
         return ssh::run(&argv0).map_err(Into::into);
+    }
+
+    // `control-mode`: speak the SERVER half of tmux's control protocol on stdio, so iTerm2
+    // and the mobile tmux clients see hyperpanes panes as tmux panes (M4). Like `attach`,
+    // a pure daemon client — no GUI, no single-instance gate.
+    if control_mode_cli::wants_control_mode(&argv0) {
+        return control_mode_cli::run(&argv0).map_err(Into::into);
     }
 
     // Extract the baked-in OFL fonts (Fira Code / JetBrains Mono) so they always resolve.
