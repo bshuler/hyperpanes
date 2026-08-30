@@ -81,6 +81,13 @@ pub struct Hover {
     pub win: Option<usize>,
     /// Cursor is over that window's tab strip (the top bar).
     pub over_strip: bool,
+    /// Cursor is over that window's left panel (the workspace tree). The tree resolves the
+    /// group + slot itself — see `LeftPanelAdapter::ext_drop_tab` — so no geometry for it is
+    /// duplicated here.
+    pub over_left_panel: bool,
+    /// The cursor in that window's own logical coordinates (from the window's top-left),
+    /// which is the frame Slint's `absolute-position` uses.
+    pub local: (f32, f32),
     /// Insertion index in the strip (for a tab reorder / dock caret).
     pub tab_slot: usize,
     /// The existing tab chip directly under the cursor (vs the empty strip / `+`), if any.

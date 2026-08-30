@@ -1614,8 +1614,18 @@ impl State {
     /// carrying its split size with it so the layout stays stable. Focus follows the moved
     /// pane. No-op when the move is a no-op or the indices are out of range.
     pub fn reorder_pane(&mut self, from: usize, to: usize) {
+        self.reorder_pane_in(self.active, from, to);
+    }
+
+    /// The general form of [`Self::reorder_pane`]: reorder within tab `ti`, which need not be
+    /// the active one. The left panel's tree shows every tab at once, so a row can be dragged
+    /// into a new position inside a group the window is not currently showing.
+    pub fn reorder_pane_in(&mut self, ti: usize, from: usize, to: usize) {
+        if ti >= self.tabs.len() {
+            return;
+        }
         let palette = self.settings.frame_palette;
-        let t = self.active_tab_mut();
+        let t = &mut self.tabs[ti];
         let n = t.panes.len();
         if from >= n || to > n {
             return;
@@ -4153,6 +4163,43 @@ impl State {
             return;
         }
         self.adopt_into_tab(mgr, dp, target);
+    }
+
+    /// [`Self::move_pane_between_tabs`] with a landing position: the pane ends up at
+    /// insertion index `at` inside `target` rather than appended. Composed of the two moves
+    /// that already exist rather than a third detach path, so the cross-tab rehost keeps
+    /// exactly one implementation. `target` is re-resolved across the move because the source
+    /// tab is dropped when its last pane leaves, which shifts every tab after it.
+    pub fn move_pane_between_tabs_at(
+        &mut self,
+        from: usize,
+        idx: usize,
+        target: usize,
+        at: usize,
+        mgr: &SessionManager,
+    ) {
+        // Re-validated here as well as inside the move: a rejected move leaves the target
+        // untouched, and reordering its last row afterwards would be a phantom edit.
+        if from >= self.tabs.len() || target >= self.tabs.len() || from == target {
+            return;
+        }
+        if idx >= self.tabs[from].panes.len() {
+            return;
+        }
+        let before = self.tabs.len();
+        self.move_pane_between_tabs(from, idx, target, mgr);
+        let target = if self.tabs.len() < before && from < target {
+            target - 1
+        } else {
+            target
+        };
+        let Some(t) = self.tabs.get(target) else {
+            return;
+        };
+        // The pane was appended, so it is the last row; `at` is an insertion index in the
+        // post-append list, which for a move DOWN the list is exactly the destination.
+        let last = t.panes.len().saturating_sub(1);
+        self.reorder_pane_in(target, last, at.min(last));
     }
 
     // ---- tab actions ----

@@ -57,6 +57,11 @@ const TOPBAR_H: f32 = 32.0;
 /// `paneview.slint`. Used to show the open-hand cursor only over the handle, not the body.
 const HEADER_BAND: f32 = 26.0;
 
+/// Logical width of the left slide-out panel — matches the `width: 300px` binding in
+/// `app.slint`. The panel is a *sibling* of the pane area, not an overlay, so this is also
+/// the x-offset of every (area-relative) pane rect while the panel is open.
+const LEFT_PANEL_W: f32 = 300.0;
+
 /// Write the final window's live workspace snapshot to `last-workspace.json` — the "last
 /// session" a bare relaunch restores via core's `resolve_launch_workspace` fallback (#14:
 /// this is what carries per-pane zoom, layout, focus and cwds across a plain relaunch).
@@ -1900,6 +1905,7 @@ impl App {
 
             let mut h = Hover {
                 win: Some(w.id),
+                local: (lx, ly),
                 ..Default::default()
             };
 
@@ -1912,8 +1918,22 @@ impl App {
                 return h;
             }
 
-            // Otherwise the pane area (area-relative: subtract the top bar).
-            let ax = lx;
+            // The left panel takes width from the left edge, so it both swallows the drop
+            // (the tree hit-tests the pointer itself) and shifts the pane area's origin —
+            // without this offset every pane hit-test is wrong by the panel's width while
+            // it is open.
+            let panel_w = if st.left_panel_open && !fullscreen {
+                LEFT_PANEL_W
+            } else {
+                0.0
+            };
+            if lx < panel_w {
+                h.over_left_panel = true;
+                return h;
+            }
+
+            // Otherwise the pane area (area-relative: subtract the top bar and the panel).
+            let ax = lx - panel_w;
             let ay = ly - if fullscreen { 0.0 } else { TOPBAR_H };
             let vertical = st.active_is_rows();
             for (j, p) in st.active_tab().panes.iter().enumerate() {
@@ -2060,6 +2080,49 @@ impl App {
                 let Some(src) = self.window_by_id(d.source_win) else {
                     return;
                 };
+                // ---- dropped on a window's left panel (the workspace tree) ----
+                // The tree resolved which group and which slot while the drag was live; all
+                // that is left is to read its answer and re-host the pane.
+                if hover.over_left_panel {
+                    let Some(tw) = hover.win.and_then(|id| self.window_by_id(id)) else {
+                        return;
+                    };
+                    let lp = tw.app.global::<crate::LeftPanelAdapter>();
+                    let (ti, at) = (lp.get_ext_drop_tab(), lp.get_ext_drop_slot().max(0) as usize);
+                    if ti < 0 {
+                        return; // over the panel but not over a group — no drop
+                    }
+                    let ti = ti as usize;
+                    if tw.id == d.source_win {
+                        // Same window: a move between its own tabs, or — dropped back into
+                        // the group it came from — a reorder in place.
+                        let here = src.state.borrow_mut().find_pane(uid);
+                        if let Some((from, idx)) = here {
+                            let mut st = src.state.borrow_mut();
+                            if from == ti {
+                                st.reorder_pane_in(ti, idx, at);
+                            } else {
+                                st.move_pane_between_tabs_at(from, idx, ti, at, &self.mgr);
+                            }
+                        }
+                    } else {
+                        // Cross-window: detach here, then adopt into that window's tab. The
+                        // target switches to the tab it was dropped into, exactly like a drop
+                        // on that window's tab chip.
+                        let det = src.state.borrow_mut().detach_uid(uid);
+                        if let Some((det, alive)) = det {
+                            {
+                                let mut st = tw.state.borrow_mut();
+                                st.switch_tab(ti);
+                                st.adopt_pane_at(&self.mgr, det, at);
+                            }
+                            if !alive {
+                                src.closing.set(true);
+                            }
+                        }
+                    }
+                    return;
+                }
                 match hover.win {
                     // ---- in-window ----
                     Some(target_id) if target_id == d.source_win => {
@@ -2201,6 +2264,20 @@ impl App {
                 w.app.set_drop_tab_active(false);
             }
 
+            // The left panel as a drop target: publish the live pointer so the tree can
+            // hit-test it — and draw its own caret — with the same code path its own row
+            // drags use. It publishes the resolved group/slot back on the adapter, which
+            // `apply_drop` reads on release.
+            let lp = w.app.global::<crate::LeftPanelAdapter>();
+            if is_pane && is_target && hover.over_left_panel {
+                lp.set_ext_drag(true);
+                lp.set_ext_drag_y(hover.local.1);
+            } else if lp.get_ext_drag() {
+                lp.set_ext_drag(false);
+                lp.set_ext_drop_tab(-1);
+                lp.set_ext_drop_slot(-1);
+            }
+
             // Pane tile slot highlight (stitch / reorder target).
             let pane_active = is_pane && is_target && !hover.over_strip && hover.pane_idx.is_some();
             if pane_active {
@@ -2225,6 +2302,10 @@ impl App {
             w.app.set_drop_tab_active(false);
             w.app.set_drop_tab_idx(-1);
             w.app.set_drop_rect_active(false);
+            let lp = w.app.global::<crate::LeftPanelAdapter>();
+            lp.set_ext_drag(false);
+            lp.set_ext_drop_tab(-1);
+            lp.set_ext_drop_slot(-1);
         }
     }
 
@@ -2823,12 +2904,33 @@ impl App {
             let id = win.id;
             win.app
                 .global::<crate::LeftPanelAdapter>()
-                .on_move_pane(move |from, i, to| {
+                .on_move_pane(move |from, i, to, at| {
                     if let Some(w) = app.window_by_id(id) {
                         if from >= 0 && i >= 0 && to >= 0 {
                             app.run_command(
                                 &w,
-                                Command::LeftMovePane(from as usize, i as usize, to as usize),
+                                Command::LeftMovePane(
+                                    from as usize,
+                                    i as usize,
+                                    to as usize,
+                                    at.max(0) as usize,
+                                ),
+                            );
+                        }
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_reorder_pane(move |ti, from, to| {
+                    if let Some(w) = app.window_by_id(id) {
+                        if ti >= 0 && from >= 0 && to >= 0 {
+                            app.run_command(
+                                &w,
+                                Command::LeftReorderPane(ti as usize, from as usize, to as usize),
                             );
                         }
                     }

@@ -369,8 +369,22 @@ export global LeftPanelAdapter {
     callback toggle();
     // A pane row clicked → switch to tab `0` and focus its pane `1`.
     callback focus-pane(int, int);
-    // A pane row dragged onto another tab → move pane `1` of tab `0` into tab `2`.
-    callback move-pane(int, int, int);
+    // A pane row dragged onto another tab → move pane `1` of tab `0` into tab `2`, landing
+    // at insertion index `3` among that tab's panes.
+    callback move-pane(int, int, int, int);
+    // A pane row dragged within its OWN tab → move pane `1` of tab `0` to slot `2`.
+    callback reorder-pane(int, int, int);
+
+    // ---- an external (pane-grid) drag hovering the panel ----
+    // The drag pump publishes the live pointer here while a pane torn out of the grid is over
+    // the panel, and the tree hit-tests it with exactly the machinery it uses for its own row
+    // drags — one implementation of "which group is under the cursor", not two. The group and
+    // slot it resolves come back through `ext-drop-tab` / `ext-drop-slot` (-1 = none), which
+    // the pump reads on release. `ext-drag-y` is window-absolute, matching `absolute-position`.
+    in property <bool> ext-drag;
+    in property <length> ext-drag-y;
+    in-out property <int> ext-drop-tab: -1;
+    in-out property <int> ext-drop-slot: -1;
     // A library row clicked → load saved workspace `0` (index into `workspaces`).
     callback open-workspace(int);
     // The library header's ＋ → save the active tab into the library.

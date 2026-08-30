@@ -199,12 +199,13 @@ component TabRowView inherits Rectangle {
     in property <LeftTabRow> tab;
     in property <bool> drag-active;
     in property <length> drag-y;
-    in property <bool> is-source;      // the drag started in this tab → not a drop target
+    in property <bool> is-source;      // the drag started in this tab (a drop here = reorder)
     in property <int> drag-pane;       // pane index being dragged (only when `is-source`)
     callback activate(int);            // pane index clicked
     callback drag-moved(int, length);  // (pane index, absolute y)
     callback drag-released();
-    callback hover-changed(bool);      // this group became / stopped being the drop target
+    // This group is / is no longer the drop target, and the insertion slot within it.
+    callback hover-changed(bool, int);
 
     property <bool> expanded: true;
 
@@ -220,23 +221,54 @@ component TabRowView inherits Rectangle {
     // layout is safe because the tree is already built.
     property <bool> drop-hover: false;
 
+    // Where inside this group the pointer sits: an insertion index among its pane rows
+    // (0 = above the first, panes.length = below the last), or -1 when the group is
+    // collapsed and has no rows to insert between. Derived from the two row metrics below
+    // rather than from the rows themselves, so it needs no per-row geometry report — and,
+    // like `drop-hover`, it is only ever assigned from an event handler.
+    property <int> drop-slot: -1;
+    // Mirrors the layout below: a 28px header plus the VerticalLayout's 1px spacing, then a
+    // 26px row every 27px. Change these together with the layout.
+    property <length> header-h: 29px;
+    property <length> row-pitch: 27px;
+
     function refresh-drop-hover() {
-        root.drop-hover = root.drag-active && !root.is-source
+        root.drop-hover = root.drag-active
             && root.drag-y >= root.absolute-position.y
             && root.drag-y <= root.absolute-position.y + root.height;
+        if (root.drop-hover && root.expanded) {
+            root.drop-slot = clamp(round((root.drag-y - root.absolute-position.y - root.header-h)
+                / root.row-pitch), 0, root.tab.panes.length);
+        } else {
+            root.drop-slot = -1;
+        }
+        root.hover-changed(root.drop-hover, root.drop-slot);
     }
 
     changed drag-y => { root.refresh-drop-hover(); }
     changed drag-active => { root.refresh-drop-hover(); }
     changed is-source => { root.refresh-drop-hover(); }
-    changed drop-hover => { root.hover-changed(root.drop-hover); }
 
     border-radius: 6px;
-    border-width: root.drop-hover ? 1px : 0px;
+    // The source group gets the caret alone (a reorder does not change the pane's home);
+    // any other group also gets the wash, because the drop moves the pane into it.
+    border-width: root.drop-hover && !root.is-source ? 1px : 0px;
     // The drop highlight wears the DESTINATION group's colour, so a pane in flight shows
     // you the halo it is about to take on rather than a generic accent.
     border-color: root.tab.tint;
-    background: root.drop-hover ? root.tab.tint.with-alpha(0.12) : transparent;
+    background: root.drop-hover && !root.is-source ? root.tab.tint.with-alpha(0.12) : transparent;
+
+    // The insertion caret: exactly where the row will land. Absolutely positioned inside
+    // this Rectangle (not a layout child), so it adds no cell to any box layout and its
+    // geometry reads only plain properties.
+    if root.drop-hover && root.drop-slot >= 0 : Rectangle {
+        x: 8px;
+        y: root.header-h + (root.drop-slot * root.row-pitch) - 2px;
+        width: parent.width - 16px;
+        height: 2px;
+        border-radius: 1px;
+        background: root.tab.tint;
+    }
 
     VerticalLayout {
         spacing: 1px;
@@ -563,6 +595,7 @@ export component LeftPanel inherits Rectangle {
     property <int> drag-pane: -1;
     property <length> drag-y: 0;
     property <int> drop-tab: -1;
+    property <int> drop-slot: -1;
 
     // per-section disclosure — local UI state, like the sidebar's per-row expansion
     property <bool> tree-open: true;
@@ -649,8 +682,11 @@ export component LeftPanel inherits Rectangle {
                     spacing: 2px;
                     for t[i] in LeftPanelAdapter.tabs : TabRowView {
                         tab: t;
-                        drag-active: root.dragging;
-                        drag-y: root.drag-y;
+                        // Two drag sources feed the same hit-test: a row dragged inside the
+                        // tree, and a pane torn out of the grid whose pointer the drag pump
+                        // publishes on the adapter. Neither knows about the other.
+                        drag-active: root.dragging || LeftPanelAdapter.ext-drag;
+                        drag-y: root.dragging ? root.drag-y : LeftPanelAdapter.ext-drag-y;
                         drag-pane: root.drag-pane;
                         is-source: root.drag-tab == i;
                         activate(j) => { LeftPanelAdapter.focus-pane(i, j); }
@@ -661,20 +697,34 @@ export component LeftPanel inherits Rectangle {
                             root.drag-y = y;
                         }
                         drag-released => {
-                            // Resolve against whichever group last reported itself hovered.
+                            // Resolve against whichever group last reported itself hovered:
+                            // another group is a move, this one is a reorder in place.
                             if (root.drop-tab >= 0 && root.drop-tab != i) {
-                                LeftPanelAdapter.move-pane(i, root.drag-pane, root.drop-tab);
+                                LeftPanelAdapter.move-pane(i, root.drag-pane, root.drop-tab,
+                                    max(root.drop-slot, 0));
+                            } else if (root.drop-tab == i && root.drop-slot >= 0) {
+                                LeftPanelAdapter.reorder-pane(i, root.drag-pane, root.drop-slot);
                             }
                             root.dragging = false;
                             root.drag-tab = -1;
                             root.drag-pane = -1;
                             root.drop-tab = -1;
+                            root.drop-slot = -1;
                         }
-                        hover-changed(on) => {
+                        hover-changed(on, slot) => {
                             if (on) {
                                 root.drop-tab = i;
+                                root.drop-slot = slot;
                             } else if (root.drop-tab == i) {
                                 root.drop-tab = -1;
+                                root.drop-slot = -1;
+                            }
+                            // Publish the resolution for an external drag; the pump reads it
+                            // on release. Never published for the tree's own drags, which
+                            // resolve locally in `drag-released` above.
+                            if (LeftPanelAdapter.ext-drag) {
+                                LeftPanelAdapter.ext-drop-tab = root.drop-tab;
+                                LeftPanelAdapter.ext-drop-slot = root.drop-slot;
                             }
                         }
                     }

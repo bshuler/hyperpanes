@@ -262,8 +262,12 @@ pub enum Command {
     ToggleLeftPanel,
     /// Workspace tree: focus pane `1` of tab `0` (switching to that tab first).
     LeftFocusPane(usize, usize),
-    /// Workspace tree: drag pane `1` of tab `0` onto tab `2` (re-host, no PTY restart).
-    LeftMovePane(usize, usize, usize),
+    /// Workspace tree: drag pane `1` of tab `0` onto tab `2`, landing at insertion index `3`
+    /// among that tab's panes (re-host, no PTY restart).
+    LeftMovePane(usize, usize, usize, usize),
+    /// Workspace tree: drag pane `1` of tab `0` to insertion index `2` within its OWN tab —
+    /// the same gesture as a cross-group drop, resolved as a reorder because it never left.
+    LeftReorderPane(usize, usize, usize),
     /// Library: load saved workspace row `0` as new tabs.
     LeftOpenWorkspace(usize),
     /// Library: save the active tab into the workspace library (no file dialog).
@@ -526,7 +530,10 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         // ---- the left slide-out panel ----
         Command::ToggleLeftPanel => state.toggle_left_panel(),
         Command::LeftFocusPane(ti, i) => state.focus_pane_in_tab(ti, i),
-        Command::LeftMovePane(from, i, to) => state.move_pane_between_tabs(from, i, to, mgr),
+        Command::LeftMovePane(from, i, to, at) => {
+            state.move_pane_between_tabs_at(from, i, to, at, mgr)
+        }
+        Command::LeftReorderPane(ti, from, to) => state.reorder_pane_in(ti, from, to),
         Command::LeftOpenWorkspace(i) => state.open_workspace_from_library(i, mgr),
         Command::LeftSaveWorkspace => state.save_workspace_to_library(),
         Command::LeftOpenSet(i) => state.open_set_from_library(i, mgr),
