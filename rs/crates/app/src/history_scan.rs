@@ -179,6 +179,17 @@ pub fn request_worktrees(repo_path: &str) {
 /// Ask for a (re-)scan of `tool_id`'s resumable sessions across every project. No-op while
 /// one is already in flight for that tool — the projection asks on every dirty tick the
 /// panel is showing that mode, and only the first ask enqueues a job.
+/// Whether a tool-session scan for `tool_id` is still in flight.
+///
+/// The panel needs this to tell "looked, found nothing" apart from "haven't looked yet": a
+/// cold cache hands back no rows, and announcing "No resumable sessions found" while the
+/// scanner is still walking the transcripts states a verdict on a question nobody has
+/// answered. `PENDING_TOOL` already holds exactly that fact — it is what keeps a second
+/// request from queueing a duplicate job — so this only reads it.
+pub fn tool_scan_pending(tool_id: &str) -> bool {
+    PENDING_TOOL.with(|p| p.borrow().contains(tool_id))
+}
+
 pub fn request_tool_sessions(tool_id: &str, overrides: BTreeMap<String, String>) {
     let fresh = PENDING_TOOL.with(|p| p.borrow_mut().insert(tool_id.to_string()));
     if fresh {
@@ -219,4 +230,29 @@ pub fn drain() -> bool {
         }
     });
     any
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_unscanned_tool_reads_as_pending_until_the_result_is_drained() {
+        let id = "hp-test-no-such-tool";
+        // Nothing has been asked for yet, so nothing is in flight.
+        assert!(!tool_scan_pending(id));
+
+        request_tool_sessions(id, BTreeMap::new());
+        // Pending the moment the job is queued — this is the fact the panel reads to say
+        // "looking" instead of "none found" over a cache that has never been filled.
+        assert!(tool_scan_pending(id));
+
+        // Only `drain` clears it, so the flag cannot go false while the answer is unknown.
+        // The scanner finds no such tool and returns an empty list; draining it is what
+        // turns the panel's message into the real verdict.
+        while tool_scan_pending(id) {
+            drain();
+        }
+        assert!(!tool_scan_pending(id));
+    }
 }

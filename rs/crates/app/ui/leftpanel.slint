@@ -998,7 +998,11 @@ export component LeftPanel inherits Rectangle {
         // switch views would change it for the workspace mode too. With `mode != 0` every
         // section above is `false` and contributes nothing, so this is the only child left.
         if LeftPanelAdapter.mode != 0 && LeftPanelAdapter.sessions.length == 0 : Text {
-            text: "No resumable sessions found for this tool yet.";
+            // A cold cache is empty for the same reason a tool with no history is, so say
+            // which one it is: the scan runs off the UI thread and lands a tick later.
+            text: LeftPanelAdapter.sessions-scanning
+                ? "Looking for resumable sessions…"
+                : "No resumable sessions found for this tool yet.";
             color: Theme.subtext;
             font-size: 11px;
             wrap: word-wrap;

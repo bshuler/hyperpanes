@@ -500,6 +500,11 @@ export global LeftPanelAdapter {
     // The current mode's sessions, already sorted by (project, recency) — the view only
     // draws a heading when `group` changes.
     in property <[LeftSessionItem]> sessions;
+    // Whether the scan behind `sessions` is still walking the transcripts. An empty list
+    // means two different things — "looked, found nothing" and "haven't looked yet" — and
+    // the first time a mode is opened its cache is cold, so the panel would state a verdict
+    // on a question nobody had answered yet.
+    in property <bool> sessions-scanning;
     // A session row clicked → resume session `0` of the current mode's tool.
     callback resume-session(string);
 }

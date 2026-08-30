@@ -1177,9 +1177,13 @@ pub fn resync(
             // Mode 0 is the workspace tree and asks the providers nothing: a human who never
             // opens a tool mode never pays for a transcript scan. Everything below is served
             // from `leftpanel`'s cache — the scan itself runs on the history-scan thread.
-            let sess_rows: Vec<LeftSessionItem> = match mode_tools
-                .get((lp.get_mode() as usize).wrapping_sub(1))
-            {
+            let mode_tool = mode_tools.get((lp.get_mode() as usize).wrapping_sub(1));
+            // An empty list while the scan is still running is not "this tool has no
+            // history" — the panel says so rather than reporting a verdict early.
+            lp.set_sessions_scanning(
+                mode_tool.is_some_and(|id| crate::history_scan::tool_scan_pending(id)),
+            );
+            let sess_rows: Vec<LeftSessionItem> = match mode_tool {
                 None => Vec::new(),
                 Some(tool_id) => crate::leftpanel::tool_sessions(
                     tool_id,
