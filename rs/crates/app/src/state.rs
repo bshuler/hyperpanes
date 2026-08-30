@@ -4160,7 +4160,14 @@ impl State {
     /// or once the session is gone, `pane_load` falls back to a fresh spawn from the recorded
     /// command/args/shell — exactly the old behaviour.
     pub fn to_library_workspace_file(&self) -> WorkspaceFile {
-        let t = self.active_tab();
+        self.library_workspace_of(self.active_tab())
+    }
+
+    /// Snapshot ONE tab into the library shape (name/layout/panes + durable uids) — the
+    /// single serializer behind [`Self::to_library_workspace_file`] (the active tab) and
+    /// [`Self::save_set`] (every tab), so a set member and a saved workspace are byte-for-byte
+    /// the same shape.
+    fn library_workspace_of(&self, t: &Tab) -> WorkspaceFile {
         let base = self.settings.font_px.round() as u32;
         let panes: Vec<PaneSpec> = t
             .panes
@@ -4174,6 +4181,9 @@ impl State {
                     command: p.spawn_command.clone(),
                     args: p.spawn_args.clone(),
                     shell: p.spawn_shell.clone(),
+                    // The live (shell-integration tracked) cwd, so a reloaded pane reopens
+                    // where it was — same as the relaunch snapshot.
+                    cwd: p.cwd.clone(),
                     // Only a zoomed pane records its size (keeps un-zoomed files clean).
                     font_size: (px != base).then_some(px),
                     uid: Some(p.uid.clone()),
@@ -4189,40 +4199,11 @@ impl State {
         }
     }
 
-    /// Snapshot ONE tab into the library shape (name/layout/panes + durable uids) — the
-    /// per-member serialization behind [`Self::save_set`]. Same rules as
-    /// [`Self::to_library_workspace_file`], but for an arbitrary tab rather than the active
-    /// one, so a set can capture every tab of the window in one action.
+    /// The library snapshot of tab `i`, or `None` when that tab has no panes — a 0-pane tab
+    /// describes nothing and must never be written as a set member.
     fn library_workspace_of_tab(&self, i: usize) -> Option<WorkspaceFile> {
-        let t = self.tabs.get(i)?;
-        if t.panes.is_empty() {
-            return None; // a 0-pane tab describes nothing; never write it as a member
-        }
-        let base = self.settings.font_px.round() as u32;
-        let panes: Vec<PaneSpec> = t
-            .panes
-            .iter()
-            .map(|p| {
-                let px = p.font_px.round() as u32;
-                PaneSpec {
-                    label: Some(p.title.to_string()),
-                    color: Some(color_hex(p.accent)),
-                    command: p.spawn_command.clone(),
-                    args: p.spawn_args.clone(),
-                    shell: p.spawn_shell.clone(),
-                    cwd: p.cwd.clone(),
-                    font_size: (px != base).then_some(px),
-                    uid: Some(p.uid.clone()),
-                    ..Default::default()
-                }
-            })
-            .collect();
-        Some(WorkspaceFile {
-            name: Some(t.title.to_string()),
-            layout: Some(theme::layout_name(t.layout).to_string()),
-            panes: Some(panes),
-            ..Default::default()
-        })
+        let t = self.tabs.get(i).filter(|t| !t.panes.is_empty())?;
+        Some(self.library_workspace_of(t))
     }
 
     /// Snapshot **every tab** into the persistable file shape — the relaunch-restore
@@ -4480,20 +4461,35 @@ impl State {
         };
         let members = sets::load_members(&set);
         let n = members.len();
+        // `load_workspace` selects the tab IT just appended, so loading N members in a row
+        // would leave the window focused on member N. A set opens on its FIRST member — the
+        // order the user wrote it in — so keep the first landing and restore it at the end.
+        // (Nothing is purged after the first member: every appended tab has panes, so the
+        // remembered index stays valid.)
+        let mut first_landing: Option<usize> = None;
         for file in members {
-            self.load_workspace(file, mgr);
+            let landed = self.load_workspace(file, mgr);
+            first_landing = first_landing.or(landed);
+        }
+        if let Some(i) = first_landing {
+            self.active = i.min(self.tabs.len().saturating_sub(1));
+            self.editing_tab = -1;
+            self.dirty = true;
         }
         n
     }
 
     /// Load a parsed workspace file: append a tab per group of its first window and switch to
-    /// the first appended tab. Each pane re-spawns from its spec (label/color/cwd/command/
-    /// shell). Shared by [`Self::open_workspace`].
-    pub fn load_workspace(&mut self, file: WorkspaceFile, mgr: &SessionManager) {
+    /// the tab it landed on (the file's saved active tab, else the first appended one). Each
+    /// pane takes the reattach-or-spawn decision from its spec (uid/label/color/cwd/command/
+    /// shell). Shared by [`Self::open_workspace`] and [`Self::open_set_from`].
+    ///
+    /// Returns the index of the tab it selected, or `None` when the file described nothing
+    /// and no tab was appended — [`Self::open_set_from`] needs that to land a multi-member
+    /// set on its FIRST member rather than wherever the last member happened to select.
+    pub fn load_workspace(&mut self, file: WorkspaceFile, mgr: &SessionManager) -> Option<usize> {
         let windows = windows_of(Some(&file));
-        let Some(win) = windows.into_iter().next() else {
-            return;
-        };
+        let win = windows.into_iter().next()?;
         let first_new = self.tabs.len();
         let saved_active = win.active.map(|a| a as usize);
         // Contentless groups are skipped by `append_tab_from_group`, which shifts the
@@ -4520,7 +4516,9 @@ impl State {
             // 0-pane-tab sighting that motivated the B6 hardening).
             self.purge_empty_tabs();
             self.dirty = true;
+            return Some(self.active);
         }
+        None
     }
 
     /// Remove every 0-pane tab, keeping `active` pointed at the same tab. Callers must
@@ -5943,6 +5941,8 @@ mod set_tests {
             vec![Some("claude".to_string()), Some("htop".to_string())],
             "each member re-runs its own program"
         );
+        // A set opens on its FIRST member, not on whichever member happened to load last.
+        assert_eq!(st2.active, 0, "Open set lands on the first member's tab");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -6001,6 +6001,104 @@ mod set_tests {
         assert_eq!(st.open_set_from(&dir.join("gone.json"), &m), 0);
         assert_eq!(st.tabs.len(), 1, "no tab was appended");
         assert_eq!(st.active_tab().panes.len(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Backward compatibility, app side.** A workspace file written by a PRE-M6 build has
+    /// no `uid` on any pane. Loading it must not fail, must not adopt anything, and must
+    /// simply spawn every pane from its recorded program — exactly the pre-M6 behaviour.
+    #[test]
+    fn a_legacy_workspace_file_loads_and_spawns_every_pane() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let dir = temp_dir("legacy");
+        let path = dir.join("legacy.hyperpanes");
+        // Verbatim shape of an old save-dialog file: bare object, no envelope, no uid.
+        std::fs::write(
+            &path,
+            br#"{
+  "name": "Old Save",
+  "layout": "grid",
+  "panes": [
+    { "label": "one", "command": "claude" },
+    { "label": "two", "shell": "/bin/zsh", "fontSize": 18 }
+  ]
+}"#,
+        )
+        .unwrap();
+
+        let file = hyperpanes_core::workspace::io::read_workspace(&path).expect("legacy parses");
+        for p in file.panes.iter().flatten() {
+            assert_eq!(p.uid, None, "the fixture really is uid-less");
+        }
+
+        let mut st = fresh();
+        let m = mgr();
+        st.load_workspace(file, &m);
+        let tab = st.active_tab();
+        assert_eq!(tab.panes.len(), 2, "both legacy panes materialised");
+        assert_eq!(tab.panes[0].spawn_command.as_deref(), Some("claude"));
+        assert_eq!(tab.panes[1].spawn_shell.as_deref(), Some("/bin/zsh"));
+        for p in &tab.panes {
+            assert!(!p.started, "a uid-less pane is spawned, not re-attached");
+            assert!(!p.uid.is_empty(), "the loader minted a fresh uid");
+        }
+        assert_ne!(tab.panes[0].uid, tab.panes[1].uid, "fresh uids are unique");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Forward round-trip.** "Save workspace as…" → disk → "Open workspace" preserves the
+    /// durable uid on disk (the reattach key) while the load itself still spawns, because the
+    /// in-process backend has no survivor to adopt. Uids are written, never `null`.
+    #[test]
+    fn save_as_then_reload_round_trips_the_durable_uid() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let dir = temp_dir("save-as");
+        let path = dir.join("saved.hyperpanes");
+
+        let mut st = fresh();
+        let m = mgr();
+        st.adopt_pane(&m, det("pane-keep-1", Some("claude")));
+        st.adopt_pane(&m, det("pane-keep-2", Some("htop")));
+        assert!(st.write_workspace_to(&path), "save-as wrote the file");
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.contains("\"uid\""), "the field is camelCase `uid`");
+        assert!(
+            !raw.contains("null"),
+            "unset optionals are omitted, never null"
+        );
+        assert!(raw.contains("pane-keep-1") && raw.contains("pane-keep-2"));
+
+        let back = hyperpanes_core::workspace::io::read_workspace(&path).expect("re-reads");
+        let uids: Vec<Option<String>> =
+            back.panes.iter().flatten().map(|p| p.uid.clone()).collect();
+        assert_eq!(
+            uids,
+            vec![
+                Some("pane-keep-1".to_string()),
+                Some("pane-keep-2".to_string())
+            ],
+            "both durable uids survived the disk round-trip in order"
+        );
+
+        let mut st2 = fresh();
+        let m2 = mgr();
+        st2.load_workspace(back, &m2);
+        let tab = st2.active_tab();
+        assert_eq!(tab.panes.len(), 2);
+        for p in &tab.panes {
+            assert!(
+                !p.uid.starts_with("pane-keep"),
+                "no live session named those uids, so each pane re-spawns fresh, got {}",
+                p.uid
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

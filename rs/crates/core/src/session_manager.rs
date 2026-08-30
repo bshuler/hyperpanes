@@ -688,28 +688,6 @@ impl SessionRegistry {
     }
 }
 
-/// Owns every live pty session, keyed by uid — the GUI's single handle to sessions. The
-/// GUI holds an `Arc<SessionManager>` and calls this exact API; the **backend** behind it
-/// is chosen once at construction (`docs/session-daemon-plan.md` M1):
-///
-/// * [`Backend::InProcess`] — the historical path: the PTYs are children of the GUI process
-///   and live in a [`SessionRegistry`] right here. This is the default
-///   ([`SessionManager::new`]) and what CI / `--no-daemon` use.
-/// * [`Backend::Daemon`] — a [`DaemonSessionManager`] talking to the PTY-owning
-///   [session daemon](crate::session::daemon) over a UDS, so the PTYs survive a GUI crash
-///   (selected by [`SessionManager::new_daemon`], wired to `HYPERPANES_SESSION_DAEMON=1`).
-///
-/// Every public method dispatches to the active backend with an **identical signature**, so
-/// the GUI's call sites are untouched — the whole point of M1: the backend swap is invisible
-/// above this type. The daemon backend honors the plan's non-blocking-API contract (shadow
-/// state + a mirror buffer; only `render_screen` does a bounded round-trip).
-///
-/// `SessionManager` stays **`Clone`** exactly as the historical in-process one was — the
-/// in-process variant clones the cheap [`SessionRegistry`] handle (a shared map + sender),
-/// and the daemon variant is an `Arc<DaemonSessionManager>` so a clone shares the one
-/// socket + reader thread (the daemon backend is single-connection; a clone is another
-/// handle, not another connection). Preserving `Clone` keeps GUI code that moves an owned
-/// `mgr.clone()` onto a worker thread (`state.rs::spawn_session_async`) untouched.
 /// How a pane described by a spec should come up: adopt a surviving daemon session under its
 /// durable uid, or spawn a fresh one. See [`SessionManager::pane_load`]. Either way the
 /// variant carries the uid the pane must use.
@@ -736,6 +714,28 @@ impl PaneLoad {
     }
 }
 
+/// Owns every live pty session, keyed by uid — the GUI's single handle to sessions. The
+/// GUI holds an `Arc<SessionManager>` and calls this exact API; the **backend** behind it
+/// is chosen once at construction (`docs/session-daemon-plan.md` M1):
+///
+/// * [`Backend::InProcess`] — the historical path: the PTYs are children of the GUI process
+///   and live in a [`SessionRegistry`] right here. This is the default
+///   ([`SessionManager::new`]) and what CI / `--no-daemon` use.
+/// * [`Backend::Daemon`] — a [`DaemonSessionManager`] talking to the PTY-owning
+///   [session daemon](crate::session::daemon) over a UDS, so the PTYs survive a GUI crash
+///   (selected by [`SessionManager::new_daemon`], wired to `HYPERPANES_SESSION_DAEMON=1`).
+///
+/// Every public method dispatches to the active backend with an **identical signature**, so
+/// the GUI's call sites are untouched — the whole point of M1: the backend swap is invisible
+/// above this type. The daemon backend honors the plan's non-blocking-API contract (shadow
+/// state + a mirror buffer; only `render_screen` does a bounded round-trip).
+///
+/// `SessionManager` stays **`Clone`** exactly as the historical in-process one was — the
+/// in-process variant clones the cheap [`SessionRegistry`] handle (a shared map + sender),
+/// and the daemon variant is an `Arc<DaemonSessionManager>` so a clone shares the one
+/// socket + reader thread (the daemon backend is single-connection; a clone is another
+/// handle, not another connection). Preserving `Clone` keeps GUI code that moves an owned
+/// `mgr.clone()` onto a worker thread (`state.rs::spawn_session_async`) untouched.
 #[derive(Clone)]
 pub enum SessionManager {
     /// The PTYs live in this process (the default, pre-daemon path).
