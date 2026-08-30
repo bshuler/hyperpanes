@@ -26,6 +26,7 @@
 // failure), so a PUA icon renders as nothing at all.
 
 import { Theme } from "theme.slint";
+import { TipArea } from "tooltip.slint";
 import { LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSessionRow, LeftPanelAdapter } from "types.slint";
 
 // A disclosure chevron: pointing down when the section is open, right when it is closed.
@@ -124,7 +125,8 @@ component PaneRowView inherits Rectangle {
     background: root.dragging ? Theme.surface : (ta.has-hover ? Theme.surface2 : transparent);
     opacity: root.dragging ? 0.55 : 1.0;
 
-    ta := TouchArea {
+    ta := TipArea {
+        tip: "Focus this pane · drag to reorder or move it to another tab";
         mouse-cursor: pointer;
         pointer-event(e) => {
             if (e.kind == PointerEventKind.down) {
@@ -219,7 +221,8 @@ component TabRowView inherits Rectangle {
             border-radius: 5px;
             background: hta.has-hover ? Theme.surface2 : transparent;
 
-            hta := TouchArea {
+            hta := TipArea {
+                tip: "Switch to this tab";
                 mouse-cursor: pointer;
                 // Clicking the header focuses the tab through its FIRST pane: the tree has
                 // no separate "switch tab" command, because focusing a pane already
@@ -241,7 +244,8 @@ component TabRowView inherits Rectangle {
                         open: root.expanded;
                         ink: cta.has-hover ? Theme.accent : Theme.subtext;
                     }
-                    cta := TouchArea {
+                    cta := TipArea {
+                        tip: root.expanded ? "Collapse this tab's panes" : "Show this tab's panes";
                         mouse-cursor: pointer;
                         clicked => { root.expanded = !root.expanded; }
                     }
@@ -301,7 +305,8 @@ component WorkspaceRowView inherits Rectangle {
     border-radius: 5px;
     background: wa.has-hover ? Theme.surface2 : transparent;
 
-    wa := TouchArea {
+    wa := TipArea {
+        tip: "Open this saved workspace";
         mouse-cursor: pointer;
         clicked => { root.activate(); }
     }
@@ -335,7 +340,8 @@ component SessionRowView inherits Rectangle {
     border-radius: 5px;
     background: sa.has-hover ? Theme.surface2 : transparent;
 
-    sa := TouchArea {
+    sa := TipArea {
+        tip: "Adopt this orphaned session into the current tab — it keeps running, scrollback and all";
         mouse-cursor: pointer;
         clicked => { root.activate(); }
     }
@@ -383,13 +389,18 @@ component SectionHead inherits Rectangle {
     in property <string> label;
     in property <bool> open;
     in property <bool> has-action;
+    // Per-instance, because this component heads three different sections and its chevron
+    // and action glyph mean something different in each.
+    in property <string> tip;
+    in property <string> action-tip;
     callback toggled();
     callback acted();
     height: 22px;
 
     // Declared FIRST so the action button's own TouchArea (declared later, on top) wins
     // its clicks; this one is also narrowed to leave the button's corner alone.
-    hta := TouchArea {
+    hta := TipArea {
+        tip: root.tip;
         x: 0;
         width: root.has-action ? parent.width - 24px : parent.width;
         mouse-cursor: pointer;
@@ -431,7 +442,8 @@ component SectionHead inherits Rectangle {
                     y: (parent.height - self.height) / 2;
                     ink: aa.has-hover ? Theme.text : Theme.subtext;
                 }
-                aa := TouchArea {
+                aa := TipArea {
+                    tip: root.action-tip;
                     mouse-cursor: pointer;
                     clicked => { root.acted(); }
                 }
@@ -502,7 +514,8 @@ export component LeftPanel inherits Rectangle {
                         y: (parent.height - self.height) / 2;
                         ink: xa.has-hover ? Theme.text : Theme.subtext;
                     }
-                    xa := TouchArea {
+                    xa := TipArea {
+                        tip: "Hide this panel";
                         mouse-cursor: pointer;
                         clicked => { LeftPanelAdapter.toggle(); }
                     }
@@ -514,6 +527,7 @@ export component LeftPanel inherits Rectangle {
         SectionHead {
             label: "WORKSPACE";
             open: root.tree-open;
+            tip: root.tree-open ? "Collapse the tab and pane tree" : "Show the tab and pane tree";
             toggled => { root.tree-open = !root.tree-open; }
         }
 
@@ -568,6 +582,8 @@ export component LeftPanel inherits Rectangle {
             label: "LIBRARY";
             open: root.lib-open;
             has-action: true;
+            tip: root.lib-open ? "Collapse the saved workspaces" : "Show the saved workspaces";
+            action-tip: "Save the current tabs and panes as a workspace";
             toggled => { root.lib-open = !root.lib-open; }
             acted => { LeftPanelAdapter.save-workspace(); }
         }
@@ -602,6 +618,7 @@ export component LeftPanel inherits Rectangle {
         SectionHead {
             label: "DETACHED";
             open: root.det-open;
+            tip: root.det-open ? "Collapse the orphaned sessions" : "Show sessions still running with no window";
             toggled => { root.det-open = !root.det-open; }
         }
 
