@@ -64,7 +64,10 @@ component ViewRowView inherits Rectangle {
     callback activate();
 
     // A rule is a divider, not a line of text; everything else gets a full row.
-    height: root.item.role == 10 ? 15px
+    // A diagram is the one role that sizes itself: its height was decided by the
+    // layout in `src/mermaid.rs`, and nothing here may second-guess it.
+    height: root.item.role == 12 ? root.item.diagram.h + 12px
+        : root.item.role == 10 ? 15px
         : root.item.role == 4 ? 26px
         : root.item.role == 5 ? 22px
         : 19px;
@@ -199,8 +202,133 @@ component ViewRowView inherits Rectangle {
         }
     }
 
+    // --- 12: a mermaid diagram, laid out Rust-side and drawn absolutely ---
+    if root.item.role == 12 : Rectangle {
+        clip: true;
+        // A diagram wider than the pane pans instead of clipping. The viewport is
+        // pinned to the row's own height so a horizontal drag can never fight the
+        // enclosing ListView for the vertical gesture.
+        Flickable {
+            x: 6px;
+            y: 6px;
+            width: parent.width - 12px;
+            height: parent.height - 12px;
+            viewport-width: max(root.item.diagram.w, self.width);
+            viewport-height: self.height;
+
+            // Everything sits inside one canvas sized to the diagram itself. A
+            // Path stretches to fill its parent whatever its own width says, so
+            // this box is what makes that stretch the identity transform and
+            // keeps the strokes in the same coordinate space as the nodes.
+            Rectangle {
+            x: 0px;
+            y: 0px;
+            width: root.item.diagram.w;
+            height: root.item.diagram.h;
+
+            // Strokes first, so every node paints over its own edges.
+            Path {
+                width: root.item.diagram.w;
+                height: root.item.diagram.h;
+                viewbox-width: root.item.diagram.w / 1px;
+                viewbox-height: root.item.diagram.h / 1px;
+                commands: root.item.diagram.lines;
+                stroke: Theme.subtext;
+                stroke-width: 1.3px;
+                fill: transparent;
+            }
+            Path {
+                width: root.item.diagram.w;
+                height: root.item.diagram.h;
+                viewbox-width: root.item.diagram.w / 1px;
+                viewbox-height: root.item.diagram.h / 1px;
+                commands: root.item.diagram.dashed;
+                stroke: Theme.faint;
+                stroke-width: 1.3px;
+                fill: transparent;
+            }
+            Path {
+                width: root.item.diagram.w;
+                height: root.item.diagram.h;
+                viewbox-width: root.item.diagram.w / 1px;
+                viewbox-height: root.item.diagram.h / 1px;
+                commands: root.item.diagram.thick;
+                stroke: root.accent;
+                stroke-width: 2.4px;
+                fill: transparent;
+            }
+            Path {
+                width: root.item.diagram.w;
+                height: root.item.diagram.h;
+                viewbox-width: root.item.diagram.w / 1px;
+                viewbox-height: root.item.diagram.h / 1px;
+                commands: root.item.diagram.heads;
+                stroke: transparent;
+                fill: Theme.subtext;
+            }
+            // Diamonds are the one shape a Rectangle cannot be, so they arrive as
+            // a filled path and skip the box below.
+            Path {
+                width: root.item.diagram.w;
+                height: root.item.diagram.h;
+                viewbox-width: root.item.diagram.w / 1px;
+                viewbox-height: root.item.diagram.h / 1px;
+                commands: root.item.diagram.diamonds;
+                stroke: root.accent.with-alpha(0.65);
+                stroke-width: 1.2px;
+                fill: Theme.surface;
+            }
+
+            for nd in root.item.diagram.nodes : Rectangle {
+                x: nd.x;
+                y: nd.y;
+                width: nd.w;
+                height: nd.h;
+                // shape 2 (diamond) is already drawn by the path above.
+                background: nd.shape == 2 ? transparent : Theme.surface;
+                border-color: nd.shape == 2 ? transparent : root.accent.with-alpha(0.65);
+                border-width: nd.shape == 2 ? 0px : 1.2px;
+                // 1 = rounded/stadium, 3 = circle: both are a box whose radius is
+                // half its shorter side.
+                border-radius: nd.shape == 1 || nd.shape == 3 ? nd.h / 2 : 4px;
+                Text {
+                    x: 6px;
+                    width: parent.width - 12px;
+                    height: 100%;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    text: nd.text;
+                    color: Theme.text;
+                    font-size: 11px;
+                    overflow: elide;
+                }
+            }
+            // Labels last and over their own ground, so an edge never runs through
+            // the text that describes it.
+            for lb in root.item.diagram.labels : Rectangle {
+                x: lb.x;
+                y: lb.y;
+                width: lb.w;
+                height: 15px;
+                background: Theme.bg;
+                border-radius: 3px;
+                Text {
+                    width: 100%;
+                    height: 100%;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    text: lb.text;
+                    color: Theme.subtext;
+                    font-size: 10px;
+                    overflow: elide;
+                }
+            }
+            }
+        }
+    }
+
     // --- 3 (and anything unknown): a plain line, with the viewer's line number ---
-    if root.item.role == 3 || root.item.role > 11 : HorizontalLayout {
+    if root.item.role == 3 || root.item.role > 12 : HorizontalLayout {
         // Markdown prose lands on this role too, and it carries no line number.
         // Reserving the gutter for it indents every paragraph ~40px past the
         // headings and bullets around it, which reads as accidental centring.

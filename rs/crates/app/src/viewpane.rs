@@ -29,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hyperpanes_core::tools::PaneKind;
 use slint::{ModelRc, VecModel};
 
-use crate::PaneViewRow;
+use crate::{DiagLabel, DiagNode, PaneDiagram, PaneViewRow};
 
 /// How a row is drawn. The `.slint` side switches on this and nothing else — it
 /// never re-parses `text`. Keep these in lock-step with `ViewPane` in
@@ -60,13 +60,17 @@ pub mod role {
     /// An advisory row the app generated — truncation, "empty directory", an IO
     /// error. Never activatable.
     pub const NOTICE: i32 = 11;
+    /// A rendered mermaid diagram. The row's `text` is empty and its geometry
+    /// rides along in [`super::ViewRow::diagram`]; it is the one role whose
+    /// height is decided by its content rather than by the role itself.
+    pub const DIAGRAM: i32 = 12;
 }
 
 /// One projected row. `path` is empty for everything that is not activatable, so
 /// the click handler can refuse a row without consulting its role — the same
 /// "decide it once, on the producing side" rule the left panel's `blocked` flag
 /// follows.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ViewRow {
     pub role: i32,
     pub text: String,
@@ -75,6 +79,9 @@ pub struct ViewRow {
     pub detail: String,
     /// The absolute path this row activates, or "" when the row is inert.
     pub path: PathBuf,
+    /// Set only on [`role::DIAGRAM`]. Boxed because it is large and every other
+    /// row in a 5,000-row file would otherwise carry the empty space for it.
+    pub diagram: Option<Box<crate::mermaid::Diagram>>,
 }
 
 impl ViewRow {
@@ -85,6 +92,7 @@ impl ViewRow {
             text: text.into(),
             detail: String::new(),
             path: PathBuf::new(),
+            diagram: None,
         }
     }
 
@@ -200,6 +208,7 @@ pub fn list_dir(dir: &Path) -> Vec<ViewRow> {
                     text: name,
                     detail: "—".into(),
                     path: ent.path(),
+                    diagram: None,
                 });
                 continue;
             }
@@ -219,6 +228,7 @@ pub fn list_dir(dir: &Path) -> Vec<ViewRow> {
                 text: name,
                 detail: age,
                 path: ent.path(),
+                diagram: None,
             });
         } else {
             let detail = if age.is_empty() {
@@ -231,6 +241,7 @@ pub fn list_dir(dir: &Path) -> Vec<ViewRow> {
                 text: name,
                 detail,
                 path: ent.path(),
+                diagram: None,
             });
         }
     }
@@ -245,6 +256,7 @@ pub fn list_dir(dir: &Path) -> Vec<ViewRow> {
             text: "..".into(),
             detail: String::new(),
             path: parent.to_path_buf(),
+            diagram: None,
         });
     }
     let empty = dirs.is_empty() && files.is_empty();
@@ -280,6 +292,7 @@ pub fn read_lines(file: &Path) -> Vec<ViewRow> {
             text: clip(line),
             detail: (i + 1).to_string(),
             path: PathBuf::new(),
+            diagram: None,
         });
     }
     if rows.is_empty() {
@@ -305,6 +318,9 @@ pub fn markdown_blocks(file: &Path) -> Vec<ViewRow> {
     };
     let mut rows: Vec<ViewRow> = Vec::new();
     let mut fenced = false;
+    // The lines of an open ```mermaid fence, held back until the fence closes: a
+    // diagram cannot be laid out one line at a time.
+    let mut pending: Option<Vec<String>> = None;
     let mut total = 0usize;
     for (i, raw) in text.lines().enumerate() {
         total = i + 1;
@@ -313,8 +329,18 @@ pub fn markdown_blocks(file: &Path) -> Vec<ViewRow> {
         }
         let trimmed = raw.trim_start();
         if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            // The fence line itself is chrome, not content: toggle and drop it.
+            // The fence line itself is chrome, not content: toggle and drop it —
+            // but its info string decides what the body becomes.
             fenced = !fenced;
+            match pending.take() {
+                Some(src) => rows.append(&mut diagram_rows(&src)),
+                None if fenced && is_mermaid(&trimmed[3..]) => pending = Some(Vec::new()),
+                None => {}
+            }
+            continue;
+        }
+        if let Some(src) = pending.as_mut() {
+            src.push(raw.to_string());
             continue;
         }
         if fenced {
@@ -336,6 +362,10 @@ pub fn markdown_blocks(file: &Path) -> Vec<ViewRow> {
         };
         rows.push(row);
     }
+    // A fence that never closed still has a diagram in it worth drawing.
+    if let Some(src) = pending.take() {
+        rows.append(&mut diagram_rows(&src));
+    }
     if rows.is_empty() {
         rows.push(ViewRow::inert(role::NOTICE, "Empty file"));
     } else if total > MAX_LINES {
@@ -349,6 +379,41 @@ pub fn markdown_blocks(file: &Path) -> Vec<ViewRow> {
 
 /// `#`/`##`/`###+` → the matching heading row. `None` when the line is not a
 /// heading — including `#hashtag`, which needs the space ATX requires.
+/// Whether a fence's info string opens a mermaid block. Mermaid is only ever the
+/// first word — ```` ```mermaid {init: …} ```` is legal and still a diagram.
+fn is_mermaid(info: &str) -> bool {
+    info.trim()
+        .split(|c: char| c.is_whitespace() || c == '{')
+        .next()
+        .is_some_and(|w| w.eq_ignore_ascii_case("mermaid"))
+}
+
+/// A mermaid fence body, as either one diagram row or the code block it was.
+///
+/// Falling back to code is the whole point of the `Result`: mermaid has a dozen
+/// dialects and this renders two, so the unsupported case is the common case, not
+/// an error path. The reader gets the source plus a line saying why — which is
+/// strictly more than the preview showed before diagrams existed.
+fn diagram_rows(src: &[String]) -> Vec<ViewRow> {
+    match crate::mermaid::render(&src.join("\n")) {
+        Ok(d) => vec![ViewRow {
+            role: role::DIAGRAM,
+            text: String::new(),
+            detail: String::new(),
+            path: PathBuf::new(),
+            diagram: Some(Box::new(d)),
+        }],
+        Err(why) => {
+            let mut rows: Vec<ViewRow> = src
+                .iter()
+                .map(|l| ViewRow::inert(role::CODE, clip(l)))
+                .collect();
+            rows.push(ViewRow::inert(role::NOTICE, format!("mermaid: {why}")));
+            rows
+        }
+    }
+}
+
 fn heading(trimmed: &str) -> Option<ViewRow> {
     let hashes = trimmed.chars().take_while(|c| *c == '#').count();
     if hashes == 0 || hashes > 6 {
@@ -543,6 +608,60 @@ thread_local! {
 /// The Slint row model for pane `uid`, recomputed only when the target changed on
 /// disk. Cheap enough to call from the per-frame pump — the steady state is one
 /// `stat` and a refcount bump.
+/// The "no diagram" value. `w == 0` is what the view tests, so a blank one is
+/// inert without needing a second flag.
+fn blank_diagram() -> PaneDiagram {
+    PaneDiagram {
+        w: 0.0,
+        h: 0.0,
+        nodes: ModelRc::from(Rc::new(VecModel::from(Vec::<DiagNode>::new()))),
+        labels: ModelRc::from(Rc::new(VecModel::from(Vec::<DiagLabel>::new()))),
+        lines: Default::default(),
+        dashed: Default::default(),
+        thick: Default::default(),
+        heads: Default::default(),
+        diamonds: Default::default(),
+    }
+}
+
+/// Hand a laid-out diagram to Slint. A straight field-for-field copy: the layout
+/// is finished before it gets here, and this side adds no geometry of its own.
+fn diagram_model(d: &crate::mermaid::Diagram) -> PaneDiagram {
+    PaneDiagram {
+        w: d.w,
+        h: d.h,
+        nodes: ModelRc::from(Rc::new(VecModel::from(
+            d.nodes
+                .iter()
+                .map(|n| DiagNode {
+                    x: n.x,
+                    y: n.y,
+                    w: n.w,
+                    h: n.h,
+                    shape: n.shape,
+                    text: n.text.as_str().into(),
+                })
+                .collect::<Vec<_>>(),
+        ))),
+        labels: ModelRc::from(Rc::new(VecModel::from(
+            d.labels
+                .iter()
+                .map(|l| DiagLabel {
+                    x: l.x,
+                    y: l.y,
+                    w: l.w,
+                    text: l.text.as_str().into(),
+                })
+                .collect::<Vec<_>>(),
+        ))),
+        lines: d.lines.as_str().into(),
+        dashed: d.dashed.as_str().into(),
+        thick: d.thick.as_str().into(),
+        heads: d.heads.as_str().into(),
+        diamonds: d.diamonds.as_str().into(),
+    }
+}
+
 pub fn model_for(uid: &str, kind: &PaneKind, target: Option<&str>) -> ModelRc<PaneViewRow> {
     let fp = fingerprint(kind, target);
     VIEW_CACHE.with(|c| {
@@ -553,6 +672,10 @@ pub fn model_for(uid: &str, kind: &PaneKind, target: Option<&str>) -> ModelRc<Pa
             }
         }
         let rows = rows_for(kind, target);
+        // Built once and cloned: a `PaneDiagram` holds two `ModelRc`s, and minting
+        // a fresh empty pair for each of 5,000 plain rows is 10,000 allocations to
+        // say "no diagram here".
+        let blank = blank_diagram();
         let model: ModelRc<PaneViewRow> = ModelRc::from(Rc::new(VecModel::from(
             rows.iter()
                 .map(|r| PaneViewRow {
@@ -560,6 +683,10 @@ pub fn model_for(uid: &str, kind: &PaneKind, target: Option<&str>) -> ModelRc<Pa
                     text: r.text.as_str().into(),
                     detail: r.detail.as_str().into(),
                     activatable: r.activatable(),
+                    diagram: match &r.diagram {
+                        Some(d) => diagram_model(d),
+                        None => blank.clone(),
+                    },
                 })
                 .collect::<Vec<_>>(),
         )));
@@ -771,6 +898,63 @@ mod tests {
                 (role::LINE, "after".into()),
             ]
         );
+    }
+
+    #[test]
+    fn a_mermaid_fence_collapses_to_one_diagram_row() {
+        let d = scratch("mermaid");
+        let f = write(
+            &d,
+            "doc.md",
+            "intro\n```mermaid\nflowchart TD\n  A[start] --> B[stop]\n```\nouttro\n",
+        );
+
+        let rows = markdown_blocks(&f);
+        let got: Vec<i32> = rows.iter().map(|r| r.role).collect();
+        assert_eq!(got, vec![role::LINE, role::DIAGRAM, role::LINE]);
+        let dg = rows[1].diagram.as_ref().expect("the row carries its geometry");
+        assert_eq!(dg.nodes.len(), 2);
+        assert!(dg.w > 0.0 && dg.h > 0.0);
+        // The source lines are gone: a diagram replaces its fence, it does not
+        // follow it.
+        assert!(!rows.iter().any(|r| r.text.contains("flowchart")));
+    }
+
+    #[test]
+    fn a_dialect_we_cannot_draw_falls_back_to_the_code_it_was() {
+        let d = scratch("mermaid-fallback");
+        let f = write(
+            &d,
+            "doc.md",
+            "```mermaid\nclassDiagram\n  Animal <|-- Duck\n```\n",
+        );
+
+        let rows = markdown_blocks(&f);
+        assert!(!rows.iter().any(|r| r.role == role::DIAGRAM));
+        assert_eq!(rows[0].role, role::CODE);
+        assert_eq!(rows[0].text, "classDiagram");
+        let last = rows.last().unwrap();
+        assert_eq!(last.role, role::NOTICE);
+        assert!(last.text.starts_with("mermaid: class"), "{}", last.text);
+    }
+
+    #[test]
+    fn only_a_mermaid_fence_is_a_diagram() {
+        let d = scratch("mermaid-other");
+        let f = write(&d, "doc.md", "```rust\nflowchart TD\n A --> B\n```\n");
+
+        let rows = markdown_blocks(&f);
+        assert!(rows.iter().all(|r| r.role == role::CODE));
+    }
+
+    #[test]
+    fn an_unterminated_mermaid_fence_still_draws() {
+        let d = scratch("mermaid-open");
+        let f = write(&d, "doc.md", "```mermaid\nflowchart LR\n A --> B\n");
+
+        let rows = markdown_blocks(&f);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].role, role::DIAGRAM);
     }
 
     #[test]

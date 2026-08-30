@@ -10,6 +10,47 @@ import { HiRect } from "@widgets";
 // `viewpane::role` — an unrecognised role falls back to the plain-line style.
 //   0 ".."  1 dir  2 file  3 line  4 h1  5 h2  6 h3  7 code  8 bullet  9 quote
 //   10 rule  11 notice (an app-generated advisory: truncated, empty, unreadable)
+//   12 diagram (a rendered mermaid graph; `diagram` carries it, `text` is empty)
+
+// One box in a mermaid diagram: a flowchart node, or a sequence participant.
+// Position is absolute inside the diagram's own w x h canvas.
+//   shape: 0 rect  1 rounded/stadium  2 diamond  3 circle
+// A diamond draws itself from `PaneDiagram.diamonds` instead of a rectangle, so
+// the view skips its box and keeps only its text.
+export struct DiagNode {
+    x: length,
+    y: length,
+    w: length,
+    h: length,
+    shape: int,
+    text: string,
+}
+
+// A free-standing caption: an edge label, or a sequence message. `x`/`y` is the
+// top-left of a centred box `w` wide.
+export struct DiagLabel {
+    x: length,
+    y: length,
+    w: length,
+    text: string,
+}
+
+// A laid-out mermaid diagram. Every stroke arrives as an SVG command string, so
+// all of the geometry — arrowheads, dash segmentation, diamond outlines — is
+// computed in `src/mermaid.rs` and drawn here by four Path elements, rather than
+// modelled edge by edge.
+export struct PaneDiagram {
+    w: length,
+    h: length,
+    nodes: [DiagNode],
+    labels: [DiagLabel],
+    lines: string,
+    dashed: string,
+    thick: string,
+    heads: string,
+    diamonds: string,
+}
+
 export struct PaneViewRow {
     role: int,
     text: string,
@@ -19,6 +60,8 @@ export struct PaneViewRow {
     // Whether clicking this row opens something. Decided Rust-side so the view
     // never has to re-derive it from `role`.
     activatable: bool,
+    // Only meaningful when role == 12; empty (w == 0) on every other row.
+    diagram: PaneDiagram,
 }
 
 // One tiled pane: the rendered terminal surface + its placement + chrome state.

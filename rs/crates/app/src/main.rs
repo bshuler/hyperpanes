@@ -36,6 +36,7 @@ mod glow;
 mod history_scan;
 mod keybindings;
 mod leftpanel;
+mod mermaid;
 mod pair;
 mod palette;
 mod paneview;
