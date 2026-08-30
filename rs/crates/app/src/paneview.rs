@@ -108,6 +108,10 @@ pub struct Ui {
     pub pref_tools: Rc<VecModel<PrefToolRow>>,
     /// Preferences → Browser: the browsers this OS reports as installed.
     pub pref_browsers: Rc<VecModel<PrefBrowserRow>>,
+    /// The "Open link with…" chooser's rows — a *snapshot* taken when the overlay opened
+    /// (`State::ask_browsers`), not the prefs list, so a scan finishing mid-choice can't
+    /// renumber the row under the cursor.
+    pub ask_browsers: Rc<VecModel<PrefBrowserRow>>,
     /// Where `PATH` (and the well-known dirs) found each tool, scanned ONCE and kept.
     /// Deliberately computed with an EMPTY override map, so it is the answer to "what
     /// would we find on our own" and never changes when the user edits an override —
@@ -155,6 +159,7 @@ impl Ui {
             lp_pane_models: RefCell::new(HashMap::new()),
             pref_tools: Rc::new(VecModel::default()),
             pref_browsers: Rc::new(VecModel::default()),
+            ask_browsers: Rc::new(VecModel::default()),
             tool_detected: RefCell::new(None),
             browsers_found: RefCell::new(None),
         })
@@ -176,6 +181,7 @@ impl Ui {
         app.set_pref_shells(ModelRc::from(self.shells.clone()));
         app.set_pref_tools(ModelRc::from(self.pref_tools.clone()));
         app.set_pref_browsers(ModelRc::from(self.pref_browsers.clone()));
+        app.set_ask_browsers(ModelRc::from(self.ask_browsers.clone()));
         app.set_pref_themes(ModelRc::from(self.themes.clone()));
         app.set_pref_idle_effects(ModelRc::from(self.idle_effects.clone()));
         app.set_pref_keybindings(ModelRc::from(self.keybindings.clone()));
@@ -670,8 +676,27 @@ pub fn resync(
         Overlay::NewPane => 3,
         Overlay::AddProject => 4,
         Overlay::NewGoal => 5,
+        Overlay::AskBrowser => 6,
     };
     app.set_overlay_kind(kind);
+
+    // "Open link with…" chooser: the held URL + the browser rows snapshotted at open. Only
+    // refreshed while the card is up — `sync_model` rewrites every row, and there is no
+    // reason to pay for that on every tick of a session that never opens a link.
+    if state.overlay == Overlay::AskBrowser {
+        app.set_ask_url(state.ask_url.as_str().into());
+        let rows: Vec<PrefBrowserRow> = state
+            .ask_browsers
+            .iter()
+            .map(|b| PrefBrowserRow {
+                id: b.id.as_str().into(),
+                name: b.name.as_str().into(),
+                // The chooser is a one-shot question, not a setting: no row is "current".
+                active: false,
+            })
+            .collect();
+        sync_model(&ui.ask_browsers, rows);
+    }
 
     // Add-Project dialog: mirror the inline validation error (`""` = none). The dialog is
     // re-instantiated each time `kind` becomes 4, but the error must update live while it

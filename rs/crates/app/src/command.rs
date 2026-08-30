@@ -140,6 +140,13 @@ pub enum Command {
     RefreshEnvPane(usize),
     /// Open pane `0`'s current working directory in the OS file explorer (#23).
     RevealPaneCwd(usize),
+    /// Route a URL through Preferences → Browser: the OS default handler, one chosen
+    /// browser, or the [`crate::state::Overlay::AskBrowser`] chooser. The single entry
+    /// point for "something in a pane wants a link opened", so the setting can never be
+    /// bypassed by a caller that opens a URL directly.
+    OpenLink(String),
+    /// Answer the browser chooser: open its held URL in browser row `0`, then close it.
+    PickBrowser(usize),
     /// Open the in-pane search box on pane `0`.
     SearchPane(usize),
     /// Open the in-pane search box on the focused pane (the Ctrl+F keybinding).
@@ -440,6 +447,18 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
                 if let Err(e) = hyperpanes_core::open::reveal_path(std::path::Path::new(&cwd)) {
                     crate::dbg_log(&format!("RevealPaneCwd {cwd}: {e}"));
                 }
+            }
+        }
+        Command::OpenLink(url) => {
+            // The routing itself lives in `State::open_link` (it may mount an overlay, so it
+            // needs `&mut State`); all that's left here is saying why a link went nowhere.
+            if let Err(e) = state.open_link(&url) {
+                crate::dbg_log(&format!("OpenLink: {e}"));
+            }
+        }
+        Command::PickBrowser(i) => {
+            if let Err(e) = state.pick_browser(i) {
+                crate::dbg_log(&format!("PickBrowser {i}: {e}"));
             }
         }
         Command::OpenFileBrowser(i) => {

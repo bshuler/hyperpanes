@@ -312,6 +312,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Empty editor command → core picks VS Code (if on PATH) else the guarded OS default.
             match st.panes[idx].pane.activate_link(x, y, w, h, ctrl, "") {
                 Some(LinkAction::Copy(p)) => eprintln!("[demo] Ctrl+click → copy: {p}"),
+                // The demo has no Preferences, so it does what "System default" would.
+                Some(LinkAction::OpenUrl(u)) => {
+                    eprintln!("[demo] click → url {u}: {:?}", hyperpanes_core::open::open_url(&u));
+                }
                 Some(LinkAction::Opened(res)) => {
                     if res.ok {
                         eprintln!("[demo] click → opened");

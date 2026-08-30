@@ -1,0 +1,151 @@
+// The "Open link with…" chooser — Preferences → Browser → "Ask each time".
+//
+// A centred modal card (the same overlay-panel pattern as addproject.slint, mounted by
+// overlays.slint when `kind == 6`): the URL a pane asked to open, then one row per browser
+// this OS reports as installed. Clicking a row opens the link there and closes; Esc or
+// Cancel closes without opening, because "ask" has to allow the answer "not right now".
+//
+// The rows are a snapshot taken when the card opened (`State::ask_browsers`), so a browser
+// scan finishing mid-choice can never renumber the row under the cursor.
+
+import { Theme } from "theme.slint";
+import { PrefBrowserRow } from "types.slint";
+
+// One browser row — a full-width click target, hover-lit like the prefs list.
+component AbRow inherits Rectangle {
+    in property <string> label;
+    callback clicked;
+    height: 36px;
+    border-radius: 7px;
+    background: ta.has-hover ? Theme.surface2 : Theme.surface;
+    border-width: 1px;
+    border-color: ta.has-hover ? Theme.accent : Theme.border;
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        Text {
+            text: root.label;
+            color: Theme.text;
+            font-size: 13px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// A small footer button — mirrors addproject.slint's `ApButton`.
+component AbButton inherits Rectangle {
+    in property <string> label;
+    callback clicked;
+    height: 32px;
+    min-width: 84px;
+    border-radius: 7px;
+    background: ta.has-hover ? Theme.surface2 : Theme.surface;
+    border-width: 1px;
+    border-color: Theme.border;
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        Text {
+            text: root.label;
+            color: Theme.text;
+            font-size: 13px;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+    ta := TouchArea { clicked => { root.clicked(); } }
+}
+
+export component AskBrowserDialog inherits Rectangle {
+    // The URL being routed. Already validated Rust-side — the card never shows a URL
+    // Hyperpanes would then refuse to open.
+    in property <string> url;
+    in property <[PrefBrowserRow]> browsers;
+    callback pick(int);     // index into `browsers`
+    callback cancel();
+
+    // eat scrim clicks behind the card
+    TouchArea {}
+
+    // Esc closes. The card owns a focus scope of its own so the key lands here rather than
+    // in the terminal underneath, which is still mounted below the scrim.
+    fs := FocusScope {
+        init => { fs.focus(); }
+        key-pressed(e) => {
+            if (e.text == Key.Escape) { root.cancel(); return EventResult.accept; }
+            return EventResult.reject;
+        }
+    }
+
+    card := Rectangle {
+        width: 460px;
+        x: (parent.width - self.width) / 2;
+        y: max(60px, (parent.height - self.height) / 2);
+        height: body.preferred-height;
+        background: Theme.mantle;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 48px;
+        drop-shadow-color: Theme.scrim;
+        drop-shadow-offset-y: 18px;
+        TouchArea {} // keep clicks on the card from dismissing
+
+        body := VerticalLayout {
+            padding: 18px;
+            spacing: 12px;
+
+            Text {
+                text: "Open link with…";
+                color: Theme.text;
+                font-size: 15px;
+                font-weight: 700;
+            }
+
+            // The destination, spelled out. A chooser that hides where you're going is a
+            // worse chooser than no chooser at all.
+            Rectangle {
+                height: dest.preferred-height + 16px;
+                border-radius: 7px;
+                background: Theme.bg;
+                border-width: 1px;
+                border-color: Theme.border;
+                dest := Text {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    y: 8px;
+                    text: root.url;
+                    color: Theme.subtext;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+
+            VerticalLayout {
+                spacing: 6px;
+                for b[i] in root.browsers : AbRow {
+                    label: b.name;
+                    clicked => { root.pick(i); }
+                }
+            }
+
+            Text {
+                text: "change this in Preferences → Browser";
+                color: Theme.faint;
+                font-size: 11px;
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle { horizontal-stretch: 1; }
+                AbButton { label: "Cancel"; clicked => { root.cancel(); } }
+            }
+        }
+    }
+}

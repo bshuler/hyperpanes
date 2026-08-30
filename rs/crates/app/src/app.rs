@@ -2569,11 +2569,21 @@ impl App {
                         .state
                         .borrow_mut()
                         .pane_link_activate(i as usize, x, y, ctrl);
-                    if let Some(hyperpanes_terminal_widget::LinkAction::Copy(path)) = action {
-                        // Copy via the pane's arboard clipboard + "Copied …" toast — NOT a
-                        // `clip.exe` shell-out, whose blocking `child.wait()` froze the UI
-                        // thread on every Ctrl+click (and showed no indicator).
-                        win.state.borrow_mut().copy_link_text(i as usize, &path);
+                    match action {
+                        Some(hyperpanes_terminal_widget::LinkAction::Copy(path)) => {
+                            // Copy via the pane's arboard clipboard + "Copied …" toast — NOT a
+                            // `clip.exe` shell-out, whose blocking `child.wait()` froze the UI
+                            // thread on every Ctrl+click (and showed no indicator).
+                            win.state.borrow_mut().copy_link_text(i as usize, &path);
+                        }
+                        // A clicked URL comes back unopened so it can go through
+                        // Preferences → Browser — the OS default, one chosen browser, or the
+                        // "Open link with…" chooser. `action` was read out of a borrow that
+                        // ended with the statement above, so dispatching here is safe.
+                        Some(hyperpanes_terminal_widget::LinkAction::OpenUrl(url)) => {
+                            app.run_command(&win, Command::OpenLink(url));
+                        }
+                        _ => {}
                     }
                 }
             });
@@ -3302,6 +3312,15 @@ impl App {
             win.app.on_submit_add_project(move |path| {
                 if let Some(w) = app.window_by_id(id) {
                     app.run_command(&w, Command::SubmitAddProject(path.to_string()));
+                }
+            });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app.on_pick_browser(move |row| {
+                if let Some(w) = app.window_by_id(id) {
+                    app.run_command(&w, Command::PickBrowser(row.max(0) as usize));
                 }
             });
         }

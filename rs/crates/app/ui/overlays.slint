@@ -20,6 +20,7 @@ import { ToolIcon } from "@widgets";
 import { KeyMsg } from "@widgets";
 import { NewPaneDialog } from "newpane.slint";
 import { AddProjectDialog } from "addproject.slint";
+import { AskBrowserDialog } from "askbrowser.slint";
 import { NewGoalDialog } from "newgoal.slint";
 import { TipArea } from "tooltip.slint";
 
@@ -488,6 +489,10 @@ export component OverlayLayer inherits Rectangle {
     // ---- Add Project dialog (kind 4) ----
     in property <string> ap-error: "";       // inline validation error ("" = none)
     callback add-project-submit(string);     // the typed directory path
+    // ---- "Open link with…" chooser (kind == 6) ----
+    in property <string> ask-url;            // the URL being routed
+    in property <[PrefBrowserRow]> ask-browsers;
+    callback browser-pick(int);              // index into `ask-browsers`
     callback pref-action(int, int);  // (kind, arg) — see state::Setting mapping
     callback pref-text(int, string); // (kind, value) — string-valued settings
     callback pref-done();            // commit the appearance draft + close (Done / Save)
@@ -1694,6 +1699,16 @@ export component OverlayLayer inherits Rectangle {
         attach-image => { root.goal-attach-image(); }
         paste-image => { root.goal-paste-image(); }
         remove-image(i) => { root.goal-remove-image(i); }
+        cancel => { root.dismiss(); }
+    }
+
+    // ===== "Open link with…" chooser =====
+    if root.kind == 6 : AskBrowserDialog {
+        width: 100%;
+        height: 100%;
+        url: root.ask-url;
+        browsers: root.ask-browsers;
+        pick(i) => { root.browser-pick(i); }
         cancel => { root.dismiss(); }
     }
 }

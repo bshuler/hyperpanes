@@ -125,29 +125,13 @@ pub struct LinkHit {
 pub enum LinkAction {
     /// Ctrl/Cmd-click — the caller should copy this absolute path (or URL) to the clipboard.
     Copy(String),
-    /// Plain click — the file/dir/URL was opened (the result carries blocked/err detail).
+    /// Plain click on a file/dir — it was opened (the result carries blocked/err detail).
     Opened(OpenResult),
-}
-
-/// Open an http/https URL in the default browser, detached.
-///
-/// The launch mechanics (and the URL screening — scheme allow-list, no characters that
-/// could split a command line) live in `core::open`, which is the single place all three
-/// of Hyperpanes' openers now go through. This wrapper only reshapes the result into the
-/// `OpenResult` the link-activation path returns.
-fn open_url(url: &str) -> OpenResult {
-    match hyperpanes_core::open::open_url(url) {
-        Ok(()) => OpenResult {
-            ok: true,
-            blocked: false,
-            error: None,
-        },
-        Err(e) => OpenResult {
-            ok: false,
-            blocked: false,
-            error: Some(e),
-        },
-    }
+    /// Plain click on a URL — the caller should route it. The widget deliberately does NOT
+    /// open URLs itself: *which* browser gets the link is an app-level preference
+    /// (Preferences → Browser, including the "ask each time" chooser) that this crate can't
+    /// see, and a widget that launched the OS default directly would silently bypass it.
+    OpenUrl(String),
 }
 
 impl TerminalPane {
@@ -445,11 +429,11 @@ impl TerminalPane {
             }
             return Some(LinkAction::Copy(hit.abs_path));
         }
-        let res = if hit.is_url {
-            open_url(&hit.abs_path)
-        } else {
-            paths::open_resolved_path(&hit.abs_path, hit.line, hit.col, editor_command)
-        };
+        if hit.is_url {
+            // Handed back, not opened — see `LinkAction::OpenUrl`.
+            return Some(LinkAction::OpenUrl(hit.abs_path));
+        }
+        let res = paths::open_resolved_path(&hit.abs_path, hit.line, hit.col, editor_command);
         Some(LinkAction::Opened(res))
     }
 
@@ -1372,6 +1356,19 @@ mod tests {
         match p.activate_link(5.5, 0.5, 30.0, 2.0, true, "") {
             Some(LinkAction::Copy(url)) => assert_eq!(url, "https://a.com/x"),
             other => panic!("ctrl+click on a URL should copy it, got {other:?}"),
+        }
+    }
+
+    /// A plain click on a URL hands it back rather than launching it: which browser gets the
+    /// link is a Hyperpanes preference this crate can't see, and a widget that opened the OS
+    /// default itself would silently bypass "ask each time".
+    #[test]
+    fn plain_click_hands_the_url_back_unopened() {
+        let mut p = unit_pane(30, 2);
+        p.feed("https://a.com/x");
+        match p.activate_link(5.5, 0.5, 30.0, 2.0, false, "") {
+            Some(LinkAction::OpenUrl(url)) => assert_eq!(url, "https://a.com/x"),
+            other => panic!("a clicked URL should come back as OpenUrl, got {other:?}"),
         }
     }
 

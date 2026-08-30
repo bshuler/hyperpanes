@@ -53,6 +53,11 @@ pub enum Overlay {
     /// The "New goal" dialog (command palette → "New goal…"): pick a project + type a goal;
     /// submitting routes through [`State::submit_new_goal`].
     NewGoal,
+    /// The "Open link with…" chooser — Preferences → Browser → "Ask each time". Holds the
+    /// URL in [`State::ask_url`] until a human picks one of [`State::ask_browsers`];
+    /// picking routes through [`State::pick_browser`]. Dismissing drops the URL on the
+    /// floor, which is the point: "ask" means the human may also answer "not this one".
+    AskBrowser,
 }
 
 // Pane/session uid minting moved to the backend: `SessionManager::fresh_uid` picks the
@@ -804,6 +809,13 @@ pub struct State {
     /// Inline validation error shown in the Add-Project dialog (`""` = none). Set when a
     /// submitted path doesn't exist / isn't a directory; cleared on open and on close.
     pub add_project_error: String,
+    /// The URL the [`Overlay::AskBrowser`] chooser is holding (`""` when it isn't open).
+    /// Already validated by [`hyperpanes_core::open::is_openable_url`] before the overlay
+    /// mounts — the chooser never displays a URL it would refuse to open.
+    pub ask_url: String,
+    /// The browsers offered by the [`Overlay::AskBrowser`] chooser. Snapshotted at open so
+    /// the row a human clicks is the row they saw, even if an install finishes mid-choice.
+    pub ask_browsers: Vec<hyperpanes_core::open::BrowserApp>,
     /// Persisted appearance preferences (font, frame/dot).
     pub settings: Settings,
     /// The user's keybinding overrides — consulted (override-first) by the key router. Edited
@@ -1028,6 +1040,8 @@ impl State {
             dirty: true,
             overlay: Overlay::None,
             add_project_error: String::new(),
+            ask_url: String::new(),
+            ask_browsers: Vec::new(),
             settings: prefs::load(),
             keymap: crate::keybindings::Keymap::load(),
             capturing_binding: None,
@@ -2313,6 +2327,8 @@ impl State {
             self.capturing_binding = None;
             self.capture_conflict = None;
             self.add_project_error.clear();
+            self.ask_url.clear();
+            self.ask_browsers.clear();
             if was_goal {
                 self.refocus_active_pane_scope();
             }
@@ -2367,6 +2383,55 @@ impl State {
         self.goal_focus_seq = self.goal_focus_seq.wrapping_add(1);
         self.dirty = true;
     }
+
+    /// Route a URL a pane asked to open, honouring Preferences → Browser.
+    ///
+    /// Three outcomes, in the order the settings name them:
+    /// * `"ask"` and at least one browser was found → mount [`Overlay::AskBrowser`] and
+    ///   return `Ok(())`. Nothing opens until a human picks. With *no* browser found there
+    ///   is nothing to ask about, so it degrades to the OS handler rather than putting an
+    ///   empty card on screen.
+    /// * `"app"` and the chosen browser is still installed → open in that browser.
+    /// * anything else → the OS default handler, which is where `BROWSER` is honoured.
+    ///
+    /// A refused URL reports `Err` here rather than silently doing nothing, so the caller
+    /// can say why. Validation happens before the overlay mounts, so the chooser is never
+    /// holding a URL it would then refuse to open.
+    pub fn open_link(&mut self, url: &str) -> Result<(), String> {
+        if !hyperpanes_core::open::is_openable_url(url) {
+            return Err(format!(
+                "refusing to open {url:?}: not an http/https/mailto URL"
+            ));
+        }
+        if self.settings.browser_asks() {
+            let found = hyperpanes_core::open::list_browsers();
+            if !found.is_empty() {
+                self.ask_url = url.to_string();
+                self.ask_browsers = found;
+                self.overlay = Overlay::AskBrowser;
+                self.dirty = true;
+                return Ok(());
+            }
+        }
+        match self.settings.browser_launcher() {
+            Some(l) => hyperpanes_core::open::open_url_with(&l, url),
+            None => hyperpanes_core::open::open_url(url),
+        }
+    }
+
+    /// Answer the [`Overlay::AskBrowser`] chooser: open the held URL in row `idx`, then
+    /// close. An out-of-range row closes without opening — the card comes down either way,
+    /// so a stale click can never strand it on screen.
+    pub fn pick_browser(&mut self, idx: usize) -> Result<(), String> {
+        let url = std::mem::take(&mut self.ask_url);
+        let launcher = self.ask_browsers.get(idx).map(|b| b.launcher.clone());
+        self.close_overlay_now();
+        match launcher {
+            Some(l) if !url.is_empty() => hyperpanes_core::open::open_url_with(&l, &url),
+            _ => Ok(()),
+        }
+    }
+
 
     /// Hand keyboard focus back to the active pane's terminal `FocusScope` (bumps its
     /// `refocus_seq`). Called when the New-goal box closes so the shell regains the keyboard.
@@ -7262,5 +7327,89 @@ mod set_tests {
             .is_none());
         assert!(!set_path.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// The browser routing seam: `State::open_link` (which setting sends a URL where) and
+/// `State::pick_browser` (answering the chooser). Deliberately free of any real launch —
+/// what these pin down is the *decision*, which is the part a setting can get wrong.
+#[cfg(test)]
+mod browser_routing_tests {
+    use super::*;
+
+    fn fresh() -> State {
+        State::new(crate::theme::load_font(1.0))
+    }
+
+    /// A scheme the open seam refuses never reaches the chooser: it reports the refusal and
+    /// leaves the overlay alone. Otherwise "ask each time" would put a card on screen for a
+    /// URL that could not be opened by any of the answers.
+    #[test]
+    fn refused_url_never_opens_the_chooser() {
+        let mut st = fresh();
+        st.settings.browser_mode = crate::prefs::BROWSER_MODE_ASK.to_string();
+        assert!(st.open_link("javascript:alert(1)").is_err());
+        assert_eq!(st.overlay, Overlay::None);
+        assert!(st.ask_url.is_empty());
+    }
+
+    /// "ask" holds the URL rather than opening it — the whole point of the mode. Skipped
+    /// where the machine reports no browsers at all, which is the documented degrade-to-OS
+    /// path (there is nothing to ask about) and not something a test should assert against.
+    #[test]
+    fn ask_mode_holds_the_url_for_a_human() {
+        if hyperpanes_core::open::list_browsers().is_empty() {
+            return;
+        }
+        let mut st = fresh();
+        st.settings.browser_mode = crate::prefs::BROWSER_MODE_ASK.to_string();
+        assert!(st.open_link("https://example.com/x").is_ok());
+        assert_eq!(st.overlay, Overlay::AskBrowser);
+        assert_eq!(st.ask_url, "https://example.com/x");
+        assert!(!st.ask_browsers.is_empty());
+    }
+
+    /// A row index that is no longer there closes the card instead of erroring or stranding
+    /// it — a stale click must never leave the chooser stuck over the terminal.
+    #[test]
+    fn out_of_range_pick_closes_without_opening() {
+        let mut st = fresh();
+        st.ask_url = "https://example.com/x".into();
+        st.ask_browsers = vec![hyperpanes_core::open::BrowserApp {
+            id: "test.browser".into(),
+            name: "Test".into(),
+            launcher: "/nonexistent/browser".into(),
+        }];
+        st.overlay = Overlay::AskBrowser;
+
+        assert!(st.pick_browser(99).is_ok());
+        assert_eq!(st.overlay, Overlay::None);
+        assert!(st.ask_url.is_empty());
+        assert!(st.ask_browsers.is_empty());
+    }
+
+    /// Dismissing the card (Esc / Cancel → `close_overlay`) drops the held URL. "Ask" has to
+    /// allow the answer "none of these", and a URL left in `ask_url` would be re-shown by the
+    /// next open.
+    #[test]
+    fn dismissing_the_chooser_drops_the_url() {
+        let mut st = fresh();
+        st.ask_url = "https://example.com/x".into();
+        st.overlay = Overlay::AskBrowser;
+        st.close_overlay();
+        assert_eq!(st.overlay, Overlay::None);
+        assert!(st.ask_url.is_empty());
+    }
+
+    /// `"app"` naming a browser that is not installed degrades to the OS default handler
+    /// rather than resolving to nothing — losing a browser must not turn links into dead
+    /// clicks. (`browser_launcher` returning `None` is exactly the "OS handler" branch.)
+    #[test]
+    fn uninstalled_chosen_browser_falls_back_to_the_os() {
+        let mut st = fresh();
+        st.settings.browser_mode = crate::prefs::BROWSER_MODE_APP.to_string();
+        st.settings.browser_app = "com.example.browser.that.is.not.installed".into();
+        assert!(st.settings.browser_launcher().is_none());
+        assert!(!st.settings.browser_asks());
     }
 }

@@ -933,3 +933,40 @@ actually read — a name that lies about the format is a trap for the next provi
 are private in `claude_history.rs` and are now duplicated in the Copilot provider. Making
 them `pub(crate)` and deleting the copies is a clean, separable change; doing it inside a
 parallel wave would have collided with B1.
+
+### Wave 2 · B3 (T8) — browser routing and the "Open link with…" chooser — 2026-08-30
+
+**Status: landed, green.** Less remained here than §10's table implied. Wave 0 had already
+shipped `core/src/open/list_browsers()` on all three OSes, and the Preferences → Browser page
+(`prefs.sel == 6`) with its three-way mode pill and installed-browser list was already wired
+through `Settings::browser_mode` / `browser_app`. What was missing was everything on the
+*other* side of the setting: nothing consulted it, and the "Ask" mode had no chooser.
+
+**The setting was being bypassed, and the bypass was in the widget.** `TerminalPane::
+activate_link` opened a clicked URL itself, through `core::open::open_url` — i.e. straight to
+the OS default handler, with Preferences → Browser never consulted. The widget crate cannot
+see app settings and should not learn to, so the fix inverts the call: a clicked URL now comes
+back as the new `LinkAction::OpenUrl(String)` and the app routes it. `LinkAction::Opened`
+stays for file paths, which the widget still resolves on its own. This is why "ask each time"
+could not simply have been added on top of the existing page — the mode would have been
+correct in prefs and inert in practice.
+
+**One entry point, so the setting cannot be bypassed again.** `Command::OpenLink(String)` →
+`State::open_link` is now the only way a URL reaches the OS from a pane. It resolves in the
+order the settings name: `"ask"` with at least one browser found mounts the chooser and
+returns without opening; `"app"` with the chosen browser still installed opens there; anything
+else goes to the OS handler, which is where `BROWSER` is honoured (user Q3). `"ask"` on a
+machine reporting *no* browsers degrades to the OS handler rather than raising an empty card —
+there is nothing to ask about.
+
+**The chooser is `Overlay::AskBrowser` / `kind == 6`**, following the `kind == 3/4/5`
+small-card idiom in `ui/askbrowser.slint`: the destination URL spelled out (a chooser that
+hides where you're going is worse than no chooser), one row per browser, Esc/Cancel to
+dismiss. Two decisions worth keeping: the rows are a **snapshot** taken at open
+(`State::ask_browsers`), not the live prefs list, so a scan finishing mid-choice cannot
+renumber the row under the cursor; and dismissing **drops** the held URL, because "ask" has to
+permit the answer "none of these" — a URL left in `ask_url` would resurface on the next open.
+An out-of-range pick closes the card without opening, so a stale click can never strand it.
+
+Validation happens *before* the overlay mounts, so the card never displays a URL that
+`is_openable_url` would then refuse — the refusal is reported at `open_link` instead.
