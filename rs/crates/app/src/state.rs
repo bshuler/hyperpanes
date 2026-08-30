@@ -1434,7 +1434,12 @@ impl State {
                     // the relaunch snapshot.
                     shell: shell.clone(),
                     command: command.clone(),
-                    env: opts.env.clone(),
+                    // `BROWSER` points at our shim so a link a tool in this pane wants to
+                    // show goes back through `App::route_event` → `Command::OpenLink` (and
+                    // thus Preferences → Browser) instead of straight to the OS. Wrapped
+                    // here and not where the env is recorded on the pane: the shim path is
+                    // regenerated every run, so it must not be baked into a snapshot.
+                    env: hyperpanes_core::open::with_browser_shim(opts.env.clone()),
                     integration,
                     ..Default::default()
                 },
@@ -1934,6 +1939,48 @@ impl State {
                 self.sniffed_tool.insert(uid.to_string(), t.id.to_string());
                 self.dirty = true;
             }
+        }
+    }
+
+    /// Fold the kernel's answer to "what is running in this pane's foreground *right now*"
+    /// into the sniffed-tool map (D5's deterministic signal — see
+    /// `docs/tool-panes-plan.md` §D5).
+    ///
+    /// `name` is a normalised process name (`Some("claude")`, `Some("zsh")`) or `None`.
+    /// The two are **not** alike:
+    ///
+    /// * `Some(n)` is a definite answer. If it names a tool the pane wears that tool's
+    ///   chrome; if it names anything else the shell is back at a prompt, so this is the
+    ///   honest **downgrade** — the same one [`note_agent_idle`](Self::note_agent_idle)
+    ///   performs, and for the same reason: a pane that ran `claude` once must not wear
+    ///   its mark forever.
+    /// * `None` is *no answer* — a platform with no foreground process group, a daemon
+    ///   that predates the field, a pty that exposes no descriptor. It must leave every
+    ///   previous belief alone: treating it as a downgrade would erase every title sniff
+    ///   on the platforms that can never answer.
+    ///
+    /// Like every other sniff this may only upgrade a pane whose recorded [`PaneKind`] is
+    /// `Terminal`, and it never touches `spawn_command` / `spawn_args` / the persisted
+    /// kind — what the pane *relaunches* is not inferred.
+    pub fn note_pane_foreground(&mut self, uid: &str, name: Option<&str>) {
+        let Some(name) = name else {
+            return; // no answer — not "nothing is running"
+        };
+        let Some((ti, pi)) = self.find_pane(uid) else {
+            return;
+        };
+        if !matches!(self.tabs[ti].panes[pi].kind, PaneKind::Terminal) {
+            return;
+        }
+        match hyperpanes_core::tools::foreground::tool_for_foreground_name(name) {
+            Some(t) => {
+                if self.sniffed_tool.get(uid).map(String::as_str) != Some(t.id) {
+                    self.sniffed_tool.insert(uid.to_string(), t.id.to_string());
+                    self.dirty = true;
+                }
+            }
+            // Nothing tool-shaped is in the foreground: the shell owns the terminal again.
+            None => self.note_agent_idle(uid),
         }
     }
 
@@ -2504,7 +2551,6 @@ impl State {
             _ => Ok(()),
         }
     }
-
 
     /// Hand keyboard focus back to the active pane's terminal `FocusScope` (bumps its
     /// `refocus_seq`). Called when the New-goal box closes so the shell regains the keyboard.
@@ -3611,14 +3657,96 @@ impl State {
             .collect()
     }
 
-    /// Open project `idx` (from the flyout) in a new pane cd'd into its repo, focused.
+    /// Open project `idx` (from the flyout): as the windows the checkout describes for
+    /// itself if it describes any, else in a new pane cd'd into its repo, focused.
     /// Collapses the flyout afterwards (mirrors the Electron click behaviour).
     pub fn open_project(&mut self, idx: usize, mgr: &SessionManager) {
         let Some(p) = self.projects.get(idx).cloned() else {
             return;
         };
         self.sidebar_open = false;
+        if self.open_project_windows(&p.path, mgr) {
+            return;
+        }
         self.add_pane_cwd(mgr, Some(p.path.clone()), Some(parse_hex(&p.color)));
+    }
+
+    /// Open the windows `<root>/.hyperpanes/project.json` describes, and say whether it
+    /// did. The layout as a property of the *checkout*: cloned with the repo, still there
+    /// after a reboot or a six-month pause.
+    ///
+    /// Precedence is `project::resolve`'s, not a second opinion: a layout already on
+    /// screen for this checkout wins, so re-opening a folder you are already working in
+    /// can never replace the running panes with a months-old file. Only what is live
+    /// *for this project* counts — the rest of the window is somebody else's work.
+    fn open_project_windows(&mut self, root: &str, mgr: &SessionManager) -> bool {
+        use hyperpanes_core::workspace::project;
+        let repo = match project::discover_project(root) {
+            Ok(Some(f)) => f,
+            Ok(None) => return false,
+            Err(e) => {
+                crate::dbg_log(&format!("project file for {root}: {e}"));
+                return false;
+            }
+        };
+        let mut live = self.to_session_file();
+        if let Some(groups) = live.groups.as_mut() {
+            for g in groups.iter_mut() {
+                g.panes
+                    .retain(|pane| pane.cwd.as_deref().is_some_and(|c| cwd_in_project(c, root)));
+            }
+            groups.retain(|g| !g.panes.is_empty());
+        }
+        if project::resolve(Some(&live), Some(&repo.workspace)) != project::Source::Repo {
+            return false;
+        }
+        self.load_workspace(repo.workspace, mgr).is_some()
+    }
+
+    /// "Save to this repo": write the active tab's layout into the checkout the focused
+    /// pane sits in, as `.hyperpanes/project.json`.
+    ///
+    /// The root is found by walking up from the pane's cwd, so a `.git` checkout with no
+    /// `.hyperpanes/` yet is where a first save lands — that is the whole point of the
+    /// walk stopping at `.git`. Pane cwds under the root are stored relative to it, so
+    /// the file still means something on a machine that keeps its checkouts elsewhere.
+    pub fn save_project(&mut self) {
+        use hyperpanes_core::workspace::project;
+        let f = self.active_tab().focused;
+        // The focused pane's live cwd, else any pane in this tab that has reported one —
+        // a tab whose focus happens to sit on a fresh pane still knows where it is.
+        let Some(cwd) = self
+            .active_tab()
+            .panes
+            .get(f)
+            .and_then(|p| p.cwd.clone())
+            .or_else(|| self.active_tab().panes.iter().find_map(|p| p.cwd.clone()))
+        else {
+            self.toast_active("no folder to save to");
+            return;
+        };
+        let Some(root) = project::find_project_root(&cwd) else {
+            self.toast_active("not inside a checkout");
+            return;
+        };
+        let file = self.to_library_workspace_file();
+        match project::write_project(&root.dir, &project::relativize_cwds(&file, &root.dir)) {
+            Ok(_) => self.toast_active("saved to .hyperpanes"),
+            Err(e) => {
+                crate::dbg_log(&format!("save to repo: {e}"));
+                self.toast_active("could not save to .hyperpanes");
+            }
+        }
+    }
+
+    /// Flash a line on the focused pane — the same transient the widget uses for
+    /// copy/paste confirmations, for an action with no other visible result.
+    fn toast_active(&mut self, msg: &str) {
+        let f = self.active_tab().focused;
+        if let Some(p) = self.active_tab_mut().panes.get_mut(f) {
+            p.pane.set_toast(msg.to_string());
+        }
+        self.dirty = true;
     }
 
     /// Recolor project at flyout row `idx` to palette swatch `swatch`, persist via core,
@@ -4348,7 +4476,12 @@ impl State {
     /// documents for "your terminal intercepts Ctrl+V". Unconditional (the user knows there's an
     /// image): the app simply lets the focused program resolve the clipboard.
     pub fn paste_image_focused(&mut self, idx: usize, mgr: &SessionManager) {
-        if let Some(p) = self.active_tab_mut().panes.get_mut(idx).filter(|p| p.kind.is_pty()) {
+        if let Some(p) = self
+            .active_tab_mut()
+            .panes
+            .get_mut(idx)
+            .filter(|p| p.kind.is_pty())
+        {
             let uid = p.uid.clone();
             p.pane.set_toast("Pasting image…");
             mgr.write(&uid, "\u{16}");
@@ -4480,7 +4613,12 @@ impl State {
             // Cloned so the resolved shell is also recorded on the pane (below) as its new
             // spawn spec.
             shell: shell.clone(),
-            env: env.clone(),
+            // `BROWSER` points at our shim so a link a tool in this pane wants to
+            // show goes back through `App::route_event` → `Command::OpenLink` (and
+            // thus Preferences → Browser) instead of straight to the OS. Wrapped
+            // here and not where the env is recorded on the pane: the shim path is
+            // regenerated every run, so it must not be baked into a snapshot.
+            env: hyperpanes_core::open::with_browser_shim(env.clone()),
             integration,
             ..Default::default()
         }) {
@@ -5641,7 +5779,9 @@ impl State {
             };
             // A pane opened from the session list already persists `<tool> --resume <id>` as
             // its command; appending a second `--resume` is a usage error, not a no-op.
-            let already = spawn_command.as_deref().is_some_and(|c| c.contains(&mark.id))
+            let already = spawn_command
+                .as_deref()
+                .is_some_and(|c| c.contains(&mark.id))
                 || spawn_args
                     .as_ref()
                     .is_some_and(|a| a.iter().any(|x| x == &mark.id));
@@ -5699,7 +5839,12 @@ impl State {
                     shell: shell.clone(),
                     command: spawn_command,
                     args: spawn_args,
-                    env: spawn_env,
+                    // `BROWSER` points at our shim so a link a tool in this pane wants to
+                    // show goes back through `App::route_event` → `Command::OpenLink` (and
+                    // thus Preferences → Browser) instead of straight to the OS. Wrapped
+                    // here and not where the env is recorded on the pane: the shim path is
+                    // regenerated every run, so it must not be baked into a snapshot.
+                    env: hyperpanes_core::open::with_browser_shim(spawn_env),
                     integration,
                     ..Default::default()
                 },
@@ -6872,7 +7017,9 @@ mod view_pane_tests {
     fn a_view_pane_is_not_registered_with_the_backend() {
         let m = mgr();
         let mut st = State::new(theme::load_font(1.0));
-        let uid = st.add_pane_opts(&m, view_opts(PaneKind::FileBrowser)).unwrap();
+        let uid = st
+            .add_pane_opts(&m, view_opts(PaneKind::FileBrowser))
+            .unwrap();
         assert!(
             !m.has(&uid),
             "a view pane must leave no session behind it for the manager to answer for"
@@ -6906,8 +7053,8 @@ mod view_pane_tests {
                         hyperpanes_core::tools::kind::META_KIND_KEY.to_string(),
                         "view:markdown".to_string(),
                     )]
-                        .into_iter()
-                        .collect(),
+                    .into_iter()
+                    .collect(),
                 ),
                 ..Default::default()
             }],
@@ -6915,7 +7062,10 @@ mod view_pane_tests {
         let p = st.active_tab().panes.last().unwrap();
         assert_eq!(p.kind, PaneKind::Markdown, "the recorded kind is restored");
         assert!(p.uid.starts_with("view-"));
-        assert!(!m.has(&p.uid), "restore must not spawn a pty for a view pane");
+        assert!(
+            !m.has(&p.uid),
+            "restore must not spawn a pty for a view pane"
+        );
     }
 
     #[test]
@@ -6958,8 +7108,8 @@ mod view_pane_tests {
                         hyperpanes_core::tools::kind::META_KIND_KEY.to_string(),
                         "view:files".to_string(),
                     )]
-                        .into_iter()
-                        .collect(),
+                    .into_iter()
+                    .collect(),
                 ),
                 ..Default::default()
             }],
@@ -6998,7 +7148,9 @@ mod view_pane_tests {
         // Two views, so the close is not the last pane of the last tab — and so the whole
         // test stays pty-free, which is itself the assertion: none of this needs a runtime.
         st.add_pane_opts(&m, view_opts(PaneKind::Markdown));
-        let view = st.add_pane_opts(&m, view_opts(PaneKind::FileBrowser)).unwrap();
+        let view = st
+            .add_pane_opts(&m, view_opts(PaneKind::FileBrowser))
+            .unwrap();
         // The gate is `kill_session_of`; what it protects is the daemon being asked to kill a
         // uid it never issued.
         assert!(st.close_pane_in(0, 1, &m), "window survives the close");
@@ -7066,7 +7218,11 @@ mod tool_session_tests {
             .expect("a tool pane carries meta");
         // The kind is what says *which* tool to relaunch; the mark is what says which
         // chat. Both, or the relaunch is a fresh copilot in the right directory.
-        assert_eq!(meta.get(hyperpanes_core::tools::kind::META_KIND_KEY).map(String::as_str), Some("copilot"));
+        assert_eq!(
+            meta.get(hyperpanes_core::tools::kind::META_KIND_KEY)
+                .map(String::as_str),
+            Some("copilot")
+        );
         assert_eq!(
             meta.get(hyperpanes_core::tools::META_SESSION_KEY)
                 .map(String::as_str),
@@ -7280,7 +7436,10 @@ mod tool_identity_tests {
             PaneKind::Terminal,
             "the sniff must NOT touch the persisted kind — that is what a relaunch replays"
         );
-        assert!(ps.spawn_command.is_none(), "and it must not invent a command");
+        assert!(
+            ps.spawn_command.is_none(),
+            "and it must not invent a command"
+        );
     }
 
     /// Explicit beats inferred. A pane spawned as Codex that happens to print a title
@@ -7330,6 +7489,148 @@ mod tool_identity_tests {
         assert_eq!(
             st.effective_kind(pane_of(&st, "p1")),
             PaneKind::Tool("claude".into())
+        );
+    }
+
+    // ---- D13: the layout as a property of the checkout ----
+
+    /// The save seam end to end: what lands in `.hyperpanes/project.json` is what the
+    /// checkout needs to rebuild these windows — the command, and a cwd expressed
+    /// *relative to the root* so the file still means something on a machine that keeps
+    /// its checkouts somewhere else. The run-local session uid must not be in it.
+    #[test]
+    fn saving_to_a_repo_writes_a_relocatable_file_with_no_run_local_state() {
+        let root = std::env::temp_dir().join(format!(
+            "hp-d13-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        // `find_project_root` walks up to a `.git`, so a plain checkout with no
+        // `.hyperpanes/` yet is exactly where a first save lands.
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let sub = root.join("crates").join("core");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let m = mgr();
+        let mut st = window_with(&m, "pane-0");
+        {
+            let (ti, pi) = st.find_pane("pane-0").unwrap();
+            st.tabs[ti].panes[pi].cwd = Some(sub.to_string_lossy().into_owned());
+            st.tabs[ti].panes[pi].spawn_command = Some("claude".into());
+        }
+
+        st.save_project();
+
+        let written = root.join(".hyperpanes").join("project.json");
+        let raw = std::fs::read_to_string(&written).expect("the save landed in the checkout");
+        assert!(
+            raw.contains("claude"),
+            "what the window runs is the point: {raw}"
+        );
+        assert!(
+            !raw.contains("\"uid\""),
+            "a run-local uid must not travel in a version-controlled file: {raw}"
+        );
+        assert!(
+            raw.contains("\"cwd\": \"crates/core\""),
+            "the cwd is stored relative to the root: {raw}"
+        );
+        assert!(
+            !raw.contains(&root.to_string_lossy().into_owned()),
+            "an absolute path outside the clone would not survive the trip: {raw}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The "already live" test that guards the open path is scoped to *this* project: a
+    /// pane sitting in an unrelated checkout is somebody else's work and must not count as
+    /// "this project is already on screen".
+    #[test]
+    fn only_panes_inside_the_checkout_count_as_that_project_being_live() {
+        let root = std::env::temp_dir().join(format!("hp-d13-live-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        let inside = root.join("crates");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let root_s = root.to_string_lossy().into_owned();
+        assert!(cwd_in_project(&inside.to_string_lossy(), &root_s));
+        assert!(
+            !cwd_in_project(&std::env::temp_dir().to_string_lossy(), &root_s),
+            "a cwd outside the checkout is not this project"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The kernel's answer upgrades chrome exactly like a title does — and, like a title,
+    /// leaves the field a relaunch replays alone.
+    #[test]
+    fn a_foreground_probe_upgrades_the_chrome_and_nothing_else() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        st.note_pane_foreground("p1", Some("claude"));
+
+        let ps = pane_of(&st, "p1");
+        assert_eq!(st.effective_kind(ps), PaneKind::Tool("claude".into()));
+        assert_eq!(ps.kind, PaneKind::Terminal);
+        assert!(ps.spawn_command.is_none());
+    }
+
+    /// `None` is "the question has no answer here" — a platform with no foreground process
+    /// group, a daemon that predates the field. Treating it as a downgrade would erase
+    /// every other detection signal on exactly those platforms.
+    #[test]
+    fn no_answer_from_the_probe_leaves_every_belief_alone() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        st.note_pane_title("p1", "claude");
+        st.note_agent_state("p1", AgentLiveness::Busy);
+
+        st.note_pane_foreground("p1", None);
+
+        assert_eq!(
+            st.effective_kind(pane_of(&st, "p1")),
+            PaneKind::Tool("claude".into()),
+            "silence is not a downgrade"
+        );
+        assert_eq!(st.liveness_ui("p1"), 1);
+    }
+
+    /// A definite answer naming something that is not a tool *is* a downgrade: the shell
+    /// owns the terminal again, so the mark and the badge both go. This is the difference
+    /// between the probe and a title — a title that names no tool means nothing.
+    #[test]
+    fn a_shell_in_the_foreground_is_an_honest_downgrade() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        st.note_pane_title("p1", "claude");
+        st.note_agent_state("p1", AgentLiveness::AwaitingInput);
+
+        st.note_pane_foreground("p1", Some("zsh"));
+
+        assert_eq!(st.effective_kind(pane_of(&st, "p1")), PaneKind::Terminal);
+        assert_eq!(st.liveness_ui("p1"), 0, "a stale badge is worse than none");
+    }
+
+    /// Explicit still beats inferred: a pane spawned as Codex whose foreground reads
+    /// `claude` (a subprocess, a typo, a wrapper) stays Codex, and records nothing.
+    #[test]
+    fn a_foreground_probe_never_overwrites_an_explicit_kind() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        {
+            let (ti, pi) = st.find_pane("p1").unwrap();
+            st.tabs[ti].panes[pi].kind = PaneKind::Tool("codex".into());
+        }
+        st.note_pane_foreground("p1", Some("claude"));
+        assert!(st.sniffed_tool.is_empty());
+        assert_eq!(
+            st.effective_kind(pane_of(&st, "p1")),
+            PaneKind::Tool("codex".into())
         );
     }
 

@@ -193,6 +193,10 @@ pub struct App {
     /// hash fed to the engine and when, so we feed only on change and at most every
     /// [`AI_FEED_INTERVAL`].
     ai_feed: RefCell<std::collections::HashMap<String, (u64, std::time::Instant)>>,
+    /// Per-pane leftover of the `BROWSER`-shim scan: an `openurl` reply can be split
+    /// across two pty reads, so the tail of a chunk that might still be the start of one
+    /// is carried into the next. See [`hyperpanes_core::session::openurl`].
+    openurl_carry: RefCell<std::collections::HashMap<String, String>>,
     /// The embedded control HTTP+WS server host (default-OFF): publishes the live windows→
     /// tabs→panes tree into `core::control`'s read-model + applies inbound `/command`s to the
     /// GUI in-process, so the MCP / agent orchestration drives this process like Electron.
@@ -219,6 +223,10 @@ pub struct App {
     last_autosave_json: RefCell<String>,
     /// Throttle for the queued-prompt delivery tick (claude-resume speak-first).
     last_prompt_delivery: Cell<Option<std::time::Instant>>,
+    /// Throttle for the foreground-process sniff (D5): when the panes' foreground programs
+    /// were last read. On the daemon backend the read is a shadow-map lookup, but the
+    /// in-process backend does two syscalls per pane, so it never rides the 8 ms pump.
+    last_foreground_sniff: Cell<Option<std::time::Instant>>,
 }
 
 /// How often (at most) a pane's rendered screen is re-fed to the ambient-AI engine. The
@@ -249,6 +257,7 @@ impl App {
             ai: crate::ai::AiBridge::spawn(),
             ai_ctx_sig: RefCell::new(std::collections::HashMap::new()),
             ai_feed: RefCell::new(std::collections::HashMap::new()),
+            openurl_carry: RefCell::new(std::collections::HashMap::new()),
             control,
             update: crate::update::Updater::new(),
             timer: RefCell::new(None),
@@ -258,6 +267,7 @@ impl App {
             last_autosave: Cell::new(None),
             last_autosave_json: RefCell::new(String::new()),
             last_prompt_delivery: Cell::new(None),
+            last_foreground_sniff: Cell::new(None),
         })
     }
 
@@ -298,6 +308,59 @@ impl App {
                         meta.insert(claude_panes::META_CONFIG_DIR_KEY.to_string(), s.config_dir);
                     }
                 }
+            }
+        }
+    }
+
+    /// D5's deterministic identity signal: ask what each pane is running *right now* and
+    /// fold the answer into [`State::note_pane_foreground`].
+    ///
+    /// This is the counterpart to the OSC-title sniff. A title is whatever the program
+    /// chose to print — `CommandStart` cannot name a command at all, because a shell emits
+    /// `133;C` *before* it forks — whereas the foreground process group is the kernel's own
+    /// answer, and it downgrades honestly when the shell takes the terminal back.
+    ///
+    /// Sampled on a slow timer rather than on an event for exactly that reason: there is no
+    /// event whose moment is the right one to ask. On the daemon backend the daemon watches
+    /// the pgrps and pushes on change, so this is a pure map read; in-process it costs two
+    /// syscalls per pane, which is why it is throttled well off the pump's cadence.
+    ///
+    /// Chrome only — nothing here writes `spawn_command` / `spawn_args` or the persisted
+    /// [`PaneKind`](hyperpanes_core::tools::PaneKind).
+    fn sniff_foreground(&self, windows: &[Rc<Window>]) {
+        const EVERY: Duration = Duration::from_millis(750);
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_foreground_sniff.get() {
+            if now.duration_since(last) < EVERY {
+                return;
+            }
+        }
+        self.last_foreground_sniff.set(Some(now));
+        for w in windows {
+            // Collect first, ask second: the borrow is released before the session manager
+            // is touched, so nothing holds `State` across a call that may take locks.
+            let uids: Vec<String> = w
+                .state
+                .borrow()
+                .tabs
+                .iter()
+                .flat_map(|t| t.panes.iter())
+                .filter(|p| p.kind.is_pty())
+                .map(|p| p.uid.clone())
+                .collect();
+            if uids.is_empty() {
+                continue;
+            }
+            let answers: Vec<(String, Option<String>)> = uids
+                .into_iter()
+                .map(|uid| {
+                    let fg = self.mgr.foreground_name(&uid);
+                    (uid, fg)
+                })
+                .collect();
+            let mut st = w.state.borrow_mut();
+            for (uid, fg) in answers {
+                st.note_pane_foreground(&uid, fg.as_deref());
             }
         }
     }
@@ -1000,6 +1063,7 @@ impl App {
                     self.ai_ctx_sig.borrow_mut().remove(&w.id);
                     for uid in w.state.borrow().session_uids() {
                         self.ai_feed.borrow_mut().remove(&uid);
+                        self.openurl_carry.borrow_mut().remove(&uid);
                         self.mgr.kill(&uid);
                     }
                     let _ = w.app.window().hide();
@@ -1023,6 +1087,9 @@ impl App {
         // 5b. Queued-prompt delivery + app-restart requests (claude-resume "speak-first" and
         //     the restartApp control command). Both throttled/cheap no-ops in the common case.
         self.deliver_queued_prompts();
+        // 5c. D5 foreground sniff: what each pty pane is running *now* (throttled; a map
+        //     read on the daemon backend). Upgrades/downgrades chrome only.
+        self.sniff_foreground(&windows);
         self.deliver_pending_goals();
         self.service_restart_request();
 
@@ -1069,6 +1136,18 @@ impl App {
                 let Some(w) = find_window(windows, &uid) else {
                     return 0;
                 };
+                // The other half of the `BROWSER` shim (`core::open::with_browser_shim`):
+                // a tool in this pane that wanted to show the user a link printed one of
+                // these instead of launching a browser itself, and this is where we take
+                // it back. Scanned before the borrow so routing can re-borrow below.
+                let urls = {
+                    let mut carries = self.openurl_carry.borrow_mut();
+                    let carry = carries.entry(uid.clone()).or_default();
+                    let (urls, rest) =
+                        hyperpanes_core::session::openurl::parse_osc_open_url(carry, &data);
+                    *carry = rest;
+                    urls
+                };
                 let mut st = w.state.borrow_mut();
                 let mut fed = 0;
                 // Sniff the shell's OSC window title so the idle glow can tell an agent
@@ -1097,11 +1176,21 @@ impl App {
                 if let Some(title) = sniffed {
                     st.note_pane_title(&uid, &title);
                 }
+                // After the borrow: `open_link` may mount the browser chooser, so it wants
+                // the state mutably and to itself.
+                drop(st);
+                for url in urls {
+                    let mut st = w.state.borrow_mut();
+                    if let Err(e) = st.open_link(&url) {
+                        crate::dbg_log(&format!("openurl from {uid}: {e}"));
+                    }
+                }
                 fed
             }
             SessionEvent::Exit { uid, .. } => {
                 self.ai.send(crate::ai::AiMsg::Exit { uid: uid.clone() });
                 self.ai_feed.borrow_mut().remove(&uid);
+                self.openurl_carry.borrow_mut().remove(&uid);
                 if let Some(w) = find_window(windows, &uid) {
                     let alive = {
                         let mut st = w.state.borrow_mut();
@@ -1126,7 +1215,9 @@ impl App {
             // is running, which clears the previous one's liveness.
             SessionEvent::CommandStart { uid } => {
                 if let Some(w) = find_window(windows, &uid) {
-                    w.state.borrow_mut().note_agent_state(&uid, AgentLiveness::Busy);
+                    w.state
+                        .borrow_mut()
+                        .note_agent_state(&uid, AgentLiveness::Busy);
                 }
                 0
             }
@@ -2123,7 +2214,10 @@ impl App {
                         return;
                     };
                     let lp = tw.app.global::<crate::LeftPanelAdapter>();
-                    let (ti, at) = (lp.get_ext_drop_tab(), lp.get_ext_drop_slot().max(0) as usize);
+                    let (ti, at) = (
+                        lp.get_ext_drop_tab(),
+                        lp.get_ext_drop_slot().max(0) as usize,
+                    );
                     if ti < 0 {
                         return; // over the panel but not over a group — no drop
                     }
@@ -2590,7 +2684,11 @@ impl App {
                         // there what happens to it (viewer, markdown preview, vim, …).
                         // That choice is the whole point of routing through the panel
                         // instead of handing the path to the OS.
-                        Some(hyperpanes_terminal_widget::LinkAction::Reveal { path, line, col }) => {
+                        Some(hyperpanes_terminal_widget::LinkAction::Reveal {
+                            path,
+                            line,
+                            col,
+                        }) => {
                             app.run_command(&win, Command::RevealInFiles { path, line, col });
                         }
                         None => {}
@@ -3213,10 +3311,7 @@ impl App {
                 .global::<crate::LeftPanelAdapter>()
                 .on_files_context(move |path, x, y| {
                     if let Some(w) = app.window_by_id(id) {
-                        app.run_command(
-                            &w,
-                            Command::OpenFileContext(path.to_string(), x, y),
-                        );
+                        app.run_command(&w, Command::OpenFileContext(path.to_string(), x, y));
                     }
                 });
         }
@@ -3715,9 +3810,7 @@ impl App {
                 if kind == 26 {
                     app.run_command(
                         &w,
-                        Command::ApplySetting(crate::state::Setting::BrowserApp(
-                            value.to_string(),
-                        )),
+                        Command::ApplySetting(crate::state::Setting::BrowserApp(value.to_string())),
                     );
                     app.run_command(
                         &w,

@@ -175,6 +175,12 @@ pub fn build(state: &State) -> Vec<Entry> {
         Command::SaveWorkspaceAs,
     ));
     cmds.push(Entry::new(
+        "Save to this repo",
+        "Write this tab into the checkout as .hyperpanes/project.json",
+        "project repo checkout hyperpanes save layout windows",
+        Command::SaveProject,
+    ));
+    cmds.push(Entry::new(
         "Save set…",
         "Save every tab as a named set of workspaces",
         "set workspace library collection save group",

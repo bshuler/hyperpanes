@@ -418,10 +418,7 @@ pub fn file_menu(state: &State, path: &std::path::Path, x: f32, y: f32) -> CtxMe
 
     if is_dir {
         b.item("Open as Root", Command::FilesSetRoot(p.clone()));
-        b.item(
-            "New File Browser Pane",
-            Command::FilesOpen(p.clone()),
-        );
+        b.item("New File Browser Pane", Command::FilesOpen(p.clone()));
     } else {
         if is_md {
             // First, because for a `.md` the rendered view is what "open" means to a human.
@@ -650,6 +647,17 @@ pub fn app_menu(state: &State, x: f32, y: f32) -> CtxMenu {
         false,
         sub::NONE,
         Some(Command::SaveWorkspaceAs),
+    );
+    b.row(
+        "Save to this repo",
+        "",
+        crate::theme::menu_icon::SAVE_WORKSPACE,
+        false,
+        false,
+        false,
+        false,
+        sub::NONE,
+        Some(Command::SaveProject),
     );
     b.sep();
     // Workspace SETS (M6): a named collection of workspaces, opened as a batch.

@@ -474,6 +474,7 @@ mod tests {
             alive: true,
             cols: Some(120),
             rows: Some(40),
+            foreground: None,
         }
     }
 

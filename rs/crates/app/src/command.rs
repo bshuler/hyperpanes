@@ -118,7 +118,10 @@ pub enum Command {
     FilesRefresh,
     /// Open `path` in a terminal pane running tool `tool` — "open in a terminal with vi".
     /// The pane is a `Tool` pane, so it gets the tool's brand and icon like any other.
-    OpenPathWith { path: String, tool: String },
+    OpenPathWith {
+        path: String,
+        tool: String,
+    },
     /// Copy an arbitrary path to the clipboard (the row menu). Goes through the focused
     /// pane's clipboard so it raises the same "Copied …" toast as a Ctrl+click does.
     CopyPathText(String),
@@ -266,6 +269,9 @@ pub enum Command {
     // ---- workspace library + sets (M6) ----
     /// Always prompt for a destination, save the active tab there, and remember it.
     SaveWorkspaceAs,
+    /// Write the active tab into the checkout it is working in, as
+    /// `.hyperpanes/project.json` — the layout travels with the repo, not the laptop.
+    SaveProject,
     /// Save every non-empty tab as a member workspace and index them in a `sets/*.json`.
     SaveSet,
     /// Pick a saved set and load every member workspace (reattach-or-spawn per pane).
@@ -565,10 +571,9 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
             }
             // `.md` gets the renderer, everything else the plain viewer — the same split the
             // pane menu makes, so a file opens the same way however it was reached.
-            let md = p
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"));
+            let md = p.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+                e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown")
+            });
             let kind = if md {
                 hyperpanes_core::tools::kind::PaneKind::Markdown
             } else {
@@ -697,6 +702,7 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         Command::SaveWorkspace => state.save_workspace(),
         // ---- workspace library + sets (M6) ----
         Command::SaveWorkspaceAs => state.save_workspace_as(),
+        Command::SaveProject => state.save_project(),
         Command::SaveSet => state.save_set(),
         Command::OpenSet => state.open_set(mgr),
         // ---- multi-window ----
@@ -772,8 +778,9 @@ pub fn set_layout_from_id(id: i32) -> Command {
 /// A bare word is left alone so the common case reads as itself in the pane header.
 fn quote_arg(s: &str) -> String {
     let plain = !s.is_empty()
-        && s.chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '=' | ':' | '~'));
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-' | '+' | '=' | ':' | '~')
+        });
     if plain {
         return s.to_string();
     }
