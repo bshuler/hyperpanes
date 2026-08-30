@@ -129,43 +129,15 @@ pub enum LinkAction {
     Opened(OpenResult),
 }
 
-/// Open an http/https URL in the default browser, detached. Same launch mechanism as
-/// `core::paths`' `os_open` (`cmd /C start "" <target>` on Windows, `open`/`xdg-open` elsewhere),
-/// but the URL is passed pre-quoted via `raw_arg` so cmd metacharacters in query strings
-/// (`?a=1&b=2`) can't split the command — the extractor guarantees a URL never contains `"`.
+/// Open an http/https URL in the default browser, detached.
+///
+/// The launch mechanics (and the URL screening — scheme allow-list, no characters that
+/// could split a command line) live in `core::open`, which is the single place all three
+/// of Hyperpanes' openers now go through. This wrapper only reshapes the result into the
+/// `OpenResult` the link-activation path returns.
 fn open_url(url: &str) -> OpenResult {
-    use std::process::{Command, Stdio};
-    #[cfg(windows)]
-    let spawn = {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000; // don't flash a console (see core's NoWindow)
-        Command::new("cmd")
-            .raw_arg("/C")
-            .raw_arg("start")
-            .raw_arg("\"\"") // window-title arg, so the quoted URL isn't consumed as the title
-            .raw_arg(format!("\"{url}\""))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-    };
-    #[cfg(target_os = "macos")]
-    let spawn = Command::new("open")
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let spawn = Command::new("xdg-open")
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    match spawn {
-        Ok(_) => OpenResult {
+    match hyperpanes_core::open::open_url(url) {
+        Ok(()) => OpenResult {
             ok: true,
             blocked: false,
             error: None,
@@ -173,7 +145,7 @@ fn open_url(url: &str) -> OpenResult {
         Err(e) => OpenResult {
             ok: false,
             blocked: false,
-            error: Some(e.to_string()),
+            error: Some(e),
         },
     }
 }

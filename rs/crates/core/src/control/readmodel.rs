@@ -19,6 +19,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde::Serialize;
 
 use crate::control::scope::{pane_in_scope, PaneCoords, Scope, ScopeTree};
+use crate::tools::PaneKind;
 
 /// Process liveness of a pane's pty.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +92,11 @@ pub struct PaneInfo {
     /// Per-pane "talk": speak new Claude assistant replies aloud via local TTS.
     /// Default-off; omitted from `/state` when `false` (see [`PaneOut::talk`]).
     pub talk: bool,
+    /// What the pane *is* — a plain shell, a known CLI tool, or a non-PTY view. Carried
+    /// here so an agent driving the control API can tell a Claude pane from a shell
+    /// without parsing `command`. Serialised via [`PaneKind::as_meta_value`], which
+    /// yields `None` for `Terminal` and so omits the field for ordinary panes.
+    pub kind: PaneKind,
 }
 
 /// One tab (group): a layout + its panes.
@@ -691,6 +697,11 @@ pub struct PaneOut {
     /// Per-pane "talk" — additive, omitted when off so the legacy shape is untouched.
     #[serde(skip_serializing_if = "is_false")]
     pub talk: bool,
+    /// Pane kind — additive, omitted for a plain terminal so the legacy shape is untouched.
+    /// A registry id (`"claude"`) or a `view:` token, exactly as it is written to
+    /// `meta["pane.kind"]`; the two encodings are deliberately the same one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -717,6 +728,7 @@ fn pane_out(p: &PaneInfo, activity: Activity, dims: Option<(u16, u16)>) -> PaneO
         cols: dims.map(|(c, _)| c),
         rows: dims.map(|(_, r)| r),
         talk: p.talk,
+        kind: p.kind.as_meta_value(),
     }
 }
 
@@ -740,6 +752,7 @@ mod tests {
             exit_code: None,
             meta: None,
             talk: false,
+            kind: PaneKind::Terminal,
         }
     }
 
@@ -917,6 +930,32 @@ mod tests {
 
         assert!(m.set_talk("p1", false));
         assert!(!m.set_talk("ghost", true));
+    }
+
+    #[test]
+    fn kind_omitted_for_a_terminal_present_for_a_tool() {
+        let mut m = seeded();
+        let out = m.state_for_scope(None, &busy);
+        let s = serde_json::to_string(&out).unwrap();
+        assert!(!s.contains("kind"), "kind must be omitted for a shell: {s}");
+
+        // A tool pane names itself with the same string it writes to `meta["pane.kind"]`.
+        m.add_window(WindowInfo {
+            window_id: 2,
+            active_tab_id: Some("t2".to_string()),
+            tabs: vec![TabInfo {
+                id: "t2".to_string(),
+                title: "Tab 2".to_string(),
+                layout: "auto".to_string(),
+                panes: vec![PaneInfo {
+                    kind: PaneKind::Tool("claude".to_string()),
+                    ..pane("p2", "u2")
+                }],
+            }],
+        });
+        let v: serde_json::Value =
+            serde_json::to_value(m.state_for_scope(None, &busy)).unwrap();
+        assert_eq!(v["windows"][1]["tabs"][0]["panes"][0]["kind"], json!("claude"));
     }
 
     #[test]

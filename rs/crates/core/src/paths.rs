@@ -400,20 +400,16 @@ fn launch(command_line: &str) {
 /// underlying error string on spawn failure. The Electron version uses `shell.openPath`; here
 /// we shell out to the platform opener. Public so the app can open URLs (e.g. the GitHub
 /// releases page from the NotifyOnly update flow) without growing its own opener.
+///
+/// The launch itself now lives in [`crate::open`] — this stays as the `&str`-taking front
+/// door its callers already use, and routes a URL to the browser path (which screens the
+/// scheme) and everything else to the file/folder path.
 pub fn os_open(path: &str) -> Result<(), String> {
-    let spawn = if cfg!(windows) {
-        // `start` is a cmd builtin; the empty "" is the window title arg so a quoted path
-        // isn't consumed as the title.
-        Command::new("cmd")
-            .args(["/C", "start", "", path])
-            .no_window()
-            .spawn()
-    } else if cfg!(target_os = "macos") {
-        Command::new("open").arg(path).spawn()
+    if crate::open::is_openable_url(path) {
+        crate::open::open_url(path)
     } else {
-        Command::new("xdg-open").arg(path).spawn()
-    };
-    spawn.map(|_| ()).map_err(|e| e.to_string())
+        crate::open::open_path(Path::new(path))
+    }
 }
 
 #[cfg(test)]

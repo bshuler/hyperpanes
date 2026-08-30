@@ -4,7 +4,7 @@
 
 import { Theme } from "theme.slint";
 import { PaneItem, DividerItem, PaletteItem, PrefOption, FramePaletteOption } from "types.slint";
-import { TerminalPane, KeyMsg } from "@widgets";
+import { TerminalPane, KeyMsg, ToolIcon } from "@widgets";
 import { TipArea } from "tooltip.slint";
 
 // A draggable resize seam. Reports the cursor's offset from the seam centre each
@@ -376,6 +376,20 @@ export component PaneView inherits Rectangle {
                                 border-radius: 4px;
                                 background: pane.accent;
                                 visible: pane.show-dot;
+                            }
+                        }
+                        // ---- tool mark ----
+                        // What the pane is RUNNING, in the leading identity slot right after
+                        // the pane's own colour dot. Tinted with the tool's brand and nothing
+                        // else: the dot, frame and title still carry the user's accent, so the
+                        // branding reads as "this is Claude" without restyling the pane.
+                        // `tool-icon == 0` covers both a plain terminal and a tool id this
+                        // build has no mark for, and draws nothing in either case.
+                        if pane.tool-icon != 0 : VerticalLayout {
+                            alignment: center;
+                            ToolIcon {
+                                kind: pane.tool-icon;
+                                ink: pane.tool-brand;
                             }
                         }
                         // "talk" indicator: a small speaker glyph, shown only while this

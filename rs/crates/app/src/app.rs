@@ -2378,6 +2378,10 @@ impl App {
                             show_dot: Some(dot),
                             env: None,
                             startup: None,
+                            // The dialog names a program, not a kind — `make_pane` derives
+                            // the kind from that command, so a user who types `claude` here
+                            // gets a Claude pane without the dialog knowing tools exist.
+                            kind: None,
                         };
                         app.run_command(&w, Command::SubmitNewPane(opts));
                     }
@@ -3197,6 +3201,9 @@ impl App {
                     show_dot: None,
                     env: None,
                     startup: None,
+                    // The command is `claude --resume …`, so the derived kind is already
+                    // Tool("claude") — no need to say it twice.
+                    kind: None,
                 };
                 app.run_command(&w, Command::SubmitNewPane(opts));
             });
@@ -3204,6 +3211,20 @@ impl App {
         {
             let app = app.clone();
             let id = win.id;
+            // `kind` is an OPAQUE ALLOCATED CODE shared with `overlays.slint` — the Slint
+            // side has no access to the `Setting` enum, so the two sides agree by number.
+            // Keep this table current and allocate the next free number; two controls that
+            // send the same code silently drive the same setting, and the one handled by an
+            // early `return` above wins (that is exactly how 21 was double-booked: the
+            // General page's keep-alive toggle shadowed the Terminal page's copy-on-select
+            // until keep-alive moved to 22).
+            //   0 font select · 1 font size · 2 show frame · 3 show dot · 4 frame palette
+            //   5 default shell · 6 clickable paths · 9 terminal theme · 10 idle alert
+            //   11 idle effect · 12 idle seconds · 13 ambient-AI on · 15 control API on
+            //   16 control API input · 17 auto-update · 18 check · 19 download · 20 install
+            //   21 copy on select · 22 keep alive · 23 favourite tool (arg = registry index)
+            //   24 browser mode (arg = 0 default / 1 app / 2 ask)
+            // String-valued settings use `pref_text` and its own separate code space.
             win.app.on_pref_action(move |kind, arg| {
                 let Some(w) = app.window_by_id(id) else {
                     return;
@@ -3286,12 +3307,39 @@ impl App {
                 }
                 // Keep-terminals-running-in-the-background toggle (session-daemon M3,
                 // persisted) — apply + mirror the prop back immediately, like auto-update.
-                if kind == 21 {
+                if kind == 22 {
                     app.run_command(
                         &w,
                         Command::ApplySetting(crate::state::Setting::KeepAlive(arg != 0)),
                     );
                     w.app.set_pref_keep_alive(arg != 0);
+                    return;
+                }
+                // Preferences → Tools: star/unstar. `arg` indexes `tools::TOOLS` rather than
+                // carrying the id as a string, because `pref_action` is the int-valued
+                // callback; an index the registry doesn't have is ignored, not guessed at.
+                if kind == 23 {
+                    if let Some(t) = hyperpanes_core::tools::TOOLS.get(arg.max(0) as usize) {
+                        app.run_command(
+                            &w,
+                            Command::ApplySetting(crate::state::Setting::ToggleFavoriteTool(
+                                t.id.to_string(),
+                            )),
+                        );
+                    }
+                    return;
+                }
+                // Preferences → Browser: which handler opens a URL.
+                if kind == 24 {
+                    let mode = match arg {
+                        1 => crate::prefs::BROWSER_MODE_APP,
+                        2 => crate::prefs::BROWSER_MODE_ASK,
+                        _ => crate::prefs::BROWSER_MODE_DEFAULT,
+                    };
+                    app.run_command(
+                        &w,
+                        Command::ApplySetting(crate::state::Setting::BrowserMode(mode.to_string())),
+                    );
                     return;
                 }
                 let setting = match kind {
@@ -3332,6 +3380,9 @@ impl App {
                 let Some(w) = app.window_by_id(id) else {
                     return;
                 };
+                // `pref_text` has its OWN code space, separate from `pref_action`'s:
+                //   7 editor command · 8 custom font path · 13 Ollama host · 14 model
+                //   25 tool path override ("<registry index> <path>") · 26 browser app id
                 // Custom font path (kind 8) is its own command; editor command (7) is a setting.
                 if kind == 8 {
                     app.run_command(&w, Command::FontCustomValue(value.to_string()));
@@ -3352,6 +3403,45 @@ impl App {
                         }
                     };
                     app.ai.send(crate::ai::AiMsg::Configure(patch));
+                    return;
+                }
+                // Preferences → Tools: "<registry index> <path>". Split on the FIRST space
+                // because a path may contain spaces and the index never does; an empty path
+                // clears the override (see `Setting::ToolPath`). The index, not the id, is
+                // what the row sends — the UI has no string form of the id to hand back.
+                if kind == 25 {
+                    let (idx, path) = value.split_once(' ').unwrap_or((value.as_str(), ""));
+                    let Ok(idx) = idx.parse::<usize>() else {
+                        return;
+                    };
+                    let Some(t) = hyperpanes_core::tools::TOOLS.get(idx) else {
+                        return;
+                    };
+                    app.run_command(
+                        &w,
+                        Command::ApplySetting(crate::state::Setting::ToolPath(
+                            t.id.to_string(),
+                            path.to_string(),
+                        )),
+                    );
+                    return;
+                }
+                // Preferences → Browser: the platform's own handle for the chosen app,
+                // passed through untouched. Picking one also means the user wants it used,
+                // so the mode follows — otherwise the click appears to do nothing.
+                if kind == 26 {
+                    app.run_command(
+                        &w,
+                        Command::ApplySetting(crate::state::Setting::BrowserApp(
+                            value.to_string(),
+                        )),
+                    );
+                    app.run_command(
+                        &w,
+                        Command::ApplySetting(crate::state::Setting::BrowserMode(
+                            crate::prefs::BROWSER_MODE_APP.to_string(),
+                        )),
+                    );
                     return;
                 }
                 let setting = match kind {

@@ -424,11 +424,12 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         Command::RefreshEnvPane(i) => state.refresh_env_pane(i, mgr),
         Command::RevealPaneCwd(i) => {
             // Open the pane's live cwd (reported by shell integration) in the OS file explorer.
+            // This used to branch `explorer` / `xdg-open` inline, which meant it did nothing
+            // at all on macOS (no `xdg-open` there); `core::open` owns the per-OS launch now.
             if let Some(cwd) = state.active_tab().panes.get(i).and_then(|p| p.cwd.clone()) {
-                #[cfg(windows)]
-                let _ = std::process::Command::new("explorer").arg(&cwd).spawn();
-                #[cfg(not(windows))]
-                let _ = std::process::Command::new("xdg-open").arg(&cwd).spawn();
+                if let Err(e) = hyperpanes_core::open::reveal_path(std::path::Path::new(&cwd)) {
+                    crate::dbg_log(&format!("RevealPaneCwd {cwd}: {e}"));
+                }
             }
         }
         Command::SearchPane(i) => state.open_search(i),

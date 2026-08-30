@@ -249,6 +249,12 @@ pub mod menu_icon {
     pub const LEFT_PANEL: i32 = 6;
     /// Base for the layout minis: `LAYOUT_BASE + layout_id(l)` (see [`super::layout_icon_kind`]).
     pub const LAYOUT_BASE: i32 = 10;
+    /// Base for the per-tool marks. Kinds from here up are allocated by the core registry
+    /// (`hyperpanes_core::tools::registry::TOOL_ICON_BASE`, which MUST equal this) and drawn
+    /// by `ToolIcon` in `ui/contextmenu.slint`. The two constants live in different crates
+    /// because the registry is data in core while the drawing is app-side; the assertion in
+    /// [`super::tests::tool_icons_start_where_the_registry_says`] is what keeps them equal.
+    pub const TOOL_BASE: i32 = 40;
 }
 
 /// The drawn-icon kind evoking a layout (`menu_icon::LAYOUT_BASE + layout_id`), rendered
@@ -315,4 +321,16 @@ pub fn load_font_at(path: &str, base_px: f32, scale: f32) -> Font {
     // The bundled fonts are written at startup (`prefs::init_bundled_fonts`); reaching
     // here means even those are gone — nothing sensible left to draw with.
     panic!("no loadable monospace font: tried {path:?}, then {candidates:?}");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn tool_icons_start_where_the_registry_says() {
+        // Two crates, one allocation. Drift here silently draws the wrong mark.
+        assert_eq!(
+            super::menu_icon::TOOL_BASE as u32,
+            hyperpanes_core::tools::registry::TOOL_ICON_BASE
+        );
+    }
 }

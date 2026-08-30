@@ -12,6 +12,7 @@
 
 use hyperpanes_core::persistence::paths;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 // The per-platform `PlatformDefaults` provider: the shell-picker list (`SHELL_OPTIONS`),
 // the preferred-system-shell probe (`preferred_shell`), the font picker list
@@ -187,7 +188,33 @@ pub struct Settings {
     /// OFF makes quit ask the daemon to shut down (kill its sessions + exit). INERT for the
     /// in-process backend (those PTYs die with the GUI regardless).
     pub keep_alive: bool,
+    /// Tool ids (`hyperpanes_core::tools::registry::ToolDef::id`) the user has starred, in
+    /// the order they chose. Favourites are what the left panel offers a mode for and what
+    /// the new-pane menu lists first; every registered tool stays *listed* either way.
+    /// Unknown ids are kept verbatim rather than dropped — a favourite set edited on a
+    /// newer build must survive a round-trip through an older one.
+    pub tool_favorites: Vec<String>,
+    /// Tool id → an absolute path the user picked by hand, overriding `PATH` detection.
+    /// Taken at face value (`tools::detect::resolve`): a human who points at a binary
+    /// knows something the probe does not. An empty value is not an override.
+    pub tool_paths: BTreeMap<String, String>,
+    /// How a URL a tool asks to open gets routed: `"default"` (the OS handler),
+    /// `"app"` (the browser named by [`Self::browser_app`]), or `"ask"` (choose at launch
+    /// time). Stored as a token so the list can grow without invalidating the blob.
+    /// There is deliberately no in-app browser — the *choice* is the feature.
+    pub browser_mode: String,
+    /// The `core::open::BrowserApp::id` used when `browser_mode == "app"`. Empty, or an id
+    /// that is no longer installed, falls back to the OS default rather than failing to
+    /// open — losing a browser must never turn a link into a dead click.
+    pub browser_app: String,
 }
+
+/// [`Settings::browser_mode`] — hand the URL to the OS default handler.
+pub const BROWSER_MODE_DEFAULT: &str = "default";
+/// [`Settings::browser_mode`] — hand the URL to [`Settings::browser_app`].
+pub const BROWSER_MODE_APP: &str = "app";
+/// [`Settings::browser_mode`] — ask which browser, every time.
+pub const BROWSER_MODE_ASK: &str = "ask";
 
 impl Default for Settings {
     fn default() -> Self {
@@ -209,6 +236,10 @@ impl Default for Settings {
             auto_update: false,
             copy_on_select: false,
             keep_alive: true,
+            tool_favorites: Vec::new(),
+            tool_paths: BTreeMap::new(),
+            browser_mode: String::from(BROWSER_MODE_DEFAULT),
+            browser_app: String::new(),
         }
     }
 }
@@ -224,6 +255,43 @@ impl Settings {
     /// Clamp the base font size into the supported range.
     pub fn clamp_font(px: f32) -> f32 {
         px.clamp(MIN_FONT_PX, MAX_FONT_PX)
+    }
+
+    /// Whether `id` is starred.
+    pub fn is_favorite_tool(&self, id: &str) -> bool {
+        self.tool_favorites.iter().any(|f| f == id)
+    }
+
+    /// Star/unstar `id`, keeping the user's chosen order. Starring appends (newest last)
+    /// rather than sorting by the registry, because the order IS the preference.
+    pub fn toggle_favorite_tool(&mut self, id: &str) {
+        match self.tool_favorites.iter().position(|f| f == id) {
+            Some(i) => {
+                self.tool_favorites.remove(i);
+            }
+            None => self.tool_favorites.push(id.to_string()),
+        }
+    }
+
+    /// Where a URL should go, resolved against what is actually installed.
+    ///
+    /// `Some(launcher)` names a specific browser; `None` means "the OS default handler",
+    /// which is also what a mode of `"app"` degrades to when the chosen browser has been
+    /// uninstalled. `"ask"` is NOT resolved here — that one needs a human, so the caller
+    /// checks [`Self::browser_asks`] first.
+    pub fn browser_launcher(&self) -> Option<String> {
+        if self.browser_mode != BROWSER_MODE_APP || self.browser_app.is_empty() {
+            return None;
+        }
+        hyperpanes_core::open::list_browsers()
+            .into_iter()
+            .find(|b| b.id == self.browser_app)
+            .map(|b| b.launcher)
+    }
+
+    /// Whether opening a URL should put the choice to the user.
+    pub fn browser_asks(&self) -> bool {
+        self.browser_mode == BROWSER_MODE_ASK
     }
 }
 
@@ -348,6 +416,15 @@ mod tests {
             auto_update: true,
             copy_on_select: true,
             keep_alive: false, // non-default (defaults to true)
+            // The tool/browser prefs. Every one is off its default so the round-trip
+            // test below can't pass by accidentally re-deriving a default value —
+            // in particular `tool_paths`, whose map would round-trip as empty either way.
+            tool_favorites: vec!["claude".into(), "codex".into()],
+            tool_paths: [("claude".to_string(), "/opt/bin/claude".to_string())]
+                .into_iter()
+                .collect(),
+            browser_mode: BROWSER_MODE_ASK.into(),
+            browser_app: "com.google.Chrome".into(),
         }
     }
 

@@ -512,116 +512,204 @@ conversation by project. That is the highest value-per-risk slice of the whole a
 
 | Risk | Severity | Mitigation |
 |---|---|---|
-| macOS TCC grants invalidated every rebuild (unsigned bundle) | **High** | Q1 — signing decision, or defer F8 |
-| Embedded webview contradicts the stated "no Electron, no browser" identity | **High** | Q2 — recommend external routing first |
-| PATH shim surprises the user's shell/scripts | **Medium** | Q3 — recommend `BROWSER` env var instead |
+| ~~macOS TCC grants invalidated every rebuild~~ | — | **Retired** by Q1: Developer ID available, bundle is signed |
+| ~~Embedded webview contradicts the "no Electron, no browser" identity~~ | — | **Retired** by Q2: no internal browser is built at all |
+| PATH shim surprises the user's shell/scripts | **Low** | Q3 — `BROWSER` is the default; the shim is opt-in and labelled |
 | `state.rs` / `app.rs` contention across agents | **Medium** | Wave 0 pre-carves; one owner per file per wave |
 | Slint layout-cycle assertion in the mode strip | **Medium** | Fixed-height strip; no geometry reads in bindings (commit `5c2eef5`) |
 | Per-OS app-crate code not compiled by CI until tag time | **Medium** | D12 — matrix change in Wave 0 |
 | Claude's on-disk transcript layout changes upstream | **Low** | Bounded prefix parse already tolerant; provider isolated behind the trait |
+| A detected path that does not exist offers a dead click (D14) | **Medium** | Verify against the pane's live cwd before offering reveal; copy stays ungated |
+| A repo-local project file drifts from the workspace envelope (D13) | **Medium** | Reuse `PaneSpec` verbatim — one format, one compat rule |
 | No filesystem watcher in the tree (`notify` absent) | **Low** | Poll on panel open + mtime cache, matching today's `history_scan` behaviour |
 
 ---
 
-## 8. Open questions — options and recommendations
+## 8. Answered questions — the decisions they settle
 
-### Q1. Code signing on macOS — do we get a Developer ID?
+All five questions below were put to the human on 2026-08-30 and answered the same
+day. They are kept here rather than deleted because each one is load-bearing for a
+decision above, and the *reason* a wave is shaped the way it is should not have to be
+reconstructed from a commit message.
 
-**Why it matters.** macOS keys TCC permission grants to the code-signing identity.
-The bundle is unsigned (`bundle.sh:13-14`), so every grant a user gives is
-invalidated on the next rebuild or update. F8 (screen recording, full disk access)
-is not meaningfully implementable without this, and `update/macos.rs:10-13` already
-flags the same blocker for self-update.
+### Q1 — Code signing on macOS. **Answered: a Developer ID is available.**
 
-- **(a) Get an Apple Developer ID** ($99/yr), add codesign + notarization +
-  `NS*UsageDescription` keys + an entitlements plist to `bundle.sh`. Unblocks F8
-  *and* self-update *and* removes the `xattr -dr com.apple.quarantine` step users
-  currently have to run.
-- **(b) Ship F8 unsigned.** Permissions work until the next update, then silently
-  stop. Actively bad UX — a permission that revokes itself reads as a bug.
-- **(c) Defer F8 entirely** until signing happens; build the broker seam now
-  (Wave 0 does anyway) and leave the impls returning `Undetermined`.
+macOS keys TCC grants to the code-signing identity, so an unsigned bundle loses every
+Screen Recording / Full Disk Access grant on each rebuild. With a Developer ID this
+stops being a reason to defer.
 
-**Recommendation: (a) if F8 is wanted at all, otherwise (c).** (a) pays for three
-separate blockers at once, which makes it the best value in this plan. (b) is the
-one option I would argue against.
+**Settles:** F8 (permissions) is fully in scope; `packaging/macos/bundle.sh` gains the
+`NS*UsageDescription` keys, an entitlements plist, `codesign` with the Developer ID,
+and notarization. The "grants invalidated every rebuild" risk is **retired**.
 
-### Q2. The internal browser — how far do we go?
+### Q2 — The internal browser. **Answered: skip it. The choice is the feature.**
 
-**Why it matters.** No native child view exists anywhere over the Slint window
-(`grep` for `addSubview|SetParent|WS_CHILD|define_class` across `crates/` returns
-nothing). Slint 1.17 has no embeddable web view. And the README takes visible pride
-in *a single self-contained binary (no Electron, no browser)* (`README.md:19-20`) —
-the same reasoning used to justify bundling SQLite (`core/Cargo.toml:35-37`). This
-is a cultural constraint, not a documented non-goal, but it is real and it is yours
-to weigh.
+**Settles:** no embedded webview, no `wry`/`WKWebView`/`WebView2` dependency, and
+`PaneKind::Browser` does **not** get a renderer. What ships is the *routing* choice:
+system default, any installed browser, or **Ask** (a chooser at launch time). This
+also retires the "embedded webview contradicts the product identity" risk, and
+`core::open::list_browsers` — already written and tested on all three OSes in Wave 0 —
+is the whole of the enumeration work.
 
-- **(a) True in-pane embed** — WKWebView / WebView2 / WebKitGTK as a child view
-  clipped to the pane rect, z-ordered, resized with layout, hit-test-coordinated
-  with Slint. Highest fidelity, by far the most work, and **Wayland is a hard case**:
-  `drag/linux.rs:11-19` documents that a Wayland client cannot even position a window
-  at the cursor, and `supports_cross_window()` returns false there.
-- **(b) A separate lightweight window Hyperpanes owns.** Much more tractable, and
-  there is precedent in-tree: `drag/macos.rs:83-110` already creates and drives a
-  bare `NSWindow` entirely outside Slint's render path, and `drag/windows.rs:19`
-  registers its own Win32 class with its own wndproc. Not in-pane, but ours.
-- **(c) No internal browser.** Ship installed-browser routing + Ask only. Drops one
-  of four `browser_mode` values and nothing else.
+### Q3 — Intercepting a tool's attempt to open a URL. **Answered: `BROWSER` env var.**
 
-**Recommendation: (c) for v1, (b) as the v2 shape, (a) only if in-pane embedding
-proves genuinely essential.** F7's actual user value — *"I control where Claude's
-links open"* — is fully delivered by (c). The internal browser is the most expensive
-item in the entire plan and the least load-bearing.
+**Settles:** the `BROWSER` environment variable, exported into each tool pane's PTY, is
+the default and only enabled mechanism. The `PATH` shim survives as a clearly labelled
+opt-in for tools that ignore `BROWSER`, never as a default — it is the option that can
+surprise the user's own shell and scripts.
 
-### Q3. How do we intercept a tool's attempt to open a URL?
+**New scope this answer brought with it** — recorded as D14/D15 below.
 
-**Why it matters.** Claude and its peers shell out to `open` / `xdg-open` / `start`.
-Nothing in Hyperpanes sees that today, so "which browser should Claude's links open
-in" has no hook without one.
+### Q4 — Codex. **Answered: install what is missing. Plus a correction.**
 
-- **(a) PATH shim.** Prepend a Hyperpanes-owned directory to each pane's `PATH`
-  containing our own `open` / `xdg-open` / `start`, which post the URL to the
-  daemon's control socket. Works for **every** tool without their cooperation, fully
-  deterministic. But it shadows a system command inside the user's interactive
-  shell — a script that expects real `open` semantics gets ours instead.
-- **(b) `BROWSER` environment variable.** Set `BROWSER=<hyperpanes-url-helper>` in
-  the pane environment. It is the long-standing convention, respected by a wide range
-  of CLI tools, and it changes *nothing* about how normal commands behave. Weaker
-  coverage: a tool that calls `open(1)` directly and ignores `BROWSER` slips through.
-- **(c) Do nothing.** Let the OS default browser decide; Hyperpanes' setting only
-  affects URLs the user clicks *inside* a pane (which `terminal-widget/pane.rs:118`
-  already routes).
+The human's note that "codex cli is called agent" turned out to be a name collision,
+and the probe is worth writing down because the registry would otherwise carry a wrong
+entry forever:
 
-**Recommendation: (b) as the default, with (a) available as an explicit opt-in
-"aggressive routing" toggle in the Browser settings page.** (b) is the least
-invasive thing that works for most tools; making (a) opt-in and clearly labelled
-means the one user who needs total coverage can have it, with informed consent, and
-nobody else gets a shadowed `open` they did not ask for. (c) leaves the feature
-unbuilt.
+```
+~/.local/bin/agent -> ~/.local/share/cursor-agent/versions/2026.08.25-3e8eec8/cursor-agent
+```
 
-### Q4. Codex — implement blind, or wait?
+`agent` is the **Cursor** CLI's installed name, not Codex's. Acted on both ways:
 
-Codex is **not installed on this machine**, so its session-store layout cannot be
-verified. Claude's layout was only pinned down by reading real files; guessing
-Codex's from documentation is exactly the "inferred solution" we are told to avoid.
+- `agent` was added to the `cursor-agent` entry's `alt_bins` — a *binary* name only,
+  never a detect token, because `"agent"` in a pane title names no tool at all and is
+  already in `GENERIC_AI_TOKENS` for exactly that reason.
+- The real Codex CLI was installed (`npm install -g --prefix ~/.local @openai/codex`,
+  `codex-cli 0.151.0`), so its history layout can be verified against a real install
+  instead of implemented blind. `HistoryKind::None` on the `codex` entry stands only
+  until that verification happens.
 
-- **(a) Implement from upstream docs**, untested against a real install.
-- **(b) Ship the registry entry** — detection, branded pane, favouritable, resume by
-  command line — but **no history provider** until a real install can be inspected.
-- **(c) Omit Codex entirely.**
+This also motivated `registry::by_bin`: the executable the user asked to run is direct
+evidence and needs no ambiguity rule, so it is consulted *before* the title-token match
+that `for_command` used to rely on alone.
 
-**Recommendation: (b).** It gives Codex users everything except the session list,
-costs one table row, and does not put unverifiable path-parsing code into core. If
-you install Codex, the provider becomes a half-day of work in Wave 2.
+### Q5 — Ship in waves, or hold. **Answered: build every phase and wave autonomously.**
 
-### Q5. Ship in waves, or hold until complete?
+**Settles:** no gating on human review between waves. In exchange, the verification
+contract tightens: every feature is end-to-end tested *by the implementer* — driving a
+real PTY with `expect` or equivalent, the way a human would use it — **before** it is
+handed over for manual testing. A feature that only passes unit tests is not done.
 
-- **(a) Hold** until F1–F8 are all done. One big landing, longest time to any value.
-- **(b) Ship per wave.** Wave 1 alone gives tool detection, favourites, tool-aware
-  panes that identify themselves, and the Claude conversation view. Wave 2 adds more
-  providers, browser routing, and the non-PTY view panes. Wave 3 is the gated,
-  sign-off-dependent work.
+---
 
-**Recommendation: (b).** Wave 1 is independently coherent and independently useful,
-and it is exactly the part with no open questions attached — it can start the moment
-Wave 0's contracts land, regardless of how Q1–Q4 resolve.
+## 9. Scope added by the answers
+
+### D13 — Repo-local project files: a repo describes its own windows
+
+**Asked for:** opening `~/code/tplx` should find in-repo dot-files saying which windows
+to open and what work is going on in each, so a window survives a reboot or a
+multi-month pause.
+
+This is the same durable-session problem the workspace persistence layer already
+solves, pointed at a different home: today the layout lives in the user's app-support
+directory and is keyed by workspace uid, which means it travels with the *machine* and
+not with the *repo*. A repo-local file makes the layout a property of the checkout —
+it clones, it branches, it can be committed or `.gitignore`d per the owner's taste.
+
+- **Location:** `.hyperpanes/project.json` in the repo root, discovered by walking up
+  from the opened directory to the first `.hyperpanes/` or `.git/` — the same ancestor
+  walk shape the existing git-branch lookup uses.
+- **Format:** the existing `PaneSpec`/workspace envelope, reused verbatim. Same
+  `Option<T>` + `skip_serializing_if` compat rule, same `ENVELOPE_VERSION`. Writing a
+  second serialization format for the same data is how the two drift.
+- **Intent, not just geometry:** each pane carries a human-written `note` — "what work
+  is going on in this window" — that survives independently of whether the process is
+  still alive. This is the part that makes a multi-month pause recoverable, and it is
+  the one genuinely new field.
+- **Precedence:** a live session for the workspace wins; the repo file is the fallback
+  used when there is no live session, and the seed used on first open. It never
+  silently overwrites a running layout.
+- **Never a secret store.** The file records commands and notes. Anything that would
+  put a token in a git working tree is out — the existing secret rule applies without
+  exception.
+
+### D14 — Paths in pane output are clickable and copyable
+
+**Asked for:** detect file names and paths in pane output; make them click-openable
+*and* click-copyable. Clicking a filename in a chat pane opens it in a file-tree panel
+on the left, from which the user chooses what to do with it.
+
+The terminal widget already has the machinery: it detects URLs and hit-tests them for
+click (`terminal-widget/src/pane.rs`), which is why this is an extension rather than a
+new subsystem. What changes:
+
+- A path detector beside the URL detector, scoring candidates (absolute paths,
+  `./`-relative, `file:line:col` triples as emitted by every compiler and test runner)
+  and **verifying existence against the pane's live cwd** before offering a click —
+  inferring a path from shape alone is exactly the kind of guess that produces a
+  dead link, and the cwd is already tracked by shell integration.
+- Two affordances on one target: primary click **reveals in the left file tree**,
+  modifier-click (or the context menu) **copies the path**. The copy path must not be
+  gated on the file existing; the reveal must be.
+- A `file:line` hit carries the line number through to whichever tool opens it.
+
+### D15 — Editor tool panes: vim, emacs, edit
+
+**Asked for:** "maybe we have tool panes for vim and emacs and edit, the most popular
+of the editing tools."
+
+These are registry entries like any other tool — `PaneKind::Tool("vim")` is a terminal
+pane with an identity, which is D1 doing its job. They differ from the AI tools in one
+respect only: they take a *target*. That makes them the natural consumers of D14 —
+"open in a terminal with vi" is `NewPaneOpts { command: Some("vim <path>"), kind:
+Tool("vim") }` and nothing more.
+
+`HistoryKind::None` for all three: an editor's recent-files list is its own business
+and not a resumable session in the sense the left panel means.
+
+Probed on this machine: `vim -> /usr/bin/vim`, `nvim -> /opt/homebrew/bin/nvim`,
+`nano -> /usr/bin/nano`. `emacs` is not installed; the registry entry does not require
+it to be, which is the point of D4.
+
+---
+
+## 10. Build log
+
+A running record of what has actually landed, so a fresh session can pick the work up
+without re-deriving it from the diff. Newest section last.
+
+### Wave 0 — 2026-08-30
+
+**Status: code complete, green, awaiting the two frozen-file edits.**
+
+Landed:
+
+- `core/src/tools/{mod,registry,detect,kind}.rs` — the `TOOLS` table (16 entries incl.
+  the D15 editors), `by_bin`/`by_id`/`by_title`, `PaneKind`, binary-first `for_command`,
+  and a `resolve`/`resolve_all` `PATH` + well-known-dirs scan with user overrides.
+- `core/src/open/` — the three duplicate openers consolidated behind one seam, the macOS
+  `xdg-open` bug fixed, a `http`/`https`/`mailto` allow-list plus a command-splitting
+  guard, and browser enumeration for all three OSes.
+- `core/src/permissions/` — six `Right`s, a four-state `Grant`, per-OS deep links; every
+  impl still answers `Undetermined`/`NotApplicable`, which is the Wave-0 contract.
+- `PaneKind` threaded end-to-end: `PaneState` / `DetachedPane` / `NewPaneOpts`,
+  `meta["pane.kind"]` at both spec-write sites, recorded-outranks-derived on read in BOTH
+  `app::make_pane_from_spec` and `core::spawn_seed_pane`, and `kind` on the control
+  read-model (`PaneInfo` → `PaneOut`, omitted for a plain terminal — the additive-optional
+  rule `talk` set).
+- Branded marks: 16 drawn-geometry tool glyphs plus the `ToolIcon` dispatcher in
+  `widget.slint` (kinds 40–55), consumed by the pane header, the left panel's mode strip
+  and the Preferences → Tools list. `theme::menu_icon::TOOL_BASE` is locked to the
+  registry's `TOOL_ICON_BASE` by a cross-crate test.
+- Settings: `tool_favorites`, `tool_paths`, `browser_mode`, `browser_app` (+ helpers),
+  four new `Setting` variants, and Preferences pages 5 (Tools) and 6 (Browser) — fully
+  wired, not shells: star/unstar, per-tool path override, and the three browser modes.
+- Left panel: `LeftPanelAdapter.mode` / `modes` / `sessions` / `resume-session`, the mode
+  strip, and the `mode != 0` session list. Mode 0 is the existing tree.
+
+Two decisions worth carrying forward:
+
+- **The mode strip gates the four workspace sections INDIVIDUALLY** (11 `mode == 0`
+  conditions) rather than wrapping them in one container. Wrapping would add a nesting
+  level and change this layout's `vertical-stretch` maths, and this panel has broken
+  twice on exactly that (`b0c6637`, `5c2eef5`).
+- **`pref-action` code 21 was double-booked** — the General page's keep-alive toggle and
+  the Terminal page's copy-on-select both sent 21, and the `if kind == 21` early return
+  shadowed the `21 => CopyOnSelect` match arm, so copy-on-select silently flipped
+  keep-alive. Keep-alive moved to 22 (the match arm's claim on 21 is the older, declared
+  intent) and an authoritative code table now sits above `on_pref_action`. `pref_text`
+  has its own separate code space, documented the same way.
+
+Still open in this wave: the frozen `Cargo.toml` edits and the CI matrix change that adds
+`rs/crates/app` to the macOS + Windows `cargo check` (D12).

@@ -920,6 +920,14 @@ fn spawn_pane(
     };
     sessions.create(opts).map_err(|e| e.to_string())?;
 
+    // Same rule the GUI uses when it spawns a pane: the kind comes from the PROGRAM, so a
+    // `newPane` with `command: "claude"` is a Claude pane over the control API too. A spec
+    // with no command is a plain shell until runtime detection says otherwise.
+    let kind = command
+        .as_deref()
+        .map(crate::tools::PaneKind::for_command)
+        .unwrap_or_default();
+
     Ok(PaneInfo {
         id: pane_id,
         session_uid,
@@ -934,6 +942,7 @@ fn spawn_pane(
         exit_code: None,
         meta: meta.filter(|m| !m.is_empty()),
         talk: false,
+        kind,
     })
 }
 

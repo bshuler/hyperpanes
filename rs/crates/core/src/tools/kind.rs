@@ -138,6 +138,34 @@ impl PaneKind {
             PaneKind::Browser => "Browser".to_string(),
         }
     }
+
+    /// The kind a pane spawned with `command` starts life as.
+    ///
+    /// Only the *program*'s file stem is matched — not its arguments, and not its
+    /// directories. `claude`, `/opt/homebrew/bin/claude`, and `claude.cmd` are all a Claude
+    /// pane; `bash --init-file ~/dev/gemini/rc` and `~/src/gemini-app/run.sh` are not
+    /// Gemini panes, which they would be under a whole-string token match.
+    ///
+    /// This is the *deterministic* half of tool detection: what the user explicitly asked
+    /// to run. The runtime half — noticing that a plain shell pane has started `claude` —
+    /// reads the OSC title instead, and only ever upgrades a [`PaneKind::Terminal`].
+    pub fn for_command(command: &str) -> PaneKind {
+        let Some(program) = command.split_whitespace().next() else {
+            return PaneKind::Terminal;
+        };
+        let stem = std::path::Path::new(program)
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        // The executable name is checked first and on its own terms: `agent` is the
+        // Cursor CLI even though "agent" is a title token that names no tool. Only if
+        // no binary matches do we fall back to reading the stem as a title token, which
+        // is what catches wrappers like `claude-code`.
+        match registry::by_bin(&stem).or_else(|| registry::by_title(&stem)) {
+            Some(t) => PaneKind::Tool(t.id.to_string()),
+            None => PaneKind::Terminal,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -213,5 +241,36 @@ mod tests {
         let k = PaneKind::Tool("claude".into());
         assert_eq!(k.ui_name(), "Claude Code");
         assert_eq!(k.ui_icon(), registry::by_id("claude").unwrap().icon as i32);
+    }
+
+    #[test]
+    fn a_spawn_command_names_the_kind_from_its_program_alone() {
+        assert_eq!(
+            PaneKind::for_command("claude"),
+            PaneKind::Tool("claude".into())
+        );
+        assert_eq!(
+            PaneKind::for_command("/opt/homebrew/bin/claude --resume abc"),
+            PaneKind::Tool("claude".into())
+        );
+        assert_eq!(
+            PaneKind::for_command("claude.cmd"),
+            PaneKind::Tool("claude".into())
+        );
+    }
+
+    #[test]
+    fn a_tool_name_in_an_argument_or_a_directory_is_not_a_tool_pane() {
+        // These are the false positives a whole-string token match would produce.
+        assert_eq!(
+            PaneKind::for_command("bash --init-file /home/me/dev/gemini/rc"),
+            PaneKind::Terminal
+        );
+        assert_eq!(
+            PaneKind::for_command("/home/me/src/gemini-app/run.sh"),
+            PaneKind::Terminal
+        );
+        assert_eq!(PaneKind::for_command(""), PaneKind::Terminal);
+        assert_eq!(PaneKind::for_command("   "), PaneKind::Terminal);
     }
 }

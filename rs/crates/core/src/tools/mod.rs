@@ -12,4 +12,4 @@ pub mod kind;
 pub mod registry;
 
 pub use kind::{PaneKind, META_KIND_KEY};
-pub use registry::{by_id, by_title, HistoryKind, ToolDef, TOOLS, TOOL_ICON_BASE};
+pub use registry::{by_bin, by_id, by_title, HistoryKind, ToolDef, TOOLS, TOOL_ICON_BASE};

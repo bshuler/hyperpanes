@@ -11,6 +11,10 @@
 import { Theme } from "theme.slint";
 import { TipArea } from "tooltip.slint";
 import { MenuEntry, CtxTab, LayoutOption } from "types.slint";
+// The branded tool marks live in the shared widget library, because the pane title chip
+// (drawn inside `TerminalPane`) and this menu both need them and the app can only import
+// one way across that boundary.
+import { ToolIcon } from "@widgets";
 
 // The Reminder flyout's Custom-duration bridge: a PURE parser implemented in Rust (app.rs
 // wires it to contextmenu::parse_custom_minutes_now). Returns minutes-from-now (>= 1) or
@@ -153,6 +157,7 @@ component IconLayout inherits Rectangle {
         if root.which == 5 : Rectangle { x: parent.width * 0.55; y: (parent.height - 1.2px) / 2; width: parent.width * 0.45 - 1.2px; height: 1.2px; background: ink; }
     }
 }
+
 
 // The icon dispatcher: one slot, geometry picked by kind (0 renders nothing).
 component MenuIcon inherits Rectangle {

@@ -81,12 +81,227 @@ component SearchBtn inherits Rectangle {
     }
 }
 
+
+// ===== branded tool marks =====
+// One mark per registered CLI tool, keyed by `ToolDef.icon` — allocated in Rust from
+// `hyperpanes_core::tools::registry::TOOL_ICON_BASE` (40), which `theme::menu_icon::TOOL_BASE`
+// mirrors and a cross-crate test pins. Same hard rule as the menu icons above: DRAWN GEOMETRY,
+// never a font glyph — a brand's own wordmark font is exactly the thing a Windows box won't
+// have, and it would fail as a hollow box rather than as a missing icon (df773005).
+//
+// Each mark is a *recognizable evocation* drawn from primitives, tinted with the tool's own
+// `brand` colour, not a traced copy of a logo: it reads as "that's my tool" in a 14px slot
+// while staying our own geometry.
+//   40 claude · 41 cursor-agent · 42 codex · 43 copilot · 44 aider · 45 gemini
+//   46 goose · 47 ollama · 48 cody · 49 continue · 50 opencode · 51 amp
+//   52 vim · 53 emacs · 54 edit · 55 nano
+
+// Claude — the radiating burst: spokes from a common centre, longer on the diagonals.
+component MarkClaude inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: ink; stroke-width: 1.3px; fill: transparent;
+    commands: "M 7 1.2 L 7 5 M 7 9 L 7 12.8 M 1.2 7 L 5 7 M 9 7 L 12.8 7"
+            + "M 3.1 3.1 L 5.6 5.6 M 8.4 8.4 L 10.9 10.9"
+            + "M 10.9 3.1 L 8.4 5.6 M 5.6 8.4 L 3.1 10.9";
+}
+
+// Cursor Agent — the pointer: a filled arrowhead with its tail.
+component MarkCursor inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: ink; stroke-width: 1.2px; fill: ink;
+    commands: "M 3 1.6 L 11.4 7.4 L 7.4 8 L 9.6 11.8 L 7.8 12.7 L 5.7 8.9 L 3 11.6 Z";
+}
+
+// Codex — the knot: a hexagon with a triad tying its alternate corners together.
+component MarkCodex inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: ink; stroke-width: 1.25px; fill: transparent;
+    commands: "M 7 1.4 L 12 4.2 L 12 9.8 L 7 12.6 L 2 9.8 L 2 4.2 Z"
+            + "M 7 1.4 L 7 7 M 7 7 L 12 9.8 M 7 7 L 2 9.8";
+}
+
+// GitHub Copilot — the visor: a rounded helmet with two eye slots.
+component MarkCopilot inherits Rectangle {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    Path {
+        width: 100%; height: 100%;
+        viewbox-width: 14; viewbox-height: 14;
+        stroke: ink; stroke-width: 1.25px; fill: transparent;
+        commands: "M 1.6 8.4 C 1.6 4.4 4 2.2 7 2.2 C 10 2.2 12.4 4.4 12.4 8.4"
+                + "L 12.4 10.2 C 12.4 11.6 10 12.3 7 12.3 C 4 12.3 1.6 11.6 1.6 10.2 Z";
+    }
+    Rectangle { x: 4.1px; y: 7.6px; width: 1.6px; height: 2.6px; border-radius: 0.8px; background: ink; }
+    Rectangle { x: 8.3px; y: 7.6px; width: 1.6px; height: 2.6px; border-radius: 0.8px; background: ink; }
+}
+
+// Aider — the paired carets of an edit hunk, one opening and one closing.
+component MarkAider inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: ink; stroke-width: 1.5px; fill: transparent;
+    commands: "M 5.4 2.6 L 1.6 7 L 5.4 11.4 M 8.6 2.6 L 12.4 7 L 8.6 11.4";
+}
+
+// Gemini — the four-pointed sparkle (concave-sided star).
+component MarkGemini inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: transparent; fill: ink;
+    commands: "M 7 1 C 7 4.4 9.6 7 13 7 C 9.6 7 7 9.6 7 13 C 7 9.6 4.4 7 1 7 C 4.4 7 7 4.4 7 1 Z";
+}
+
+// Goose — the bird: a long curved neck ending in a beak, over a body arc.
+component MarkGoose inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: ink; stroke-width: 1.3px; fill: transparent;
+    commands: "M 4.2 12.4 C 3 9.6 4.4 6.2 6.6 4.6 C 8 3.6 8.6 2.6 8.4 1.6"
+            + "M 8.4 1.6 L 11.6 2.6 L 8.9 3.9"
+            + "M 4.2 12.4 L 10.4 12.4";
+}
+
+// Ollama — the llama: an upright body with two ears and a muzzle.
+component MarkOllama inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: ink; stroke-width: 1.25px; fill: transparent;
+    commands: "M 4.4 4.6 L 3.8 1.8 L 5.6 3.4 M 9.6 4.6 L 10.2 1.8 L 8.4 3.4"
+            + "M 4.2 5 C 4.2 3.6 9.8 3.6 9.8 5 L 9.8 8.6 C 9.8 11.2 8.6 12.4 7 12.4"
+            + "C 5.4 12.4 4.2 11.2 4.2 8.6 Z";
+}
+
+// Cody — three strokes converging on a point (the Sourcegraph search fan).
+component MarkCody inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: ink; stroke-width: 1.5px; fill: transparent;
+    commands: "M 2.2 3 L 11.8 5.2 M 2.2 7 L 11.8 7 M 2.2 11 L 11.8 8.8";
+}
+
+// Continue — the double chevron of a resumed run.
+component MarkContinue inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: ink; stroke-width: 1.5px; fill: transparent;
+    commands: "M 2.4 3 L 6.4 7 L 2.4 11 M 7.6 3 L 11.6 7 L 7.6 11";
+}
+
+// OpenCode — the angle brackets of `</>`.
+component MarkOpenCode inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: ink; stroke-width: 1.4px; fill: transparent;
+    commands: "M 4.6 3.4 L 1.4 7 L 4.6 10.6 M 9.4 3.4 L 12.6 7 L 9.4 10.6 M 8.2 2.4 L 5.8 11.6";
+}
+
+// Amp — the bolt.
+component MarkAmp inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: transparent; fill: ink;
+    commands: "M 8.6 1 L 3.4 7.8 L 6.6 7.8 L 5.4 13 L 10.6 6.2 L 7.4 6.2 Z";
+}
+
+// Vim — the diamond with a V cut into it.
+component MarkVim inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: ink; stroke-width: 1.25px; fill: transparent;
+    commands: "M 7 1.2 L 12.8 7 L 7 12.8 L 1.2 7 Z M 4.8 5.2 L 7 9.4 L 9.2 5.2";
+}
+
+// Emacs — the ring-and-tail of the GNU wildebeest, reduced to a circle with two horns.
+component MarkEmacs inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: ink; stroke-width: 1.25px; fill: transparent;
+    commands: "M 7 4.4 C 9.4 4.4 11.2 6.2 11.2 8.6 C 11.2 11 9.4 12.8 7 12.8"
+            + "C 4.6 12.8 2.8 11 2.8 8.6 C 2.8 6.2 4.6 4.4 7 4.4 Z"
+            + "M 4.6 5.4 L 3 1.6 L 6 3.9 M 9.4 5.4 L 11 1.6 L 8 3.9";
+}
+
+// Edit — the pencil.
+component MarkEdit inherits Path {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    viewbox-width: 14; viewbox-height: 14;
+    stroke: ink; stroke-width: 1.25px; fill: transparent;
+    commands: "M 9.6 1.8 L 12.2 4.4 L 4.6 12 L 1.4 12.6 L 2 9.4 Z M 8.2 3.2 L 10.8 5.8";
+}
+
+// Nano — a lined page with a caret sitting in it.
+component MarkNano inherits Rectangle {
+    in property <color> ink;
+    width: 14px; height: 14px;
+    Path {
+        width: 100%; height: 100%;
+        viewbox-width: 14; viewbox-height: 14;
+        stroke: ink; stroke-width: 1.2px; fill: transparent;
+        commands: "M 2.6 1.6 L 8.6 1.6 L 11.4 4.4 L 11.4 12.4 L 2.6 12.4 Z"
+                + "M 8.6 1.6 L 8.6 4.4 L 11.4 4.4"
+                + "M 4.6 7 L 9.4 7 M 4.6 9.4 L 7.6 9.4";
+    }
+    Rectangle { x: 4.6px; y: 5.6px; width: 1.2px; height: 5.2px; background: ink; }
+}
+
+// The tool-mark dispatcher: `kind` is the raw `ToolDef.icon` (>= 40). Anything else — a
+// plain terminal (0), or a tool id a newer registry knows and this build does not — draws
+// nothing, which is the right failure: no mark beats the wrong brand.
+export component ToolIcon inherits Rectangle {
+    in property <int> kind;
+    in property <color> ink;
+    width: 14px;
+    height: 14px;
+    if root.kind == 40 : MarkClaude   { ink: root.ink; }
+    if root.kind == 41 : MarkCursor   { ink: root.ink; }
+    if root.kind == 42 : MarkCodex    { ink: root.ink; }
+    if root.kind == 43 : MarkCopilot  { ink: root.ink; }
+    if root.kind == 44 : MarkAider    { ink: root.ink; }
+    if root.kind == 45 : MarkGemini   { ink: root.ink; }
+    if root.kind == 46 : MarkGoose    { ink: root.ink; }
+    if root.kind == 47 : MarkOllama   { ink: root.ink; }
+    if root.kind == 48 : MarkCody     { ink: root.ink; }
+    if root.kind == 49 : MarkContinue { ink: root.ink; }
+    if root.kind == 50 : MarkOpenCode { ink: root.ink; }
+    if root.kind == 51 : MarkAmp      { ink: root.ink; }
+    if root.kind == 52 : MarkVim      { ink: root.ink; }
+    if root.kind == 53 : MarkEmacs    { ink: root.ink; }
+    if root.kind == 54 : MarkEdit     { ink: root.ink; }
+    if root.kind == 55 : MarkNano     { ink: root.ink; }
+}
+
 export component TerminalPane inherits Rectangle {
     // --- inputs (the controller / parent layout drive these) ---
     in property <image> surface;
     in property <string> title: "";
     in property <color> accent: #7aa2f7;
     in property <bool> chrome: true;
+
+    // --- tool identity (what this pane is RUNNING) ---
+    // A tool pane IS a terminal pane; these only change what the title chip draws. `tool-icon`
+    // is the registry's icon kind (0 = plain terminal, or a tool this build has no mark for —
+    // either way no mark is drawn, which beats drawing the wrong brand). `tool-brand` tints the
+    // mark ALONE: the pane's `accent` still owns the frame, halo and title, so branding never
+    // overrides the user's palette.
+    in property <int> tool-icon: 0;
+    in property <color> tool-brand: #7aa2f7;
 
     // --- clickable-paths link overlay (driven by the controller after it hit-tests the grid) ---
     // The controller answers `link-moved` by hit-testing the cell under the cursor and, when it
@@ -543,7 +758,9 @@ export component TerminalPane inherits Rectangle {
         border-color: root.accent.with-alpha(0.35);
     }
 
-    // Pane title chip, composited above everything (auto-sized by its layout).
+    // Pane title chip, composited above everything (auto-sized by its layout). When the pane
+    // is running a known tool the chip leads with that tool's mark, so a Claude pane reads as
+    // a Claude pane at a glance without costing the title any room it was using.
     if (root.chrome && root.title != ""): Rectangle {
         x: 10px;
         y: 8px;
@@ -553,6 +770,12 @@ export component TerminalPane inherits Rectangle {
         HorizontalLayout {
             padding-left: 8px;
             padding-right: 8px;
+            spacing: root.tool-icon != 0 ? 6px : 0px;
+            if root.tool-icon != 0 : ToolIcon {
+                kind: root.tool-icon;
+                ink: root.tool-brand;
+                y: (parent.height - self.height) / 2;
+            }
             Text {
                 vertical-alignment: center;
                 text: root.title;

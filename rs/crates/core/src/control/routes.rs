@@ -1843,6 +1843,7 @@ mod golden {
             exit_code: None,
             meta: None,
             talk: false,
+            kind: crate::tools::PaneKind::Terminal,
         }
     }
 

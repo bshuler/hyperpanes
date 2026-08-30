@@ -21,6 +21,7 @@ use hyperpanes_core::layout::sizes::{
 };
 use hyperpanes_core::persistence::{paths, projects};
 use hyperpanes_core::session_manager::{SessionManager, SpawnOptions};
+use hyperpanes_core::tools::PaneKind;
 use hyperpanes_core::workspace::io::{read_workspace, windows_of, write_workspace};
 use hyperpanes_core::workspace::model::{GroupSpec, PaneSpec, WorkspaceFile};
 use hyperpanes_core::workspace::sets;
@@ -80,6 +81,10 @@ pub struct DetachedPane {
     pub spawn_command: Option<String>,
     pub spawn_args: Option<Vec<String>>,
     pub spawn_shell: Option<String>,
+    /// What the pane *is* — a plain terminal, a specific CLI tool's pane, or one of the
+    /// non-pty views. Carried across a re-host so a Claude pane torn off into another
+    /// window arrives as a Claude pane rather than reverting to a bare terminal.
+    pub kind: PaneKind,
 }
 
 /// A whole tab detached for re-hosting (the tab menu's "Move to New Window") or parked on the
@@ -132,6 +137,18 @@ pub enum Setting {
     AutoUpdate(bool),
     /// Toggle keep-terminals-running-in-the-background on quit (session-daemon M3).
     KeepAlive(bool),
+    /// Star/unstar a registry tool id (Preferences → Tools). Order is the user's, so this
+    /// toggles in place rather than re-sorting; an id this build doesn't know is still
+    /// storable, because a favourite must survive a downgrade.
+    ToggleFavoriteTool(String),
+    /// Override where a tool's binary lives: `(registry id, path)`. An EMPTY path clears the
+    /// override and returns the tool to `PATH` detection — that is the only way to undo one,
+    /// so it is deliberately not a separate variant.
+    ToolPath(String, String),
+    /// Which browser opens a URL: one of `prefs::BROWSER_MODE_{DEFAULT,APP,ASK}`.
+    BrowserMode(String),
+    /// The `core::open::BrowserApp::id` used when the mode is `app`.
+    BrowserApp(String),
 }
 
 /// A goal awaiting robust delivery into its orchestrator pane's Claude TUI. Rather than the
@@ -431,6 +448,9 @@ pub struct NewPaneOpts {
     /// resume path uses). Used to hand a freshly-spawned agent its opening prompt without a
     /// PTY timing race. `None` ⇒ nothing typed.
     pub startup: Option<String>,
+    /// An explicit pane kind. `None` ⇒ derived from `command` (so "New Claude Pane" and
+    /// "run `claude`" land in the same place without the caller having to say so twice).
+    pub kind: Option<PaneKind>,
 }
 
 /// The in-dialog draft of the **appearance** settings. While Preferences is open these edit
@@ -589,6 +609,14 @@ pub struct PaneState {
     pub spawn_command: Option<String>,
     pub spawn_args: Option<Vec<String>>,
     pub spawn_shell: Option<String>,
+    /// What this pane *is*: a plain terminal, one specific CLI tool's pane, or a non-pty
+    /// view (file browser / viewer / markdown / browser). Set at creation from the spawn
+    /// command, upgraded later when a plain terminal is seen running a known tool, and
+    /// persisted through `PaneSpec`'s `meta["pane.kind"]` so it survives a relaunch.
+    ///
+    /// Only [`PaneKind::is_pty`] kinds have a live session behind them; the views render
+    /// into the same `surface` waist without a pty.
+    pub kind: PaneKind,
 }
 
 impl PaneState {
@@ -1334,6 +1362,13 @@ impl State {
             shell_label: shell_label(&shell_path),
             // Remember the spawn spec so the relaunch snapshot can re-run this program. A New
             // Pane dialog carries no argv, so `spawn_args` stays None.
+            // An explicit kind wins; otherwise the program we were asked to run names it.
+            kind: opts.kind.clone().unwrap_or_else(|| {
+                command
+                    .as_deref()
+                    .map(PaneKind::for_command)
+                    .unwrap_or_default()
+            }),
             spawn_command: command,
             spawn_args: None,
             spawn_shell: shell,
@@ -1480,6 +1515,7 @@ impl State {
                 spawn_command: ps.spawn_command,
                 spawn_args: ps.spawn_args,
                 spawn_shell: ps.spawn_shell,
+                kind: ps.kind,
             },
             alive,
         ))
@@ -1552,6 +1588,7 @@ impl State {
             spawn_command: det.spawn_command,
             spawn_args: det.spawn_args,
             spawn_shell: det.spawn_shell,
+            kind: det.kind,
         };
         let auto = self.active_tab().layout == Layout::Auto;
         let t = self.active_tab_mut();
@@ -1599,6 +1636,7 @@ impl State {
                 spawn_command: ps.spawn_command,
                 spawn_args: ps.spawn_args,
                 spawn_shell: ps.spawn_shell,
+                kind: ps.kind,
             },
             alive,
         ))
@@ -2580,7 +2618,11 @@ impl State {
             | Setting::IdleEffect(_)
             | Setting::IdleSeconds(_)
             | Setting::AutoUpdate(_)
-            | Setting::KeepAlive(_) => {}
+            | Setting::KeepAlive(_)
+            | Setting::ToggleFavoriteTool(_)
+            | Setting::ToolPath(..)
+            | Setting::BrowserMode(_)
+            | Setting::BrowserApp(_) => {}
         }
         self.dirty = true;
     }
@@ -2717,6 +2759,17 @@ impl State {
             }
             Setting::AutoUpdate(on) => self.settings.auto_update = on,
             Setting::KeepAlive(on) => self.settings.keep_alive = on,
+            Setting::ToggleFavoriteTool(id) => self.settings.toggle_favorite_tool(&id),
+            Setting::ToolPath(id, path) => {
+                let path = path.trim().to_string();
+                if path.is_empty() {
+                    self.settings.tool_paths.remove(&id);
+                } else {
+                    self.settings.tool_paths.insert(id, path);
+                }
+            }
+            Setting::BrowserMode(mode) => self.settings.browser_mode = mode,
+            Setting::BrowserApp(id) => self.settings.browser_app = id,
         }
         prefs::save(&self.settings);
         self.dirty = true;
@@ -4003,6 +4056,7 @@ impl State {
             spawn_command: ps.spawn_command,
             spawn_args: ps.spawn_args,
             spawn_shell: ps.spawn_shell,
+            kind: ps.kind,
         })
     }
 
@@ -4070,6 +4124,7 @@ impl State {
             spawn_command: det.spawn_command,
             spawn_args: det.spawn_args,
             spawn_shell: det.spawn_shell,
+            kind: det.kind,
         };
         let auto = self.tabs[ti].layout == Layout::Auto;
         let t = &mut self.tabs[ti];
@@ -4315,6 +4370,7 @@ impl State {
                 spawn_command: p.spawn_command,
                 spawn_args: p.spawn_args,
                 spawn_shell: p.spawn_shell,
+                kind: p.kind,
             })
             .collect();
         Some((
@@ -4472,7 +4528,7 @@ impl State {
             .iter()
             .map(|p| {
                 let px = p.font_px.round() as u32;
-                PaneSpec {
+                let mut spec = PaneSpec {
                     label: Some(p.title.to_string()),
                     color: Some(color_hex(p.accent)),
                     // The original program so a reloaded pane re-runs it (not a plain shell).
@@ -4486,7 +4542,12 @@ impl State {
                     font_size: (px != base).then_some(px),
                     uid: Some(p.uid.clone()),
                     ..Default::default()
-                }
+                };
+                // A Claude pane must reload as a Claude pane, not as the plain shell its
+                // command alone would suggest once detection has upgraded it. `Terminal`
+                // writes nothing, so an ordinary pane's file stays byte-identical.
+                spec.set_pane_kind(&p.kind);
+                spec
             })
             .collect();
         WorkspaceFile {
@@ -4544,7 +4605,7 @@ impl State {
                     .iter()
                     .map(|p| {
                         let px = p.font_px.round() as u32;
-                        PaneSpec {
+                        let mut spec = PaneSpec {
                             label: Some(p.title.to_string()),
                             color: p.pinned_accent.map(color_hex),
                             // The original program (command/args/shell) so restore re-runs it
@@ -4561,7 +4622,12 @@ impl State {
                             font_size: (px != base).then_some(px),
                             uid: Some(p.uid.clone()),
                             ..Default::default()
-                        }
+                        };
+                        // Same as the library snapshot: identity survives a relaunch, so a
+                        // restored Claude pane is branded before its first byte of output
+                        // rather than waiting to be re-detected.
+                        spec.set_pane_kind(&p.kind);
+                        spec
                     })
                     .collect();
                 GroupSpec {
@@ -5071,8 +5137,22 @@ impl State {
             .map(|s| Settings::clamp_font(s as f32))
             .unwrap_or(self.settings.font_px);
         let font = theme::load_font_at(&self.settings.font_path(), font_px, self.last_scale);
+        // A recorded kind is what the pane WAS, and outranks re-deriving it from the
+        // command: detection may have upgraded a shell pane to a tool pane after it was
+        // spawned, and that upgrade is precisely what the snapshot exists to preserve.
+        // Only a spec with no recorded kind — every file written before this feature —
+        // falls back to naming the kind from the program.
+        let kind = match spec.pane_kind() {
+            PaneKind::Terminal => spec
+                .command
+                .as_deref()
+                .map(PaneKind::for_command)
+                .unwrap_or_default(),
+            k => k,
+        };
         Some(PaneState {
             uid,
+            kind,
             title: label.into(),
             subtitle: None,
             show_frame: Some(project),
@@ -5569,6 +5649,7 @@ mod spawn_cells_tests {
             spawn_command: None,
             spawn_args: None,
             spawn_shell: None,
+            kind: PaneKind::default(),
         }
     }
 
@@ -5654,6 +5735,7 @@ mod session_file_tests {
             spawn_command: None,
             spawn_args: None,
             spawn_shell: None,
+            kind: PaneKind::default(),
         }
     }
 
@@ -5992,6 +6074,7 @@ mod reminder_tests {
             spawn_command: None,
             spawn_args: None,
             spawn_shell: None,
+            kind: PaneKind::default(),
         }
     }
 
@@ -6159,6 +6242,7 @@ mod left_panel_tests {
             spawn_command: None,
             spawn_args: None,
             spawn_shell: None,
+            kind: PaneKind::default(),
         }
     }
 
@@ -6382,6 +6466,7 @@ mod set_tests {
             spawn_command: command.map(str::to_string),
             spawn_args: None,
             spawn_shell: None,
+            kind: PaneKind::default(),
         }
     }
 

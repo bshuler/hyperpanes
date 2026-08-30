@@ -10,7 +10,7 @@
 // dispatched against the central `State` (see ARCHITECTURE.md).
 
 import { Theme } from "theme.slint";
-import { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, FramePaletteOption, KeybindingItem, MenuEntry, CtxTab, HistoryUi, ReminderItem, RemindersAdapter, LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSetRow, LeftSessionRow, LeftPanelAdapter } from "types.slint";
+import { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, PrefToolRow, PrefBrowserRow, FramePaletteOption, KeybindingItem, MenuEntry, CtxTab, HistoryUi, ReminderItem, RemindersAdapter, LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSetRow, LeftSessionRow, LeftModeRow, LeftSessionItem, LeftPanelAdapter } from "types.slint";
 import { TopBar } from "topbar.slint";
 import { PaneView } from "paneview.slint";
 import { OverlayLayer } from "overlays.slint";
@@ -25,7 +25,7 @@ import { KeyMsg, HiRect } from "@widgets";
 // here only so the Rust controller can reach it via `global::<RemindersAdapter>()`; all its
 // UI lives in sidebar.slint. ReminderCustom likewise (the pane menu's custom-duration
 // parser bridge; UI in contextmenu.slint).
-export { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, KeybindingItem, MenuEntry, CtxTab, KeyMsg, HiRect, HistoryUi, ReminderItem, RemindersAdapter, ReminderCustom, LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSetRow, LeftSessionRow, LeftPanelAdapter }
+export { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, PrefToolRow, PrefBrowserRow, KeybindingItem, MenuEntry, CtxTab, KeyMsg, HiRect, HistoryUi, ReminderItem, RemindersAdapter, ReminderCustom, LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSetRow, LeftSessionRow, LeftModeRow, LeftSessionItem, LeftPanelAdapter }
 
 export component AppWindow inherits Window {
     title: "hyperpanes";
@@ -82,6 +82,12 @@ export component AppWindow inherits Window {
     in property <string> pref-theme-label;
     in property <[FramePaletteOption]> pref-palettes;
     in property <[PrefOption]> pref-shells;
+    // Preferences → Tools / Browser. Every registry tool (favourited or not) and every
+    // browser the OS reports as installed; both lists are rebuilt by `resync`.
+    in property <[PrefToolRow]> pref-tools;
+    in property <[PrefBrowserRow]> pref-browsers;
+    // 0 = system default · 1 = the chosen app · 2 = ask each time.
+    in property <int> pref-browser-mode: 0;
     in property <string> pref-shell-label;
     // idle-glow prefs
     in property <bool> pref-idle-alert: true;
@@ -527,6 +533,9 @@ export component AppWindow inherits Window {
             theme-label: root.pref-theme-label;
             frame-palettes: root.pref-palettes;
             shells: root.pref-shells;
+            tools: root.pref-tools;
+            browsers: root.pref-browsers;
+            browser-mode: root.pref-browser-mode;
             shell-label: root.pref-shell-label;
             idle-alert: root.pref-idle-alert;
             idle-effects: root.pref-idle-effects;

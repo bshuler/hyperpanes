@@ -83,6 +83,19 @@ export struct PaneItem {
     // badge). The native app removes a pane the moment its session exits, so this is
     // structurally always false today — kept for Electron parity / a future status model.
     exited: bool,
+    // ---- tool identity (a pane IS a terminal pane; this is what it's RUNNING) ----
+    // The `PaneKind` discriminator as an int (`PaneKind::ui_kind`): 0 = plain terminal,
+    // 1 = a registered tool, 2.. = the non-PTY views. Drives which chrome the header draws.
+    kind: int,
+    // Icon kind for the tool mark, allocated from `TOOL_ICON_BASE` and drawn by `Icon`.
+    // 0 = no mark (a plain terminal, or a tool id this build does not know). Geometry, never
+    // a font glyph — see the drawn-geometry rule at the top of this file.
+    tool-icon: int,
+    // Human-facing tool name for the header badge ("Claude Code"). "" = not a tool pane.
+    tool-name: string,
+    // The tool's brand accent, used for the mark only. The pane's own `accent` still owns
+    // the frame/halo, so branding never overrides the user's palette.
+    tool-brand: color,
 }
 
 // One tab (workspace group) chip in the strip.
@@ -226,6 +239,29 @@ export global RemindersAdapter {
 }
 
 // One option in a preferences picker (font family). `active` marks the current value.
+// One row in Preferences → Tools: every tool in the registry, favourited or not. `detected`
+// is where `PATH` found the binary ("" when it isn't installed) and `override` is the user's
+// own path, which wins when set — the page shows both, because "detected but I want a
+// different build" is the whole reason the override exists.
+export struct PrefToolRow {
+    id: string,
+    name: string,
+    icon: int,
+    brand: color,
+    favorite: bool,
+    detected: string,
+    override: string,
+}
+
+// One installed browser in Preferences → Browser. `id` is the platform's own handle for the
+// app (a bundle id on macOS, a .desktop name on Linux, a registry key on Windows), passed
+// straight back when the user picks one — the UI never parses it.
+export struct PrefBrowserRow {
+    id: string,
+    name: string,
+    active: bool,
+}
+
 export struct PrefOption {
     id: int,
     label: string,
@@ -348,6 +384,27 @@ export struct LeftSessionRow {
     live: float,
 }
 
+// One entry in the panel's MODE strip. Mode 0 is always WORKSPACE (the tab/pane tree);
+// every further mode is one favourited CLI tool, showing that tool's locally resumable
+// sessions. `icon` is the registry icon kind the shared `ToolIcon` switches on (0 for the
+// workspace mode, which draws its own glyph), and `brand` tints it.
+export struct LeftModeRow {
+    label: string,
+    icon: int,
+    brand: color,
+}
+
+// One resumable session in a tool mode, grouped under its project. `id` is the tool's own
+// resume key (a Claude session uuid, a Codex thread id) — index-free, so a click can't race
+// a list refresh. `group` is the project the session belongs to; the view starts a new
+// heading whenever it changes, so the Rust side sorts rather than the UI grouping.
+export struct LeftSessionItem {
+    id: string,
+    group: string,
+    label: string,
+    detail: string,
+}
+
 // The controller ↔ left-panel bridge. A GLOBAL (not AppWindow props) so the feature stays
 // self-contained in leftpanel.slint/types.slint: the projection (`paneview::resync`) pushes
 // `open` + the three sections' rows, and `app.rs` subscribes to the callbacks via
@@ -395,4 +452,20 @@ export global LeftPanelAdapter {
     callback save-set();
     // A detached row clicked → adopt session `0` into the active tab.
     callback adopt-session(string);
+
+    // ---- panel modes ----
+    // Which view the panel is showing: 0 = WORKSPACE (the tree above), n = `modes[n]`, a
+    // favourited tool's resumable-session list. `in-out` because the strip sets it directly
+    // — switching views is pure UI state, not a `State` mutation, so it does not go through
+    // Seam #2 (the mode does not survive a restart, and should not: the panel always opens
+    // on the workspace tree).
+    in-out property <int> mode: 0;
+    // Every available mode, mode 0 first. Projected from the favourites in `Settings`, so a
+    // tool the user has not starred never appears here.
+    in property <[LeftModeRow]> modes;
+    // The current mode's sessions, already sorted by (project, recency) — the view only
+    // draws a heading when `group` changes.
+    in property <[LeftSessionItem]> sessions;
+    // A session row clicked → resume session `0` of the current mode's tool.
+    callback resume-session(string);
 }

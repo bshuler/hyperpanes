@@ -241,6 +241,18 @@ fn spawn_seed_pane(
         control_file: control_file.map(str::to_string),
     };
     let _ = sessions.create(opts);
+    // Same precedence as the GUI's `make_pane_from_spec`: a kind RECORDED in the spec is
+    // what the pane was (detection may have upgraded it after it was spawned, and that is
+    // exactly what the workspace file exists to preserve), and only a spec without one —
+    // every file written before tool panes existed — re-derives it from the program.
+    let kind = match ps.pane_kind() {
+        crate::tools::PaneKind::Terminal => ps
+            .command
+            .as_deref()
+            .map(crate::tools::PaneKind::for_command)
+            .unwrap_or_default(),
+        k => k,
+    };
     PaneInfo {
         id: pane_id,
         session_uid,
@@ -255,6 +267,7 @@ fn spawn_seed_pane(
         exit_code: None,
         meta: ps.meta.clone().filter(|m| !m.is_empty()),
         talk: false,
+        kind,
     }
 }
 

@@ -33,7 +33,11 @@
 
 import { Theme } from "theme.slint";
 import { TipArea } from "tooltip.slint";
-import { LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSetRow, LeftSessionRow, LeftPanelAdapter } from "types.slint";
+import { LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSetRow, LeftSessionRow, LeftModeRow, LeftSessionItem, LeftPanelAdapter } from "types.slint";
+// The branded tool marks live in the shared widget library (the pane header needs them too,
+// and the app can only import one way across that boundary). Same hard rule as every glyph
+// in this file: drawn geometry, never a font.
+import { ToolIcon } from "@widgets";
 
 // A disclosure chevron: pointing down when the section is open, right when it is closed.
 component ChevronGlyph inherits Path {
@@ -62,6 +66,61 @@ component CloseGlyph inherits Path {
     stroke-width: 1.5px;
     fill: transparent;
     commands: "M 2 2 L 10 10 M 10 2 L 2 10";
+}
+
+// The WORKSPACE mode's own mark: a 2x2 pane grid, standing for the tab/pane tree. Drawn
+// rather than borrowed from ToolIcon because mode 0 is not a tool and has no brand.
+component GridGlyph inherits Rectangle {
+    in property <color> ink;
+    width: 14px;
+    height: 14px;
+    Rectangle { x: 1px;   y: 1px;   width: 5px; height: 5px; border-radius: 1px; background: root.ink; }
+    Rectangle { x: 8px;   y: 1px;   width: 5px; height: 5px; border-radius: 1px; background: root.ink; }
+    Rectangle { x: 1px;   y: 8px;   width: 5px; height: 5px; border-radius: 1px; background: root.ink; }
+    Rectangle { x: 8px;   y: 8px;   width: 5px; height: 5px; border-radius: 1px; background: root.ink; }
+}
+
+// One button in the mode strip. Fixed 26x24 so the strip's height never depends on what is
+// inside it — the panel's layout has been broken twice by a child whose height came back
+// through a reactive read (b0c6637, 5c2eef5), and a constant is the cheap way to not care.
+component ModeButton inherits Rectangle {
+    in property <LeftModeRow> mode-row;
+    in property <bool> active;
+    callback clicked();
+    width: 26px;
+    height: 24px;
+    border-radius: 5px;
+    background: root.active ? Theme.surface2 : (ma.has-hover ? Theme.surface : transparent);
+    // The active mode is underlined in its own brand, so the strip reads as "which tool am
+    // I looking at" even at a glance. Mode 0 has no brand and falls back to the accent.
+    Rectangle {
+        x: 5px;
+        y: parent.height - 3px;
+        width: 16px;
+        height: 2px;
+        border-radius: 1px;
+        visible: root.active;
+        background: root.mode-row.icon == 0 ? Theme.accent : root.mode-row.brand;
+    }
+    // icon == 0 is the workspace mode; anything else is a registry icon kind.
+    if root.mode-row.icon == 0 : GridGlyph {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2 - 1px;
+        ink: root.active ? Theme.text : Theme.subtext;
+    }
+    if root.mode-row.icon != 0 : ToolIcon {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2 - 1px;
+        kind: root.mode-row.icon;
+        // A dimmed brand when inactive, full brand when selected: the strip stays branded
+        // without four saturated logos fighting for attention at once.
+        ink: root.active ? root.mode-row.brand : root.mode-row.brand.darker(0.35);
+    }
+    ma := TipArea {
+        tip: root.mode-row.label;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
 }
 
 // A floppy-disk "save" glyph (stroked body + shutter + label) for the LIBRARY header.
@@ -514,6 +573,72 @@ component SessionRowView inherits Rectangle {
     }
 }
 
+// One resumable session in a TOOL mode (a Claude conversation, a Codex thread). Deliberately
+// shaped like SessionRowView above — same height, same two-line label/detail — because the
+// two mean the same thing to the user ("something you can pick back up"); only the source
+// differs, and a different shape would imply a difference that isn't there.
+component SessionItemView inherits Rectangle {
+    in property <LeftSessionItem> item;
+    // Drawn once per project, above that project's first session. Computed by the caller,
+    // which has the index; the row itself never looks at its neighbours.
+    in property <bool> heading;
+    in property <color> brand;
+    callback activate();
+
+    VerticalLayout {
+        spacing: 2px;
+        if root.heading : Text {
+            text: root.item.group;
+            color: Theme.subtext;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            overflow: elide;
+        }
+        Rectangle {
+            height: 34px;
+            border-radius: 5px;
+            background: ia.has-hover ? Theme.surface2 : transparent;
+            ia := TipArea {
+                tip: "Resume this session";
+                mouse-cursor: pointer;
+                clicked => { root.activate(); }
+            }
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                spacing: 7px;
+                VerticalLayout {
+                    alignment: center;
+                    // A brand-tinted pip rather than a second copy of the tool logo: the
+                    // mode strip already says which tool this list belongs to.
+                    Rectangle {
+                        width: 6px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: ia.has-hover ? root.brand : Theme.faint;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Text {
+                        text: root.item.label;
+                        color: Theme.text;
+                        font-size: 12px;
+                        overflow: elide;
+                    }
+                    Text {
+                        text: root.item.detail;
+                        color: Theme.subtext;
+                        font-size: 10px;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // A section heading ("WORKSPACE" / "LIBRARY" / "SETS" / "DETACHED") with its disclosure chevron and
 // an optional trailing action button (the library's save-the-current-tab button).
 component SectionHead inherits Rectangle {
@@ -656,15 +781,34 @@ export component LeftPanel inherits Rectangle {
             }
         }
 
+        // ---- mode strip: which view the panel is showing ----
+        // WORKSPACE first, then one entry per favourited CLI tool. Hidden entirely when
+        // nothing is favourited, so a user who has starred no tools sees exactly the panel
+        // they saw before modes existed. The height is a CONSTANT, not derived from the
+        // buttons: this layout has been broken twice by a child whose size came back
+        // through a reactive read (b0c6637, 5c2eef5).
+        if LeftPanelAdapter.modes.length > 1 : HorizontalLayout {
+            height: 26px;
+            spacing: 2px;
+            alignment: start;
+            for m[i] in LeftPanelAdapter.modes : ModeButton {
+                mode-row: m;
+                active: LeftPanelAdapter.mode == i;
+                // Pure UI state — switching views is not a `State` mutation, so it does
+                // not travel Seam #2. See `mode` in types.slint.
+                clicked => { LeftPanelAdapter.mode = i; }
+            }
+        }
+
         // ===== section 1: the workspace tree (tabs → panes) =====
-        SectionHead {
+        if LeftPanelAdapter.mode == 0 : SectionHead {
             label: "WORKSPACE";
             open: root.tree-open;
             tip: root.tree-open ? "Collapse the tab and pane tree" : "Show the tab and pane tree";
             toggled => { root.tree-open = !root.tree-open; }
         }
 
-        if root.tree-open : Rectangle {
+        if LeftPanelAdapter.mode == 0 && root.tree-open : Rectangle {
             // The tree is the panel's primary view, so it carries twice the weight of a
             // drawer and a floor of one whole tab group. Without the floor, four sections
             // sharing the leftover space squeeze it under a single row's height, and
@@ -733,7 +877,7 @@ export component LeftPanel inherits Rectangle {
         }
 
         // ===== section 2: the saved-workspace library =====
-        SectionHead {
+        if LeftPanelAdapter.mode == 0 : SectionHead {
             label: "LIBRARY";
             open: root.lib-open;
             has-action: true;
@@ -743,14 +887,14 @@ export component LeftPanel inherits Rectangle {
             acted => { LeftPanelAdapter.save-workspace(); }
         }
 
-        if root.lib-open && LeftPanelAdapter.workspaces.length == 0 : Text {
+        if LeftPanelAdapter.mode == 0 && root.lib-open && LeftPanelAdapter.workspaces.length == 0 : Text {
             text: "No saved workspaces yet — save this tab with the button above.";
             color: Theme.subtext;
             font-size: 11px;
             wrap: word-wrap;
         }
 
-        if root.lib-open && LeftPanelAdapter.workspaces.length > 0 : Rectangle {
+        if LeftPanelAdapter.mode == 0 && root.lib-open && LeftPanelAdapter.workspaces.length > 0 : Rectangle {
             vertical-stretch: 1;
             min-height: 44px;
             clip: true;
@@ -771,7 +915,7 @@ export component LeftPanel inherits Rectangle {
         }
 
         // ===== section 3: the saved workspace sets =====
-        SectionHead {
+        if LeftPanelAdapter.mode == 0 : SectionHead {
             label: "SETS";
             open: root.sets-open;
             has-action: true;
@@ -781,14 +925,14 @@ export component LeftPanel inherits Rectangle {
             acted => { LeftPanelAdapter.save-set(); }
         }
 
-        if root.sets-open && LeftPanelAdapter.sets.length == 0 : Text {
+        if LeftPanelAdapter.mode == 0 && root.sets-open && LeftPanelAdapter.sets.length == 0 : Text {
             text: "No saved sets yet — save every tab in this window as one group.";
             color: Theme.subtext;
             font-size: 11px;
             wrap: word-wrap;
         }
 
-        if root.sets-open && LeftPanelAdapter.sets.length > 0 : Rectangle {
+        if LeftPanelAdapter.mode == 0 && root.sets-open && LeftPanelAdapter.sets.length > 0 : Rectangle {
             vertical-stretch: 1;
             min-height: 44px;
             clip: true;
@@ -809,21 +953,21 @@ export component LeftPanel inherits Rectangle {
         }
 
         // ===== section 4: detached (adoptable) sessions =====
-        SectionHead {
+        if LeftPanelAdapter.mode == 0 : SectionHead {
             label: "DETACHED";
             open: root.det-open;
             tip: root.det-open ? "Collapse the orphaned sessions" : "Show sessions still running with no window";
             toggled => { root.det-open = !root.det-open; }
         }
 
-        if root.det-open && LeftPanelAdapter.detached.length == 0 : Text {
+        if LeftPanelAdapter.mode == 0 && root.det-open && LeftPanelAdapter.detached.length == 0 : Text {
             text: "No orphaned sessions. A session that outlives its window lands here.";
             color: Theme.subtext;
             font-size: 11px;
             wrap: word-wrap;
         }
 
-        if root.det-open && LeftPanelAdapter.detached.length > 0 : Rectangle {
+        if LeftPanelAdapter.mode == 0 && root.det-open && LeftPanelAdapter.detached.length > 0 : Rectangle {
             vertical-stretch: 1;
             min-height: 44px;
             clip: true;
@@ -838,6 +982,43 @@ export component LeftPanel inherits Rectangle {
                     for s in LeftPanelAdapter.detached : SessionRowView {
                         sess: s;
                         activate => { LeftPanelAdapter.adopt-session(s.uid); }
+                    }
+                }
+            }
+        }
+
+        // ===== the tool modes: one favourited tool's locally resumable sessions =====
+        // A sibling of the four workspace sections rather than a wrapper around them: this
+        // layout's stretch maths is load-bearing (b0c6637), and adding a nesting level to
+        // switch views would change it for the workspace mode too. With `mode != 0` every
+        // section above is `false` and contributes nothing, so this is the only child left.
+        if LeftPanelAdapter.mode != 0 && LeftPanelAdapter.sessions.length == 0 : Text {
+            text: "No resumable sessions found for this tool yet.";
+            color: Theme.subtext;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+
+        if LeftPanelAdapter.mode != 0 && LeftPanelAdapter.sessions.length > 0 : Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+            Flickable {
+                width: 100%;
+                height: 100%;
+                viewport-width: self.width;
+                viewport-height: sessbody.preferred-height;
+                sessbody := VerticalLayout {
+                    alignment: start;
+                    spacing: 2px;
+                    for it[i] in LeftPanelAdapter.sessions : SessionItemView {
+                        item: it;
+                        // The Rust side sorts by (project, recency), so a project heading is
+                        // exactly "the group changed" — no grouping logic in the UI.
+                        heading: i == 0 || LeftPanelAdapter.sessions[i - 1].group != it.group;
+                        brand: LeftPanelAdapter.modes[LeftPanelAdapter.mode].brand;
+                        // The id is the tool's OWN resume key, not an index, so a click can
+                        // never race a refresh of the list underneath it.
+                        activate => { LeftPanelAdapter.resume-session(it.id); }
                     }
                 }
             }

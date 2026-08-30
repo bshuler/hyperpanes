@@ -24,6 +24,11 @@ pub enum HistoryKind {
     CursorSqlite,
     /// `~/.copilot/session-state/<uuid>/` + `~/.copilot/session-store.db`
     CopilotSqlite,
+    /// `~/.codex/codex.sqlite` — the thread store Codex 0.151 keeps its rollouts in.
+    /// Legacy installs also leave `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl`
+    /// behind; Codex migrates those into the DB, so a provider reads the DB and treats
+    /// the JSONL tree as a fallback for a not-yet-migrated home.
+    CodexSqlite,
 }
 
 /// One tool. All fields are `'static` so the whole table is a compile-time constant.
@@ -81,7 +86,10 @@ pub static TOOLS: &[ToolDef] = &[
         id: "cursor-agent",
         name: "Cursor Agent",
         bin: "cursor-agent",
-        alt_bins: &["cursor"],
+        // `agent` is what the official installer symlinks into ~/.local/bin. It is a
+        // *binary* name only — never a detect token, because "agent" in a pane title
+        // names no tool at all (see GENERIC_AI_TOKENS).
+        alt_bins: &["cursor", "agent"],
         icon: TOOL_ICON_BASE + 1,
         brand: (0x6E, 0x7B, 0x8B),
         detect_tokens: &["cursor-agent"],
@@ -96,7 +104,7 @@ pub static TOOLS: &[ToolDef] = &[
         brand: (0x10, 0xA3, 0x7F),
         detect_tokens: &["codex"],
         // Layout unverified against a real install — registry entry only, by design.
-        history: HistoryKind::None,
+        history: HistoryKind::CodexSqlite,
     },
     ToolDef {
         id: "copilot",
@@ -188,6 +196,62 @@ pub static TOOLS: &[ToolDef] = &[
         detect_tokens: &["amp"],
         history: HistoryKind::None,
     },
+    // ---- editors (D15) ----
+    // Ordinary registry entries: an editor pane is a terminal pane like any other. They
+    // earn their place because they take a TARGET, which makes them the natural landing
+    // spot for a path clicked in another pane's output (D14) — "open this in vim" is a
+    // `NewPaneOpts { command: Some("vim <path>"), kind: Tool("vim") }` and nothing more.
+    // None of them keeps a resumable session store, hence `HistoryKind::None`.
+    ToolDef {
+        id: "vim",
+        name: "Vim",
+        bin: "vim",
+        // `nvim` is Neovim and `vi` is usually a symlink to one of the two. Both open the
+        // same file the same way, which is all this entry promises.
+        alt_bins: &["nvim", "vi"],
+        icon: TOOL_ICON_BASE + 12,
+        brand: (0x01, 0x9B, 0x33),
+        detect_tokens: &["vim"],
+        history: HistoryKind::None,
+    },
+    ToolDef {
+        id: "emacs",
+        name: "Emacs",
+        bin: "emacs",
+        alt_bins: &["emacsclient"],
+        icon: TOOL_ICON_BASE + 13,
+        brand: (0x7F, 0x5A, 0xB6),
+        detect_tokens: &["emacs"],
+        history: HistoryKind::None,
+    },
+    ToolDef {
+        id: "edit",
+        name: "Edit",
+        // Microsoft's `edit`, which ships in Windows 11. Kept as its own entry rather than
+        // folded into `nano` because they are different programs that merely fill the same
+        // role, and a wrong name in the header is worse than a missing one.
+        bin: "edit",
+        alt_bins: &[],
+        icon: TOOL_ICON_BASE + 14,
+        brand: (0x2D, 0x7D, 0xD2),
+        // Deliberately EMPTY, for the same reason "agent" is a generic token: "edit" in a
+        // pane title ("Edit config", "editing README") names no tool at all. This one is
+        // recognised by its binary name only.
+        detect_tokens: &[],
+        history: HistoryKind::None,
+    },
+    ToolDef {
+        id: "nano",
+        name: "Nano",
+        // The `edit`-shaped editor that actually exists on macOS and Linux, where Microsoft's
+        // does not. Listed alongside it so the "simple editor" slot is filled on every OS.
+        bin: "nano",
+        alt_bins: &[],
+        icon: TOOL_ICON_BASE + 15,
+        brand: (0x4E, 0x9A, 0x06),
+        detect_tokens: &["nano"],
+        history: HistoryKind::None,
+    },
 ];
 
 /// Tokens that mark a pane as agent-ish without naming a specific tool. Kept apart
@@ -198,6 +262,16 @@ pub static GENERIC_AI_TOKENS: &[&str] = &["llm", "chatgpt", "agent"];
 /// Look a tool up by its stable id.
 pub fn by_id(id: &str) -> Option<&'static ToolDef> {
     TOOLS.iter().find(|t| t.id == id)
+}
+
+/// The tool a *program name* names, if any.
+///
+/// Exact, case-insensitive match against `bin` and `alt_bins` — the binary the user
+/// asked to run is direct evidence, not a hint, so unlike [`by_title`] this needs no
+/// ambiguity rule: two tools may share a title word, never an executable name.
+pub fn by_bin(name: &str) -> Option<&'static ToolDef> {
+    let lower = name.to_ascii_lowercase();
+    TOOLS.iter().find(|t| t.candidate_bins().any(|b| b == lower))
 }
 
 /// The tool an OSC title names, if exactly one is named.
@@ -239,6 +313,40 @@ pub fn ai_tokens() -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_two_tools_claim_the_same_binary_name() {
+        // by_bin has no ambiguity rule on purpose; this is what makes that safe.
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for t in TOOLS {
+            for b in t.candidate_bins() {
+                if let Some((prev, _)) = seen.iter().find(|(_, n)| *n == b) {
+                    panic!("binary {b:?} is claimed by both {prev:?} and {:?}", t.id);
+                }
+                seen.push((t.id, b));
+            }
+        }
+    }
+
+    #[test]
+    fn a_binary_name_resolves_and_an_unknown_one_does_not() {
+        assert_eq!(by_bin("cursor-agent").map(|t| t.id), Some("cursor-agent"));
+        assert_eq!(by_bin("agent").map(|t| t.id), Some("cursor-agent"));
+        assert_eq!(by_bin("AGENT").map(|t| t.id), Some("cursor-agent"));
+        assert_eq!(by_bin("codex").map(|t| t.id), Some("codex"));
+        assert!(by_bin("bash").is_none());
+        assert!(by_bin("").is_none());
+    }
+
+    #[test]
+    fn agent_is_a_binary_name_but_never_a_title_token() {
+        // A title saying "agent" names no tool; the executable `agent` names Cursor.
+        assert!(by_title("running an agent").is_none());
+        assert!(GENERIC_AI_TOKENS.contains(&"agent"));
+        for t in TOOLS {
+            assert!(!t.detect_tokens.contains(&"agent"), "{} claims the generic token", t.id);
+        }
+    }
 
     #[test]
     fn ids_are_unique_and_stable_shaped() {

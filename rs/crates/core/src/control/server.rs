@@ -940,6 +940,7 @@ mod tests {
             exit_code: None,
             meta: None,
             talk: false,
+            kind: crate::tools::PaneKind::Terminal,
         };
         shared.model.lock().unwrap().add_window(WindowInfo {
             window_id: 1,

@@ -22,8 +22,10 @@ use crate::state::{Overlay, PaneState, State};
 use crate::theme;
 use crate::{
     AppWindow, ClaudeSessionItem, CtxTab, DividerItem, FramePaletteOption, HiRect, KeybindingItem,
-    LayoutOption, LeftPaneRow, LeftPanelAdapter, LeftSessionRow, LeftSetRow, LeftTabRow,
-    LeftWorkspaceRow, MenuEntry, PaletteItem, PaneItem, PrefOption, ProjectItem, TabItem,
+    LayoutOption, LeftModeRow, LeftPaneRow, LeftPanelAdapter, LeftSessionItem, LeftSessionRow,
+    LeftSetRow, LeftTabRow,
+    LeftWorkspaceRow, MenuEntry, PaletteItem, PaneItem, PrefBrowserRow, PrefOption, PrefToolRow,
+    ProjectItem, TabItem,
     WorktreeRow,
 };
 
@@ -91,11 +93,28 @@ pub struct Ui {
     pub lp_sets: Rc<VecModel<LeftSetRow>>,
     /// The detached (adoptable) session rows.
     pub lp_detached: Rc<VecModel<LeftSessionRow>>,
+    /// The panel's mode strip — WORKSPACE plus one entry per favourited tool.
+    pub lp_modes: Rc<VecModel<LeftModeRow>>,
+    /// The current tool mode's resumable sessions, pre-sorted by (project, recency).
+    pub lp_sessions: Rc<VecModel<LeftSessionItem>>,
     /// Per-tab pane models for the tree, keyed by tab index and reused across ticks so each
     /// `LeftTabRow.panes` keeps a STABLE model identity — the same reason `wt_models` exists:
     /// rebuilding the inner repeater every frame would drop an in-flight click or, worse, the
     /// pointer grab of a pane drag mid-flight. Pruned to the live tab count each resync.
     pub lp_pane_models: RefCell<HashMap<usize, Rc<VecModel<LeftPaneRow>>>>,
+    /// Preferences → Tools: every registry tool, favourited or not.
+    pub pref_tools: Rc<VecModel<PrefToolRow>>,
+    /// Preferences → Browser: the browsers this OS reports as installed.
+    pub pref_browsers: Rc<VecModel<PrefBrowserRow>>,
+    /// Where `PATH` (and the well-known dirs) found each tool, scanned ONCE and kept.
+    /// Deliberately computed with an EMPTY override map, so it is the answer to "what
+    /// would we find on our own" and never changes when the user edits an override —
+    /// which is exactly what makes it safe to cache for the life of the window. `None`
+    /// means "not scanned yet"; the scan happens the first time Preferences opens, so a
+    /// session that never opens it never touches the filesystem for this.
+    pub tool_detected: RefCell<Option<HashMap<&'static str, String>>>,
+    /// Same one-shot treatment for the installed-browser list.
+    pub browsers_found: RefCell<Option<Vec<hyperpanes_core::open::BrowserApp>>>,
 }
 
 impl Ui {
@@ -129,7 +148,13 @@ impl Ui {
             lp_workspaces: Rc::new(VecModel::default()),
             lp_sets: Rc::new(VecModel::default()),
             lp_detached: Rc::new(VecModel::default()),
+            lp_modes: Rc::new(VecModel::default()),
+            lp_sessions: Rc::new(VecModel::default()),
             lp_pane_models: RefCell::new(HashMap::new()),
+            pref_tools: Rc::new(VecModel::default()),
+            pref_browsers: Rc::new(VecModel::default()),
+            tool_detected: RefCell::new(None),
+            browsers_found: RefCell::new(None),
         })
     }
 
@@ -147,6 +172,8 @@ impl Ui {
         app.set_pref_families(ModelRc::from(self.families.clone()));
         app.set_pref_palettes(ModelRc::from(self.palettes.clone()));
         app.set_pref_shells(ModelRc::from(self.shells.clone()));
+        app.set_pref_tools(ModelRc::from(self.pref_tools.clone()));
+        app.set_pref_browsers(ModelRc::from(self.pref_browsers.clone()));
         app.set_pref_themes(ModelRc::from(self.themes.clone()));
         app.set_pref_idle_effects(ModelRc::from(self.idle_effects.clone()));
         app.set_pref_keybindings(ModelRc::from(self.keybindings.clone()));
@@ -164,6 +191,8 @@ impl Ui {
         lp.set_workspaces(ModelRc::from(self.lp_workspaces.clone()));
         lp.set_sets(ModelRc::from(self.lp_sets.clone()));
         lp.set_detached(ModelRc::from(self.lp_detached.clone()));
+        lp.set_modes(ModelRc::from(self.lp_modes.clone()));
+        lp.set_sessions(ModelRc::from(self.lp_sessions.clone()));
     }
 }
 
@@ -336,6 +365,18 @@ fn pane_item(
         // The native app drops a pane the moment its session exits, so a live pane is never
         // "exited"; the field exists for the taskbar's Electron-parity badge.
         exited: false,
+        // ---- tool identity ----
+        // What this pane is RUNNING, projected for the header. `ui_icon`/`ui_name` return
+        // 0/"" for a plain terminal and for a tool id this build does not know, so an
+        // unknown kind shows no mark rather than a wrong one.
+        kind: ps.kind.ui_kind(),
+        tool_icon: ps.kind.ui_icon() as i32,
+        tool_name: ps.kind.ui_name().into(),
+        tool_brand: match ps.kind.tool() {
+            Some(t) => slint::Color::from_rgb_u8(t.brand.0, t.brand.1, t.brand.2),
+            // No brand: fall back to the pane's own accent so the mark is never invisible.
+            None => ps.accent,
+        },
     }
 }
 
@@ -1029,6 +1070,40 @@ pub fn resync(
                 })
                 .collect();
             sync_model(&ui.lp_detached, det_rows);
+
+            // ---- the mode strip ----
+            // WORKSPACE is always mode 0; every further mode is a favourited tool, in the
+            // user's own favourite order (not the registry's), because the strip is theirs.
+            // A favourite id this build doesn't know is skipped rather than dropped from
+            // settings — a downgrade must not silently un-favourite a tool.
+            let mut mode_rows = vec![LeftModeRow {
+                label: "Workspace".into(),
+                // 0 means "not a tool": the strip draws its own grid glyph for this one.
+                icon: 0,
+                brand: crate::theme::accent_for(0, palette),
+            }];
+            mode_rows.extend(
+                state
+                    .settings
+                    .tool_favorites
+                    .iter()
+                    .filter_map(|id| hyperpanes_core::tools::by_id(id))
+                    .map(|t| LeftModeRow {
+                        label: t.name.into(),
+                        icon: t.icon as i32,
+                        brand: slint::Color::from_rgb_u8(t.brand.0, t.brand.1, t.brand.2),
+                    }),
+            );
+            // Un-favouriting the tool you were looking at must not leave the panel showing
+            // a mode that no longer exists — fall back to the workspace tree.
+            if lp.get_mode() as usize >= mode_rows.len() {
+                lp.set_mode(0);
+            }
+            sync_model(&ui.lp_modes, mode_rows);
+
+            // The session list itself is fed by the per-tool history providers; until one
+            // is wired the list is empty and the panel shows its own empty state.
+            sync_model(&ui.lp_sessions, Vec::<LeftSessionItem>::new());
         }
     }
 
@@ -1322,6 +1397,59 @@ pub fn pump(
         let eff = crate::glow::IdleEffect::from_token(&state.settings.idle_effect);
         let a = state.preview_glow.update(eff, true, Instant::now());
         app.set_pref_preview_glow(a);
+
+        // ---- Tools page ----
+        // The filesystem scan is one-shot per window (see `tool_detected`); the rows
+        // themselves are rebuilt each tick, which is pure map lookups.
+        {
+            let mut cache = ui.tool_detected.borrow_mut();
+            let detected = cache.get_or_insert_with(|| {
+                let none = std::collections::BTreeMap::new();
+                hyperpanes_core::tools::detect::resolve_all(&none)
+                    .into_iter()
+                    .map(|(id, r)| (id, r.path.display().to_string()))
+                    .collect()
+            });
+            let rows: Vec<PrefToolRow> = hyperpanes_core::tools::TOOLS
+                .iter()
+                .map(|t| PrefToolRow {
+                    id: t.id.into(),
+                    name: t.name.into(),
+                    icon: t.icon as i32,
+                    brand: Color::from_rgb_u8(t.brand.0, t.brand.1, t.brand.2),
+                    favorite: state.settings.is_favorite_tool(t.id),
+                    detected: detected.get(t.id).map(|s| s.as_str()).unwrap_or("").into(),
+                    r#override: state
+                        .settings
+                        .tool_paths
+                        .get(t.id)
+                        .map(|s| s.as_str())
+                        .unwrap_or("")
+                        .into(),
+                })
+                .collect();
+            sync_model(&ui.pref_tools, rows);
+        }
+
+        // ---- Browser page ----
+        {
+            let mut cache = ui.browsers_found.borrow_mut();
+            let found = cache.get_or_insert_with(hyperpanes_core::open::list_browsers);
+            let rows: Vec<PrefBrowserRow> = found
+                .iter()
+                .map(|b| PrefBrowserRow {
+                    id: b.id.as_str().into(),
+                    name: b.name.as_str().into(),
+                    active: b.id == state.settings.browser_app,
+                })
+                .collect();
+            sync_model(&ui.pref_browsers, rows);
+        }
+        app.set_pref_browser_mode(match state.settings.browser_mode.as_str() {
+            prefs::BROWSER_MODE_APP => 1,
+            prefs::BROWSER_MODE_ASK => 2,
+            _ => 0,
+        });
     }
 
     // ---- idle-glow inputs (read once per tick) ----

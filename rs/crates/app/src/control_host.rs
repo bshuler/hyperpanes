@@ -35,6 +35,7 @@ use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
 use hyperpanes_core::control::readmodel::{PaneInfo, PaneStatus, ReadModel, TabInfo, WindowInfo};
+use hyperpanes_core::tools::PaneKind;
 use hyperpanes_core::control::server::{self, notify_state, Shared};
 use hyperpanes_core::persistence::{control_settings, paths};
 use hyperpanes_core::session_manager::{SessionEvent, SessionManager};
@@ -526,6 +527,10 @@ impl ControlHost {
                     status: PaneStatus::Running,
                     exit_code: None,
                     meta: Some(meta),
+                    // Same reasoning as `talk` above: the healed pane's kind died with its
+                    // read-model entry and `Terminal` is the honest default. Detection
+                    // re-upgrades it the moment the adopted session shows a tool running.
+                    kind: PaneKind::Terminal,
                 },
             );
             if inserted {
@@ -810,6 +815,7 @@ impl ControlHost {
                         status: PaneStatus::Running,
                         exit_code: None,
                         meta: c.meta,
+                        kind: p.kind.clone(),
                     });
                 }
                 tabs.push(TabInfo {
@@ -885,6 +891,10 @@ impl ControlHost {
             spawn_command: None,
             spawn_args: None,
             spawn_shell: None,
+            // No spawn spec means no program to name a kind from. `Terminal` is the honest
+            // answer, not a lossy one: detection upgrades the pane the moment the adopted
+            // session's output shows a known tool running in it.
+            kind: PaneKind::Terminal,
         };
 
         // Resolve the GUI tab index this pane belongs in (None ⇒ it needs a brand-new tab).
@@ -1108,6 +1118,7 @@ mod tests {
             status: PaneStatus::Running,
             exit_code: None,
             meta: None,
+            kind: PaneKind::Terminal,
         }
     }
 

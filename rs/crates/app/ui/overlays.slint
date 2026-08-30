@@ -13,7 +13,10 @@
 // chords/text route here (not the panes) while open.
 
 import { Theme } from "theme.slint";
-import { PaletteItem, PrefOption, FramePaletteOption, KeybindingItem } from "types.slint";
+import { PaletteItem, PrefOption, FramePaletteOption, KeybindingItem, PrefToolRow, PrefBrowserRow } from "types.slint";
+// The branded tool marks live in the shared widget library — the same ones the pane header
+// and the left panel's mode strip draw, so the settings list is branded identically.
+import { ToolIcon } from "@widgets";
 import { KeyMsg } from "@widgets";
 import { NewPaneDialog } from "newpane.slint";
 import { AddProjectDialog } from "addproject.slint";
@@ -33,6 +36,23 @@ component Check inherits Path {
     stroke-width: 1.6px;
     fill: transparent;
     commands: "M 1 5.5 L 4.5 9 L 11 1";
+}
+
+// The favourite star on a Preferences → Tools row. Outlined when unstarred, filled in the
+// tool's own brand when starred, so the state reads at a glance without a second label.
+// Drawn geometry, never a font glyph — Slint on Windows silently drops codepoints the
+// resolved font lacks (df73005).
+component StarGlyph inherits Path {
+    in property <color> ink: Theme.faint;
+    in property <bool> filled;
+    width: 14px;
+    height: 14px;
+    viewbox-width: 24;
+    viewbox-height: 24;
+    stroke: root.ink;
+    stroke-width: 1.8px;
+    fill: root.filled ? root.ink : transparent;
+    commands: "M 12 2 L 15.1 8.3 L 22 9.3 L 17 14.1 L 18.2 21 L 12 17.8 L 5.8 21 L 7 14.1 L 2 9.3 L 8.9 8.3 Z";
 }
 
 // A drawn chevron for the dropdown buttons; points up while the popup is open.
@@ -421,6 +441,10 @@ export component OverlayLayer inherits Rectangle {
     in property <string> theme-label;
     in property <[FramePaletteOption]> frame-palettes;
     in property <[PrefOption]> shells;
+    // Preferences → Tools / Browser.
+    in property <[PrefToolRow]> tools;
+    in property <[PrefBrowserRow]> browsers;
+    in property <int> browser-mode: 0;   // 0 default · 1 chosen app · 2 ask
     in property <string> shell-label;
     // idle-glow (AI-pane quiescence glow)
     in property <bool> idle-alert: true;
@@ -630,6 +654,8 @@ export component OverlayLayer inherits Rectangle {
                     NavItem { label: "AI features"; active: prefs.sel == 2; clicked => { prefs.sel = 2; } }
                     NavItem { label: "Keybindings"; active: prefs.sel == 3; clicked => { prefs.sel = 3; } }
                     NavItem { label: "General"; active: prefs.sel == 4; clicked => { prefs.sel = 4; } }
+                    NavItem { label: "Tools"; active: prefs.sel == 5; clicked => { prefs.sel = 5; } }
+                    NavItem { label: "Browser"; active: prefs.sel == 6; clicked => { prefs.sel = 6; } }
                     Rectangle { vertical-stretch: 1; }
                 }
             }
@@ -1335,7 +1361,9 @@ export component OverlayLayer inherits Rectangle {
             PrefToggle {
                 label: "Keep terminals running in the background when Hyperpanes closes";
                 on: root.keep-alive;
-                toggled(v) => { root.pref-action(21, v ? 1 : 0); }
+                // 22, not 21 — 21 is the Terminal page's copy-on-select. See the code table
+                // over `on_pref_action` in app.rs before allocating a new one.
+                toggled(v) => { root.pref-action(22, v ? 1 : 0); }
             }
             Text {
                 text: "leaves your terminal sessions alive after you quit so they're restored on the next launch — turn off to stop every terminal when Hyperpanes closes";
@@ -1344,6 +1372,190 @@ export component OverlayLayer inherits Rectangle {
             }
 
                         } // end General panel
+
+                        // ================= Tools =================
+                        // Every tool in the registry, not just the installed ones: a tool
+                        // you have not installed yet is still worth starring, and the row
+                        // says plainly that it wasn't found rather than hiding.
+                        if prefs.sel == 5 : VerticalLayout {
+                            spacing: 12px;
+
+            Text { text: "CLI tools"; color: Theme.faint; font-size: 11px; }
+            Text {
+                text: "Star the tools you use — each favourite gets its own view in the left panel, listing the sessions you can pick back up.";
+                color: Theme.subtext;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+
+            for t[i] in root.tools : Rectangle {
+                height: 66px;
+                border-radius: 8px;
+                background: Theme.bg;
+                border-width: 1px;
+                border-color: Theme.border;
+                VerticalLayout {
+                    padding: 8px;
+                    spacing: 4px;
+                    HorizontalLayout {
+                        spacing: 8px;
+                        VerticalLayout {
+                            alignment: center;
+                            ToolIcon { kind: t.icon; ink: t.brand; }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: t.name;
+                                color: Theme.text;
+                                font-size: 13px;
+                                overflow: elide;
+                            }
+                            Text {
+                                // The override wins when set, so it is what the row reports
+                                // as the effective binary; `detected` is only the fallback.
+                                text: t.override != "" ? t.override
+                                    : (t.detected != "" ? t.detected : "not found on PATH");
+                                color: t.override != "" ? Theme.subtext
+                                    : (t.detected != "" ? Theme.subtext : Theme.faint);
+                                font-size: 10px;
+                                overflow: elide;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 28px;
+                                height: 24px;
+                                border-radius: 5px;
+                                background: sa.has-hover ? Theme.surface2 : transparent;
+                                StarGlyph {
+                                    x: (parent.width - self.width) / 2;
+                                    y: (parent.height - self.height) / 2;
+                                    filled: t.favorite;
+                                    ink: t.favorite ? t.brand : Theme.faint;
+                                }
+                                sa := TouchArea {
+                                    mouse-cursor: pointer;
+                                    // The registry INDEX, not the id: `pref-action` is the
+                                    // int-valued callback. See the code table in app.rs.
+                                    clicked => { root.pref-action(23, i); }
+                                }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 26px;
+                        border-radius: 6px;
+                        background: Theme.mantle;
+                        HorizontalLayout {
+                            padding-left: 8px;
+                            padding-right: 8px;
+                            tpi := TextInput {
+                                color: Theme.text;
+                                font-size: 11px;
+                                vertical-alignment: center;
+                                single-line: true;
+                                init => { tpi.text = t.override; }
+                                // "<registry index> <path>" — split on the FIRST space, so
+                                // a path with spaces in it survives (the index never has
+                                // one). Slint has no tab escape, hence a space and not \t.
+                                // An empty path clears the override and hands the tool back
+                                // to PATH detection.
+                                edited => { root.pref-text(25, i + " " + self.text); }
+                            }
+                        }
+                        Text {
+                            x: 8px;
+                            text: "custom path — blank to auto-detect";
+                            color: Theme.faint;
+                            font-size: 11px;
+                            vertical-alignment: center;
+                            visible: tpi.text == "";
+                        }
+                    }
+                }
+            }
+
+                        } // end Tools panel
+
+                        // ================= Browser =================
+                        if prefs.sel == 6 : VerticalLayout {
+                            spacing: 12px;
+
+            Text { text: "Opening links"; color: Theme.faint; font-size: 11px; }
+            Text {
+                text: "When a tool running in a pane opens a URL, Hyperpanes decides where it goes.";
+                color: Theme.subtext;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+            HorizontalLayout {
+                spacing: 8px;
+                Pill {
+                    label: "System default";
+                    active: root.browser-mode == 0;
+                    clicked => { root.pref-action(24, 0); }
+                }
+                Pill {
+                    label: "A specific browser";
+                    active: root.browser-mode == 1;
+                    clicked => { root.pref-action(24, 1); }
+                }
+                Pill {
+                    label: "Ask each time";
+                    active: root.browser-mode == 2;
+                    clicked => { root.pref-action(24, 2); }
+                }
+                Rectangle { horizontal-stretch: 1; }
+            }
+            Text {
+                text: root.browser-mode == 2
+                    ? "you'll get a small chooser listing your installed browsers every time a link opens"
+                    : (root.browser-mode == 1
+                        ? "every link opens in the browser you pick below"
+                        : "links follow your BROWSER environment variable, then the OS default handler");
+                color: Theme.faint;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+
+            // The list is only meaningful in "a specific browser" mode; in the other two the
+            // choice is made elsewhere (by the OS, or by you at open time).
+            if root.browser-mode == 1 : VerticalLayout {
+                spacing: 6px;
+                for b in root.browsers : Rectangle {
+                    height: 32px;
+                    border-radius: 7px;
+                    background: b.active ? Theme.surface2 : (ba.has-hover ? Theme.surface : Theme.bg);
+                    border-width: 1px;
+                    border-color: b.active ? Theme.accent : Theme.border;
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        Text {
+                            text: b.name;
+                            color: Theme.text;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                        }
+                    }
+                    ba := TouchArea {
+                        mouse-cursor: pointer;
+                        // The platform's own handle, passed straight back untouched.
+                        clicked => { root.pref-text(26, b.id); }
+                    }
+                }
+            }
+            if root.browser-mode == 1 && root.browsers.length == 0 : Text {
+                text: "No browsers detected. Links will fall back to the system default.";
+                color: Theme.faint;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+
+                        } // end Browser panel
                         } // close scrolling body layout (pbody)
                     } // close Flickable
                 }
