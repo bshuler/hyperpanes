@@ -3,8 +3,8 @@
 //!
 //! A [`WorkspaceSet`] is *a name plus references to member workspaces*: it owns no panes
 //! of its own, it points at workspace files. Sets live as `sets/*.json` under the canonical
-//! data dir ([`paths::sets_dir`]), the member workspaces they reference under
-//! [`paths::workspaces_dir`] (or anywhere else the user saved them).
+//! data dir ([`paths::sets_dir`]); the members that `SaveSet` generates go under
+//! [`paths::set_members_dir`], though a set may reference a workspace file anywhere.
 //!
 //! The serde idiom is [`crate::workspace::io`]'s, deliberately and exactly:
 //!   * camelCase field names, `skip_serializing_if = "Option::is_none"` on every optional
@@ -246,6 +246,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// `set_members_dir` nests inside `sets_dir`, so the set scan runs straight over it.
+    /// It must survive that: a subdirectory is not a set, not even one named `*.json`.
+    #[test]
+    fn the_scan_ignores_subdirectories_including_the_members_dir() {
+        let dir = temp_dir("subdirs");
+        assert!(write_set(dir.join("real.json"), &sample()));
+        std::fs::create_dir_all(dir.join("members")).unwrap();
+        // A directory whose own name would pass the extension filter, to pin that the
+        // is_file() half of the filter is what's doing the work.
+        std::fs::create_dir_all(dir.join("decoy.json")).unwrap();
+
+        let found = list_sets_in(&dir);
+        assert_eq!(found.len(), 1, "only the real set: {found:?}");
+        assert_eq!(found[0].1.name, "Morning");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn sample() -> WorkspaceSet {

@@ -263,10 +263,13 @@ rather than rows mixed into LIBRARY because the two differ on click: a library r
 thread-local cache, rescanned only on the panel's closed→open edge and after this process
 writes a set), so the projection never stats the disk per tick.
 
-Note that `sets_dir()` and the panel's `library_dir()` are siblings under the same data dir,
-and `save_set_to` writes its member workspaces into the *library's* directory — so saving a
-set also adds one LIBRARY row per tab. That is deliberate: a set is an index of ordinary
-workspace files, and each member stays independently openable.
+Set members go to `paths::set_members_dir()` (`sets/members/`), **not** the library: a set of
+N tabs generates N member files, and writing those into `workspaces_dir()` would bury the
+handful of workspaces the user saved by hand under machine-generated ones, since the LIBRARY
+drawer lists exactly that directory. Nesting members under `sets/` also keeps a set and its
+members one subtree to back up or delete, and `list_sets_in` only considers `*.json` *files*,
+so the subdirectory is invisible to the set scan. Sets written before this split keep working:
+members are recorded as absolute paths, which `resolve_members` passes through verbatim.
 
 ### M7 — discovery and adopt ✅ *(built on `mux/m7-adopt`)*
 Launch-time discovery and re-adoption already existed — `ListSessions` / `Attach` are in the

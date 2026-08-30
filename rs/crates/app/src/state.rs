@@ -2965,9 +2965,9 @@ impl State {
     }
 
     /// Save every non-empty tab in this window as a new set in the panel's SETS section
-    /// (no file dialog — that's what the drawer is for). Member workspaces land beside the
-    /// library's, so they show up as LIBRARY rows too; that is deliberate, since a set is an
-    /// index of ordinary workspace files and each one is independently openable.
+    /// (no file dialog — that's what the drawer is for). The member workspaces go to
+    /// [`paths::set_members_dir`], NOT the library: a set of N tabs generates N files, and
+    /// the LIBRARY drawer is for the workspaces the user saved by hand.
     ///
     /// Named after the active tab, with a numeric suffix on collision rather than an
     /// overwrite — the same contract as [`Self::save_workspace_to_library`]. The suffix goes
@@ -2998,13 +2998,12 @@ impl State {
         }
         let path = dir.join(format!("{}.json", sets::slug(&name)));
         if self
-            .save_set_to(&path, &paths::workspaces_dir(), &name)
+            .save_set_to(&path, &paths::set_members_dir(), &name)
             .is_some()
         {
-            // Both drawers: the set index is new, and its members just landed in the
-            // library's directory.
+            // Only the SETS drawer: the members went to `sets/members`, which the LIBRARY
+            // scan does not look at.
             crate::leftpanel::refresh_sets();
-            crate::leftpanel::refresh_library();
         }
         self.dirty = true;
     }
@@ -4609,7 +4608,7 @@ impl State {
     // ---- workspace sets (M6: the library layer over WorkspaceFile) ----
 
     /// "Save set…": write **every non-empty tab** of this window as a member workspace under
-    /// [`paths::workspaces_dir`], then write a [`WorkspaceSet`] naming them to `sets/<slug>.json`.
+    /// [`paths::set_members_dir`], then write a [`WorkspaceSet`] naming them to `sets/<slug>.json`.
     /// The set file is picked with the native save dialog (its stem names the set) — there is
     /// no text-entry dialog in this UI, and the file name is the name the user is already
     /// typing. No-op if cancelled.
@@ -4629,7 +4628,7 @@ impl State {
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "set".to_string());
-        self.save_set_to(&path, &paths::workspaces_dir(), &name);
+        self.save_set_to(&path, &paths::set_members_dir(), &name);
     }
 
     /// The dialog-free half of [`Self::save_set`] (the tested one). Writes one member

@@ -221,10 +221,12 @@ pub fn claude_sessions_dir() -> PathBuf {
 }
 
 /// The saved-workspace **library**: the folder the app writes named workspaces into
-/// (`SaveWorkspaceAs`'s default destination, and where `SaveSet` puts the member files it
-/// generates). Durable user data → [`data_dir`]. Files here are ordinary
+/// (`SaveWorkspaceAs`'s default destination, and the one the left panel's LIBRARY drawer
+/// lists). Durable user data → [`data_dir`]. Files here are ordinary
 /// [`WorkspaceFile`](crate::workspace::model::WorkspaceFile)s; nothing stops a user
 /// keeping workspaces elsewhere — a set references them by path either way.
+///
+/// Set members deliberately do NOT live here — see [`set_members_dir`].
 pub fn workspaces_dir() -> PathBuf {
     data_dir().join("workspaces")
 }
@@ -234,6 +236,21 @@ pub fn workspaces_dir() -> PathBuf {
 /// [`workspaces_dir`].
 pub fn sets_dir() -> PathBuf {
     data_dir().join("sets")
+}
+
+/// The member workspaces `SaveSet` generates (`sets/members/*.hyperpanes`).
+///
+/// Deliberately NOT [`workspaces_dir`]: a set of N tabs generates N member files, and
+/// writing them into the library would bury the handful of workspaces the user actually
+/// saved by hand under machine-generated ones — the left panel lists that directory. Nested
+/// under [`sets_dir`] rather than beside it so a set and its members are one subtree to
+/// back up or delete, and because [`crate::workspace::sets::list_sets_in`] only considers
+/// `*.json` FILES, so this directory is invisible to the set scan.
+///
+/// Sets written before this directory existed keep working untouched: their members are
+/// recorded as absolute paths, which `resolve_members` passes through verbatim.
+pub fn set_members_dir() -> PathBuf {
+    sets_dir().join("members")
 }
 
 /// Write `contents` to `path` atomically: create the parent dir, write to a sibling
@@ -262,6 +279,22 @@ pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The whole point of [`set_members_dir`]: machine-generated set members must not land
+    /// in the library the left panel lists, or a 6-tab set buries the user's own workspaces
+    /// under six rows they never saved.
+    #[test]
+    fn set_members_live_under_sets_not_under_the_library() {
+        let members = set_members_dir();
+        assert!(
+            members.starts_with(sets_dir()),
+            "members belong to the set subtree: {members:?}"
+        );
+        assert!(
+            !members.starts_with(workspaces_dir()),
+            "members must stay out of the library: {members:?}"
+        );
+    }
 
     #[cfg(windows)]
     #[test]
