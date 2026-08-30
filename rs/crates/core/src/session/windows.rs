@@ -278,6 +278,19 @@ struct Daemon {
     bus: tokio::sync::broadcast::Sender<SessionEvent>,
     cwds: Arc<Mutex<std::collections::HashMap<String, String>>>,
     lifecycle: Arc<Lifecycle>,
+    /// **M7.** The machine-wide claim table: which client connection is hosting which uid.
+    /// The mirror of the unix daemon's field — see [`claims`](crate::session::claims) for why
+    /// the daemon, and not a file, is the registry.
+    ///
+    /// Note this lives in the *user-facing* daemon, not the pty-host: claims are about which
+    /// GUI window is showing a pane, and the host has no clients but us. Claim frames are
+    /// therefore never forwarded down the (older, version-tolerant) host link.
+    claims: Arc<crate::session::claims::ClaimRegistry>,
+    /// **M7.** Unsolicited pushes (`Claims`, `SessionsChanged`) fanned out to *every*
+    /// connection. Deliberately unfiltered, unlike [`bus`](Self::bus): a client cannot
+    /// subscribe to a session it does not yet know exists, and being told about those is the
+    /// entire point.
+    notices: tokio::sync::broadcast::Sender<DaemonMsg>,
     /// Wakes the accept loop when a control path (`Shutdown`/`Takeover`) ends the daemon, so
     /// it stops waiting on `connect()` and returns — which drops every pipe instance and frees
     /// the name for a successor. The alternative, `process::exit` from inside a connection
@@ -302,15 +315,33 @@ impl Daemon {
             SessionManager::new_daemon_tolerant(etx, &host_salt(salt))?
         };
         let (bus, _) = tokio::sync::broadcast::channel::<SessionEvent>(4096);
+        let (notices, _) = tokio::sync::broadcast::channel::<DaemonMsg>(256);
         let cwds: Arc<Mutex<std::collections::HashMap<String, String>>> = Arc::default();
+        let claims = Arc::new(crate::session::claims::ClaimRegistry::new());
 
         // Event pump: backend mpsc → cwd cache + broadcast bus (identical to the unix pump).
+        // M7 adds the exit half: a session that ends can no longer be claimed or adopted, so
+        // its claim is dropped and both snapshots are re-pushed to every connection.
         let bus_tx = bus.clone();
         let cwds_pump = Arc::clone(&cwds);
+        let claims_pump = Arc::clone(&claims);
+        let notices_pump = notices.clone();
+        let sessions_pump = sessions.clone();
         tokio::spawn(async move {
             while let Some(ev) = erx.recv().await {
                 if let SessionEvent::Cwd { uid, cwd } = &ev {
                     cwds_pump.lock().unwrap().insert(uid.clone(), cwd.clone());
+                }
+                if let SessionEvent::Exit { uid, .. } = &ev {
+                    let dropped = claims_pump.forget_uid(uid);
+                    cwds_pump.lock().unwrap().remove(uid);
+                    if dropped {
+                        let _ = notices_pump.send(DaemonMsg::Claims(claims_pump.snapshot()));
+                    }
+                    let _ = notices_pump.send(DaemonMsg::SessionsChanged(session_metas(
+                        &sessions_pump,
+                        &cwds_pump,
+                    )));
                 }
                 let _ = bus_tx.send(ev);
             }
@@ -321,8 +352,24 @@ impl Daemon {
             bus,
             cwds,
             lifecycle: Arc::new(Lifecycle::new()),
+            claims,
+            notices,
             stopped: Arc::new(tokio::sync::Notify::new()),
         })
+    }
+
+    /// Push the whole claim table to every connection (M7). Full snapshots, never deltas:
+    /// applying one is idempotent, so a dropped or reordered push cannot desync a client.
+    fn broadcast_claims(&self) {
+        let _ = self.notices.send(DaemonMsg::Claims(self.claims.snapshot()));
+    }
+
+    /// Push the whole live-session list to every connection (M7) — the fix for a client
+    /// shadow that would otherwise only learn about sessions created before it connected.
+    fn broadcast_sessions(&self) {
+        let _ = self
+            .notices
+            .send(DaemonMsg::SessionsChanged(self.list_sessions()));
     }
 
     /// Idle-exit monitor (mirror of the unix one): 0 sessions AND 0 clients through the grace
@@ -399,7 +446,17 @@ impl Daemon {
         self.lifecycle.conn_opened();
         let mut pc = PipeConn::new(conn);
         let mut bus_rx = self.bus.subscribe();
+        // Subscribe to the notice channel BEFORE seeding, so a change racing the seed is
+        // either already in the snapshot we send or still queued in the stream — never lost.
+        let mut notice_rx = self.notices.subscribe();
         let mut attached: std::collections::HashSet<String> = Default::default();
+
+        // M7: this connection's identity. The seed snapshots are NOT sent here — they are
+        // broadcast when the client says `Hello` (see the dispatch arm), so that a peer which
+        // never says `Hello` (the bare `Takeover` exchange) is never handed an unsolicited
+        // frame mid-conversation.
+        let conn_id = self.claims.next_conn_id();
+        let mut notices_on = false;
 
         loop {
             tokio::select! {
@@ -407,7 +464,7 @@ impl Daemon {
                 msg = pc.read_msg() => {
                     match msg {
                         Ok(Some(m)) => {
-                            if !self.dispatch(m, &mut pc, &mut attached).await {
+                            if !self.dispatch(m, &mut pc, &mut attached, conn_id, &mut notices_on).await {
                                 break; // a control path (Shutdown) asked to close
                             }
                         }
@@ -424,7 +481,29 @@ impl Daemon {
                         }
                     }
                 }
+                // Outbound unsolicited snapshot (M7) — sent to every connection, unfiltered.
+                // A `Lagged` receiver is harmless: only whole snapshots ride this channel, so
+                // the next one it does receive is complete and correct.
+                notice = notice_rx.recv() => {
+                    if let Ok(notice) = notice {
+                        // Drained unconditionally, forwarded only once the client has said
+                        // `Hello` — see the unix `writer_loop` for the same gate and why the
+                        // seed rides this channel rather than jumping the queue.
+                        if notices_on && pc.write_msg(&notice).await.is_err() {
+                            break;
+                        }
+                    }
+                }
             }
+        }
+
+        // **The crash-safety path (M7).** Every exit from the loop above lands here —
+        // including the one that matters, the peer process dying, which closes its end of the
+        // pipe and surfaces as EOF on the next read. So a claim cannot outlive the process
+        // that made it, however that process ends; there is no lease to expire and no pid to
+        // second-guess.
+        if self.claims.release_conn(conn_id) {
+            self.broadcast_claims();
         }
         self.lifecycle.conn_closed();
     }
@@ -435,6 +514,8 @@ impl Daemon {
         msg: ClientMsg,
         pc: &mut PipeConn,
         attached: &mut std::collections::HashSet<String>,
+        conn_id: crate::session::claims::ConnId,
+        notices_on: &mut bool,
     ) -> bool {
         match msg {
             ClientMsg::Hello { .. } => {
@@ -442,8 +523,14 @@ impl Daemon {
                     .write_msg(&DaemonMsg::Hello {
                         proto_ver: PROTO_VER,
                         daemon_pid: std::process::id(),
+                        conn_id,
                     })
                     .await;
+                // M7: open the push gate, then seed by broadcasting — same ordering argument
+                // as unix (the seed and every later change travel one ordered channel).
+                *notices_on = true;
+                self.broadcast_claims();
+                self.broadcast_sessions();
             }
             ClientMsg::ListSessions => {
                 let _ = pc
@@ -470,6 +557,10 @@ impl Daemon {
                 let _ = pc.write_msg(&DaemonMsg::Created { uid: uid.clone() }).await;
                 if created.is_err() {
                     let _ = self.bus.send(SessionEvent::Exit { uid, code: -1 });
+                } else {
+                    // Tell every other connected window the session set changed, so a pane
+                    // created here shows up next door without a reconnect (M7).
+                    self.broadcast_sessions();
                 }
             }
             ClientMsg::Write { uid, data } => self.sessions.write(&uid, &data),
@@ -477,10 +568,21 @@ impl Daemon {
             ClientMsg::Kill { uid } => {
                 self.sessions.kill(&uid);
                 self.cwds.lock().unwrap().remove(&uid);
+                // A deliberate kill is silent on the event bus (no `Exit`), so the claim drop
+                // and the snapshot re-push have to happen right here or other windows keep a
+                // ghost row for a session that is gone.
+                if self.claims.forget_uid(&uid) {
+                    self.broadcast_claims();
+                }
+                self.broadcast_sessions();
             }
             ClientMsg::KillAll => {
                 self.sessions.kill_all();
                 self.cwds.lock().unwrap().clear();
+                if self.claims.clear() {
+                    self.broadcast_claims();
+                }
+                self.broadcast_sessions();
             }
             ClientMsg::RenderScreen { uid } => {
                 let text = self.sessions.render_screen(&uid);
@@ -488,6 +590,33 @@ impl Daemon {
             }
             ClientMsg::Ping => {
                 let _ = pc.write_msg(&DaemonMsg::Pong).await;
+            }
+            // ---- M7 claims ----
+            ClientMsg::Claim { uid } => {
+                // The compare-and-set that makes double adoption impossible: the registry's
+                // mutex orders two racing claims and the loser is told who won.
+                let outcome = self.claims.claim(&uid, conn_id);
+                let granted = outcome.granted();
+                let _ = pc
+                    .write_msg(&DaemonMsg::ClaimResult {
+                        uid,
+                        granted,
+                        owner: outcome.owner(),
+                    })
+                    .await;
+                if granted {
+                    self.broadcast_claims();
+                }
+            }
+            ClientMsg::Release { uid } => {
+                if self.claims.release(&uid, conn_id) {
+                    self.broadcast_claims();
+                }
+            }
+            ClientMsg::ListClaims => {
+                let _ = pc
+                    .write_msg(&DaemonMsg::Claims(self.claims.snapshot()))
+                    .await;
             }
             ClientMsg::Takeover => {
                 // Stand down for a successor built from a newer binary. Where unix ships its
@@ -523,29 +652,38 @@ impl Daemon {
     }
 
     fn list_sessions(&self) -> Vec<SessionMeta> {
-        let cwds = self.cwds.lock().unwrap();
-        self.sessions
-            .uids()
-            .into_iter()
-            .map(|uid| {
-                // The grid rides along so an attach client can letterbox at the desktop's
-                // size instead of reflowing the pane (mux-backend-plan M2).
-                let (cols, rows) = match self.sessions.dims(&uid) {
-                    Some((c, r)) => (Some(c), Some(r)),
-                    None => (None, None),
-                };
-                SessionMeta {
-                    cwd: cwds.get(&uid).cloned(),
-                    output_bytes: self.sessions.output_bytes(&uid).unwrap_or(0),
-                    last_output_at: self.sessions.last_output_at(&uid),
-                    alive: true,
-                    cols,
-                    rows,
-                    uid,
-                }
-            })
-            .collect()
+        session_metas(&self.sessions, &self.cwds)
     }
+}
+
+/// The live-session snapshot, as a free function so the event pump — which holds clones of
+/// the pieces, not a `Daemon` — can build exactly the same list the connection paths do.
+fn session_metas(
+    sessions: &SessionManager,
+    cwds: &Mutex<std::collections::HashMap<String, String>>,
+) -> Vec<SessionMeta> {
+    let cwds = cwds.lock().unwrap();
+    sessions
+        .uids()
+        .into_iter()
+        .map(|uid| {
+            // The grid rides along so an attach client can letterbox at the desktop's
+            // size instead of reflowing the pane (mux-backend-plan M2).
+            let (cols, rows) = match sessions.dims(&uid) {
+                Some((c, r)) => (Some(c), Some(r)),
+                None => (None, None),
+            };
+            SessionMeta {
+                cwd: cwds.get(&uid).cloned(),
+                output_bytes: sessions.output_bytes(&uid).unwrap_or(0),
+                last_output_at: sessions.last_output_at(&uid),
+                alive: true,
+                cols,
+                rows,
+                uid,
+            }
+        })
+        .collect()
 }
 
 fn event_uid(ev: &SessionEvent) -> &str {

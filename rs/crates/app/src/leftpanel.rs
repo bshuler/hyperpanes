@@ -311,23 +311,59 @@ thread_local! {
     /// than a per-window "everyone else" set) is enough: a window also subtracts its own
     /// uids, and a session held anywhere is not detached from anyone's point of view.
     static WINDOW_CLAIMS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
+
+    /// What this process last told the daemon it is hosting. Diffed against each new
+    /// publish so the pump sends a `Claim`/`Release` frame only when the set actually
+    /// changes — an unchanged frame costs nothing on the wire.
+    static PUBLISHED_CLAIMS: RefCell<HashSet<String>> = RefCell::new(HashSet::new());
 }
 
 /// Publish the uids every window in this process is hosting (laid out or parked). Called
 /// from the app's pump, before the per-window renders that project the panel.
-pub fn publish_window_claims(uids: impl IntoIterator<Item = String>) {
-    WINDOW_CLAIMS.with(|c| *c.borrow_mut() = uids.into_iter().collect());
+///
+/// **M7:** this also registers those uids with the daemon's cross-process claim registry, so
+/// that *other* hyperpanes processes stop offering them for adoption. Only the difference
+/// from the previous publish goes on the wire, and it goes fire-and-forget: a claim on a
+/// pane we already host is not contested, and the GUI pump must never block on the daemon.
+/// The contested case — adopting an orphan — takes the blocking path in
+/// [`SessionManager::claim_session`] and obeys its answer.
+///
+/// Releasing on the way out is a courtesy, not the safety net: the daemon drops every claim
+/// a connection holds when that connection's socket closes, so a crash releases them too.
+pub fn publish_window_claims(mgr: &SessionManager, uids: impl IntoIterator<Item = String>) {
+    let held: HashSet<String> = uids.into_iter().collect();
+    PUBLISHED_CLAIMS.with(|prev| {
+        let mut prev = prev.borrow_mut();
+        for uid in held.difference(&prev) {
+            mgr.announce_claim(uid);
+        }
+        for uid in prev.difference(&held) {
+            mgr.release_session(uid);
+        }
+        *prev = held.clone();
+    });
+    set_window_claims(held);
 }
 
-/// **M7 seam.** Uids claimed by a hyperpanes process *other than this one* — a session that
-/// another client of the same daemon is attached to. There is no wire message that reports
-/// this today (`ListSessions`/`SessionMeta` describe a session's buffer and liveness, not
-/// who is watching it), so this deliberately returns an empty set: the panel then treats a
-/// session another PROCESS holds as adoptable, and adopting it re-attaches rather than
-/// stealing (the daemon multiplexes output). M7, which adds the claim/lease notion to the
-/// protocol, fills this in and the DETACHED list narrows on its own — no call site changes.
-pub fn claimed_by_other_processes() -> HashSet<String> {
-    HashSet::new()
+/// The thread-local half of [`publish_window_claims`]: record what this process's windows
+/// hold, with no daemon traffic. Split out because the daemon half needs a live
+/// `SessionManager` (and therefore a real pty) while the subtraction it feeds does not.
+fn set_window_claims(held: HashSet<String>) {
+    WINDOW_CLAIMS.with(|c| *c.borrow_mut() = held);
+}
+
+/// Uids claimed by a hyperpanes process *other than this one* — a session another window,
+/// in another process, is currently hosting.
+///
+/// Answered from the claim snapshot the daemon pushes to every client whenever the picture
+/// changes (M7), so this is a lock and a set filter: no I/O on the panel's paint path. Empty
+/// for the in-process backend, where no other process can be holding one of our sessions.
+///
+/// A claim is scoped to the owner's daemon *connection*, so a process that dies — cleanly,
+/// by panic, or by `SIGKILL` — has its claims dropped the moment the kernel closes its
+/// socket, and its panes appear here no longer.
+pub fn claimed_by_other_processes(mgr: &SessionManager) -> HashSet<String> {
+    mgr.sessions_claimed_elsewhere()
 }
 
 /// The adoptable sessions: everything the session manager knows about, minus everything
@@ -335,17 +371,19 @@ pub fn claimed_by_other_processes() -> HashSet<String> {
 ///
 /// `claimed_here` is this window's own uids (its panes + its parked reminders). The other
 /// two subtractions come from [`publish_window_claims`] (every window in this process) and
-/// [`claimed_by_other_processes`] (the M7 seam above).
+/// [`claimed_by_other_processes`] (every OTHER process, via the daemon's claim registry).
 ///
-/// How complete this is **today**: in daemon mode `SessionManager::uids()` answers from the
-/// client's shadow table, which is seeded by `ListSessions` at connect and then maintained
-/// from the `Exit` stream plus this client's own creates — so a session orphaned by a
-/// crashed window IS listed, while one created by a different client after we connected is
-/// not (that gap closes with M7's session-event stream). In-process mode lists exactly the
-/// sessions this process spawned, which is the correct answer for a single-process run.
+/// How complete this is: in daemon mode `SessionManager::uids()` answers from the client's
+/// shadow table, which is seeded by `ListSessions` at connect and then kept current by the
+/// `Exit` stream, this client's own creates, and (M7) the full `SessionsChanged` snapshot the
+/// daemon pushes on every create/kill/exit — so a session another client made after we
+/// connected shows up here without a reconnect, and a session it killed stops showing up.
+/// In-process mode lists exactly the sessions this process spawned, which is the correct
+/// answer for a single-process run.
 pub fn detached(mgr: &SessionManager, claimed_here: &HashSet<String>) -> Vec<DetachedSession> {
     let now = crate::glow::now_epoch_ms();
-    let mut rows: Vec<DetachedSession> = adoptable_uids(mgr.uids(), claimed_here)
+    let other_procs = claimed_by_other_processes(mgr);
+    let mut rows: Vec<DetachedSession> = adoptable_uids(mgr.uids(), claimed_here, &other_procs)
         .into_iter()
         .map(|uid| {
             let last = mgr.last_output_at(&uid);
@@ -365,11 +403,16 @@ pub fn detached(mgr: &SessionManager, claimed_here: &HashSet<String>) -> Vec<Det
 /// The subtraction behind [`detached`], split out so it can be tested without a live
 /// `SessionManager` (which can only be populated by actually spawning a PTY): `all` minus
 /// this window's own claims, minus every other window in this process
-/// ([`publish_window_claims`]), minus the M7 seam ([`claimed_by_other_processes`]). Input
-/// order is preserved; [`detached`] re-sorts by last output.
-pub fn adoptable_uids(all: Vec<String>, claimed_here: &HashSet<String>) -> Vec<String> {
+/// ([`publish_window_claims`]), minus every other process (`other_procs`, which [`detached`]
+/// fills from [`claimed_by_other_processes`] — passed in rather than fetched here, since
+/// M7's source for it needs a live `SessionManager`). Input order is preserved; [`detached`]
+/// re-sorts by last output.
+pub fn adoptable_uids(
+    all: Vec<String>,
+    claimed_here: &HashSet<String>,
+    other_procs: &HashSet<String>,
+) -> Vec<String> {
     let elsewhere = WINDOW_CLAIMS.with(|c| c.borrow().clone());
-    let other_procs = claimed_by_other_processes();
     all.into_iter()
         .filter(|uid| {
             !claimed_here.contains(uid) && !elsewhere.contains(uid) && !other_procs.contains(uid)
@@ -472,35 +515,40 @@ mod tests {
         let all = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<HashSet<_>>();
 
-        publish_window_claims(Vec::<String>::new());
+        let none = HashSet::new();
+
+        set_window_claims(HashSet::new());
         // Nothing claimed → everything is adoptable, in the order given.
         assert_eq!(
-            adoptable_uids(all(&["a", "b", "c"]), &set(&[])),
+            adoptable_uids(all(&["a", "b", "c"]), &set(&[]), &none),
             all(&["a", "b", "c"])
         );
         // This window's own panes are never offered back to it.
         assert_eq!(
-            adoptable_uids(all(&["a", "b", "c"]), &set(&["b"])),
+            adoptable_uids(all(&["a", "b", "c"]), &set(&["b"]), &none),
             all(&["a", "c"])
         );
 
         // A pane sitting in the window next door is not detached either.
-        publish_window_claims(all(&["c"]));
+        set_window_claims(set(&["c"]));
         assert_eq!(
-            adoptable_uids(all(&["a", "b", "c"]), &set(&["b"])),
+            adoptable_uids(all(&["a", "b", "c"]), &set(&["b"]), &none),
             all(&["a"])
         );
 
         // Republishing replaces (never accumulates) the cross-window claim set.
-        publish_window_claims(Vec::<String>::new());
+        set_window_claims(HashSet::new());
         assert_eq!(
-            adoptable_uids(all(&["a", "b", "c"]), &set(&["b"])),
+            adoptable_uids(all(&["a", "b", "c"]), &set(&["b"]), &none),
             all(&["a", "c"])
         );
 
-        // The M7 seam is empty today — documented, and asserted so the day it stops being
-        // empty this test is the thing that says so.
-        assert!(claimed_by_other_processes().is_empty());
+        // And the M7 subtraction: a uid another PROCESS has claimed in the daemon's registry
+        // is not offered here either, even though nothing in this process holds it.
+        assert_eq!(
+            adoptable_uids(all(&["a", "b", "c"]), &set(&["b"]), &set(&["c"])),
+            all(&["a"])
+        );
     }
 
     #[test]

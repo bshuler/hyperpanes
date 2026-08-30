@@ -921,14 +921,15 @@ impl App {
         // 2f. Left panel (M5): republish the session uids every window in this process is
         //     hosting, so the panel's DETACHED section can subtract them. Cheap (a string
         //     set over the live panes) and done once for all windows, before the renders
-        //     that project it. Sessions held by ANOTHER hyperpanes process are still listed
-        //     as adoptable — see `leftpanel::claimed_by_other_processes`, the M7 seam.
+        //     that project it. M7: the same set is registered with the daemon's
+        //     cross-process claim registry, so other hyperpanes processes stop offering our
+        //     panes for adoption (only the diff goes on the wire, fire-and-forget).
         {
             let mut claims: std::collections::HashSet<String> = std::collections::HashSet::new();
             for w in &windows {
                 claims.extend(w.state.borrow().claimed_uids());
             }
-            crate::leftpanel::publish_window_claims(claims);
+            crate::leftpanel::publish_window_claims(&self.mgr, claims);
         }
 
         // 3. Render each window from its own state. Aggregate per-window activity so the

@@ -42,7 +42,19 @@ use crate::session_manager::{Integration, SessionEvent, SessionSnapshot, SpawnOp
 /// `2` adds [`ClientMsg::Takeover`] — the daemon live upgrade (M1). A version-1 daemon
 /// cannot parse that message and simply drops the connection, which is exactly how the
 /// successor detects a pre-takeover incumbent and falls back to the old tear-down.
-pub const PROTO_VER: u32 = 2;
+///
+/// `3` adds the **claim registry** (M7): [`ClientMsg::Claim`] / [`ClientMsg::Release`] /
+/// [`ClientMsg::ListClaims`], the [`DaemonMsg::ClaimResult`] / [`DaemonMsg::Claims`]
+/// answers, the unsolicited [`DaemonMsg::SessionsChanged`] push, and `conn_id` on
+/// [`DaemonMsg::Hello`]. The bump matters for the same reason `2` did: a version-2 daemon
+/// cannot deserialize `Claim`, and an unknown frame drops the connection — so claim traffic
+/// must never reach a pre-3 daemon. Normally the lock-step handshake upgrades the daemon
+/// (live takeover, M1) first; when it *cannot* — a stale daemon holding live terminals is
+/// driven as it is rather than killed for an upgrade — the client suppresses claim traffic
+/// entirely instead (`daemon_client::MIN_CLAIM_DAEMON_VER`). The additions are otherwise
+/// purely additive, and `Hello.conn_id` carries `#[serde(default)]` so an older peer's reply
+/// still parses (as `0`, the "unknown owner" sentinel).
+pub const PROTO_VER: u32 = 3;
 
 /// Hard cap on a single frame body, so a corrupt/hostile length prefix can't make a
 /// reader allocate unbounded memory. 64 MiB is far above any real replay/screen payload.
@@ -194,6 +206,26 @@ pub enum ClientMsg {
     /// `handoff::recv_with_fds` and use the socket for nothing else. Sent only by another
     /// daemon of this binary, never by the GUI.
     Takeover,
+    /// **Take ownership of `uid` for this connection** (M7). The daemon answers with
+    /// [`DaemonMsg::ClaimResult`]: `granted` when the uid was free (or already ours),
+    /// otherwise `granted: false` plus the incumbent connection.
+    ///
+    /// This is the *only* safe way to adopt an orphaned session: the check and the take are
+    /// one atomic step inside the daemon, so two windows racing for one orphan produce
+    /// exactly one winner. The claim lives as long as this connection does — see
+    /// [`claims`](crate::session::claims) for why connection lifetime, not a heartbeat, is
+    /// the liveness signal.
+    Claim { uid: String },
+    /// Give up this connection's claim on `uid` (fire-and-forget). A release from a
+    /// connection that does not own the uid is ignored. Sent when a pane closes or moves
+    /// out of this process; it is never *required* — dropping the connection releases
+    /// everything it held.
+    Release { uid: String },
+    /// Ask for the current claim table (→ [`DaemonMsg::Claims`]). Rarely needed: the daemon
+    /// pushes a fresh [`DaemonMsg::Claims`] snapshot to every connection at connect and on
+    /// every change, so a client's claim shadow stays current without polling. Kept for
+    /// diagnostics and for a client that wants to resynchronise explicitly.
+    ListClaims,
     /// Ask the daemon to **shut down**: kill every session and exit the process cleanly,
     /// releasing the lock + socket (M3). Drives the app's `--kill-daemon` path and the
     /// quit-vs-keep-alive "OFF" branch. The daemon kills its sessions, then exits — so the
@@ -218,8 +250,20 @@ pub struct HandoffPayload {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DaemonMsg {
     /// Handshake reply: the daemon's protocol version + its pid (for diagnostics / the
-    /// future kill-on-mismatch path).
-    Hello { proto_ver: u32, daemon_pid: u32 },
+    /// future kill-on-mismatch path), plus the [`ConnId`](crate::session::claims::ConnId)
+    /// the daemon assigned to THIS connection.
+    ///
+    /// `conn_id` is how a client tells its own claims apart from other processes' in a
+    /// [`Claims`](Self::Claims) snapshot — an identity the daemon *assigns* rather than one
+    /// the client asserts, so no pid is trusted and none has to be peer-credentialed.
+    /// `#[serde(default)]` (→ `0`, the "unknown" sentinel) keeps a pre-M7 daemon's reply
+    /// parseable.
+    Hello {
+        proto_ver: u32,
+        daemon_pid: u32,
+        #[serde(default)]
+        conn_id: crate::session::claims::ConnId,
+    },
     /// Reply to [`ClientMsg::ListSessions`].
     Sessions(Vec<SessionMeta>),
     /// Reply to [`ClientMsg::Create`]: the (possibly daemon-minted) uid of the new
@@ -254,6 +298,30 @@ pub enum DaemonMsg {
     Event(SessionEvent),
     /// Reply to [`ClientMsg::Ping`].
     Pong,
+    /// Reply to [`ClientMsg::Claim`] (M7): whether this connection now owns `uid`, and —
+    /// when it does not — which connection does.
+    ClaimResult {
+        uid: String,
+        granted: bool,
+        owner: Option<crate::session::claims::ConnId>,
+    },
+    /// The **whole** claim table (M7). Sent unsolicited to every connection when the daemon
+    /// accepts it and again on every change, and as the reply to [`ClientMsg::ListClaims`].
+    ///
+    /// A full snapshot rather than a delta on purpose: applying it is idempotent, a dropped
+    /// or reordered push cannot desync a client's shadow, and the table holds one entry per
+    /// visible pane on the machine (tens), so the bandwidth is irrelevant.
+    Claims(Vec<crate::session::claims::ClaimInfo>),
+    /// The daemon's live session set changed (M7): a session was created, killed, or
+    /// adopted. Pushed unsolicited to every connection, carrying the same
+    /// [`SessionMeta`] rows a [`ListSessions`](ClientMsg::ListSessions) would return.
+    ///
+    /// This closes the M5 residual where a client's uid shadow — seeded once by
+    /// `ListSessions` at connect and then maintained only from the `Exit` stream plus its
+    /// own creates — never learned about sessions *other* clients created, so an orphan
+    /// from a window opened after us stayed invisible until reconnect. Like
+    /// [`Claims`](Self::Claims) it is a full snapshot, for the same reasons.
+    SessionsChanged(Vec<SessionMeta>),
 }
 
 /// Write one length-prefixed JSON frame: a `u32` LE body length then the JSON body.
@@ -439,6 +507,7 @@ mod tests {
             DaemonMsg::Hello {
                 proto_ver: PROTO_VER,
                 daemon_pid: 4242,
+                conn_id: 7,
             },
             DaemonMsg::Sessions(vec![SessionMeta {
                 uid: "s1".into(),
@@ -473,6 +542,24 @@ mod tests {
                 code: 0,
             }),
             DaemonMsg::Pong,
+            DaemonMsg::ClaimResult {
+                uid: "s1".into(),
+                granted: false,
+                owner: Some(3),
+            },
+            DaemonMsg::Claims(vec![crate::session::claims::ClaimInfo {
+                uid: "s1".into(),
+                owner: 3,
+            }]),
+            DaemonMsg::SessionsChanged(vec![SessionMeta {
+                uid: "s2".into(),
+                cwd: None,
+                output_bytes: 0,
+                last_output_at: None,
+                alive: true,
+                cols: Some(120),
+                rows: Some(34),
+            }]),
         ];
         for m in &msgs {
             assert_eq!(&roundtrip_daemon(m), m);
@@ -517,15 +604,47 @@ mod tests {
         let DaemonMsg::Hello {
             proto_ver,
             daemon_pid,
+            conn_id,
         } = roundtrip_daemon(&DaemonMsg::Hello {
             proto_ver: PROTO_VER,
             daemon_pid: 77,
+            conn_id: 5,
         })
         else {
             panic!("expected Hello");
         };
         assert_eq!(proto_ver, PROTO_VER);
         assert_eq!(daemon_pid, 77);
+        assert_eq!(conn_id, 5);
+    }
+
+    /// `Hello.conn_id` is `#[serde(default)]` so a pre-M7 daemon's two-field reply still
+    /// parses - it lands on `0`, the "unknown owner" sentinel the claim registry never mints.
+    #[test]
+    fn a_pre_m7_hello_without_conn_id_still_parses() {
+        let body = br#"{"Hello":{"proto_ver":2,"daemon_pid":9}}"#;
+        let msg: DaemonMsg = serde_json::from_slice(body).expect("legacy Hello parses");
+        assert!(matches!(
+            msg,
+            DaemonMsg::Hello {
+                proto_ver: 2,
+                daemon_pid: 9,
+                conn_id: 0
+            }
+        ));
+    }
+
+    /// The claim messages must survive the wire in both directions - the whole
+    /// no-double-adoption path runs over them.
+    #[test]
+    fn claim_messages_round_trip() {
+        for m in [
+            ClientMsg::Claim { uid: "s1".into() },
+            ClientMsg::Release { uid: "s1".into() },
+            ClientMsg::ListClaims,
+        ] {
+            assert_eq!(roundtrip_client(&m), m);
+        }
     }
 
     // ---- framing edge cases ----

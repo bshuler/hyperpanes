@@ -947,6 +947,57 @@ impl SessionManager {
             }
         }
     }
+
+    // ---- M7: cross-process claims ----
+    //
+    // Why the in-process backend answers "yes, and nobody else holds anything": its PTYs are
+    // children of *this* process and its registry is private to it. There is no other
+    // hyperpanes process that could be hosting one of these uids, so a claim can never lose
+    // and no uid can ever be claimed elsewhere. The daemon backend is the only one where the
+    // question is real.
+
+    /// **Claim `uid` for this process** — the no-double-adoption gate. Returns whether the
+    /// claim was granted; a caller that gets `false` must NOT adopt the session, because
+    /// another hyperpanes process is already hosting it.
+    ///
+    /// See [`DaemonSessionManager::claim`](crate::session::daemon_client::DaemonSessionManager::claim)
+    /// for the round-trip and the fail-closed policy.
+    pub fn claim_session(&self, uid: &str) -> bool {
+        match self {
+            SessionManager::InProcess(_) => true,
+            SessionManager::Daemon(d) => d.claim(uid),
+        }
+    }
+
+    /// Announce a claim on `uid` without blocking — for a pane this process already hosts
+    /// (it created it, or it won the race to adopt it). Called from the GUI pump, so it must
+    /// never wait on the daemon. Inert in-process.
+    pub fn announce_claim(&self, uid: &str) {
+        match self {
+            SessionManager::InProcess(_) => {}
+            SessionManager::Daemon(d) => d.announce_claim(uid),
+        }
+    }
+
+    /// Give up this process's claim on `uid` (a pane that was closed but whose session
+    /// stays alive). Inert in-process. Not needed for crash safety — the daemon releases
+    /// every claim of a connection when that connection's socket closes.
+    pub fn release_session(&self, uid: &str) {
+        match self {
+            SessionManager::InProcess(_) => {}
+            SessionManager::Daemon(d) => d.release(uid),
+        }
+    }
+
+    /// The uids some **other** hyperpanes process is currently hosting — what the left
+    /// panel subtracts from its detached list so it never offers to adopt a pane that is
+    /// visibly running in another window. Empty for the in-process backend.
+    pub fn sessions_claimed_elsewhere(&self) -> std::collections::HashSet<String> {
+        match self {
+            SessionManager::InProcess(_) => std::collections::HashSet::new(),
+            SessionManager::Daemon(d) => d.claims_held_elsewhere(),
+        }
+    }
 }
 
 // Build the resolved pty spec from spawn options — the port of the TS `Session`

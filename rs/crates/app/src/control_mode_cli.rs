@@ -26,9 +26,13 @@
 //!   ([`SessionEvent::Data`]), already UTF-8-sanitized by the pty reader, so `%output`
 //!   payloads are the UTF-8 bytes of that string rather than the pty's raw bytes. Escaping
 //!   is byte-exact from there down.
-//! * There is no "a pane appeared / a pane was resized" push event, so this loop polls
-//!   `ListSessions` every [`POLL`] and diffs — new uids become `%window-add`, vanished uids
-//!   `%window-close`, changed grids `%layout-change`.
+//! * Pane **membership** does arrive as a push: the daemon sends `SessionsChanged` — a full
+//!   `SessionMeta` snapshot — whenever a session is created, killed or adopted (M7), so an
+//!   appearing or vanishing pane reaches the client immediately.
+//! * A **resize** still has no push event, so this loop also polls `ListSessions` every
+//!   [`POLL`]. Both paths feed the same differ: new uids become `%window-add`, vanished uids
+//!   `%window-close`, changed grids `%layout-change`. Running both is safe because the diff
+//!   is against `seen` — a snapshot that changes nothing emits nothing.
 //!
 //! ## Resize policy
 //! Same decision as `attach` (and for the same reason): by default a control-mode client
@@ -132,9 +136,11 @@ fn salt() -> String {
         .into_owned()
 }
 
-/// How often the loop re-polls `ListSessions` to notice panes appearing, vanishing, or
-/// being resized on the desktop. The daemon pushes no such event, and a client that learns
-/// about a new window a second late is fine; one that never learns is not.
+/// How often the loop re-polls `ListSessions` to notice panes being **resized** on the
+/// desktop — the one change the daemon still pushes no event for. Appearing and vanishing
+/// panes arrive on `SessionsChanged` and do not wait for this; the poll remains the backstop
+/// for them too, since a client that learns about a new window a second late is fine and one
+/// that never learns is not.
 #[cfg_attr(not(unix), allow(dead_code))]
 const POLL: std::time::Duration = std::time::Duration::from_millis(1200);
 
@@ -227,6 +233,16 @@ pub fn run(argv: &[String]) -> Result<(), String> {
         .iter()
         .map(|m| (m.uid.clone(), (m.cols, m.rows)))
         .collect();
+    // Per-uid splice point: the session's output cursor at the instant its replay buffer was
+    // snapshotted (`DaemonMsg::Replay::cursor`). The daemon starts streaming a uid the moment
+    // we attach, so live `Data` for bytes ALREADY inside the seed can reach us right after
+    // the seed does; forwarding both would paint them twice in the client's pane. Same filter
+    // `attach` runs, keyed by uid because control mode carries every pane at once.
+    //
+    // `0` means "not reported" (a daemon predating the field) — no real chunk ends at cursor
+    // 0, so the absent entry and the sentinel both leave the filter off rather than eating
+    // live output.
+    let mut seed_cursors: BTreeMap<String, u64> = BTreeMap::new();
 
     let (tx, rx) = mpsc::channel::<Msg>();
 
@@ -368,19 +384,33 @@ pub fn run(argv: &[String]) -> Result<(), String> {
             Msg::Daemon(msg) => match *msg {
                 // The replay buffer seeds the client's brand-new tab, exactly as `attach`
                 // seeds a fresh grid: the same bytes, escaped as one `%output`.
-                DaemonMsg::Replay { uid, data } => {
+                DaemonMsg::Replay { uid, data, cursor } => {
+                    // A re-attach can seed the same uid twice; keep the furthest point, so a
+                    // stale second seed never re-opens the window on bytes already painted.
+                    let seed = seed_cursors.entry(uid.clone()).or_insert(0);
+                    *seed = (*seed).max(cursor);
                     emit(&mut out, server.output(&uid, data.as_bytes()))
                         .map_err(|e| e.to_string())?;
                 }
                 DaemonMsg::Screen { uid, text } => server.set_screen(&uid, text),
-                DaemonMsg::Sessions(list) => {
+                // The poll's reply, and (M7) the daemon's unsolicited push when a session is
+                // created, killed or adopted. Same snapshot shape, so the same differ: the
+                // push just gets there first.
+                DaemonMsg::Sessions(list) | DaemonMsg::SessionsChanged(list) => {
                     let lines = diff_sessions(&mut server, &mut seen, &list, &mut sock);
                     emit(&mut out, lines).map_err(|e| e.to_string())?;
                 }
                 DaemonMsg::Event(ev) => {
                     let lines = match ev {
-                        SessionEvent::Data { uid, data, .. } => {
-                            server.output(&uid, data.as_bytes())
+                        SessionEvent::Data { uid, data, cursor } => {
+                            // `cursor` is the value AFTER the chunk, bumped under the same
+                            // lock the seed was snapshotted under, so a chunk is wholly
+                            // inside the seed or wholly outside it — never straddling.
+                            if cursor != 0 && cursor <= *seed_cursors.get(&uid).unwrap_or(&0) {
+                                Vec::new() // already in the seed we just emitted
+                            } else {
+                                server.output(&uid, data.as_bytes())
+                            }
                         }
                         SessionEvent::Exit { uid, .. } => server.pane_exited(&uid),
                         SessionEvent::Cwd { uid, cwd } => {
@@ -393,7 +423,14 @@ pub fn run(argv: &[String]) -> Result<(), String> {
                     };
                     emit(&mut out, lines).map_err(|e| e.to_string())?;
                 }
-                DaemonMsg::Hello { .. } | DaemonMsg::Created { .. } | DaemonMsg::Pong => {}
+                // Claims are the GUI's adoption bookkeeping (M7). A control-mode client never
+                // adopts an orphan — it observes whatever the desktop is hosting — so it has
+                // nothing to do with the claim table.
+                DaemonMsg::Hello { .. }
+                | DaemonMsg::Created { .. }
+                | DaemonMsg::Pong
+                | DaemonMsg::ClaimResult { .. }
+                | DaemonMsg::Claims(_) => {}
             },
         }
     }

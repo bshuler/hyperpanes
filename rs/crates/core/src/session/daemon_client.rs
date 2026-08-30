@@ -47,14 +47,16 @@
 //! daemon→pty-host link is `Tolerant`, because the host is an *older build by design* — it
 //! outlives daemon upgrades so the ConPTYs it owns are never touched.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::session::claims::ConnId;
 use crate::session::proto::{read_frame, write_frame, ClientMsg, DaemonMsg, SpawnSpec, PROTO_VER};
 use crate::session::replay::Replay;
 use crate::session::transport::{self, Conn, Endpoint};
@@ -84,6 +86,12 @@ struct Shadow {
     last_output_at: Option<u64>,
     /// Last sniffed cwd (from `Cwd` events), if any.
     cwd: Option<String>,
+    /// **M7.** This shadow was inserted *locally* (by [`DaemonSessionManager::create`]) and
+    /// the daemon has not yet confirmed it in a `SessionsChanged` snapshot. A snapshot may
+    /// not delete a pending shadow: the create frame and the snapshot race on the wire, and
+    /// a snapshot built before the spawn landed would otherwise erase a session we just
+    /// asked for. Cleared the first time the uid appears in any snapshot.
+    pending: bool,
 }
 
 impl Shadow {
@@ -93,6 +101,15 @@ impl Shadow {
             output_bytes: 0,
             last_output_at: None,
             cwd: None,
+            pending: false,
+        }
+    }
+
+    /// A shadow inserted optimistically by a local `create`, before the daemon confirms it.
+    fn new_pending() -> Self {
+        Shadow {
+            pending: true,
+            ..Shadow::new()
         }
     }
 }
@@ -115,8 +132,35 @@ pub struct DaemonSessionManager {
     /// request/response is in flight at a time — which is fine: replies are all rare and off
     /// the hot path (only `render_screen` and the connect-time `ListSessions`/handshake).
     replies: Mutex<Receiver<DaemonMsg>>,
+    /// **M7.** The daemon's claim table as last pushed to us: `uid -> owning connection`.
+    /// Maintained wholesale from `DaemonMsg::Claims` snapshots by the reader thread, so a
+    /// read is a lock and a lookup — no I/O, no round-trip, on the panel's paint path.
+    claims: Arc<Mutex<HashMap<String, ConnId>>>,
+    /// **M7.** *Our* connection id, as minted by the daemon and reported in its `Hello`.
+    /// `0` until the handshake completes (and, against a pre-M7 daemon, forever) — the
+    /// sentinel the registry never mints, so a `0` self-id makes every claim read as
+    /// somebody else's. That is the safe direction: we decline to adopt rather than
+    /// double-adopt.
+    conn_id: AtomicU64,
+    /// **M7 × the stale-daemon rule.** The `proto_ver` the daemon reported in its `Hello`,
+    /// or `0` if it never answered. The client is allowed to be talking to an OLDER daemon
+    /// than itself — [`stale_daemon_fallback`] deliberately keeps driving a stale daemon
+    /// that holds live terminals rather than killing them for an upgrade — and a daemon
+    /// below [`MIN_CLAIM_DAEMON_VER`] cannot deserialize `Claim`/`Release`/`ListClaims`.
+    /// An unknown frame makes the daemon **drop the connection**, so sending claim traffic
+    /// at one would take the user's terminals off screen. Every claim send is therefore
+    /// gated on this; see [`claims_supported`](Self::claims_supported).
+    daemon_ver: AtomicU64,
     _reader: std::thread::JoinHandle<()>,
 }
+
+/// Oldest daemon proto version that understands the M7 claim messages
+/// (`Claim`/`Release`/`ListClaims`). Below it, claim traffic is suppressed entirely and the
+/// panel degrades to its pre-M7 behaviour: every live session looks unclaimed, adoption is
+/// always allowed, and adopting re-attaches rather than stealing (the daemon multiplexes
+/// output, so a second viewer is harmless). Silence is the only safe option — an old daemon
+/// answers an unknown frame by closing the socket.
+const MIN_CLAIM_DAEMON_VER: u32 = 3;
 
 impl DaemonSessionManager {
     /// Connect to the daemon serving `salt`, spawning it (detached) if none is listening,
@@ -234,19 +278,24 @@ impl DaemonSessionManager {
         let write_half = stream;
 
         let shadows: Arc<Mutex<HashMap<String, Shadow>>> = Arc::default();
+        let claims: Arc<Mutex<HashMap<String, ConnId>>> = Arc::default();
         let (reply_tx, replies) = std::sync::mpsc::channel::<DaemonMsg>();
 
         // Reader thread: demux inbound frames. Events maintain the shadow + mirror and are
         // forwarded to the GUI channel; replies go to the reply channel.
         let shadows_r = Arc::clone(&shadows);
+        let claims_r = Arc::clone(&claims);
         let reader = std::thread::Builder::new()
             .name("hp-daemon-sm-reader".into())
-            .spawn(move || reader_loop(read_half, shadows_r, events, reply_tx))?;
+            .spawn(move || reader_loop(read_half, shadows_r, claims_r, events, reply_tx))?;
 
         let mgr = DaemonSessionManager {
             write_half: Mutex::new(write_half),
             shadows,
             replies: Mutex::new(replies),
+            claims,
+            conn_id: AtomicU64::new(0),
+            daemon_ver: AtomicU64::new(0),
             _reader: reader,
         };
 
@@ -255,12 +304,23 @@ impl DaemonSessionManager {
         mgr.send(&ClientMsg::Hello {
             proto_ver: PROTO_VER,
         })?;
-        let _ = mgr.request(
+        // The second `Hello` is the one whose reply we read — and (M7) that reply carries
+        // the connection id the daemon minted for this socket, which is how we later tell
+        // our own claims apart from another process's. It also carries the daemon's own
+        // proto version, which is NOT necessarily ours: the stale-daemon rule keeps us
+        // driving an older daemon that holds live terminals, and claim traffic must stay off
+        // the wire when it does (see `daemon_ver`).
+        if let Some(DaemonMsg::Hello {
+            conn_id, proto_ver, ..
+        }) = mgr.request(
             ClientMsg::Hello {
                 proto_ver: PROTO_VER,
             },
             |m| matches!(m, DaemonMsg::Hello { .. }),
-        );
+        ) {
+            mgr.conn_id.store(conn_id, Ordering::SeqCst);
+            mgr.daemon_ver.store(proto_ver as u64, Ordering::SeqCst);
+        }
 
         // Seed the shadow from the daemon's live session set (the "+ one `ListSessions` on
         // connect" half of the has/uids strategy) AND re-attach each survivor so its replay
@@ -346,7 +406,7 @@ impl DaemonSessionManager {
             .lock()
             .unwrap()
             .entry(uid.clone())
-            .or_insert_with(Shadow::new);
+            .or_insert_with(Shadow::new_pending);
         let spec = spawn_spec_from(opts);
         self.send(&ClientMsg::Create(spec))?;
         Ok(())
@@ -472,6 +532,122 @@ impl DaemonSessionManager {
         self.shadows.lock().unwrap().clear();
         let _ = self.send(&ClientMsg::Shutdown);
     }
+
+    // ---- M7: the cross-process claim surface ----
+
+    /// This connection's daemon-assigned [`ConnId`], or `0` if the handshake never produced
+    /// one (a pre-M7 daemon). See the [`conn_id`](Self::conn_id) field.
+    pub fn conn_id(&self) -> ConnId {
+        self.conn_id.load(Ordering::SeqCst)
+    }
+
+    /// Whether the daemon on the other end understands the M7 claim messages at all.
+    ///
+    /// This is *not* a formality. A client of this build can legitimately be driving an
+    /// OLDER daemon: [`stale_daemon_fallback`] refuses to kill a stale daemon that holds
+    /// live terminals, so a proto-1 or proto-2 daemon full of the user's shells is driven
+    /// as it is. Such a daemon cannot deserialize `Claim` — and the daemon's reader answers
+    /// an undecodable frame by closing the connection, which would take every one of those
+    /// terminals off screen to satisfy a bookkeeping message. So when this is false, every
+    /// claim send is skipped and the panel falls back to pre-M7 behaviour (nothing looks
+    /// claimed; adoption always allowed and harmless, since it re-attaches to a multiplexed
+    /// session rather than stealing it).
+    fn claims_supported(&self) -> bool {
+        self.daemon_ver.load(Ordering::SeqCst) >= MIN_CLAIM_DAEMON_VER as u64
+    }
+
+    /// **Take responsibility for `uid`, or lose the race.** A blocking `Claim`/`ClaimResult`
+    /// round-trip: `true` means the daemon's registry recorded *this* connection as the
+    /// owner, `false` means somebody else already holds it (or the daemon did not answer).
+    ///
+    /// This is the no-double-adoption gate. Two windows racing to adopt one orphan both send
+    /// `Claim`; the daemon's [`ClaimRegistry::claim`] is a compare-and-set under a mutex, so
+    /// exactly one of them is told `granted`. A caller that gets `false` must not adopt.
+    ///
+    /// Failing closed on a timeout/dropped daemon is deliberate: declining to adopt is
+    /// recoverable (click again), adopting a session another window is showing is not.
+    ///
+    /// [`ClaimRegistry::claim`]: crate::session::claims::ClaimRegistry::claim
+    pub fn claim(&self, uid: &str) -> bool {
+        // Against a pre-M7 daemon there is no registry to arbitrate, and asking would drop
+        // the connection. Answer `true`: that is the M5 behaviour this build replaces, and
+        // it is the safe direction here — no registry means no other process's claim can be
+        // violated, and an adopt is a re-attach to a multiplexed session, not a theft.
+        if !self.claims_supported() {
+            return true;
+        }
+        let want = uid.to_string();
+        let reply = self.request(
+            ClientMsg::Claim {
+                uid: uid.to_string(),
+            },
+            move |m| matches!(m, DaemonMsg::ClaimResult { uid: u, .. } if *u == want),
+        );
+        match reply {
+            Some(DaemonMsg::ClaimResult { granted, .. }) => granted,
+            _ => false,
+        }
+    }
+
+    /// Announce a claim on `uid` **without waiting for the answer**. For sessions this
+    /// process just created, where the outcome is not in doubt and the caller is the GUI
+    /// pump — a blocking round-trip there would put a wedged daemon on the frame path.
+    /// Contested acquisition (adoption) must use [`claim`](Self::claim) instead and honour
+    /// its answer.
+    ///
+    /// The daemon still replies with a `ClaimResult`; it lands in the reply channel and is
+    /// skipped by the next round-trip's filter, which drains stale replies before waiting.
+    pub fn announce_claim(&self, uid: &str) {
+        if !self.claims_supported() {
+            return; // see `claims_supported`: silence, not a dropped connection
+        }
+        let _ = self.send(&ClientMsg::Claim {
+            uid: uid.to_string(),
+        });
+    }
+
+    /// Give up our claim on `uid` — fire-and-forget; the daemon ignores a release from a
+    /// connection that does not own it. Not required for correctness on exit (the daemon
+    /// drops every claim of a connection when its socket closes), only for a window that
+    /// stays alive after closing a pane.
+    pub fn release(&self, uid: &str) {
+        if !self.claims_supported() {
+            return; // see `claims_supported`
+        }
+        let _ = self.send(&ClientMsg::Release {
+            uid: uid.to_string(),
+        });
+    }
+
+    /// The uids currently claimed by **some other connection** — i.e. panes that a different
+    /// hyperpanes process (or a different window sharing this daemon connection's process,
+    /// which cannot happen today) is responsible for. Read from the pushed claim snapshot:
+    /// no I/O.
+    ///
+    /// Claims owned by *us* are excluded, so a window's own panes never show up as
+    /// "somebody else's". If we never learned our own conn id (`0`), every claim counts as
+    /// somebody else's — see the [`conn_id`](Self::conn_id) field for why that is the safe
+    /// direction.
+    pub fn claims_held_elsewhere(&self) -> HashSet<String> {
+        let me = self.conn_id.load(Ordering::SeqCst);
+        self.claims
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, &owner)| owner != me)
+            .map(|(uid, _)| uid.clone())
+            .collect()
+    }
+
+    /// Force a fresh `Claims` snapshot from the daemon. The daemon pushes one on every
+    /// change already, so this is only for tests and for a caller that wants a synchronous
+    /// barrier; the reply is intercepted by the reader thread, not returned here.
+    pub fn request_claims(&self) {
+        if !self.claims_supported() {
+            return; // see `claims_supported`
+        }
+        let _ = self.send(&ClientMsg::ListClaims);
+    }
 }
 
 /// The reader thread body: decode inbound frames forever, demuxing events (which update the
@@ -480,6 +656,7 @@ impl DaemonSessionManager {
 fn reader_loop(
     read_half: Conn,
     shadows: Arc<Mutex<HashMap<String, Shadow>>>,
+    claims: Arc<Mutex<HashMap<String, ConnId>>>,
     events: UnboundedSender<SessionEvent>,
     replies: Sender<DaemonMsg>,
 ) {
@@ -510,7 +687,20 @@ fn reader_loop(
                     }
                 }
             }
-            // Other replies (Sessions/Screen/Hello/Pong/Created) → the request channel.
+            // **M7 push traffic.** `Claims` and `SessionsChanged` are *unsolicited* full
+            // snapshots the daemon sends to every connection whenever the machine-wide
+            // picture changes. They are folded into local state here and deliberately never
+            // forwarded to `replies`: an unsolicited frame landing in the reply channel
+            // would sit in front of the next round-trip's answer.
+            Ok(Some(DaemonMsg::Claims(list))) => {
+                let mut claims = claims.lock().unwrap();
+                *claims = list.into_iter().map(|c| (c.uid, c.owner)).collect();
+            }
+            Ok(Some(DaemonMsg::SessionsChanged(metas))) => {
+                reconcile_snapshot(&shadows, &metas);
+            }
+            // Other replies (Sessions/Screen/Hello/Pong/Created/ClaimResult) → the request
+            // channel.
             Ok(Some(reply)) => {
                 if replies.send(reply).is_err() {
                     break; // the manager was dropped
@@ -518,6 +708,44 @@ fn reader_loop(
             }
             // Clean EOF (daemon closed) or a malformed-frame/socket error → done.
             Ok(None) | Err(_) => break,
+        }
+    }
+}
+
+/// Fold an unsolicited **full session snapshot** (`DaemonMsg::SessionsChanged`) into the
+/// shadow map — the M7 fix for shadow staleness.
+///
+/// Before M7 the shadow was seeded once by `ListSessions` at connect and then maintained
+/// only from the event stream plus local creates, so a session another client created after
+/// we connected stayed invisible until we reconnected, and a session another client *killed*
+/// left a ghost row (a deliberate `Kill` is suppressed on the event bus).
+///
+/// The daemon pushes a whole `Vec<SessionMeta>`, not a delta, so applying one is idempotent
+/// and a dropped or reordered push cannot desync us. Reconciliation is:
+///
+/// * a uid in the snapshot we don't have → insert (and clear `pending` on one we do);
+/// * a uid we have that the snapshot omits → remove, **unless** it is `pending` (a local
+///   create still in flight — see [`Shadow::pending`]).
+///
+/// Metadata (`output_bytes`/`last_output_at`/`cwd`) is refreshed from the snapshot, but the
+/// local replay mirror is never touched: it is grown by the event stream and is the only
+/// copy of history this process has.
+fn reconcile_snapshot(
+    shadows: &Mutex<HashMap<String, Shadow>>,
+    metas: &[crate::session::proto::SessionMeta],
+) {
+    let mut shadows = shadows.lock().unwrap();
+    let live: HashSet<&str> = metas.iter().map(|m| m.uid.as_str()).collect();
+    shadows.retain(|uid, sh| live.contains(uid.as_str()) || sh.pending);
+    for meta in metas {
+        let shadow = shadows.entry(meta.uid.clone()).or_insert_with(Shadow::new);
+        shadow.pending = false;
+        shadow.output_bytes = meta.output_bytes;
+        if meta.last_output_at.is_some() {
+            shadow.last_output_at = meta.last_output_at;
+        }
+        if meta.cwd.is_some() {
+            shadow.cwd = meta.cwd.clone();
         }
     }
 }
@@ -640,25 +868,37 @@ fn probe_proto_version(stream: &Conn) -> io::Result<ProtoCheck> {
             proto_ver: PROTO_VER,
         },
     );
-    let check = match send
-        .and_then(|()| transport::read_frame_deadline::<DaemonMsg>(stream, PROBE_TIMEOUT))
-    {
-        Ok(Some(DaemonMsg::Hello { proto_ver, .. })) => {
-            if proto_ver == PROTO_VER {
-                ProtoCheck::Match
-            } else {
-                ProtoCheck::Mismatch {
-                    daemon_ver: proto_ver,
-                }
+    if send.is_err() {
+        return Ok(ProtoCheck::Match);
+    }
+    // Read until the `Hello` reply, skipping frames that are not it. An M7 daemon answers a
+    // `Hello` by *also* broadcasting its claim and session snapshots (see the daemon's Hello
+    // arm), and those can legitimately overtake the reply on the wire — treating the first
+    // frame as the answer would then silently report a version match against a daemon we
+    // never actually heard from. `PROBE_FRAMES` bounds the skip so a chatty or wedged peer
+    // can't hold launch open.
+    const PROBE_FRAMES: usize = 8;
+    for _ in 0..PROBE_FRAMES {
+        match transport::read_frame_deadline::<DaemonMsg>(stream, PROBE_TIMEOUT) {
+            Ok(Some(DaemonMsg::Hello { proto_ver, .. })) => {
+                return Ok(if proto_ver == PROTO_VER {
+                    ProtoCheck::Match
+                } else {
+                    ProtoCheck::Mismatch {
+                        daemon_ver: proto_ver,
+                    }
+                });
             }
+            // Unsolicited push traffic (M7) or an unrelated reply — keep looking.
+            Ok(Some(_)) => continue,
+            // EOF or a (timed-out) read: don't block launch over an unconfirmed handshake —
+            // proceed as a match. NB: `from_stream` re-runs its own Hello round-trip,
+            // draining the daemon's (second) reply, so this probe's `Hello` reply does not
+            // desync the stream the manager later owns.
+            Ok(None) | Err(_) => break,
         }
-        // Any non-Hello reply, EOF, or a (timed-out) read: don't block launch over an
-        // unconfirmed handshake — proceed as a match. NB: `from_stream` re-runs its own Hello
-        // round-trip, draining the daemon's (second) reply, so this probe's `Hello` reply does
-        // not desync the stream the manager later owns.
-        _ => ProtoCheck::Match,
-    };
-    Ok(check)
+    }
+    Ok(ProtoCheck::Match)
 }
 
 /// How long to wait for a spawned successor to take the incumbent's sessions and start
@@ -706,6 +946,14 @@ fn hand_over_stale_daemon(salt: &str, endpoint: &Endpoint) -> bool {
 /// perfectly; it just cannot upgrade it in place. Raise this floor only when a bump breaks
 /// the *base* surface — and note what it costs: below the floor, a daemon holding live
 /// sessions is refused, not killed.
+///
+/// **Version 3 (M7) added `Claim`/`Release`/`ListClaims`, and the floor deliberately did NOT
+/// move.** Those are not base surface: they are bookkeeping for the left panel's adoption
+/// list, and the client suppresses all of them against a daemon below
+/// [`MIN_CLAIM_DAEMON_VER`] (see [`DaemonSessionManager::claims_supported`]). Gating the new
+/// traffic is the right trade — raising the floor instead would refuse the connect to a
+/// proto-1/2 daemon full of the user's shells and take them off screen, which is the very
+/// outcome the fallback exists to prevent.
 const MIN_DRIVABLE_DAEMON_VER: u32 = 1;
 
 /// What to do with a stale-version daemon that would not hand its sessions over.
@@ -1687,6 +1935,7 @@ mod tests {
                     &DaemonMsg::Hello {
                         proto_ver: PROTO_VER + 1,
                         daemon_pid: 4242,
+                        conn_id: 1,
                     },
                 );
                 // Keep the connection open briefly so the client reads the reply.
@@ -1777,6 +2026,109 @@ mod tests {
             StaleFallback::TearDown,
             "an unconfirmed session count must never authorise a tear-down"
         );
+    }
+
+    // The seam where M7 meets the stale-daemon rule. `StaleFallback::Drive` means this
+    // build's client can be driving a proto-2 daemon that is holding the user's terminals —
+    // and proto 2 cannot deserialize `Claim`, which the daemon's reader answers by CLOSING
+    // the connection. Sending claim bookkeeping there would take every one of those
+    // terminals off screen. So: not one claim frame may reach a pre-3 daemon, and `claim`
+    // answers `true` locally (the pre-M7 behaviour: adoption allowed, and harmless because
+    // it re-attaches to a multiplexed session rather than stealing it).
+    #[test]
+    fn no_claim_traffic_is_ever_sent_to_a_pre_m7_daemon() {
+        let socket = temp_socket("claims-gate");
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("fake bind");
+
+        // A fake proto-2 daemon: it answers `Hello` (reporting version 2) and `ListSessions`
+        // and records every frame it is sent, so the test can assert on the whole stream. It
+        // stops on a `Ping`, which the test sends last as a barrier — the manager's reader
+        // thread keeps its own dup of the socket alive past `drop(mgr)`, so waiting for EOF
+        // here would wait forever.
+        let seen: Arc<Mutex<Vec<ClientMsg>>> = Arc::default();
+        let seen_srv = Arc::clone(&seen);
+        let server = std::thread::spawn(move || {
+            let Ok((conn, _)) = listener.accept() else {
+                return;
+            };
+            let mut r = conn.try_clone().expect("clone");
+            let mut w = conn;
+            while let Ok(Some(msg)) = read_frame::<_, ClientMsg>(&mut r) {
+                seen_srv.lock().unwrap().push(msg.clone());
+                match msg {
+                    ClientMsg::Hello { .. } => {
+                        let _ = write_frame(
+                            &mut w,
+                            &DaemonMsg::Hello {
+                                proto_ver: MIN_CLAIM_DAEMON_VER - 1,
+                                daemon_pid: 4242,
+                                conn_id: 0,
+                            },
+                        );
+                    }
+                    ClientMsg::ListSessions => {
+                        let _ = write_frame(&mut w, &DaemonMsg::Sessions(Vec::new()));
+                    }
+                    ClientMsg::Ping => break, // the test's end-of-stream barrier
+                    _ => {}
+                }
+            }
+        });
+
+        let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect fake");
+        let (etx, _erx) = unbounded_channel::<SessionEvent>();
+        let mgr = DaemonSessionManager::from_stream(stream, etx).expect("manager");
+
+        assert!(
+            !mgr.claims_supported(),
+            "a proto-{} daemon must be recognised as claim-blind",
+            MIN_CLAIM_DAEMON_VER - 1
+        );
+        assert!(
+            mgr.claim("orphan"),
+            "with no registry to arbitrate, adoption stays allowed"
+        );
+        mgr.announce_claim("orphan");
+        mgr.release("orphan");
+        mgr.request_claims();
+        assert!(
+            mgr.claims_held_elsewhere().is_empty(),
+            "no snapshots arrive, so nothing reads as somebody else's"
+        );
+
+        // The barrier: every frame the manager was going to send is already queued behind
+        // it, so once the fake has read this one it has read them all.
+        mgr.send(&ClientMsg::Ping).expect("barrier ping");
+        let _ = server.join();
+        drop(mgr);
+        let seen = seen.lock().unwrap();
+        assert!(
+            !seen.iter().any(|m| matches!(
+                m,
+                ClientMsg::Claim { .. } | ClientMsg::Release { .. } | ClientMsg::ListClaims
+            )),
+            "a pre-M7 daemon must never be sent a claim frame; got {seen:?}"
+        );
+        assert!(
+            seen.iter().any(|m| matches!(m, ClientMsg::Hello { .. })),
+            "the fake daemon really was driven (the handshake reached it)"
+        );
+    }
+
+    // The other direction: against a daemon of our own version the gate is open, so the
+    // claim surface is live and the registry actually arbitrates.
+    #[test]
+    fn a_current_daemon_enables_the_claim_surface() {
+        let socket = temp_socket("claims-open");
+        let _daemon = spawn_in_process(&socket).expect("daemon binds");
+        let (mgr, _rx) = connect_manager(&socket);
+        assert!(
+            mgr.claims_supported(),
+            "a daemon of this build speaks the claim protocol"
+        );
+        assert_ne!(mgr.conn_id(), 0, "and it minted us a connection id");
+        assert!(mgr.claim("orphan"), "an unheld uid is granted");
     }
 
     // tear_down_stale_daemon actually brings a running daemon down: after it returns, the

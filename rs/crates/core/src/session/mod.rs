@@ -9,6 +9,8 @@ pub mod adopt;
 /// tty or stdio in it — the app crate supplies those, and M3's SSH channel will supply its own.
 pub mod attach;
 pub mod batcher;
+/// The cross-process session claim registry (M7): who is hosting which uid right now.
+pub mod claims;
 /// The tmux **control-mode** (`-CC`) server surface (M4): a pure protocol encoder and state
 /// machine that presents hyperpanes panes to iTerm2 and the mobile tmux clients as native
 /// tmux panes. No I/O — the app crate and M3's SSH channel each supply their own transport.
