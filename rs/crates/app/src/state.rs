@@ -1369,7 +1369,9 @@ impl State {
                     cols: Some(cols),
                     rows: Some(rows),
                     pane_id: Some(uid.clone()),
-                    cwd,
+                    // Cloned for the same reason as `shell` below: a view pane keeps its own
+                    // copy on the PaneState.
+                    cwd: cwd.clone(),
                     // Cloned so the resolved spawn spec is also kept on the PaneState (below) for
                     // the relaunch snapshot.
                     shell: shell.clone(),
@@ -1433,7 +1435,11 @@ impl State {
             font_px,
             font,
             font_dirty: false,
-            cwd: None,
+            // A pty pane starts with an unknown cwd and learns its live one from the shell's
+            // OSC 7. A view pane has no shell to ask, and its target IS its cwd (see
+            // `State::view_navigate`) — so it has to be seeded here, or the browser opens on
+            // "No path set for this pane" no matter what the caller passed.
+            cwd: (!kind.is_pty()).then_some(cwd).flatten(),
             env: opts.env,
             // The resolved shell program → its short header badge (computed once here).
             shell_label: shell_label(&shell_path),
@@ -5447,7 +5453,9 @@ impl State {
             font_px,
             font,
             font_dirty: false,
-            cwd: None,
+            // Restored view panes get their target back the same way (2); a restored pty pane
+            // re-learns its cwd from the shell it just respawned.
+            cwd: is_view.then(|| spec.cwd.clone()).flatten(),
             env: None,
             // The resolved shell program → its short header badge (computed once here).
             shell_label: shell_label(&shell_path),
@@ -6607,6 +6615,57 @@ mod view_pane_tests {
         assert_eq!(p.kind, PaneKind::Markdown, "the recorded kind is restored");
         assert!(p.uid.starts_with("view-"));
         assert!(!m.has(&p.uid), "restore must not spawn a pty for a view pane");
+    }
+
+    #[test]
+    fn a_view_pane_keeps_the_cwd_it_was_opened_at() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        // "Browse Files" passes the terminal's cwd as the new pane's cwd, and for a view
+        // pane that value IS the thing being browsed. It used to be dropped on the floor —
+        // the pane's header showed the directory's name while its body said "No path set
+        // for this pane", because only the label was built from it.
+        st.add_pane_opts(
+            &m,
+            NewPaneOpts {
+                kind: Some(PaneKind::FileBrowser),
+                cwd: Some("/tmp".to_string()),
+                ..Default::default()
+            },
+        );
+        let p = st.active_tab().panes.last().unwrap();
+        assert_eq!(p.cwd.as_deref(), Some("/tmp"));
+
+        // A pty pane is the contrast: its cwd is a *spawn* argument, and the live value is
+        // whatever the shell reports over OSC 7 — so it must still start out unknown rather
+        // than claiming a directory the shell may already have left.
+        assert!(!PaneKind::FileBrowser.is_pty());
+    }
+
+    #[test]
+    fn a_restored_view_pane_comes_back_at_its_target() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        // The snapshot records a view pane's cwd like any other pane's; restore has to read
+        // it back, or every browser/viewer/markdown pane returns from a relaunch blank.
+        st.attach_panes_from_specs(
+            &m,
+            &[PaneSpec {
+                cwd: Some("/tmp".into()),
+                meta: Some(
+                    [(
+                        hyperpanes_core::tools::kind::META_KIND_KEY.to_string(),
+                        "view:files".to_string(),
+                    )]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            }],
+        );
+        let p = st.active_tab().panes.last().unwrap();
+        assert_eq!(p.kind, PaneKind::FileBrowser);
+        assert_eq!(p.cwd.as_deref(), Some("/tmp"));
     }
 
     #[test]
