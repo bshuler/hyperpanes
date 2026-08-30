@@ -337,11 +337,11 @@ Windows (`session/windows.rs`) mirrors all of this, but could not be compiled lo
 | Track | Branch | Depends on |
 |---|---|---|
 | M1 live upgrade ✅ | `mux/m1-takeover` | — |
-| M2 attach client | `mux/m2-attach` | — |
+| M2 attach client ✅ | `mux/m2-attach` | — |
 | M3 embedded SSH ✅ | `mux/m3-ssh` | M2 |
 | M4 control mode ✅ | `mux/m4-control-mode` | M2 |
 | M5 left panel ✅ | `mux/m5-panel` | — (adoption list landed with M7) |
-| M6 workspace sets | `mux/m6-sets` | — |
+| M6 workspace sets ✅ | `mux/m6-sets` | — |
 | M7 orphan adoption ✅ | `mux/m7-adopt` | M5 |
 
 **Wave 1 (parallel now):** M5 ‖ M6 — no shared files (M1 landed).

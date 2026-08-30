@@ -43,11 +43,19 @@ pub struct PaneSpec {
     /// free-form per-pane metadata (agent-orchestration C)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub meta: Option<BTreeMap<String, String>>,
-    /// The pane's live session uid at snapshot time — recorded only by the relaunch
-    /// ("last session") snapshot so a future session-daemon relaunch can `Attach{uid}` a
-    /// surviving session instead of re-spawning it (session-daemon plan, M2 re-attach).
-    /// Omitted by the save-dialog snapshot (a saved workspace is a launch *template*, not a
-    /// re-attach target). New here (no TS sibling), so it trails the ported fields.
+    /// The pane's live session uid at snapshot time, so a later load can `Attach{uid}` a
+    /// surviving daemon session instead of re-spawning it (session-daemon plan, M2
+    /// re-attach; the decision is `SessionManager::pane_load`).
+    ///
+    /// **Always optional, in both directions.** It is written by the relaunch ("last
+    /// session") snapshot and — since M6 — by "Save workspace"/"Save workspace as…" and by
+    /// the member workspaces a set writes, so a saved workspace can be re-opened while its
+    /// panes are still running. A file that omits it (anything written before M6, or a
+    /// hand-authored launch template) is fully valid: every pane simply spawns fresh, which
+    /// is exactly the pre-M6 behaviour. Nothing here is `deny_unknown_fields`, so a file
+    /// carrying a uid also loads on a build that predates the field — it is ignored.
+    ///
+    /// New here (no TS sibling), so it trails the ported fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
     /// Per-pane "talk" (speak new Claude assistant replies aloud via local TTS), recorded only

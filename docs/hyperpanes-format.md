@@ -7,8 +7,12 @@ a recommendation, (3) gives the Windows file-association snippet so a double-cli
 workspace opens in the app, and (4) lists the exact implementation touch-points for whichever
 option is chosen.
 
-The app today round-trips workspaces as plain **JSON**. There is no dedicated extension, no
-magic header, and no schema-version field. Everything below is grounded in the existing port:
+The app round-trips workspaces as plain **JSON**. Option (b) below — the versioned container
+(`{"format": "hyperpanes", "version": 1, "workspace": {…}}`) — has since **shipped**: the
+writer emits the envelope and the reader accepts both it and a bare `WorkspaceFile` object
+(legacy, treated as "version 0"). Sections 2-3 are preserved as the decision record; read
+them as history, not as a description of today's reader. Everything below is grounded in the
+existing port:
 
 - schema: [`rs/crates/core/src/workspace/model.rs`](../rs/crates/core/src/workspace/model.rs)
 - read/write/normalise: [`rs/crates/core/src/workspace/io.rs`](../rs/crates/core/src/workspace/io.rs)
@@ -79,6 +83,35 @@ present into a flat window list (precedence `windows` → `groups` → `panes`, 
 | `shell`    | `string?`              | shell override (e.g. `pwsh`) |
 | `fontSize` | `number?` (u32)        | per-pane font size |
 | `meta`     | `{string:string}?`     | free-form per-pane metadata (sorted keys; used by agent orchestration / ambient AI) |
+| `uid`      | `string?`              | the pane's live session id at save time — the **re-attach key** (see below). Always optional |
+| `talk`     | `boolean?`             | speak new Claude assistant replies aloud (recorded only when on) |
+
+#### `uid` — the re-attach key, and why it is always optional
+
+`uid` records the durable session id the pane was running under when the file was written
+(`pane-<uuid>` against the session daemon, `s<N>` in-process). On load, each pane is decided
+**independently** by `SessionManager::pane_load`: if the recorded uid still names a *live*
+daemon session, that pane **re-attaches** to it; otherwise the pane **spawns fresh** from its
+`command`/`args`/`shell`, under a newly minted uid. This is what lets a saved workspace be
+re-opened without duplicating terminals that are still running.
+
+It is written by the relaunch ("last session") snapshot, and — since the workspace-library
+milestone — by *Save workspace*, *Save workspace as…*, and by the member workspaces a set
+writes.
+
+**Compatibility runs both ways, and both directions are covered by tests**
+(`rs/crates/core/tests/workspace_uid_compat.rs`):
+
+- **Old file, new build.** A workspace written before `uid` existed simply has no `uid` on any
+  pane. Every pane is a `Spawn` — i.e. the exact pre-`uid` behaviour — so hand-authored launch
+  templates keep working unchanged. There is nothing to migrate.
+- **New file, old build.** No struct in `workspace/` uses `deny_unknown_fields`, so a build
+  that predates the field parses a `uid`-bearing file and ignores the extra key.
+- **Per pane, not per file.** A file may carry a `uid` on some panes and not others; each is
+  decided on its own.
+
+Because `uid` names a *runtime* session, it is not meaningful to hand-write and is safe to
+delete from a file by hand — doing so just forces a fresh spawn.
 
 ### Serialization rules (parity contract — `model.rs`)
 
@@ -108,6 +141,37 @@ These are guaranteed by the serde model and exercised by its round-trip tests:
 }
 ```
 
+### Workspace **sets** (`sets/*.json`)
+
+A *set* is a named collection of workspaces opened as a batch. It lives beside the library in
+the app's data directory (`sets/` alongside `workspaces/`) and uses its own envelope, mirroring
+the workspace one:
+
+```json
+{
+  "format": "hyperpanes-set",
+  "version": 1,
+  "set": {
+    "name": "Morning Routine",
+    "members": [
+      { "path": "workspaces/morning-routine-1.hyperpanes", "name": "editor" },
+      { "path": "workspaces/morning-routine-2.hyperpanes" }
+    ]
+  }
+}
+```
+
+| JSON field | Rust type | Notes |
+|---|---|---|
+| `name`    | `string`       | the set's display name |
+| `members` | `SetMember[]`  | the workspaces to open, in order |
+
+`SetMember` is `{ "path": string, "name": string? }`. A relative `path` is resolved against the
+**set file's own directory**, so a `sets/` + `workspaces/` pair is relocatable as a unit. Saving
+a set writes one member workspace per non-empty tab (a 0-pane tab is never a member) and then
+the index; opening one loads every member as a tab, each pane taking the same
+re-attach-or-spawn decision described above. Schema: `rs/crates/core/src/workspace/sets.rs`.
+
 ## 2. How a workspace is opened and saved today
 
 **Open (launch / CLI).** `launch.rs` resolves what to load, in precedence order:
@@ -122,7 +186,7 @@ The positional path is captured in `parse.rs` only when the argument **(case-ins
 
 **Save.** `io::write_workspace` serializes pretty (2-space) and writes the file; `windows_of` normalises any in-memory `WorkspaceFile` into the flat window list the launcher seeds from. Session auto-save targets `last-workspace.json`.
 
-**Takeaway:** the *only* thing tying a file to the app is the **`.json` suffix check in `parse.rs`** (and the equivalent check in the GUI argv bootstrap). There is no content sniffing, no magic header, and no version field. Any `.hyperpanes` story has to start there.
+**Takeaway:** the *only* thing tying a file to the app is the **`.json` suffix check in `parse.rs`** (and the equivalent check in the GUI argv bootstrap). There is no content sniffing, no magic header, and no version field. Any `.hyperpanes` story has to start there. *(Historical: the envelope of option (b) has since shipped, so the reader does now sniff `format`/`version` — while still accepting a bare object.)*
 
 ---
 

@@ -543,6 +543,41 @@ pub fn app_menu(state: &State, x: f32, y: f32) -> CtxMenu {
         sub::NONE,
         Some(Command::SaveWorkspace),
     );
+    b.row(
+        "Save workspace as…",
+        "",
+        crate::theme::menu_icon::SAVE_WORKSPACE,
+        false,
+        false,
+        false,
+        false,
+        sub::NONE,
+        Some(Command::SaveWorkspaceAs),
+    );
+    b.sep();
+    // Workspace SETS (M6): a named collection of workspaces, opened as a batch.
+    b.row(
+        "Open set…",
+        "",
+        crate::theme::menu_icon::OPEN_WORKSPACE,
+        false,
+        false,
+        false,
+        false,
+        sub::NONE,
+        Some(Command::OpenSet),
+    );
+    b.row(
+        "Save set…",
+        "",
+        crate::theme::menu_icon::SAVE_WORKSPACE,
+        false,
+        false,
+        false,
+        false,
+        sub::NONE,
+        Some(Command::SaveSet),
+    );
     b.sep();
     b.row(
         "Preferences…",

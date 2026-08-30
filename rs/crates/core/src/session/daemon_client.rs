@@ -1639,6 +1639,13 @@ mod tests {
             reattach_survivor,
             "restore would RE-ATTACH the surviving uid (no re-spawn)"
         );
+        // The same decision through the named API the GUI actually calls (M6): the survivor
+        // re-attaches UNDER ITS RECORDED UID (a different uid would spawn a second session).
+        assert_eq!(
+            mgr2.pane_load(Some(&recorded_uid)),
+            crate::session_manager::PaneLoad::Reattach(recorded_uid.clone()),
+            "pane_load re-attaches the survivor under its recorded uid"
+        );
         assert!(
             wait_until(Dur::from_secs(3), || {
                 mgr2.replay(&recorded_uid)
@@ -1656,8 +1663,112 @@ mod tests {
             !reattach_dead,
             "an unknown/dead uid does NOT re-attach → restore re-spawns it"
         );
+        let dead_load = mgr2.pane_load(Some(dead_uid));
+        assert!(
+            !dead_load.is_reattach(),
+            "pane_load spawns for a dead uid, got {dead_load:?}"
+        );
+        assert_ne!(
+            dead_load.uid(),
+            dead_uid,
+            "the re-spawn mints a fresh uid rather than re-using the dead one"
+        );
 
         mgr2.kill(&recorded_uid);
+    }
+
+    // M6 COMPATIBILITY, against a real daemon: a workspace file written by an OLD build
+    // records no pane uids at all. Loading it must degrade to SPAWN-EVERYTHING — even with
+    // live sessions sitting in the daemon — and must never adopt one of them by accident.
+    // The mixed case is the same run: the one pane whose recorded uid is live re-attaches to
+    // exactly that session, every other pane spawns, and the daemon gains no duplicate.
+    #[test]
+    fn a_legacy_uidless_workspace_spawns_everything_even_beside_live_sessions() {
+        use crate::workspace::model::{GroupSpec, PaneSpec, WorkspaceFile};
+
+        let socket = temp_socket("legacy-spawn");
+        let _daemon = spawn_in_process(&socket).expect("daemon binds");
+        let (mgr, _rx) = daemon_manager(&socket);
+
+        // A live session, as if left behind by a previous run.
+        let live = mgr.fresh_uid();
+        mgr.create(SpawnOptions {
+            uid: live.clone(),
+            shell: Some("/bin/sh".into()),
+            args: Some(vec!["-i".into()]),
+            ..Default::default()
+        })
+        .expect("create");
+        assert!(
+            wait_until(Dur::from_secs(2), || mgr.has(&live)),
+            "the live session registers, uids {:?}",
+            mgr.uids()
+        );
+        let sessions_before = mgr.uids().len();
+
+        // (a) A legacy file: two panes, NO uid on either. Every pane spawns fresh.
+        let legacy = WorkspaceFile {
+            groups: Some(vec![GroupSpec {
+                panes: vec![
+                    PaneSpec {
+                        command: Some("claude".into()),
+                        ..Default::default()
+                    },
+                    PaneSpec {
+                        command: Some("htop".into()),
+                        ..Default::default()
+                    },
+                ],
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        for (i, spec) in legacy
+            .groups
+            .iter()
+            .flatten()
+            .flat_map(|g| &g.panes)
+            .enumerate()
+        {
+            let load = mgr.pane_load(spec.uid.as_deref());
+            assert!(
+                !load.is_reattach(),
+                "legacy pane {i} must spawn even on a daemon backend, got {load:?}"
+            );
+            assert_ne!(
+                load.uid(),
+                live.as_str(),
+                "a uid-less pane must never adopt an unrelated live session"
+            );
+        }
+
+        // (b) A new-format file whose FIRST pane's uid is live and whose second is dead: the
+        //     survivor re-attaches under its own uid, the dead one spawns fresh.
+        let modern = [Some(live.as_str()), Some("pane-0000-dead"), None];
+        let decisions: Vec<_> = modern.iter().map(|u| mgr.pane_load(*u)).collect();
+        assert_eq!(
+            decisions[0],
+            crate::session_manager::PaneLoad::Reattach(live.clone()),
+            "the live uid re-attaches"
+        );
+        assert!(!decisions[1].is_reattach(), "a dead uid spawns");
+        assert!(!decisions[2].is_reattach(), "a uid-less pane spawns");
+        assert_ne!(decisions[1].uid(), decisions[2].uid());
+
+        // Deciding never spawned anything: exactly one re-attach target, no duplicate.
+        assert_eq!(
+            mgr.uids().len(),
+            sessions_before,
+            "reattach-or-spawn creates no sessions by itself, uids {:?}",
+            mgr.uids()
+        );
+        assert_eq!(
+            mgr.uids().iter().filter(|u| **u == live).count(),
+            1,
+            "the survivor is adopted once, not duplicated"
+        );
+
+        mgr.kill(&live);
     }
 
     // uid-stability invariant (the plan's "uid stability"): the daemon backend's fresh_uid is
