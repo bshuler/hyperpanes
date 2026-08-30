@@ -20,7 +20,7 @@ use hyperpanes_core::layout::sizes::{
     clamp_fraction, equal_sizes, insert_size, remove_size, resize_at,
 };
 use hyperpanes_core::persistence::{paths, projects};
-use hyperpanes_core::session_manager::{SessionManager, SpawnOptions};
+use hyperpanes_core::session_manager::{AgentLiveness, SessionManager, SpawnOptions};
 use hyperpanes_core::tools::PaneKind;
 use hyperpanes_core::workspace::io::{read_workspace, windows_of, write_workspace};
 use hyperpanes_core::workspace::model::{GroupSpec, PaneSpec, WorkspaceFile};
@@ -918,6 +918,20 @@ pub struct State {
     pub goal_account_cursor: usize,
     /// Whether the sidebar bell's reminder-list panel is expanded.
     pub reminders_open: bool,
+    /// uid → the registry id of a tool a **plain terminal** pane was caught running, from
+    /// the OSC-title sniff (`glow::sniff_osc_title`). Deliberately NOT `PaneState.kind`.
+    ///
+    /// A sniff is an inference, and the plan's detection precedence (D5) says an inference
+    /// may upgrade a pane's *chrome* but must never touch what the pane relaunches as. Kept
+    /// out here, that rule holds by construction rather than by everyone remembering it:
+    /// `kind` stays the explicit/derived answer that persistence writes, and the only place
+    /// the two are combined is the projection into the UI (`paneview::effective_kind`).
+    /// Runtime-only — never serialized, re-learned the moment the tool prints its title again.
+    pub sniffed_tool: std::collections::HashMap<String, String>,
+    /// uid → the program's own last self-reported liveness (`OSC 9;hp;state=…`). Cleared
+    /// when the command ends or the shell returns to a prompt, because a stale "busy" badge
+    /// is worse than none. Runtime-only, same as `sniffed_tool`.
+    pub agent_live: std::collections::HashMap<String, AgentLiveness>,
 }
 
 /// A pane parked by "Remind at…" — the detached pane (its session alive centrally) plus
@@ -1039,6 +1053,8 @@ impl State {
             closed_tabs: Vec::new(),
             reminders: Vec::new(),
             reminders_open: false,
+            sniffed_tool: std::collections::HashMap::new(),
+            agent_live: std::collections::HashMap::new(),
         };
         let tab = s.fresh_tab();
         s.tabs.push(tab);
@@ -1434,6 +1450,19 @@ impl State {
     /// is dropped. Shared by [`Self::close_pane_in`] (which then kills the session) and
     /// pane re-host (which keeps the session alive to rebind it in another window).
     fn take_pane_in(&mut self, ti: usize, idx: usize) -> Option<(PaneState, bool)> {
+        let taken = self.take_pane_inner(ti, idx);
+        if let Some((ps, _)) = taken.as_ref() {
+            // The pane is leaving this window (closed, or detached for re-host). Its
+            // runtime-only facts are re-learned from the next title/state marker wherever
+            // it lands, so dropping them here is what keeps the maps bounded.
+            self.forget_pane_runtime(&ps.uid);
+        }
+        taken
+    }
+
+    /// The removal itself — see [`Self::take_pane_in`], which wraps this to drop the
+    /// pane's runtime-only side-map entries on every exit path.
+    fn take_pane_inner(&mut self, ti: usize, idx: usize) -> Option<(PaneState, bool)> {
         if ti >= self.tabs.len() {
             return None;
         }
@@ -1751,6 +1780,83 @@ impl State {
                 }
                 true
             }
+        }
+    }
+
+    // ---- runtime tool identity (D5: inference upgrades chrome, never the relaunch) ----
+
+    /// Fold an OSC window title into the sniffed-tool map.
+    ///
+    /// Only a pane whose recorded [`PaneKind`] is `Terminal` can be upgraded: a pane that
+    /// was *spawned* as a tool already has the authoritative answer, and a title that
+    /// happens to name a different tool must not overwrite it. A title that names no tool
+    /// leaves the previous sniff alone — `claude` prints plenty of transient titles, and
+    /// the honest downgrade signal is the shell returning to a prompt, not a quiet frame.
+    pub fn note_pane_title(&mut self, uid: &str, title: &str) {
+        let Some((ti, pi)) = self.find_pane(uid) else {
+            return;
+        };
+        if !matches!(self.tabs[ti].panes[pi].kind, PaneKind::Terminal) {
+            return;
+        }
+        if let Some(t) = hyperpanes_core::tools::registry::by_title(title) {
+            let changed = self.sniffed_tool.get(uid).map(String::as_str) != Some(t.id);
+            if changed {
+                self.sniffed_tool.insert(uid.to_string(), t.id.to_string());
+                self.dirty = true;
+            }
+        }
+    }
+
+    /// Record the program's own liveness report (`OSC 9;hp;state=…`).
+    pub fn note_agent_state(&mut self, uid: &str, state: AgentLiveness) {
+        if self.agent_live.get(uid) != Some(&state) {
+            self.agent_live.insert(uid.to_string(), state);
+            self.dirty = true;
+        }
+    }
+
+    /// The shell is back at a prompt (or the foreground command ended): whatever was
+    /// running is not running any more. This is D5's **downgrade** — the sniffed identity
+    /// and the liveness badge both go, so a pane that ran `claude` once does not wear its
+    /// mark forever. A pane spawned as a tool is untouched (nothing was ever sniffed for
+    /// it), which is exactly right: it relaunches as that tool.
+    pub fn note_agent_idle(&mut self, uid: &str) {
+        if self.agent_live.remove(uid).is_some() | self.sniffed_tool.remove(uid).is_some() {
+            self.dirty = true;
+        }
+    }
+
+    /// Drop every runtime-only fact keyed by `uid`. Called wherever a pane leaves this
+    /// window (closed, detached, restarted under a new uid) so the maps cannot grow
+    /// without bound. Everything here is re-learned from the next title or state marker.
+    pub fn forget_pane_runtime(&mut self, uid: &str) {
+        self.sniffed_tool.remove(uid);
+        self.agent_live.remove(uid);
+    }
+
+    /// The identity a pane is **drawn** with: its own `kind` when it has one, else
+    /// whatever the title sniff caught it running. `PaneState.kind` — the thing
+    /// persistence writes and a relaunch replays — is never written from a sniff.
+    pub fn effective_kind(&self, ps: &PaneState) -> PaneKind {
+        if !matches!(ps.kind, PaneKind::Terminal) {
+            return ps.kind.clone();
+        }
+        match self.sniffed_tool.get(&ps.uid) {
+            Some(id) => PaneKind::Tool(id.clone()),
+            None => PaneKind::Terminal,
+        }
+    }
+
+    /// The liveness badge code for the UI: 0 none, 1 busy, 2 awaiting input, 3 done,
+    /// 4 error. An opaque int like every other code crossing the Slint seam.
+    pub fn liveness_ui(&self, uid: &str) -> i32 {
+        match self.agent_live.get(uid) {
+            None => 0,
+            Some(AgentLiveness::Busy) => 1,
+            Some(AgentLiveness::AwaitingInput) => 2,
+            Some(AgentLiveness::Done) => 3,
+            Some(AgentLiveness::Error) => 4,
         }
     }
 
@@ -4009,9 +4115,12 @@ impl State {
             Box::new(SoftwareRenderer::new()),
         );
         newgrid.set_palette(theme::terminal_theme(self.settings.terminal_theme));
+        let mut stale_uid: Option<String> = None;
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             let old = std::mem::replace(&mut p.uid, uid);
             mgr.kill(&old);
+            // The restart mints a NEW uid, so the old key can never be reached again.
+            stale_uid = Some(old);
             p.pane = newgrid;
             p.applied = (cols as usize, rows as usize);
             p.started = false;
@@ -4028,6 +4137,9 @@ impl State {
             p.spawn_command = None;
             p.spawn_args = None;
             p.spawn_shell = shell;
+        }
+        if let Some(old) = stale_uid {
+            self.forget_pane_runtime(&old);
         }
         self.dirty = true;
     }
@@ -6209,6 +6321,199 @@ mod reminder_tests {
         // a Custom 90 min from 23:00 rolls over midnight too.
         let (d, l) = due_for(23 * 3600, ReminderOffset::Custom(90));
         assert_eq!((d, l.as_str()), (90 * 60_000, "tomorrow 00:30"));
+    }
+}
+
+#[cfg(test)]
+mod tool_identity_tests {
+    //! T3 — the runtime half of tool detection: an OSC title upgrades a plain terminal's
+    //! CHROME, and never what it relaunches as.
+    //!
+    //! The plan's detection precedence is Explicit → Marker → Sniff, with one hard rule:
+    //! an inference may change how a pane is drawn but must never rewrite `spawn_command`
+    //! or the persisted `PaneKind`. Here that rule is structural rather than remembered —
+    //! the sniff lives in a runtime-only side map (`State::sniffed_tool`) that nothing
+    //! serializes, and the two are combined only in `effective_kind`, which the UI
+    //! projection reads. These tests pin both halves of that split.
+    use super::*;
+
+    fn mgr() -> SessionManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionManager::new(tx)
+    }
+
+    /// One window holding one plain-terminal pane called `uid`.
+    fn window_with(m: &SessionManager, uid: &str) -> State {
+        let mut st = State::new(theme::load_font(1.0));
+        st.adopt_pane(
+            m,
+            DetachedPane {
+                uid: uid.into(),
+                title: uid.into(),
+                subtitle: None,
+                pinned_accent: None,
+                show_frame: None,
+                show_dot: None,
+                font_px: 14.0,
+                spawn_command: None,
+                spawn_args: None,
+                spawn_shell: None,
+                kind: PaneKind::default(),
+            },
+        );
+        st
+    }
+
+    fn pane_of<'a>(st: &'a State, uid: &str) -> &'a PaneState {
+        let (ti, pi) = st
+            .tabs
+            .iter()
+            .enumerate()
+            .find_map(|(ti, t)| t.panes.iter().position(|p| p.uid == uid).map(|pi| (ti, pi)))
+            .expect("pane is hosted");
+        &st.tabs[ti].panes[pi]
+    }
+
+    /// The core of D5: after the sniff the pane *draws* as Claude, but the field a relaunch
+    /// replays is untouched. Getting this wrong permanently brands a shell as Claude.
+    #[test]
+    fn a_title_sniff_upgrades_the_chrome_and_nothing_else() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        st.note_pane_title("p1", "claude — ~/code/hyperpanes");
+
+        let ps = pane_of(&st, "p1");
+        assert_eq!(
+            st.effective_kind(ps),
+            PaneKind::Tool("claude".into()),
+            "the sniff must drive what the header draws"
+        );
+        assert_eq!(
+            ps.kind,
+            PaneKind::Terminal,
+            "the sniff must NOT touch the persisted kind — that is what a relaunch replays"
+        );
+        assert!(ps.spawn_command.is_none(), "and it must not invent a command");
+    }
+
+    /// Explicit beats inferred. A pane spawned as Codex that happens to print a title
+    /// mentioning Claude stays Codex, and nothing is recorded for it at all.
+    #[test]
+    fn a_sniff_never_overwrites_an_explicit_kind() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        {
+            let (ti, pi) = st.find_pane("p1").unwrap();
+            st.tabs[ti].panes[pi].kind = PaneKind::Tool("codex".into());
+        }
+        st.note_pane_title("p1", "claude");
+
+        assert!(
+            st.sniffed_tool.is_empty(),
+            "an already-identified pane must not even be sniffed"
+        );
+        assert_eq!(
+            st.effective_kind(pane_of(&st, "p1")),
+            PaneKind::Tool("codex".into())
+        );
+    }
+
+    /// The downgrade path. Without it, a pane that ran `claude` once wears the mark forever.
+    #[test]
+    fn returning_to_a_prompt_drops_the_sniff_and_the_badge() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        st.note_pane_title("p1", "claude");
+        st.note_agent_state("p1", AgentLiveness::AwaitingInput);
+        assert_eq!(st.liveness_ui("p1"), 2);
+
+        st.note_agent_idle("p1");
+        assert_eq!(st.effective_kind(pane_of(&st, "p1")), PaneKind::Terminal);
+        assert_eq!(st.liveness_ui("p1"), 0, "a stale badge is worse than none");
+    }
+
+    /// A tool prints plenty of transient titles. One frame that names no tool is not a
+    /// downgrade signal — only the shell reaching a prompt is.
+    #[test]
+    fn a_title_naming_no_tool_leaves_the_previous_sniff_alone() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        st.note_pane_title("p1", "claude");
+        st.note_pane_title("p1", "~/code/hyperpanes");
+        assert_eq!(
+            st.effective_kind(pane_of(&st, "p1")),
+            PaneKind::Tool("claude".into())
+        );
+    }
+
+    /// An ambiguous title names two tools; `registry::by_title` refuses to guess, so no
+    /// upgrade happens rather than a coin-flip one.
+    #[test]
+    fn an_ambiguous_title_upgrades_nothing() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        st.note_pane_title("p1", "claude · codex");
+        assert_eq!(st.effective_kind(pane_of(&st, "p1")), PaneKind::Terminal);
+    }
+
+    /// Every liveness state gets its own code, and an unknown pane reports 0.
+    #[test]
+    fn liveness_codes_are_distinct() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        assert_eq!(st.liveness_ui("p1"), 0);
+        let mut seen = vec![];
+        for s in [
+            AgentLiveness::Busy,
+            AgentLiveness::AwaitingInput,
+            AgentLiveness::Done,
+            AgentLiveness::Error,
+        ] {
+            st.note_agent_state("p1", s);
+            seen.push(st.liveness_ui("p1"));
+        }
+        let n = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), n, "each state needs its own code");
+        assert!(!seen.contains(&0), "0 is reserved for 'nothing reported'");
+    }
+
+    /// The side maps are keyed by uid and nothing ever revisits a closed pane's key, so
+    /// every removal path has to drop them or they grow for the life of the process.
+    #[test]
+    fn closing_a_pane_forgets_its_runtime_facts() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        st.note_pane_title("p1", "claude");
+        st.note_agent_state("p1", AgentLiveness::Busy);
+        assert!(!st.sniffed_tool.is_empty() && !st.agent_live.is_empty());
+
+        let (ti, pi) = st.find_pane("p1").unwrap();
+        st.close_pane_in(ti, pi, &m);
+        assert!(st.sniffed_tool.is_empty(), "sniff outlived its pane");
+        assert!(st.agent_live.is_empty(), "badge outlived its pane");
+    }
+
+    /// Detaching for re-host takes the same path — the target window re-learns from the
+    /// next title, and the source window must not keep a dangling key.
+    #[test]
+    fn detaching_a_pane_forgets_its_runtime_facts() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        st.note_pane_title("p1", "claude");
+        st.detach_focused(&m).expect("the pane detaches");
+        assert!(st.sniffed_tool.is_empty());
+    }
+
+    /// A pane that isn't hosted here can't be sniffed — the events are routed per window,
+    /// and a stray uid must not seed an entry that nothing will ever clean up.
+    #[test]
+    fn an_unhosted_uid_records_nothing() {
+        let m = mgr();
+        let mut st = window_with(&m, "p1");
+        st.note_pane_title("ghost", "claude");
+        assert!(st.sniffed_tool.is_empty());
     }
 }
 

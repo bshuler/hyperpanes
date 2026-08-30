@@ -9,6 +9,7 @@ use hyperpanes_core::layout::presets::{
     compute_tiles, effective_layout, DividerKind, Layout, Orientation,
 };
 use hyperpanes_core::session_manager::SessionManager;
+use hyperpanes_core::tools::PaneKind;
 use hyperpanes_terminal_widget::{cells_for_px, RenderOpts};
 
 use slint::{Color, Model, ModelRc, SharedString, VecModel};
@@ -260,6 +261,8 @@ fn pane_item(
     show_frame: bool,
     show_dot: bool,
     font_px: f32,
+    kind: &PaneKind,
+    live: i32,
 ) -> PaneItem {
     let (x, y, w, h) = ps.rect;
     // Project the clickable-path hover overlay (if any) into the model row.
@@ -366,13 +369,17 @@ fn pane_item(
         // "exited"; the field exists for the taskbar's Electron-parity badge.
         exited: false,
         // ---- tool identity ----
-        // What this pane is RUNNING, projected for the header. `ui_icon`/`ui_name` return
-        // 0/"" for a plain terminal and for a tool id this build does not know, so an
-        // unknown kind shows no mark rather than a wrong one.
-        kind: ps.kind.ui_kind(),
-        tool_icon: ps.kind.ui_icon() as i32,
-        tool_name: ps.kind.ui_name().into(),
-        tool_brand: match ps.kind.tool() {
+        // What this pane is RUNNING, projected for the header. `kind` is the MERGED
+        // identity from `State::effective_kind` (the pane's own kind, or the OSC-title
+        // sniff when it is a plain terminal) — this projection is the one place the two
+        // are combined, which is what keeps a sniff out of what a relaunch replays.
+        // `ui_icon`/`ui_name` return 0/"" for a plain terminal and for a tool id this
+        // build does not know, so an unknown kind shows no mark rather than a wrong one.
+        kind: kind.ui_kind(),
+        tool_icon: kind.ui_icon(),
+        tool_name: kind.ui_name().into(),
+        agent_live: live,
+        tool_brand: match kind.tool() {
             Some(t) => slint::Color::from_rgb_u8(t.brand.0, t.brand.1, t.brand.2),
             // No brand: fall back to the pane's own accent so the mark is never invisible.
             None => ps.accent,
@@ -537,6 +544,14 @@ pub fn resync(
     let show_frame = state.settings.show_frame;
     let show_dot = state.settings.show_dot;
     let editing_pane = state.editing_pane;
+    // The merged tool identity + liveness badge, resolved BEFORE the tab borrow: both read
+    // `State`'s runtime side-maps, which the per-pane borrow below would otherwise block.
+    let tool_row: Vec<(PaneKind, i32)> = state
+        .active_tab()
+        .panes
+        .iter()
+        .map(|p| (state.effective_kind(p), state.liveness_ui(&p.uid)))
+        .collect();
     let t = state.active_tab();
     let focused = t.focused;
     let items: Vec<PaneItem> = t
@@ -551,6 +566,8 @@ pub fn resync(
                 show_frame,
                 show_dot,
                 p.font_px,
+                &tool_row[i].0,
+                tool_row[i].1,
             )
         })
         .collect();
@@ -1467,6 +1484,12 @@ pub fn pump(
     let editing_pane = state.editing_pane;
     let active_idx = state.active;
     let focused = state.tabs[active_idx].focused;
+    // Same merge as `resync`, resolved before the `&mut state.tabs[..]` borrow below.
+    let tool_row: Vec<(PaneKind, i32)> = state.tabs[active_idx]
+        .panes
+        .iter()
+        .map(|p| (state.effective_kind(p), state.liveness_ui(&p.uid)))
+        .collect();
     let tab = &mut state.tabs[active_idx];
     let n = tab.panes.len();
     let mut rendered = 0usize;
@@ -1555,6 +1578,8 @@ pub fn pump(
                     show_frame,
                     show_dot,
                     ps.font_px,
+                    &tool_row[i].0,
+                    tool_row[i].1,
                 ),
             );
         }

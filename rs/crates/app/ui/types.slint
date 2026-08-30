@@ -93,6 +93,12 @@ export struct PaneItem {
     tool-icon: int,
     // Human-facing tool name for the header badge ("Claude Code"). "" = not a tool pane.
     tool-name: string,
+    // The running program's own last self-reported liveness, as an opaque code:
+    // 0 = nothing reported, 1 = busy, 2 = awaiting input, 3 = done, 4 = error. Drives the
+    // small dot after the tool mark, so "the agent is waiting for you" is visible without
+    // reading the pane. Cleared the moment the shell returns to a prompt — a stale badge
+    // is worse than no badge.
+    agent-live: int,
     // The tool's brand accent, used for the mark only. The pane's own `accent` still owns
     // the frame/halo, so branding never overrides the user's palette.
     tool-brand: color,

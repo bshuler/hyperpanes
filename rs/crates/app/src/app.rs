@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hyperpanes_core::layout::presets::DividerKind;
-use hyperpanes_core::session_manager::{SessionEvent, SessionManager};
+use hyperpanes_core::session_manager::{AgentLiveness, SessionEvent, SessionManager};
 use hyperpanes_terminal_widget::{encode_key, keys};
 
 use slint::platform::Key;
@@ -1071,11 +1071,12 @@ impl App {
                 };
                 let mut st = w.state.borrow_mut();
                 let mut fed = 0;
+                // Sniff the shell's OSC window title so the idle glow can tell an agent
+                // pane (claude, etc.) from a plain shell (app-side; no core change).
+                let sniffed = crate::glow::sniff_osc_title(&data);
                 if let Some((ti, pi)) = st.find_pane(&uid) {
                     let pc = &mut st.tabs[ti].panes[pi];
-                    // Sniff the shell's OSC window title so the idle glow can tell an agent
-                    // pane (claude, etc.) from a plain shell (app-side; no core change).
-                    if let Some(title) = crate::glow::sniff_osc_title(&data) {
+                    if let Some(title) = sniffed.clone() {
                         pc.shell_title = title;
                     }
                     pc.pane.feed(&data);
@@ -1091,13 +1092,24 @@ impl App {
                         }
                     }
                 }
+                // The same title, read a second way: which *tool* it says is running. This
+                // upgrades a plain terminal's chrome only — see `State::note_pane_title`.
+                if let Some(title) = sniffed {
+                    st.note_pane_title(&uid, &title);
+                }
                 fed
             }
             SessionEvent::Exit { uid, .. } => {
                 self.ai.send(crate::ai::AiMsg::Exit { uid: uid.clone() });
                 self.ai_feed.borrow_mut().remove(&uid);
                 if let Some(w) = find_window(windows, &uid) {
-                    let alive = w.state.borrow_mut().pane_exited(&uid, &self.mgr);
+                    let alive = {
+                        let mut st = w.state.borrow_mut();
+                        // Belt-and-braces: the laid-out path drops these in `take_pane_in`,
+                        // but a PARKED (reminder) pane's exit never goes through it.
+                        st.forget_pane_runtime(&uid);
+                        st.pane_exited(&uid, &self.mgr)
+                    };
                     crate::dbg_log(&format!("exit[{}] uid={uid} alive={alive}", w.id));
                     if !alive {
                         w.closing.set(true);
@@ -1105,12 +1117,35 @@ impl App {
                 }
                 0
             }
-            // OSC-133 / agent-state liveness markers: consumed by the control server for
-            // liveness, not relevant to the GUI render path. Ignore (0 bytes fed).
-            SessionEvent::CommandStart { .. }
-            | SessionEvent::CommandEnd { .. }
-            | SessionEvent::PromptReady { .. }
-            | SessionEvent::AgentState { .. } => 0,
+            // OSC-133 / agent-state liveness markers. The control server consumes these for
+            // its own liveness read-model; the GUI uses them for the pane header's tool
+            // identity + "waiting for you" badge. No output bytes, so always 0.
+            //
+            // `CommandStart` carries no command text, so it cannot name a tool — only the
+            // OSC title can (see the `Data` arm). What it *can* say is that a fresh command
+            // is running, which clears the previous one's liveness.
+            SessionEvent::CommandStart { uid } => {
+                if let Some(w) = find_window(windows, &uid) {
+                    w.state.borrow_mut().note_agent_state(&uid, AgentLiveness::Busy);
+                }
+                0
+            }
+            // The command ended / the shell is back at a prompt: nothing is running, so the
+            // sniffed identity and the badge both go. This is the detection precedence's
+            // downgrade path — a pane that ran `claude` once must not wear its mark forever.
+            SessionEvent::CommandEnd { uid, .. } | SessionEvent::PromptReady { uid } => {
+                if let Some(w) = find_window(windows, &uid) {
+                    w.state.borrow_mut().note_agent_idle(&uid);
+                }
+                0
+            }
+            // The program's own report, which beats every inference we could make.
+            SessionEvent::AgentState { uid, state, .. } => {
+                if let Some(w) = find_window(windows, &uid) {
+                    w.state.borrow_mut().note_agent_state(&uid, state);
+                }
+                0
+            }
             SessionEvent::Cwd { uid, cwd } => {
                 if let Some(w) = find_window(windows, &uid) {
                     let project = {

@@ -392,6 +392,24 @@ export component PaneView inherits Rectangle {
                                 ink: pane.tool-brand;
                             }
                         }
+                        // ---- agent liveness ----
+                        // The running program's own last report, as a small dot after the
+                        // tool mark: amber = it's waiting for YOU, green = it finished, red
+                        // = it errored, dim = still working. Gated on `kind` (a tool pane)
+                        // rather than on the mark, so a tool this build has no icon for
+                        // still reports; a plain shell running `make` never grows a dot.
+                        if pane.kind != 0 && pane.agent-live != 0 : VerticalLayout {
+                            alignment: center;
+                            Rectangle {
+                                width: 6px;
+                                height: 6px;
+                                border-radius: 3px;
+                                background: pane.agent-live == 2 ? Theme.warn
+                                    : pane.agent-live == 3 ? Theme.ok
+                                    : pane.agent-live == 4 ? Theme.danger
+                                    : Theme.faint;
+                            }
+                        }
                         // "talk" indicator: a small speaker glyph, shown only while this
                         // pane's talk is on (the pane menu's "Talk (speak replies)" toggle).
                         if pane.talk : VerticalLayout {
