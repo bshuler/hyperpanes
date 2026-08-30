@@ -7,7 +7,8 @@
 //!     (top-level `panes`, each group's panes, each window's groups' panes): an
 //!     absolute cwd is kept verbatim, a relative one is resolved against `base_dir`;
 //!   * `has_panes` is true when ANY of `panes` / `groups` / `windows` is present (an
-//!     empty array still counts, mirroring `Array.isArray`);
+//!     empty array still counts, mirroring `Array.isArray`) — when you mean "describes
+//!     at least one actual pane", use [`describes_panes`], which is the content check;
 //!   * `read_workspace` returns `None` on read/parse error or a contentless file, and
 //!     otherwise resolves cwds against the file's own directory;
 //!   * `windows_of` normalises any file into a flat window list with the schema's
@@ -183,6 +184,28 @@ pub fn resolve_cwds(file: &WorkspaceFile, base_dir: &str) -> WorkspaceFile {
 /// A file is loadable if it describes panes at any nesting level.
 pub fn has_panes(file: &WorkspaceFile) -> bool {
     file.panes.is_some() || file.groups.is_some() || file.windows.is_some()
+}
+
+/// Whether a file describes at least one ACTUAL pane, at any nesting level.
+///
+/// [`has_panes`] is a *shape* check, kept at parity with the TypeScript `Array.isArray`
+/// test: an empty `panes: []` / `groups: []` still counts as "loadable-shaped". That is
+/// the wrong question for precedence. A live-session snapshot always carries
+/// `groups: Some(..)` (see `State::to_session_file`), so a caller that filters a live
+/// record's panes down to nothing is left holding `groups: Some(vec![])` — shape-true,
+/// content-empty — and a shape check would let that empty shell outrank a real repo
+/// file forever. This is the *content* check; use it wherever "describes panes" is
+/// meant literally.
+pub fn describes_panes(file: &WorkspaceFile) -> bool {
+    fn any_group_has_panes(groups: &[GroupSpec]) -> bool {
+        groups.iter().any(|g| !g.panes.is_empty())
+    }
+    file.panes.as_deref().is_some_and(|p| !p.is_empty())
+        || file.groups.as_deref().is_some_and(any_group_has_panes)
+        || file
+            .windows
+            .as_deref()
+            .is_some_and(|ws| ws.iter().any(|w| any_group_has_panes(&w.groups)))
 }
 
 /// Read + validate a workspace file, resolving relative cwds against its directory.
@@ -437,6 +460,69 @@ mod tests {
         }));
         assert!(has_panes(&WorkspaceFile {
             windows: Some(vec![]),
+            ..Default::default()
+        }));
+    }
+
+    /// `describes_panes` is the CONTENT check: present-but-empty containers, at every
+    /// nesting level, are not panes. This is the distinction `project::resolve` needs —
+    /// see `a_live_record_filtered_down_to_no_panes_is_an_empty_shell`.
+    #[test]
+    fn describes_panes_is_content_not_shape() {
+        let pane = || PaneSpec {
+            label: Some("one".into()),
+            ..Default::default()
+        };
+        let group_of = |panes: Vec<PaneSpec>| GroupSpec {
+            panes,
+            ..Default::default()
+        };
+
+        assert!(!describes_panes(&WorkspaceFile::default()));
+        // Present but empty at each level — shape-true, content-false.
+        for empty in [
+            WorkspaceFile {
+                panes: Some(vec![]),
+                ..Default::default()
+            },
+            WorkspaceFile {
+                groups: Some(vec![]),
+                ..Default::default()
+            },
+            WorkspaceFile {
+                groups: Some(vec![group_of(vec![])]),
+                ..Default::default()
+            },
+            WorkspaceFile {
+                windows: Some(vec![]),
+                ..Default::default()
+            },
+            WorkspaceFile {
+                windows: Some(vec![WindowSpec {
+                    groups: vec![group_of(vec![])],
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+        ] {
+            assert!(has_panes(&empty), "shape check still true: {empty:?}");
+            assert!(!describes_panes(&empty), "content check must be false: {empty:?}");
+        }
+
+        // One real pane at each level is enough.
+        assert!(describes_panes(&WorkspaceFile {
+            panes: Some(vec![pane()]),
+            ..Default::default()
+        }));
+        assert!(describes_panes(&WorkspaceFile {
+            groups: Some(vec![group_of(vec![]), group_of(vec![pane()])]),
+            ..Default::default()
+        }));
+        assert!(describes_panes(&WorkspaceFile {
+            windows: Some(vec![WindowSpec {
+                groups: vec![group_of(vec![pane()])],
+                ..Default::default()
+            }]),
             ..Default::default()
         }));
     }

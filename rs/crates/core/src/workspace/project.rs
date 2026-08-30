@@ -215,12 +215,18 @@ pub enum Source {
 /// the "first ever open" case — the same answer serves both.
 ///
 /// "Live" means live *and describing panes*: a session record that lists no panes at any
-/// nesting level ([`io::has_panes`]) is an empty shell, and letting it outrank a real
+/// nesting level ([`io::describes_panes`]) is an empty shell, and letting it outrank a real
 /// repo file would make the feature look broken exactly when it matters.
+///
+/// The test is [`io::describes_panes`] (content), NOT [`io::has_panes`] (shape). A live
+/// snapshot always carries `groups: Some(..)`, so a caller that filters the live record
+/// down to the panes inside the project — `State::open_project_windows` does exactly
+/// that — hands us `groups: Some(vec![])` when none of them are. Under a shape test that
+/// empty shell wins forever and the repo file can never open while any window is up.
 pub fn resolve(live: Option<&WorkspaceFile>, repo: Option<&WorkspaceFile>) -> Source {
-    if live.is_some_and(io::has_panes) {
+    if live.is_some_and(io::describes_panes) {
         Source::Live
-    } else if repo.is_some_and(io::has_panes) {
+    } else if repo.is_some_and(io::describes_panes) {
         Source::Repo
     } else {
         Source::Neither
@@ -693,6 +699,35 @@ mod tests {
         assert_eq!(resolve(Some(&full), Some(&empty)), Source::Live);
         assert_eq!(resolve(Some(&empty), None), Source::Neither);
         assert_eq!(resolve(None, Some(&empty)), Source::Neither);
+    }
+
+    /// The shape the app actually produces: `State::to_session_file` always sets
+    /// `groups: Some(..)`, and `open_project_windows` then drops every group whose panes
+    /// are outside the project. When none are, what is left is `groups: Some(vec![])` —
+    /// present but empty. That is an empty shell, not a live session, and the repo file
+    /// must win; otherwise clicking a project in the sidebar can never restore its saved
+    /// layout while any window is open (the D13 open half).
+    #[test]
+    fn a_live_record_filtered_down_to_no_panes_is_an_empty_shell() {
+        let filtered_away = WorkspaceFile {
+            groups: Some(vec![]),
+            active: Some(0),
+            ..Default::default()
+        };
+        let repo = with_panes();
+        assert_eq!(resolve(Some(&filtered_away), Some(&repo)), Source::Repo);
+        assert_eq!(resolve(Some(&filtered_away), None), Source::Neither);
+
+        // Same shell, one nesting level down: groups present, all of them paneless.
+        let empty_groups = WorkspaceFile {
+            groups: Some(vec![GroupSpec {
+                title: Some("term 1".into()),
+                panes: vec![],
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(resolve(Some(&empty_groups), Some(&repo)), Source::Repo);
     }
 
     #[test]
