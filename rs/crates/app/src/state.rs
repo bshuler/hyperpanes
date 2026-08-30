@@ -1442,7 +1442,12 @@ impl State {
             cwd: (!kind.is_pty()).then_some(cwd).flatten(),
             env: opts.env,
             // The resolved shell program → its short header badge (computed once here).
-            shell_label: shell_label(&shell_path),
+            // Only a pty pane gets one: a file browser never spawned a shell, and a header
+            // reading "notes.md  zsh" claims a process that does not exist.
+            shell_label: kind
+                .is_pty()
+                .then(|| shell_label(&shell_path))
+                .unwrap_or_default(),
             // Remember the spawn spec so the relaunch snapshot can re-run this program. A New
             // Pane dialog carries no argv, so `spawn_args` stays None. A view pane never ran a
             // program, so it records none — the snapshot restores it from its `kind` alone.
@@ -5457,8 +5462,11 @@ impl State {
             // re-learns its cwd from the shell it just respawned.
             cwd: is_view.then(|| spec.cwd.clone()).flatten(),
             env: None,
-            // The resolved shell program → its short header badge (computed once here).
-            shell_label: shell_label(&shell_path),
+            // The resolved shell program → its short header badge (computed once here);
+            // suppressed for a view pane for the same reason as in `make_pane`.
+            shell_label: (!is_view)
+                .then(|| shell_label(&shell_path))
+                .unwrap_or_default(),
             // Carry the spawned program forward so a later relaunch snapshot still records it
             // (the spec's command/args + the resolved shell).
             spawn_command: (!is_view).then(|| spec.command.clone()).flatten(),
@@ -6666,6 +6674,28 @@ mod view_pane_tests {
         let p = st.active_tab().panes.last().unwrap();
         assert_eq!(p.kind, PaneKind::FileBrowser);
         assert_eq!(p.cwd.as_deref(), Some("/tmp"));
+    }
+
+    #[test]
+    fn a_view_pane_carries_no_shell_badge() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        // The header badge names the pane's shell program. A view pane never spawned one,
+        // so the badge has to be empty — it read "notes.md  zsh" otherwise, claiming a
+        // process that does not exist.
+        st.add_pane_opts(
+            &m,
+            NewPaneOpts {
+                kind: Some(PaneKind::Markdown),
+                cwd: Some("/tmp".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(st.active_tab().panes.last().unwrap().shell_label, "");
+
+        // The contrast is the helper itself: a resolved shell program still yields a
+        // badge, so the suppression above is about the *kind*, not a broken label.
+        assert_eq!(shell_label("/bin/zsh"), "zsh");
     }
 
     #[test]
