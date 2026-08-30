@@ -1,5 +1,5 @@
 // The left slide-out panel (mux plan M5) — the workspace tree, the saved-workspace
-// library, and the detached (adoptable) sessions.
+// library, the saved workspace sets (M6), and the detached (adoptable) sessions.
 //
 //   ┌─────────────┬──────────  a 300px panel living to the LEFT of the pane area, a real
 //   │ PANELS     ×│  panes     SIBLING of it (exactly like the right-edge rail): NOT an
@@ -8,7 +8,8 @@
 //   │    ● claude │            `Command` (`ToggleLeftPanel`, Seam #2); every row it draws
 //   │    ● shell  │            is projected by `paneview::resync` (Seam #1) into the
 //   │ ▾ LIBRARY  💾            `LeftPanelAdapter` global, mirroring the way the rail's
-//   │ ▾ DETACHED  │            reminder section is fed.
+//   │ ▾ SETS     💾            reminder section is fed.
+//   │ ▾ DETACHED  │
 //   └─────────────┴──────────
 //
 // Section 1 — WORKSPACE: a two-level tree (tab → its panes). Clicking a pane switches to
@@ -18,7 +19,12 @@
 // the same activity source the idle glow uses.
 // Section 2 — LIBRARY: the saved workspaces on disk; one click loads one, the header's
 // save button writes the current tab into the library.
-// Section 3 — DETACHED: live sessions no window in this process is showing; one click
+// Section 3 — SETS: the saved workspace SETS — a set is a named group of workspaces, so
+// one click here opens several tabs at once. The header's save button stores every
+// non-empty tab in this window as a new set. Kept separate from LIBRARY rather than mixed
+// into it because the two behave differently on click: a library row appends ONE tab, a
+// set row appends one per member.
+// Section 4 — DETACHED: live sessions no window in this process is showing; one click
 // adopts one back into the active tab.
 //
 // Every icon here is DRAWN geometry (Path / composed Rectangles), never a font glyph:
@@ -27,7 +33,7 @@
 
 import { Theme } from "theme.slint";
 import { TipArea } from "tooltip.slint";
-import { LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSessionRow, LeftPanelAdapter } from "types.slint";
+import { LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSetRow, LeftSessionRow, LeftPanelAdapter } from "types.slint";
 
 // A disclosure chevron: pointing down when the section is open, right when it is closed.
 component ChevronGlyph inherits Path {
@@ -332,6 +338,62 @@ component WorkspaceRowView inherits Rectangle {
     }
 }
 
+// Two stacked sheets — marks a SETS row as a *group of* workspaces at a glance, so the
+// two library sections don't read as one long undifferentiated list.
+component StackGlyph inherits Path {
+    in property <color> ink;
+    width: 12px;
+    height: 12px;
+    viewbox-width: 16;
+    viewbox-height: 16;
+    stroke: ink;
+    stroke-width: 1.3px;
+    fill: transparent;
+    commands: "M 5.5 2.5 L 13.5 2.5 L 13.5 10.5 M 2.5 5.5 L 10.5 5.5 L 10.5 13.5 L 2.5 13.5 Z";
+}
+
+// One saved workspace set in the sets section. One click opens every member.
+component SetRowView inherits Rectangle {
+    in property <LeftSetRow> set;
+    callback activate();
+    height: 36px;
+    border-radius: 5px;
+    background: sta.has-hover ? Theme.surface2 : transparent;
+
+    sta := TipArea {
+        tip: "Open this set — every workspace in it opens as its own tab";
+        mouse-cursor: pointer;
+        clicked => { root.activate(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 6px;
+        VerticalLayout {
+            alignment: center;
+            StackGlyph {
+                ink: sta.has-hover ? Theme.text : Theme.subtext;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.set.name;
+                color: Theme.text;
+                font-size: 12px;
+                overflow: elide;
+            }
+            Text {
+                text: root.set.detail;
+                color: Theme.subtext;
+                font-size: 10px;
+                overflow: elide;
+            }
+        }
+    }
+}
+
 // One adoptable session in the detached section (click anywhere on the row to adopt it).
 component SessionRowView inherits Rectangle {
     in property <LeftSessionRow> sess;
@@ -383,13 +445,13 @@ component SessionRowView inherits Rectangle {
     }
 }
 
-// A section heading ("WORKSPACE" / "LIBRARY" / "DETACHED") with its disclosure chevron and
+// A section heading ("WORKSPACE" / "LIBRARY" / "SETS" / "DETACHED") with its disclosure chevron and
 // an optional trailing action button (the library's save-the-current-tab button).
 component SectionHead inherits Rectangle {
     in property <string> label;
     in property <bool> open;
     in property <bool> has-action;
-    // Per-instance, because this component heads three different sections and its chevron
+    // Per-instance, because this component heads four different sections and its chevron
     // and action glyph mean something different in each.
     in property <string> tip;
     in property <string> action-tip;
@@ -468,6 +530,7 @@ export component LeftPanel inherits Rectangle {
     // per-section disclosure — local UI state, like the sidebar's per-row expansion
     property <bool> tree-open: true;
     property <bool> lib-open: true;
+    property <bool> sets-open: true;
     property <bool> det-open: true;
 
     background: Theme.mantle;
@@ -614,7 +677,44 @@ export component LeftPanel inherits Rectangle {
             }
         }
 
-        // ===== section 3: detached (adoptable) sessions =====
+        // ===== section 3: the saved workspace sets =====
+        SectionHead {
+            label: "SETS";
+            open: root.sets-open;
+            has-action: true;
+            tip: root.sets-open ? "Collapse the saved sets" : "Show the saved sets";
+            action-tip: "Save every tab in this window as a new named set";
+            toggled => { root.sets-open = !root.sets-open; }
+            acted => { LeftPanelAdapter.save-set(); }
+        }
+
+        if root.sets-open && LeftPanelAdapter.sets.length == 0 : Text {
+            text: "No saved sets yet — the save button above stores every tab in this window as one group you can reopen together.";
+            color: Theme.subtext;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+
+        if root.sets-open : Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+            Flickable {
+                width: 100%;
+                height: 100%;
+                viewport-width: self.width;
+                viewport-height: setbody.preferred-height;
+                setbody := VerticalLayout {
+                    alignment: start;
+                    spacing: 2px;
+                    for st[i] in LeftPanelAdapter.sets : SetRowView {
+                        set: st;
+                        activate => { LeftPanelAdapter.open-set(i); }
+                    }
+                }
+            }
+        }
+
+        // ===== section 4: detached (adoptable) sessions =====
         SectionHead {
             label: "DETACHED";
             open: root.det-open;

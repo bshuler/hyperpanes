@@ -325,6 +325,14 @@ export struct LeftWorkspaceRow {
     detail: string,
 }
 
+// One saved workspace SET in the panel's sets section (mux plan M6). `path` is the
+// `sets/*.json` index file; `detail` is a dim one-liner ("4 workspaces · 5m ago").
+export struct LeftSetRow {
+    name: string,
+    path: string,
+    detail: string,
+}
+
 // One live session that no window in this process is showing — adoptable with one click.
 // `uid` is the session uid (the adopt key: index-free, so a row click can't race a list
 // change); `detail` is a dim one-liner ("pane-1a2b… · 5m ago").
@@ -348,7 +356,9 @@ export global LeftPanelAdapter {
     in property <[LeftTabRow]> tabs;
     // Section 2: the saved-workspace library (newest-first).
     in property <[LeftWorkspaceRow]> workspaces;
-    // Section 3: live sessions no window is showing (newest-first).
+    // Section 3: the saved workspace sets (newest-first).
+    in property <[LeftSetRow]> sets;
+    // Section 4: live sessions no window is showing (newest-first).
     in property <[LeftSessionRow]> detached;
     // Panel header ×  → close the panel.
     callback toggle();
@@ -360,6 +370,10 @@ export global LeftPanelAdapter {
     callback open-workspace(int);
     // The library header's ＋ → save the active tab into the library.
     callback save-workspace();
+    // A set row clicked → open every member workspace of set `0` (index into `sets`).
+    callback open-set(int);
+    // The sets header's ＋ → save every non-empty tab as a new named set.
+    callback save-set();
     // A detached row clicked → adopt session `0` into the active tab.
     callback adopt-session(string);
 }

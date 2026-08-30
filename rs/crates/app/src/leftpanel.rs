@@ -1,7 +1,7 @@
 //! The left slide-out panel's data side (mux plan M5) — everything `ui/leftpanel.slint`
 //! draws that isn't already in [`crate::state::State`].
 //!
-//! The panel has three sections, and this module owns the two that need to look outside
+//! The panel has four sections, and this module owns the three that need to look outside
 //! the window's own state:
 //!
 //! * **WORKSPACE tree** — pure projection over `State.tabs`, done in [`crate::paneview`];
@@ -12,6 +12,10 @@
 //! * **LIBRARY** — the saved workspaces under [`library_dir`]. Cached in a thread-local and
 //!   rescanned on the panel's closed→open edge, the same shape `sidebar.rs` uses for its
 //!   project scans, so the projection never stats the disk on every tick.
+//! * **SETS** — the saved workspace *sets* under [`hyperpanes_core::persistence::paths::sets_dir`]
+//!   (mux plan M6): a named group of workspaces opened as one batch. Cached and rescanned
+//!   on exactly the same edge as the library, since the two directories are siblings and a
+//!   set write drops member files into the library's.
 //! * **DETACHED** — live sessions that no window is showing. Computed by subtracting the
 //!   claimed uids from `SessionManager::uids()`; see [`detached`] for exactly how complete
 //!   that answer is today and where M7 fills in the rest.
@@ -23,8 +27,9 @@ use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use hyperpanes_core::persistence::paths::data_dir;
+use hyperpanes_core::persistence::paths::{self as paths, data_dir};
 use hyperpanes_core::session_manager::SessionManager;
+use hyperpanes_core::workspace::sets;
 
 /// How long after a session's last output its liveness dot stays fully lit before fading
 /// to the floor. 30s matches the "is this thing doing something right now?" question the
@@ -129,6 +134,7 @@ thread_local! {
 pub fn note_panel_open(seen: &mut bool, open: bool) {
     if rescan_due(seen, open) {
         refresh_library();
+        refresh_sets();
     }
 }
 
@@ -288,6 +294,88 @@ fn sanitize_name(name: &str) -> String {
     } else {
         out.chars().take(64).collect()
     }
+}
+
+// ===================== the saved-workspace sets =====================
+
+/// One row of the SETS section: a saved [`sets::WorkspaceSet`] on disk.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SetEntry {
+    /// The `sets/*.json` index file (what a click reads back).
+    pub path: PathBuf,
+    /// The display name — the set's own `name`, falling back to the file stem.
+    pub name: String,
+    /// The second line: member count plus how long ago the index was written.
+    pub detail: String,
+}
+
+thread_local! {
+    /// The last scan of [`sets::path_for`]'s directory. Same contract as [`LIB_CACHE`]:
+    /// process-wide, refreshed only on the panel's open edge and after this process writes
+    /// a set, never per tick.
+    static SET_CACHE: RefCell<Vec<SetEntry>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Rescan the canonical sets directory into the cache.
+pub fn refresh_sets() {
+    let rows = scan_sets(&paths::sets_dir());
+    SET_CACHE.with(|c| *c.borrow_mut() = rows);
+}
+
+/// The cached set rows, in display order (newest first).
+pub fn sets_rows() -> Vec<SetEntry> {
+    SET_CACHE.with(|c| c.borrow().clone())
+}
+
+/// Scan `dir` for readable sets, newest first. Split out from [`refresh_sets`] so it can be
+/// tested against a temp directory.
+///
+/// Ordering differs from [`sets::list_sets_in`] on purpose: that returns file-name order (a
+/// stable index for programmatic use), while this panel section is a *recency* drawer, like
+/// [`scan_library`] beside it — the set you just saved belongs at the top.
+pub fn scan_sets(dir: &Path) -> Vec<SetEntry> {
+    let now = crate::glow::now_epoch_ms();
+    let mut rows: Vec<(u64, SetEntry)> = Vec::new();
+    for (path, set) in sets::list_sets_in(dir) {
+        let mtime = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let name = if set.name.trim().is_empty() {
+            path.file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "set".to_string())
+        } else {
+            set.name.clone()
+        };
+        rows.push((
+            mtime,
+            SetEntry {
+                detail: describe_set(set.members.len(), mtime, now),
+                name,
+                path,
+            },
+        ));
+    }
+    rows.sort_by_key(|r| std::cmp::Reverse(r.0));
+    rows.into_iter().map(|(_, e)| e).collect()
+}
+
+/// The set row's second line: "4 workspaces · 5m ago". Counts the set's OWN member list
+/// rather than reading each member file — a set is an index of references, and a stale
+/// reference should not change the count the user saved.
+fn describe_set(members: usize, mtime: u64, now: u64) -> String {
+    let mut out = format!("{members} workspace{}", if members == 1 { "" } else { "s" });
+    if mtime > 0 {
+        let rel = crate::sidebar::relative_time(Some(mtime), now);
+        if !rel.is_empty() {
+            out.push_str(" · ");
+            out.push_str(&rel);
+        }
+    }
+    out
 }
 
 // ===================== detached (adoptable) sessions =====================
@@ -634,6 +722,58 @@ mod tests {
 
         // a directory that doesn't exist is empty, not a panic
         assert!(scan_library(&dir.join("nope")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_scan_reads_sets_and_skips_junk() {
+        let dir = std::env::temp_dir().join(format!("hp-sets-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let member = |p: &str| sets::SetMember {
+            path: p.to_string(),
+            name: None,
+        };
+        assert!(sets::write_set(
+            dir.join("morning.json"),
+            &sets::WorkspaceSet {
+                name: "Morning".to_string(),
+                members: vec![member("a.hyperpanes"), member("b.hyperpanes")],
+            }
+        ));
+        // A set whose stored name is blank falls back to the file stem, like the library.
+        assert!(sets::write_set(
+            dir.join("unnamed.json"),
+            &sets::WorkspaceSet {
+                name: String::new(),
+                members: vec![member("c.hyperpanes")],
+            }
+        ));
+        std::fs::write(dir.join("broken.json"), b"{{{").unwrap();
+
+        let rows = scan_sets(&dir);
+        assert_eq!(rows.len(), 2, "only the two readable sets: {rows:?}");
+        let by_name: HashSet<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert!(by_name.contains("Morning"), "{by_name:?}");
+        assert!(by_name.contains("unnamed"), "{by_name:?}");
+
+        // The detail line counts the set's own members, and singular/plural agree.
+        let morning = rows.iter().find(|r| r.name == "Morning").unwrap();
+        assert!(
+            morning.detail.starts_with("2 workspaces"),
+            "{:?}",
+            morning.detail
+        );
+        let one = rows.iter().find(|r| r.name == "unnamed").unwrap();
+        assert!(
+            one.detail.starts_with("1 workspace ·") || one.detail == "1 workspace",
+            "{:?}",
+            one.detail
+        );
+
+        // a directory that doesn't exist is empty, not a panic
+        assert!(scan_sets(&dir.join("nope")).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

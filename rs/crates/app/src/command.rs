@@ -268,6 +268,11 @@ pub enum Command {
     LeftOpenWorkspace(usize),
     /// Library: save the active tab into the workspace library (no file dialog).
     LeftSaveWorkspace,
+    /// A SETS row clicked: open every member workspace of set `0` (index into the panel's
+    /// set list) as its own tab.
+    LeftOpenSet(usize),
+    /// The SETS header's save button: store every non-empty tab as a new named set.
+    LeftSaveSet,
     /// Detached: adopt live session uid `0` into the active tab (re-attach + replay).
     LeftAdoptSession(String),
 }
@@ -524,6 +529,8 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         Command::LeftMovePane(from, i, to) => state.move_pane_between_tabs(from, i, to, mgr),
         Command::LeftOpenWorkspace(i) => state.open_workspace_from_library(i, mgr),
         Command::LeftSaveWorkspace => state.save_workspace_to_library(),
+        Command::LeftOpenSet(i) => state.open_set_from_library(i, mgr),
+        Command::LeftSaveSet => state.save_set_to_library(),
         Command::LeftAdoptSession(uid) => state.adopt_detached_session(&uid, mgr),
     }
     Effect::None

@@ -22,8 +22,9 @@ use crate::state::{Overlay, PaneState, State};
 use crate::theme;
 use crate::{
     AppWindow, ClaudeSessionItem, CtxTab, DividerItem, FramePaletteOption, HiRect, KeybindingItem,
-    LayoutOption, LeftPaneRow, LeftPanelAdapter, LeftSessionRow, LeftTabRow, LeftWorkspaceRow,
-    MenuEntry, PaletteItem, PaneItem, PrefOption, ProjectItem, TabItem, WorktreeRow,
+    LayoutOption, LeftPaneRow, LeftPanelAdapter, LeftSessionRow, LeftSetRow, LeftTabRow,
+    LeftWorkspaceRow, MenuEntry, PaletteItem, PaneItem, PrefOption, ProjectItem, TabItem,
+    WorktreeRow,
 };
 
 /// Thickness (logical px) of the draggable divider hit-area.
@@ -87,6 +88,7 @@ pub struct Ui {
     pub lp_tabs: Rc<VecModel<LeftTabRow>>,
     /// The saved-workspace library rows.
     pub lp_workspaces: Rc<VecModel<LeftWorkspaceRow>>,
+    pub lp_sets: Rc<VecModel<LeftSetRow>>,
     /// The detached (adoptable) session rows.
     pub lp_detached: Rc<VecModel<LeftSessionRow>>,
     /// Per-tab pane models for the tree, keyed by tab index and reused across ticks so each
@@ -125,6 +127,7 @@ impl Ui {
             claude_models: RefCell::new(HashMap::new()),
             lp_tabs: Rc::new(VecModel::default()),
             lp_workspaces: Rc::new(VecModel::default()),
+            lp_sets: Rc::new(VecModel::default()),
             lp_detached: Rc::new(VecModel::default()),
             lp_pane_models: RefCell::new(HashMap::new()),
         })
@@ -159,6 +162,7 @@ impl Ui {
         let lp = app.global::<LeftPanelAdapter>();
         lp.set_tabs(ModelRc::from(self.lp_tabs.clone()));
         lp.set_workspaces(ModelRc::from(self.lp_workspaces.clone()));
+        lp.set_sets(ModelRc::from(self.lp_sets.clone()));
         lp.set_detached(ModelRc::from(self.lp_detached.clone()));
     }
 }
@@ -990,6 +994,16 @@ pub fn resync(
                 })
                 .collect();
             sync_model(&ui.lp_workspaces, ws_rows);
+
+            let set_rows: Vec<LeftSetRow> = crate::leftpanel::sets_rows()
+                .into_iter()
+                .map(|e| LeftSetRow {
+                    name: e.name.into(),
+                    path: e.path.display().to_string().into(),
+                    detail: e.detail.into(),
+                })
+                .collect();
+            sync_model(&ui.lp_sets, set_rows);
 
             let claimed = state.claimed_uids();
             let det_rows: Vec<LeftSessionRow> = crate::leftpanel::detached(mgr, &claimed)

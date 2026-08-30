@@ -254,6 +254,20 @@ A `WorkspaceSet` model (`sets/*.json`: a name plus member workspace references) 
 existing `WorkspaceFile`. `SaveWorkspaceAs` / `SaveSet` / `OpenSet`. Loading becomes
 **reattach-or-spawn** per pane, using the durable ids from M0.
 
+**The library picker** (added after the M6 merge). The dialog commands above reach a set
+anywhere on disk; the panel's **SETS** section is the zero-friction path — a fourth section
+beside LIBRARY, listing `sets_dir()` newest-first, one click opening every member as its own
+tab, and a header button saving every non-empty tab as a new set. It is a section of its own
+rather than rows mixed into LIBRARY because the two differ on click: a library row appends
+*one* tab, a set row appends one *per member*. The scan mirrors `scan_library` exactly (a
+thread-local cache, rescanned only on the panel's closed→open edge and after this process
+writes a set), so the projection never stats the disk per tick.
+
+Note that `sets_dir()` and the panel's `library_dir()` are siblings under the same data dir,
+and `save_set_to` writes its member workspaces into the *library's* directory — so saving a
+set also adds one LIBRARY row per tab. That is deliberate: a set is an index of ordinary
+workspace files, and each member stays independently openable.
+
 ### M7 — discovery and adopt ✅ *(built on `mux/m7-adopt`)*
 Launch-time discovery and re-adoption already existed — `ListSessions` / `Attach` are in the
 protocol, `App::attach_panes_from_specs` rebinds snapshot panes to surviving sessions, and the

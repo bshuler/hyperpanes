@@ -2964,6 +2964,65 @@ impl State {
         self.load_workspace(file, mgr);
     }
 
+    /// Save every non-empty tab in this window as a new set in the panel's SETS section
+    /// (no file dialog — that's what the drawer is for). Member workspaces land beside the
+    /// library's, so they show up as LIBRARY rows too; that is deliberate, since a set is an
+    /// index of ordinary workspace files and each one is independently openable.
+    ///
+    /// Named after the active tab, with a numeric suffix on collision rather than an
+    /// overwrite — the same contract as [`Self::save_workspace_to_library`]. The suffix goes
+    /// on the *display* name, not the slug, so the unique name flows through to the member
+    /// filenames too (`save_set_to` stems those from it) and a second save of the same tab
+    /// title cannot clobber the first set's members.
+    pub fn save_set_to_library(&mut self) {
+        let dir = paths::sets_dir();
+        if std::fs::create_dir_all(&dir).is_err() {
+            eprintln!("[hyperpanes] failed to create the sets directory");
+            return;
+        }
+        let title = self.active_tab().title.trim().to_string();
+        let base = if title.is_empty() {
+            "set".to_string()
+        } else {
+            title
+        };
+        let mut name = base.clone();
+        let mut n = 2;
+        while dir.join(format!("{}.json", sets::slug(&name))).exists() {
+            name = format!("{base} {n}");
+            n += 1;
+            if n > 999 {
+                eprintln!("[hyperpanes] too many sets named {base:?}");
+                return;
+            }
+        }
+        let path = dir.join(format!("{}.json", sets::slug(&name)));
+        if self
+            .save_set_to(&path, &paths::workspaces_dir(), &name)
+            .is_some()
+        {
+            // Both drawers: the set index is new, and its members just landed in the
+            // library's directory.
+            crate::leftpanel::refresh_sets();
+            crate::leftpanel::refresh_library();
+        }
+        self.dirty = true;
+    }
+
+    /// Open set row `i` (the panel's SETS list order): load every member workspace, each as
+    /// its own tab, exactly as the "Open set…" dialog path does.
+    pub fn open_set_from_library(&mut self, i: usize, mgr: &SessionManager) {
+        let Some(entry) = crate::leftpanel::sets_rows().into_iter().nth(i) else {
+            return;
+        };
+        if self.open_set_from(&entry.path, mgr) == 0 {
+            // Nothing loaded: the row is stale (deleted or corrupted since the scan), or
+            // every member reference is dead. Rescan so a vanished row goes.
+            crate::leftpanel::refresh_sets();
+            self.dirty = true;
+        }
+    }
+
     /// Adopt detached session `uid` into the active tab: a re-attach, not a respawn — the
     /// spec carries the uid, so `make_pane_from_spec` re-hosts the live session and seeds
     /// the fresh grid from its replay buffer.

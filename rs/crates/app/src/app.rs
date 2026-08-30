@@ -2842,6 +2842,30 @@ impl App {
             let id = win.id;
             win.app
                 .global::<crate::LeftPanelAdapter>()
+                .on_open_set(move |i| {
+                    if let Some(w) = app.window_by_id(id) {
+                        if i >= 0 {
+                            app.run_command(&w, Command::LeftOpenSet(i as usize));
+                        }
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_save_set(move || {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::LeftSaveSet);
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
                 .on_adopt_session(move |uid| {
                     if let Some(w) = app.window_by_id(id) {
                         app.run_command(&w, Command::LeftAdoptSession(uid.to_string()));
