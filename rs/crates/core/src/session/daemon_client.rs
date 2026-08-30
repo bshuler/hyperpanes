@@ -90,6 +90,18 @@ struct Shadow {
     /// ([`SessionMeta::foreground`](crate::session::proto::SessionMeta::foreground)).
     /// `None` is "no answer yet", never "nothing is running".
     foreground: Option<String>,
+    /// The pty's grid `(cols, rows)` as the daemon last reported it
+    /// ([`SessionMeta::cols`](crate::session::proto::SessionMeta::cols)).
+    ///
+    /// Mirrored here because a re-attaching client has to render this session's *retained
+    /// replay*, and that byte stream is full of cursor-positioning sequences the pty wrote
+    /// for the width it had at the time. Replaying it into a grid of some other width lands
+    /// those moves in the wrong columns, so the scrollback comes back mangled. The seed has
+    /// to happen at the daemon's width, then reflow.
+    ///
+    /// `None` = unknown (a daemon predating `SessionMeta::cols`, or no snapshot seen yet):
+    /// the caller keeps whatever size it would have used anyway.
+    dims: Option<(u16, u16)>,
     /// **M7.** This shadow was inserted *locally* (by [`DaemonSessionManager::create`]) and
     /// the daemon has not yet confirmed it in a `SessionsChanged` snapshot. A snapshot may
     /// not delete a pending shadow: the create frame and the snapshot race on the wire, and
@@ -106,6 +118,7 @@ impl Shadow {
             last_output_at: None,
             cwd: None,
             foreground: None,
+            dims: None,
             pending: false,
         }
     }
@@ -388,6 +401,7 @@ impl DaemonSessionManager {
                     shadow.cwd = meta.cwd.clone();
                 }
                 shadow.foreground = meta.foreground.clone();
+                shadow.dims = meta.cols.zip(meta.rows);
             }
         }
         // Attach each survivor to (a) subscribe this connection to its live events and (b)
@@ -464,6 +478,13 @@ impl DaemonSessionManager {
             .unwrap()
             .get(uid)
             .map(|s| s.replay.get().to_string())
+    }
+
+    /// The pty's grid `(cols, rows)` as of the daemon's last snapshot — from the shadow
+    /// (no I/O). `None` when the daemon has not reported one. Seed a re-attaching grid at
+    /// this size before feeding [`replay`](Self::replay); see [`Shadow::dims`].
+    pub fn dims(&self, uid: &str) -> Option<(u16, u16)> {
+        self.shadows.lock().unwrap().get(uid).and_then(|s| s.dims)
     }
 
     /// Monotonic UTF-16 output cursor — from the shadow (no I/O).
@@ -790,6 +811,10 @@ fn reconcile_snapshot(
         // a reader is required to treat it as such — carrying a stale name forward would
         // outlive the command that produced it.
         shadow.foreground = meta.foreground.clone();
+        // Same rule as `foreground`, for the same reason: a daemon that cannot answer says
+        // `None`, and a stale grid size is worse than no size — it would seed a replay at a
+        // width the pty stopped using.
+        shadow.dims = meta.cols.zip(meta.rows);
     }
 }
 
@@ -1704,6 +1729,51 @@ mod tests {
 
         mgr2.kill("surv");
     }
+
+    // The width the replay was WRITTEN at travels with it. A survivor's retained replay is raw
+    // pty output — cursor-positioning escapes included — so the re-attaching GUI has to build
+    // its grid at the daemon's grid size before feeding it. That size is only knowable through
+    // the shadow, and `SessionManager::dims` used to answer a hardcoded `None` for every
+    // daemon-backed pane, which is why a restored pane rendered its scrollback at 80 columns
+    // whatever width it actually had.
+    #[test]
+    fn a_survivors_grid_size_is_known_after_reconnect() {
+        let socket = temp_socket("dims-mirror");
+        let _daemon = spawn_in_process(&socket).expect("daemon binds");
+
+        let (mgr1, mut rx1) = connect_manager(&socket);
+        mgr1.create(SpawnOptions {
+            uid: "surv".into(),
+            shell: Some("/bin/sh".into()),
+            args: Some(vec!["-i".into()]),
+            cols: Some(113),
+            rows: Some(37),
+            ..Default::default()
+        })
+        .expect("create");
+        // `has` answers from the optimistic local shadow, so it says yes before the daemon
+        // has spawned anything — wait for real output instead, which only the pty can produce.
+        mgr1.write("surv", "echo DIMS_READY\n");
+        assert!(
+            recv_event_until(&mut rx1, Dur::from_secs(10), |e| {
+                matches!(e, SessionEvent::Data { uid, data, .. } if uid == "surv" && data.contains("DIMS_READY"))
+            })
+            .is_some(),
+            "session should come up"
+        );
+        drop(mgr1);
+        drop(rx1);
+
+        let (mgr2, _rx2) = connect_manager(&socket);
+        assert_eq!(
+            mgr2.dims("surv"),
+            Some((113, 37)),
+            "reconnect must learn the pty grid, not leave the caller guessing 80x24"
+        );
+
+        mgr2.kill("surv");
+    }
+
 
     // ---- M2 re-attach: the SessionManager-level decision the GUI restore branches on ----
     //

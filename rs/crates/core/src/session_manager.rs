@@ -986,13 +986,14 @@ impl SessionManager {
         }
     }
 
-    /// Current pty grid `(cols, rows)`, or `None` when unknown. Daemon-backed panes
-    /// return `None` for now (dims live daemon-side; mirroring them into the shadow is
-    /// a follow-up, like `liveness`) — `/state` simply omits cols/rows for them.
+    /// Current pty grid `(cols, rows)`, or `None` when unknown. The daemon-backed answer
+    /// is mirrored into the shadow from each `SessionMeta`, so it is one snapshot old
+    /// rather than live — close enough for the two callers that want it (`/state`, and the
+    /// re-attach seed, which needs the width the retained replay was written at).
     pub fn dims(&self, uid: &str) -> Option<(u16, u16)> {
         match self {
             SessionManager::InProcess(r) => r.dims(uid),
-            SessionManager::Daemon(_) => None,
+            SessionManager::Daemon(d) => d.dims(uid),
         }
     }
 

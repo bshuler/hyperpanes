@@ -5925,6 +5925,19 @@ impl State {
             }
         }
 
+        // A survivor's grid is born at the size the DAEMON says its pty has, not at
+        // `spawn_cells()`'s 80x24 guess. The replay we are about to feed it is the raw pty
+        // stream, cursor-positioning escapes and all, written for that width — replay it
+        // narrower or wider and every absolute column move lands somewhere else, so the
+        // scrollback comes back with lines overwriting each other. Seed at the daemon's
+        // width, let the pump's `place()` reflow to the real rect afterwards (alacritty's
+        // reflow preserves scrollback; a mis-rendered seed is not recoverable).
+        // `None` = daemon can't say (predates `SessionMeta::cols`, or in-process backend) —
+        // keep the guess.
+        let (cols, rows) = match reattach.then(|| mgr.dims(&uid)).flatten() {
+            Some((c, r)) if c >= 2 && r >= 1 => (c, r),
+            _ => (cols, rows),
+        };
         let mut pane = TerminalPane::new(
             cols as usize,
             rows as usize,
