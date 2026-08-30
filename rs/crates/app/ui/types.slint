@@ -313,6 +313,11 @@ export struct LeftPaneRow {
 export struct LeftTabRow {
     title: string,
     active: bool,
+    // The group's colour, and the whole point of it: the accent of the pane this tab
+    // focuses — the same colour as that pane's frame halo. A tab in the tree therefore
+    // reads as the colour you will see glowing when you switch to it. An empty tab falls
+    // back to its own slot in the active frame palette, so every group is coloured.
+    tint: color,
     panes: [LeftPaneRow],
 }
 

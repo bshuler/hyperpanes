@@ -242,6 +242,19 @@ pub fn default_bindings() -> Vec<Binding> {
             "Command palette",
             Command::PaletteOpen,
         ),
+        // The left panel's only keyboard route. Ctrl+B matches the "toggle the side panel"
+        // chord editors have trained everyone on, and is free here (Ctrl+F is pane search,
+        // Ctrl+V paste — B is unclaimed).
+        b(
+            "panel.toggle",
+            true,
+            false,
+            false,
+            Char('b'),
+            "General",
+            "Left panel (workspace tree)",
+            Command::ToggleLeftPanel,
+        ),
         // Tabs
         b(
             "tab.new",

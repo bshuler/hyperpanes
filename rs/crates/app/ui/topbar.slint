@@ -21,6 +21,36 @@ component HamburgerIcon inherits Rectangle {
     Rectangle { y: 10px; width: 100%; height: 1.7px; border-radius: 1px; background: ink; }
 }
 
+// The left-panel toggle: a window outline with its leading column filled in — the
+// universal "side panel" mark. Drawn geometry, never a font glyph (see the note atop
+// leftpanel.slint: Slint on Windows silently drops codepoints the font lacks).
+component PanelIcon inherits Rectangle {
+    in property <color> ink;
+    // Filled column + brighter frame while the panel is showing, so the button reads as
+    // a state, not just an action.
+    in property <bool> on;
+    width: 15px;
+    height: 13px;
+    // frame
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-width: 1.4px;
+        border-color: ink;
+        border-radius: 2.5px;
+        background: transparent;
+    }
+    // the panel column itself
+    Rectangle {
+        x: 1.4px;
+        y: 1.4px;
+        width: 4.6px;
+        height: parent.height - 2.8px;
+        background: root.on ? ink : ink.with-alpha(0.35);
+        border-radius: 1.2px;
+    }
+}
+
 component PlusIcon inherits Rectangle {
     in property <color> ink;
     width: 11px;
@@ -233,6 +263,11 @@ export component TopBar inherits Rectangle {
     callback open-palette();
     callback open-prefs();
     callback toggle-sidebar();
+    // The left slide-out panel (mux plan M5). Mirrored from `LeftPanelAdapter.open` so the
+    // button shows the panel's state, and routed back through the same `toggle` callback the
+    // panel's own × uses — one command, three entry points (button, Ctrl+B, app menu).
+    in property <bool> left-panel-open: false;
+    callback toggle-left-panel();
     callback toggle-zoom();
     callback toggle-fullscreen();
     callback start-drag();
@@ -287,6 +322,31 @@ export component TopBar inherits Rectangle {
                         root.open-app-menu(menu-btn.absolute-position.x,
                                            menu-btn.absolute-position.y + menu-btn.height);
                     }
+                }
+            }
+        }
+
+        // ===== left-panel toggle =====
+        // Sits next to the hamburger, on the same edge as the panel it opens.
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 28px;
+                height: 26px;
+                border-radius: 6px;
+                background: root.left-panel-open ? Theme.surface2
+                    : (pta.has-hover ? Theme.surface2 : transparent);
+                PanelIcon {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    on: root.left-panel-open;
+                    ink: (root.left-panel-open || pta.has-hover) ? Theme.text : Theme.subtext;
+                }
+                pta := TipArea {
+                    tip: root.left-panel-open
+                        ? "Hide the left panel — workspace tree, library, sets, detached sessions"
+                        : "Show the left panel — workspace tree, library, sets, detached sessions";
+                    clicked => { root.toggle-left-panel(); }
                 }
             }
         }

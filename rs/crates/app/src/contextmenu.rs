@@ -505,6 +505,19 @@ pub fn app_menu(state: &State, x: f32, y: f32) -> CtxMenu {
         sub::NONE,
         Some(Command::PaletteOpen),
     );
+    // The left panel's third entry point (the top bar's button and Ctrl+B are the other
+    // two). Checked, because it toggles a persistent surface rather than firing an action.
+    b.row(
+        "Left panel",
+        &state.keymap.label_for("panel.toggle").unwrap_or_default(),
+        crate::theme::menu_icon::LEFT_PANEL,
+        state.left_panel_open,
+        true,
+        false,
+        false,
+        sub::NONE,
+        Some(Command::ToggleLeftPanel),
+    );
     b.sep();
     // Layout submenu header: drawn icon + label of the CURRENT layout (the submenu lists
     // Automatic + the 5 presets with the radio ✓ on the current). The current label sits in

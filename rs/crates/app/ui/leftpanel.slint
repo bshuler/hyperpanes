@@ -164,7 +164,7 @@ component PaneRowView inherits Rectangle {
     }
 
     HorizontalLayout {
-        padding-left: 22px;      // indent, under the tab's chevron
+        padding-left: 29px;      // indent, under the tab's chevron (past the colour rail)
         padding-right: 8px;
         spacing: 7px;
 
@@ -233,8 +233,10 @@ component TabRowView inherits Rectangle {
 
     border-radius: 6px;
     border-width: root.drop-hover ? 1px : 0px;
-    border-color: Theme.accent;
-    background: root.drop-hover ? Theme.surface : transparent;
+    // The drop highlight wears the DESTINATION group's colour, so a pane in flight shows
+    // you the halo it is about to take on rather than a generic accent.
+    border-color: root.tab.tint;
+    background: root.drop-hover ? root.tab.tint.with-alpha(0.12) : transparent;
 
     VerticalLayout {
         spacing: 1px;
@@ -243,7 +245,10 @@ component TabRowView inherits Rectangle {
         Rectangle {
             height: 28px;
             border-radius: 5px;
-            background: hta.has-hover ? Theme.surface2 : transparent;
+            // The active group carries a wash of its own colour; hover stays neutral so the
+            // two readings never fight.
+            background: hta.has-hover ? Theme.surface2
+                : (root.tab.active ? root.tab.tint.with-alpha(0.13) : transparent);
 
             hta := TipArea {
                 tip: "Switch to this tab";
@@ -259,6 +264,20 @@ component TabRowView inherits Rectangle {
                 padding-right: 8px;
                 spacing: 4px;
 
+                // the group's colour rail — the tab's link to its pane halo. Full strength
+                // on the active tab, dimmed on the rest so the tree still has one focus.
+                Rectangle {
+                    width: 3px;
+                    Rectangle {
+                        width: 3px;
+                        height: 16px;
+                        y: (parent.height - self.height) / 2;
+                        border-radius: 1.5px;
+                        background: root.tab.tint;
+                        opacity: root.tab.active ? 1.0 : 0.45;
+                    }
+                }
+
                 // expand toggle (drawn chevron, never a font glyph)
                 Rectangle {
                     width: 18px;
@@ -266,7 +285,7 @@ component TabRowView inherits Rectangle {
                         x: (parent.width - self.width) / 2;
                         y: (parent.height - self.height) / 2;
                         open: root.expanded;
-                        ink: cta.has-hover ? Theme.accent : Theme.subtext;
+                        ink: cta.has-hover ? root.tab.tint : Theme.subtext;
                     }
                     cta := TipArea {
                         tip: root.expanded ? "Collapse this tab's panes" : "Show this tab's panes";
@@ -292,10 +311,10 @@ component TabRowView inherits Rectangle {
                         width: 18px;
                         height: 15px;
                         border-radius: 7px;
-                        background: Theme.surface2;
+                        background: root.tab.tint.with-alpha(root.tab.active ? 0.28 : 0.16);
                         Text {
                             text: root.tab.panes.length;
-                            color: Theme.subtext;
+                            color: root.tab.active ? root.tab.tint : Theme.subtext;
                             font-size: 9px;
                             horizontal-alignment: center;
                             vertical-alignment: center;

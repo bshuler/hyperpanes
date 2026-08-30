@@ -291,6 +291,7 @@ export component AppWindow inherits Window {
             drop-tab-x: root.drop-tab-x;
             drop-tab-active: root.drop-tab-active;
             drop-tab-idx: root.drop-tab-idx;
+            left-panel-open: LeftPanelAdapter.open;
 
             tab-grab(i) => { root.tab-grab(i); }
             tab-geom(i, x, w) => { root.tab-geom(i, x, w); }
@@ -308,6 +309,7 @@ export component AppWindow inherits Window {
             open-palette => { root.open-palette(); }
             open-prefs => { root.open-prefs(); }
             toggle-sidebar => { root.toggle-sidebar(); }
+            toggle-left-panel => { LeftPanelAdapter.toggle(); }
             toggle-zoom => { root.toggle-zoom(); }
             toggle-fullscreen => { root.toggle-fullscreen(); }
             start-drag => { root.start-drag(); }

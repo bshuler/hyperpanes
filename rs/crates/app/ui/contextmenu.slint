@@ -92,6 +92,28 @@ component IconSliders inherits Rectangle {
     Rectangle { x: 4.5px; y: 9.2px; width: 4px; height: 4px; border-radius: 2px; background: ink; }
 }
 
+// A window frame with its leading column filled — the Left-panel action icon. Same mark
+// the top bar's toggle button draws, so the two read as the one control.
+component IconPanel inherits Rectangle {
+    in property <color> ink;
+    width: 14px;
+    height: 14px;
+    Rectangle {
+        x: 0.5px; y: 1.5px;
+        width: 13px; height: 11px;
+        border-width: 1.2px;
+        border-color: ink;
+        border-radius: 2px;
+        background: transparent;
+        Rectangle {
+            x: 1.2px; y: 1.2px;
+            width: 3.8px; height: parent.height - 2.4px;
+            border-radius: 1px;
+            background: ink;
+        }
+    }
+}
+
 // A layout mini: an outlined frame whose inner dividers evoke the preset (the drawn
 // replacement for the ⊞ □ ▥ ▤ ▦ ▧ chars). `which` = MenuEntry.icon - 10 (the layout id):
 // 0 auto (2×2 cross) · 1 single (empty) · 2 columns (2 vertical) · 3 rows (2 horizontal) ·
@@ -142,6 +164,7 @@ component MenuIcon inherits Rectangle {
     if root.kind == 3 : IconFolder  { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; }
     if root.kind == 4 : IconSave    { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; }
     if root.kind == 5 : IconSliders { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; }
+    if root.kind == 6 : IconPanel   { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; }
     if root.kind >= 10 : IconLayout { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; which: root.kind - 10; }
 }
 

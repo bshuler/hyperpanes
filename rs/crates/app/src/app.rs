@@ -1304,6 +1304,15 @@ impl App {
                             "sidebar" => {
                                 dispatch(st, Command::ToggleProjects, &self.mgr);
                             }
+                            // The left panel (workspace tree / library / sets / detached).
+                            // Idempotent on purpose: `left_panel_open` is persisted, so a
+                            // blind toggle would CLOSE the panel on any relaunch that
+                            // restored it open — the opposite of what HYPERPANES_OPEN means.
+                            "leftpanel" => {
+                                if !st.left_panel_open {
+                                    dispatch(st, Command::ToggleLeftPanel, &self.mgr);
+                                }
+                            }
                             // The New-goal box (palette-style card; goals system).
                             "newgoal" => {
                                 dispatch(st, Command::OpenNewGoal, &self.mgr);
@@ -1381,6 +1390,18 @@ impl App {
             PendingSeed::Adopt(det) => st.adopt_pane(&self.mgr, det),
             PendingSeed::AdoptTab(det) => st.adopt_tab(&self.mgr, det),
             PendingSeed::Done => {}
+        }
+
+        // `HYPERPANES_OPEN=leftpanel` has to work on a RESTORED window too, not only on the
+        // empty-tab scaffold above — the panel shows the workspace tree, so the launch that
+        // most wants it open is exactly the one that restored a workspace (which seeds
+        // `Workspace`, not `EmptyTab`, and so never reaches the match arm). `first_seed` is
+        // already spent when the arm ran, which is what keeps this from firing twice.
+        if self.first_seed.replace(false)
+            && std::env::var_os("HYPERPANES_OPEN").is_some_and(|v| v == "leftpanel")
+            && !st.left_panel_open
+        {
+            dispatch(st, Command::ToggleLeftPanel, &self.mgr);
         }
     }
 

@@ -939,6 +939,7 @@ pub fn resync(
             let idle_on = state.settings.idle_alert;
             let idle_threshold_ms = state.settings.idle_alert_seconds as u64 * 1000;
             let active = state.active;
+            let palette = state.settings.frame_palette;
             let tab_rows: Vec<LeftTabRow> = state
                 .tabs
                 .iter()
@@ -977,6 +978,18 @@ pub fn resync(
                     LeftTabRow {
                         title: t.title.clone(),
                         active: ti == active,
+                        // The group's colour = the halo of the pane this tab focuses, so a
+                        // row in the tree matches the glow you get when you switch to it.
+                        // An empty tab has no pane to borrow from: give it its own slot in
+                        // the active palette rather than leaving it uncoloured.
+                        tint: t
+                            .panes
+                            .get(t.focused)
+                            .or_else(|| t.panes.first())
+                            .map(|p| p.accent)
+                            .unwrap_or_else(|| {
+                                crate::theme::accent_for(ti, palette)
+                            }),
                         panes: ModelRc::from(model),
                     }
                 })

@@ -510,6 +510,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 m
             }
             Err(e) => {
+                // LOUD, not debug-gated: in-process ptys die with the window, so this is the
+                // one failure that silently revokes session survival across a restart. The
+                // usual cause is a socket path over SUN_LEN (a long TMPDIR), which is
+                // fixable — but only by someone who has been told.
+                eprintln!(
+                    "hyperpanes: session daemon unavailable ({e}); running ptys in-process \
+                     — terminals will NOT survive restarting the app"
+                );
                 dbg_log(&format!(
                     "session-backend: daemon unavailable ({e}); falling back to in-process"
                 ));

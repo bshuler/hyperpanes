@@ -245,6 +245,8 @@ pub mod menu_icon {
     pub const SAVE_WORKSPACE: i32 = 4;
     /// Preferences — drawn slider bars.
     pub const PREFERENCES: i32 = 5;
+    /// Left panel — a drawn window frame with its leading column filled.
+    pub const LEFT_PANEL: i32 = 6;
     /// Base for the layout minis: `LAYOUT_BASE + layout_id(l)` (see [`super::layout_icon_kind`]).
     pub const LAYOUT_BASE: i32 = 10;
 }
