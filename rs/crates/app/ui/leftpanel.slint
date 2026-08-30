@@ -207,10 +207,27 @@ component TabRowView inherits Rectangle {
     callback hover-changed(bool);      // this group became / stopped being the drop target
 
     property <bool> expanded: true;
-    property <bool> drop-hover: root.drag-active && !root.is-source
-        && root.drag-y >= root.absolute-position.y
-        && root.drag-y <= root.absolute-position.y + root.height;
 
+    // `drop-hover` is a PLAIN property recomputed from the drag events — never a reactive
+    // binding. Reading `absolute-position` (or `height`) inside a binding makes that binding
+    // depend on the ancestor box layout, and the `changed drop-hover` handler below forces it
+    // to be evaluated during this repeated item's own `init` — i.e. while the repeater has
+    // built some TabRowViews but not yet all of them. `solve_box_layout` then trips
+    //   assertion failed: result.len() >= total_repeated_cells * 2
+    // because the cell vector is short one entry for every sibling that does not exist yet,
+    // and the entire WORKSPACE tree fails to build: the section renders empty. Recomputing
+    // from `changed drag-*` keeps every geometry read in an event handler, where resolving the
+    // layout is safe because the tree is already built.
+    property <bool> drop-hover: false;
+
+    function refresh-drop-hover() {
+        root.drop-hover = root.drag-active && !root.is-source
+            && root.drag-y >= root.absolute-position.y
+            && root.drag-y <= root.absolute-position.y + root.height;
+    }
+
+    changed drag-y => { root.refresh-drop-hover(); }
+    changed drag-active => { root.refresh-drop-hover(); }
     changed drop-hover => { root.hover-changed(root.drop-hover); }
 
     border-radius: 6px;
