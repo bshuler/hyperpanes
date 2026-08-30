@@ -98,9 +98,15 @@ fn a_legacy_pane_keeps_the_meta_keys_it_already_had() {
     let path = temp_file("legacy-meta");
     std::fs::write(&path, LEGACY_WORKSPACE_JSON).unwrap();
     let ws = read_workspace(&path).unwrap();
-    let meta = ws.panes.as_ref().unwrap()[1].meta.clone().expect("meta survived");
+    let meta = ws.panes.as_ref().unwrap()[1]
+        .meta
+        .clone()
+        .expect("meta survived");
     assert_eq!(meta.get("role").map(String::as_str), Some("logs"));
-    assert_eq!(meta.get("ai.subtitle").map(String::as_str), Some("watching"));
+    assert_eq!(
+        meta.get("ai.subtitle").map(String::as_str),
+        Some("watching")
+    );
     assert!(!meta.contains_key(META_KIND_KEY));
     let _ = std::fs::remove_file(&path);
 }
@@ -181,7 +187,11 @@ fn a_kind_bearing_file_still_loads_on_a_build_that_predates_the_key() {
     assert_eq!(panes[0].command.as_deref(), Some("claude"));
     // The old build sees the key as just another meta entry and preserves it.
     assert_eq!(
-        panes[0].meta.as_ref().and_then(|m| m.get(META_KIND_KEY)).map(String::as_str),
+        panes[0]
+            .meta
+            .as_ref()
+            .and_then(|m| m.get(META_KIND_KEY))
+            .map(String::as_str),
         Some("claude")
     );
     let _ = std::fs::remove_file(&path);
@@ -191,7 +201,8 @@ fn a_kind_bearing_file_still_loads_on_a_build_that_predates_the_key() {
 fn a_kind_this_build_does_not_know_survives_a_round_trip_unchanged() {
     // A workspace from a future build that supports a tool we have never heard of.
     let path = temp_file("unknown-kind");
-    let json = r##"{"name":"future","panes":[{"command":"x","meta":{"pane.kind":"some-future-tool"}}]}"##;
+    let json =
+        r##"{"name":"future","panes":[{"command":"x","meta":{"pane.kind":"some-future-tool"}}]}"##;
     std::fs::write(&path, json).unwrap();
 
     let ws = read_workspace(&path).unwrap();
@@ -225,7 +236,10 @@ fn a_plain_terminal_writes_no_kind_key_at_all() {
         ..Default::default()
     };
     p.set_pane_kind(&PaneKind::Terminal);
-    assert!(p.meta.is_none(), "setting the default kind must not create a meta map");
+    assert!(
+        p.meta.is_none(),
+        "setting the default kind must not create a meta map"
+    );
 
     let ws = WorkspaceFile {
         panes: Some(vec![p]),
@@ -257,7 +271,10 @@ fn pane_kinds_survive_a_disk_round_trip_at_every_nesting_level() {
     let path = temp_file("nesting");
     let ws = WorkspaceFile {
         name: Some("nested".into()),
-        panes: Some(vec![pane_with_kind("claude", PaneKind::Tool("claude".into()))]),
+        panes: Some(vec![pane_with_kind(
+            "claude",
+            PaneKind::Tool("claude".into()),
+        )]),
         groups: Some(vec![GroupSpec {
             title: Some("g".into()),
             panes: vec![pane_with_kind("", PaneKind::FileBrowser)],

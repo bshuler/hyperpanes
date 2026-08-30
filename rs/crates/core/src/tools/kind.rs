@@ -190,7 +190,11 @@ mod tests {
         ];
         for k in kinds {
             let v = k.as_meta_value().expect("non-default kinds are written");
-            assert_eq!(PaneKind::from_meta_value(&v), k, "round-trip failed for {k:?}");
+            assert_eq!(
+                PaneKind::from_meta_value(&v),
+                k,
+                "round-trip failed for {k:?}"
+            );
         }
     }
 
@@ -200,21 +204,36 @@ mod tests {
         let k = PaneKind::from_meta_value("some-future-tool");
         assert_eq!(k, PaneKind::Tool("some-future-tool".into()));
         assert_eq!(k.as_meta_value().as_deref(), Some("some-future-tool"));
-        assert!(k.tool().is_none(), "unknown id must not resolve in the registry");
-        assert_eq!(k.ui_icon(), 0, "unknown tool shows no icon rather than a wrong one");
+        assert!(
+            k.tool().is_none(),
+            "unknown id must not resolve in the registry"
+        );
+        assert_eq!(
+            k.ui_icon(),
+            0,
+            "unknown tool shows no icon rather than a wrong one"
+        );
         assert_eq!(k.ui_name(), "some-future-tool");
     }
 
     #[test]
     fn an_unknown_view_degrades_to_a_terminal_not_a_tool() {
-        assert_eq!(PaneKind::from_meta_value("view:hologram"), PaneKind::Terminal);
+        assert_eq!(
+            PaneKind::from_meta_value("view:hologram"),
+            PaneKind::Terminal
+        );
     }
 
     #[test]
     fn only_terminals_and_tools_are_pty_backed() {
         assert!(PaneKind::Terminal.is_pty());
         assert!(PaneKind::Tool("claude".into()).is_pty());
-        for k in [PaneKind::FileBrowser, PaneKind::FileViewer, PaneKind::Markdown, PaneKind::Browser] {
+        for k in [
+            PaneKind::FileBrowser,
+            PaneKind::FileViewer,
+            PaneKind::Markdown,
+            PaneKind::Browser,
+        ] {
             assert!(!k.is_pty(), "{k:?} must not mint a session uid");
         }
     }

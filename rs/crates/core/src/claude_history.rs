@@ -1284,8 +1284,16 @@ mod tests {
         assert_eq!(p.summary, "fix the flaky drop-target test");
         // Nor are the envelopes searchable: `/clear` would otherwise match every session
         // that ever cleared its context.
-        assert!(!p.full_text.contains("caveat"), "full text: {}", p.full_text);
-        assert!(!p.full_text.contains("command-name"), "full text: {}", p.full_text);
+        assert!(
+            !p.full_text.contains("caveat"),
+            "full text: {}",
+            p.full_text
+        );
+        assert!(
+            !p.full_text.contains("command-name"),
+            "full text: {}",
+            p.full_text
+        );
         assert!(p.full_text.contains("flaky drop-target"));
         // The count is of *records*, not of human turns, so it is unaffected.
         assert_eq!(p.message_count, 3);

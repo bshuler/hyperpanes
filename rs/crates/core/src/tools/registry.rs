@@ -289,7 +289,9 @@ pub fn by_id(id: &str) -> Option<&'static ToolDef> {
 /// ambiguity rule: two tools may share a title word, never an executable name.
 pub fn by_bin(name: &str) -> Option<&'static ToolDef> {
     let lower = name.to_ascii_lowercase();
-    TOOLS.iter().find(|t| t.candidate_bins().any(|b| b == lower))
+    TOOLS
+        .iter()
+        .find(|t| t.candidate_bins().any(|b| b == lower))
 }
 
 /// The tool an OSC title names, if exactly one is named.
@@ -373,7 +375,11 @@ mod tests {
         assert!(by_title("running an agent").is_none());
         assert!(GENERIC_AI_TOKENS.contains(&"agent"));
         for t in TOOLS {
-            assert!(!t.detect_tokens.contains(&"agent"), "{} claims the generic token", t.id);
+            assert!(
+                !t.detect_tokens.contains(&"agent"),
+                "{} claims the generic token",
+                t.id
+            );
         }
     }
 
@@ -385,7 +391,11 @@ mod tests {
         ids.dedup();
         assert_eq!(ids.len(), n, "duplicate tool id in TOOLS");
         for t in TOOLS {
-            assert!(!t.id.is_empty() && !t.bin.is_empty(), "{} has an empty field", t.name);
+            assert!(
+                !t.id.is_empty() && !t.bin.is_empty(),
+                "{} has an empty field",
+                t.name
+            );
             assert!(
                 t.id.chars().all(|c| c.is_ascii_lowercase() || c == '-'),
                 "{} id must be lowercase-kebab (it is persisted)",
@@ -418,7 +428,10 @@ mod tests {
     #[test]
     fn title_match_is_token_wise_and_refuses_ambiguity() {
         assert_eq!(by_title("user@host: claude").map(|t| t.id), Some("claude"));
-        assert_eq!(by_title("cursor-agent — repo").map(|t| t.id), Some("cursor-agent"));
+        assert_eq!(
+            by_title("cursor-agent — repo").map(|t| t.id),
+            Some("cursor-agent")
+        );
         // A word merely containing a tool name is not a match.
         assert!(by_title("ssh-agent").is_none());
         assert!(by_title("claudette").is_none());

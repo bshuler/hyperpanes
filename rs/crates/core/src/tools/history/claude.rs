@@ -141,11 +141,7 @@ impl SessionProvider for ClaudeProvider {
         let Some(args) = crate::tools::resume_args(TOOL_ID, &session.id) else {
             return ResumePlan::Blocked(ResumeBlocked::Unsupported { tool_id: TOOL_ID });
         };
-        ResumePlan::Ready(ResumeCommand {
-            program,
-            args,
-            cwd,
-        })
+        ResumePlan::Ready(ResumeCommand { program, args, cwd })
     }
 }
 

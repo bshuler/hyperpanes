@@ -724,7 +724,10 @@ mod tests {
             control_file: None,
             browser_shim: None,
         });
-        assert_eq!(env.get("CLAUDECODE").map(String::as_str), Some("deliberate"));
+        assert_eq!(
+            env.get("CLAUDECODE").map(String::as_str),
+            Some("deliberate")
+        );
     }
 
     #[test]

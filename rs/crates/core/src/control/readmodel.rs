@@ -953,9 +953,11 @@ mod tests {
                 }],
             }],
         });
-        let v: serde_json::Value =
-            serde_json::to_value(m.state_for_scope(None, &busy)).unwrap();
-        assert_eq!(v["windows"][1]["tabs"][0]["panes"][0]["kind"], json!("claude"));
+        let v: serde_json::Value = serde_json::to_value(m.state_for_scope(None, &busy)).unwrap();
+        assert_eq!(
+            v["windows"][1]["tabs"][0]["panes"][0]["kind"],
+            json!("claude")
+        );
     }
 
     #[test]

@@ -425,7 +425,10 @@ mod tests {
             assert!(close(tile.rect.w, 0.5) && close(tile.rect.h, 0.5));
         }
         let corners: Vec<(f64, f64)> = t.iter().map(|x| (x.rect.x, x.rect.y)).collect();
-        for (got, want) in corners.iter().zip([(0.0, 0.0), (0.5, 0.0), (0.0, 0.5), (0.5, 0.5)]) {
+        for (got, want) in corners
+            .iter()
+            .zip([(0.0, 0.0), (0.5, 0.0), (0.0, 0.5), (0.5, 0.5)])
+        {
             assert!(close(got.0, want.0) && close(got.1, want.1));
         }
     }
@@ -616,7 +619,9 @@ mod tests {
     /// the document: `from_token` reports it, and the deserializer falls back to `Auto`.
     #[test]
     fn an_unknown_token_falls_back_instead_of_failing() {
-        for bad in ["grid-0x2", "grid-2x0", "grid-2x", "grid-axb", "hexagons", ""] {
+        for bad in [
+            "grid-0x2", "grid-2x0", "grid-2x", "grid-axb", "hexagons", "",
+        ] {
             assert_eq!(Layout::from_token(bad), None, "{bad}");
             assert_eq!(
                 serde_json::from_str::<Layout>(&format!("\"{bad}\"")).unwrap(),

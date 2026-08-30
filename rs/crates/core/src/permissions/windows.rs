@@ -56,8 +56,8 @@ pub fn prompt(right: Right) -> Grant {
 }
 
 pub fn request(right: Right) -> Result<(), String> {
-    let url = settings_url(right)
-        .ok_or_else(|| format!("{} is not gated on Windows", right.id()))?;
+    let url =
+        settings_url(right).ok_or_else(|| format!("{} is not gated on Windows", right.id()))?;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     use std::os::windows::process::CommandExt;
     Command::new("cmd")
