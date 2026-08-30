@@ -362,7 +362,17 @@ mod tests {
                 "{} id must be lowercase-kebab (it is persisted)",
                 t.id
             );
-            assert!(!t.detect_tokens.is_empty(), "{} has no detect tokens", t.id);
+            // A tool may deliberately carry NO title tokens when its name is an ordinary
+            // English word — "edit" in a pane title ("Edit config") names no tool, and a
+            // wrong badge is worse than a missing one. Those are recognised by binary name
+            // only, and the allow-list is spelled out here so a silently forgotten token
+            // list still fails: this is a "was that on purpose?" gate, not a formality.
+            const TOKENLESS_BY_DESIGN: &[&str] = &["edit"];
+            assert!(
+                !t.detect_tokens.is_empty() || TOKENLESS_BY_DESIGN.contains(&t.id),
+                "{} has no detect tokens (add it to TOKENLESS_BY_DESIGN if that is deliberate)",
+                t.id
+            );
         }
     }
 

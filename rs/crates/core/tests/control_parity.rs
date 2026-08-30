@@ -77,6 +77,7 @@ fn boot() -> u16 {
                 exit_code: None,
                 meta: None,
                 talk: false,
+                kind: hyperpanes_core::tools::PaneKind::Terminal,
             }],
         }],
     });

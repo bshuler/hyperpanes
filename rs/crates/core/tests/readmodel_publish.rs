@@ -24,6 +24,7 @@ fn pane(id: &str, uid: &str) -> PaneInfo {
         status: PaneStatus::Running,
         exit_code: None,
         meta: None,
+        kind: hyperpanes_core::tools::PaneKind::Terminal,
     }
 }
 
