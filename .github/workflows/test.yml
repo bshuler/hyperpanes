@@ -10,9 +10,10 @@ name: Test (Rust native)
 #   * `rs`                        — the lean headless core (~370 unit + integration tests),
 #   * `rs/crates/terminal-widget` — the live-terminal widget (owns the seeded grid/keymap
 #                                   reference tests under tests/).
-# The GUI `rs/crates/app` workspace is compiled — and thus build-verified — by
-# release-rust.yml at tag time, so its heavy GPU build is kept off the per-push path to
-# keep this gate fast.
+# The GUI `rs/crates/app` workspace owns no tests, so it is not a leg here. It is
+# build-verified on ubuntu + macOS + Windows by verify.yml's `build-gui` matrix (see
+# docs/tool-panes-plan.md D12) and built for release by release-rust.yml at tag time —
+# its heavy GPU build stays off THIS gate to keep the test path fast.
 #
 # `cargo test` is the HARD gate (it must pass; release-rust.yml is gated on it). `clippy`
 # and `rustfmt` run report-only (`continue-on-error`) for now: the existing tree predates
@@ -46,8 +47,8 @@ jobs:
       matrix:
         os:
           - windows-latest
-          # Linux leg (W0-SEAMS): core + terminal-widget only — the GUI app crate stays
-          # off the per-push path on every OS (it is build-verified at tag time).
+          # Linux leg (W0-SEAMS): core + terminal-widget only — the GUI app crate has no
+          # tests to run, and its per-OS compile is verify.yml's `build-gui` matrix (D12).
           - ubuntu-latest
           # macOS leg (T7 ci-matrix): mirrors the ubuntu leg exactly — same two
           # workspaces, no extra system deps needed (the apt step below is Linux-only).

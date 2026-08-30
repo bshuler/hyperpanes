@@ -711,5 +711,23 @@ Two decisions worth carrying forward:
   intent) and an authoritative code table now sits above `on_pref_action`. `pref_text`
   has its own separate code space, documented the same way.
 
-Still open in this wave: the frozen `Cargo.toml` edits and the CI matrix change that adds
-`rs/crates/app` to the macOS + Windows `cargo check` (D12).
+**D12 (CI blind spot) closed.** `verify.yml`'s `build-gui` is now a three-OS matrix:
+Linux keeps the full `cargo build --locked` (it also proves the link step and is the
+cheapest runner), macOS and Windows run `cargo check --locked --bins`, which is what
+actually type-checks the per-OS `cfg` blocks without paying for codegen of the whole GPU
+stack on the slowest runners. `fail-fast: false`, so one OS breaking does not hide the
+other two. `test.yml`'s two comments claiming the app crate is tag-time-only on every OS
+were stale the moment this landed and now point here.
+
+**No `Cargo.toml` edits were needed after all**, so the frozen files stay untouched and
+Wave 1 inherits them clean. Everything Wave 0 added is std-only or uses deps already
+declared: `core` already has `serde`/`serde_json` (the session providers in T5 need
+nothing more), and the macOS permission *status* probes that Wave 2+ will want
+(`CGPreflightScreenCaptureAccess` and friends) are reachable through a raw
+`#[link(name = "CoreGraphics", kind = "framework")] extern "C"` block — `core` does not
+need `objc2` for them. If a later wave does need a crate, that is still an orchestrator
+checkpoint, not a unilateral edit.
+
+**Wave 0 gate: MET.** `cargo check --manifest-path rs/crates/app/Cargo.toml --bins`
+green; `cargo test --bins` 249 passed / 0 failed; `cargo test` on `rs` 883 passed / 0
+failed / 5 ignored. Landed as `fc067e3`.

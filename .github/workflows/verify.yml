@@ -129,11 +129,26 @@ jobs:
   # PR touches any Rust crate (see `changes`), carries the `area:app` label, or runs inside the
   # merge queue — so we never auto-merge code that fails to compile on the GUI path. (--locked:
   # all three workspaces ship a committed Cargo.lock, so a dep can't silently float in.)
+  #
+  # THREE OSes, not one (docs/tool-panes-plan.md D12). This crate carries a growing body of
+  # `cfg(windows)` / `cfg(target_os = "macos")` code — window chrome, drag, native dialogs,
+  # permission deep links — that a Linux-only leg does not compile at all. Before this matrix
+  # the first thing to notice a broken Windows `cfg` block was a release tag.
+  #
+  # Linux stays a full `cargo build` (it also proves the link step and is the cheapest leg);
+  # macOS and Windows run `cargo check --bins`, which is what actually type-checks the per-OS
+  # code without paying for codegen of the whole GPU stack on the slowest runners. `--bins`,
+  # not the default: `hyperpanes` is a binary-only package and a bare `--lib` errors out.
   build-gui:
-    name: build-gui
+    name: build-gui (${{ matrix.os }})
     needs: changes
     if: needs.changes.outputs.rust == 'true' || contains(github.event.pull_request.labels.*.name, 'area:app') || github.event_name == 'merge_group'
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One OS failing must not hide the other two — the whole point is finding per-OS breaks.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     defaults:
       run:
         shell: bash
@@ -141,6 +156,7 @@ jobs:
       - uses: actions/checkout@v5
 
       - name: Install Linux build deps
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -152,9 +168,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: rs/crates/app
+          key: ${{ matrix.os }}
 
-      - name: Build GUI crate
+      - name: Build GUI crate (Linux — full build, proves the link step too)
+        if: runner.os == 'Linux'
         run: cd rs/crates/app && cargo build --locked
+
+      - name: Check GUI crate (macOS / Windows — compiles the per-OS cfg blocks)
+        if: runner.os != 'Linux'
+        run: cd rs/crates/app && cargo check --locked --bins
 
   # Umbrella gate: the ONLY required status check (context name `verify`). It aggregates
   # the matrix legs so the ruleset never has to enumerate per-OS / per-workspace contexts.
