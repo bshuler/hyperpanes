@@ -21,6 +21,8 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+use crate::tools::kind::{PaneKind, META_KIND_KEY};
+
 /// One terminal pane: an optional shell command plus presentation/launch hints.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -62,6 +64,43 @@ pub struct PaneSpec {
     /// when on (a plain pane omits it). New here (no TS sibling), so it trails the ported fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub talk: Option<bool>,
+}
+
+impl PaneSpec {
+    /// What kind of pane this is, read out of `meta["pane.kind"]`.
+    ///
+    /// A spec with no `meta`, or no such key, is a plain [`PaneKind::Terminal`] — which
+    /// is every pane written before tool panes existed, and every pane that is still
+    /// just a shell. See `tools::kind` for why the discriminator rides in `meta`
+    /// instead of becoming a field of its own.
+    pub fn pane_kind(&self) -> PaneKind {
+        self.meta
+            .as_ref()
+            .and_then(|m| m.get(META_KIND_KEY))
+            .map(|v| PaneKind::from_meta_value(v))
+            .unwrap_or_default()
+    }
+
+    /// Record this pane's kind. `Terminal` *removes* the key rather than writing
+    /// `"terminal"`, so an ordinary pane's file stays byte-identical to what a build
+    /// without this feature would write, and an empty `meta` map is dropped entirely.
+    pub fn set_pane_kind(&mut self, kind: &PaneKind) {
+        match kind.as_meta_value() {
+            Some(v) => {
+                self.meta
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(META_KIND_KEY.to_string(), v);
+            }
+            None => {
+                if let Some(m) = self.meta.as_mut() {
+                    m.remove(META_KIND_KEY);
+                    if m.is_empty() {
+                        self.meta = None;
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// One tab (group): a layout plus its panes and per-slot split state.
