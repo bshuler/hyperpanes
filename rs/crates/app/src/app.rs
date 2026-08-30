@@ -3348,20 +3348,72 @@ impl App {
                     }
                 });
         }
+        // ---- left panel: Git mode (J) ----
+        // The rows carry git's REPO-RELATIVE path; `State::git_abs` resolves it. No Stage /
+        // Unstage / Discard: this view is read-only by design.
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_git_click(move |path| {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::GitClick(path.to_string()));
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_git_open(move |path| {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::GitOpen(path.to_string()));
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_git_context(move |path, x, y| {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::GitContext(path.to_string(), x, y));
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_git_refresh(move || {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::GitRefresh);
+                    }
+                });
+        }
         // `mode` is `in-out` and the strip writes it in Slint, so Rust would otherwise never
-        // learn the panel had been switched. Entering FILES has to read the filesystem, so
-        // the strip says so rather than leaving the resync to notice a mode it can't see.
+        // learn the panel had been switched. Entering FILES reads the filesystem and
+        // entering GIT runs `git status`, so the strip says so rather than leaving the
+        // resync to notice a mode it can't see — the resync must never do either.
         {
             let app = app.clone();
             let id = win.id;
             win.app
                 .global::<crate::LeftPanelAdapter>()
                 .on_mode_changed(move |mode| {
-                    if mode != crate::paneview::LEFT_MODE_FILES {
+                    let cmd = if mode == crate::paneview::LEFT_MODE_FILES {
+                        Command::FilesRefresh
+                    } else if mode == crate::paneview::LEFT_MODE_GIT {
+                        Command::GitRefresh
+                    } else {
                         return;
-                    }
+                    };
                     if let Some(w) = app.window_by_id(id) {
-                        app.run_command(&w, Command::FilesRefresh);
+                        app.run_command(&w, cmd);
                     }
                 });
         }

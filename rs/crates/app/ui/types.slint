@@ -431,6 +431,18 @@ export struct LeftFileRow {
     selected: bool,
 }
 
+// One changed file in the GIT mode, already assigned to its section by `crate::gitpanel`.
+// `path` is REPO-RELATIVE, exactly as git reported it, and is the row's identity; `label`
+// is the file name and `detail` its parent directory (empty at the repo root). `code` is
+// the one-letter status badge (`A` `M` `D` `R` `C` `T` `U` `?`).
+export struct LeftGitRow {
+    path: string,
+    label: string,
+    detail: string,
+    code: string,
+    selected: bool,
+}
+
 // One entry in the panel's MODE strip. Mode 0 is always WORKSPACE (the tab/pane tree);
 // every further mode is one favourited CLI tool, showing that tool's locally resumable
 // sessions. `icon` is the registry icon kind the shared `ToolIcon` switches on (0 for the
@@ -506,9 +518,9 @@ export global LeftPanelAdapter {
 
     // ---- panel modes ----
     // Which view the panel is showing: 0 = WORKSPACE (the tree above), 1 = FILES (the
-    // project explorer), n >= 2 = `modes[n]`, a favourited tool's resumable-session list.
-    // Files sits at a fixed index rather than after the favourites because it is not a tool
-    // and cannot be un-starred away. `in-out` because the strip sets it directly
+    // project explorer), 2 = GIT (the working tree), n >= 3 = `modes[n]`, a favourited
+    // tool's resumable-session list. Files and Git sit at fixed indices rather than after
+    // the favourites because neither is a tool and neither can be un-starred away. `in-out` because the strip sets it directly
     // — switching views is pure UI state, not a `State` mutation, so it does not go through
     // Seam #2 (the mode does not survive a restart, and should not: the panel always opens
     // on the workspace tree).
@@ -551,4 +563,35 @@ export global LeftPanelAdapter {
     callback files-up();
     // Re-read the tree from disk (nothing watches the filesystem).
     callback files-refresh();
+
+    // ---- mode 2: the working tree ----
+    // Read-only by design: staging, committing and discarding are one-click destructive and
+    // are not wired to a row. The three sections are separate models rather than one list
+    // plus a section column, so each keeps its own disclosure state the way the workspace
+    // mode's four sections do.
+    in property <[LeftGitRow]> git-staged;
+    in property <[LeftGitRow]> git-changed;
+    in property <[LeftGitRow]> git-untracked;
+    // The header line, already assembled by Rust ("main  ↑2  ↓1"). Empty when `git-repo`
+    // is false.
+    in property <string> git-head;
+    // The repo's own directory name, for the header.
+    in property <string> git-root;
+    // Each section's heading, counted by Rust ("CHANGES · 3"). Formatted there rather than
+    // concatenated here for the same reason `git-head` is: the panel draws strings.
+    in property <string> git-staged-title;
+    in property <string> git-changed-title;
+    in property <string> git-untracked-title;
+    // Whether the panel's root is inside a repository at all. False draws the empty state
+    // instead of three empty sections, which would read as "a clean tree".
+    in property <bool> git-repo;
+    // A row clicked once → select it.
+    callback git-click(string);
+    // A row double-clicked → open it in a view pane.
+    callback git-open(string);
+    // A row right-clicked at window-logical (`1`, `2`) → the same file menu the explorer
+    // opens, so a path acts the same however it was reached.
+    callback git-context(string, length, length);
+    // Re-run `git status` (nothing watches the repository).
+    callback git-refresh();
 }

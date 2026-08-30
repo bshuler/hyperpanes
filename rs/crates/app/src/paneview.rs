@@ -23,7 +23,8 @@ use crate::state::{Overlay, PaneState, State};
 use crate::theme;
 use crate::{
     AppWindow, ClaudeSessionItem, CtxTab, DividerItem, FramePaletteOption, HiRect, KeybindingItem,
-    LayoutOption, LeftFileRow, LeftModeRow, LeftPaneRow, LeftPanelAdapter, LeftSessionItem,
+    LayoutOption, LeftFileRow, LeftGitRow, LeftModeRow, LeftPaneRow, LeftPanelAdapter,
+    LeftSessionItem,
     LeftSessionRow, LeftSetRow, LeftTabRow, LeftWorkspaceRow, MenuEntry, PaletteItem, PaneItem,
     PaneViewRow, PrefBrowserRow, PrefOption, PrefToolRow, ProjectItem, TabItem, WorktreeRow,
 };
@@ -97,6 +98,9 @@ pub struct Ui {
     /// The current tool mode's resumable sessions, pre-sorted by (project, recency).
     pub lp_sessions: Rc<VecModel<LeftSessionItem>>,
     pub lp_files: Rc<VecModel<LeftFileRow>>,
+    pub lp_git_staged: Rc<VecModel<LeftGitRow>>,
+    pub lp_git_changed: Rc<VecModel<LeftGitRow>>,
+    pub lp_git_untracked: Rc<VecModel<LeftGitRow>>,
     /// Per-tab pane models for the tree, keyed by tab index and reused across ticks so each
     /// `LeftTabRow.panes` keeps a STABLE model identity — the same reason `wt_models` exists:
     /// rebuilding the inner repeater every frame would drop an in-flight click or, worse, the
@@ -155,6 +159,9 @@ impl Ui {
             lp_modes: Rc::new(VecModel::default()),
             lp_sessions: Rc::new(VecModel::default()),
             lp_files: Rc::new(VecModel::default()),
+            lp_git_staged: Rc::new(VecModel::default()),
+            lp_git_changed: Rc::new(VecModel::default()),
+            lp_git_untracked: Rc::new(VecModel::default()),
             lp_pane_models: RefCell::new(HashMap::new()),
             pref_tools: Rc::new(VecModel::default()),
             pref_browsers: Rc::new(VecModel::default()),
@@ -201,6 +208,9 @@ impl Ui {
         lp.set_modes(ModelRc::from(self.lp_modes.clone()));
         lp.set_sessions(ModelRc::from(self.lp_sessions.clone()));
         lp.set_files(ModelRc::from(self.lp_files.clone()));
+        lp.set_git_staged(ModelRc::from(self.lp_git_staged.clone()));
+        lp.set_git_changed(ModelRc::from(self.lp_git_changed.clone()));
+        lp.set_git_untracked(ModelRc::from(self.lp_git_untracked.clone()));
     }
 }
 
@@ -532,17 +542,21 @@ fn build_dividers(state: &State, area: (f32, f32)) -> Vec<DividerItem> {
 
 /// Rebuild every UI model + scalar from `State` (the resync step). Called when
 /// `state.dirty` is set.
-/// Left-panel mode indices. WORKSPACE and FILES are fixed slots that no settings change
-/// can move: the favourited tools start at [`LEFT_MODE_TOOL_BASE`], so a mode index and
-/// `mode_tools[mode - LEFT_MODE_TOOL_BASE]` mean the same thing in Rust and in Slint.
+/// Left-panel mode indices. WORKSPACE, FILES and GIT are fixed slots that no settings
+/// change can move: the favourited tools start at [`LEFT_MODE_TOOL_BASE`], so a mode index
+/// and `mode_tools[mode - LEFT_MODE_TOOL_BASE]` mean the same thing in Rust and in Slint.
 pub const LEFT_MODE_WORKSPACE: i32 = 0;
 pub const LEFT_MODE_FILES: i32 = 1;
-pub const LEFT_MODE_TOOL_BASE: i32 = 2;
+pub const LEFT_MODE_GIT: i32 = 2;
+pub const LEFT_MODE_TOOL_BASE: i32 = 3;
 
-/// The FILES row's icon number. `LeftModeRow::icon` is a registry icon id when positive and
-/// 0 already means "the workspace grid", so the folder glyph needs a value of its own —
-/// negative, because the registry will only ever grow upward.
+/// The FILES and GIT rows' icon numbers. `LeftModeRow::icon` is a registry icon id when
+/// positive and 0 already means "the workspace grid", so each built-in glyph needs a value
+/// of its own — negative, because the registry will only ever grow upward. The strip tests
+/// these EXACTLY (not `< 0`): a second built-in is only distinguishable from the first if
+/// nobody treats "negative" as a synonym for "folder".
 pub const LEFT_MODE_FILES_ICON: i32 = -1;
+pub const LEFT_MODE_GIT_ICON: i32 = -2;
 
 pub fn resync(
     state: &mut State,
@@ -1165,6 +1179,11 @@ pub fn resync(
                     icon: LEFT_MODE_FILES_ICON,
                     brand: crate::theme::accent_for(0, palette),
                 },
+                LeftModeRow {
+                    label: "Git".into(),
+                    icon: LEFT_MODE_GIT_ICON,
+                    brand: crate::theme::accent_for(0, palette),
+                },
             ];
             // The strip and this list are built from ONE filtered pass, so mode index n
             // and `mode_tools[n - 2]` can never disagree — filtering twice is exactly how a
@@ -1233,6 +1252,59 @@ pub fn resync(
                     })
                     .collect();
                 sync_model(&ui.lp_files, file_rows);
+            }
+
+            // ---- mode 2: the working tree ----
+            // Also a stored projection: reading it runs `git status`, which happens on a
+            // real event (entering the mode, the refresh button) and never per frame.
+            if lp.get_mode() == LEFT_MODE_GIT {
+                let sel = state.git_sel.clone();
+                let git = &state.git;
+                lp.set_git_repo(git.is_repo());
+                lp.set_git_head(git.head_summary().into());
+                lp.set_git_root(
+                    git.root
+                        .as_ref()
+                        .and_then(|r| r.file_name())
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                        .into(),
+                );
+                let project = |section: crate::gitpanel::Section| -> Vec<LeftGitRow> {
+                    git.section(section)
+                        .map(|r| LeftGitRow {
+                            path: r.path.as_str().into(),
+                            label: r.label.as_str().into(),
+                            detail: r.detail.as_str().into(),
+                            code: r.code.to_string().into(),
+                            selected: sel.as_deref() == Some(r.path.as_str()),
+                        })
+                        .collect()
+                };
+                let staged = project(crate::gitpanel::Section::Staged);
+                let changed = project(crate::gitpanel::Section::Changed);
+                let untracked = project(crate::gitpanel::Section::Untracked);
+                // The counts are formatted here, not concatenated in Slint: the panel draws
+                // strings, exactly as it does for `head_summary`.
+                lp.set_git_staged_title(
+                    format!("{} · {}", crate::gitpanel::Section::Staged.title(), staged.len())
+                        .into(),
+                );
+                lp.set_git_changed_title(
+                    format!("{} · {}", crate::gitpanel::Section::Changed.title(), changed.len())
+                        .into(),
+                );
+                lp.set_git_untracked_title(
+                    format!(
+                        "{} · {}",
+                        crate::gitpanel::Section::Untracked.title(),
+                        untracked.len()
+                    )
+                    .into(),
+                );
+                sync_model(&ui.lp_git_staged, staged);
+                sync_model(&ui.lp_git_changed, changed);
+                sync_model(&ui.lp_git_untracked, untracked);
             }
 
             // ---- the current mode's session list ----
@@ -1506,6 +1578,19 @@ pub fn pump(
         && crate::leftpanel::heartbeat_due(&mut state.left_panel_beat, Instant::now())
     {
         state.dirty = true;
+    }
+
+    // ---- keep the left panel anchored on the SELECTED pane (K) ----
+    // Both the explorer and the git view describe the pane you are looking at, and focus
+    // moves from a dozen places (clicks, drags, navigation, closing a pane, restoring a
+    // workspace) — instrumenting every one of them would be a list that goes stale. One
+    // guarded check per tick is the deterministic version: `sync_left_root` compares the
+    // anchor cwd first and does nothing at all when it has not moved, so the quiet tick
+    // costs a string compare and reads no filesystem. Closed panel, not even that.
+    if state.left_panel_open {
+        use slint::ComponentHandle as _;
+        let mode = app.global::<crate::LeftPanelAdapter>().get_mode();
+        state.sync_left_root(mode);
     }
 
     // ---- expire a held-Esc once auto-repeat stops (no key-release event) ----

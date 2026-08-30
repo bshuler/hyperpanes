@@ -116,6 +116,22 @@ pub enum Command {
     /// Re-read the tree from disk. Nothing watches the filesystem, so this is how a human
     /// says "I changed something outside the app".
     FilesRefresh,
+    // ---- left panel: Git mode (J) ----
+    //
+    // Read-only: there is deliberately no Stage / Unstage / Discard here. The rows carry
+    // git's own REPO-RELATIVE path, which `State::git_abs` resolves against the repo root —
+    // the panel speaks git's identity for a file, and everything downstream speaks the
+    // filesystem's.
+    /// Single click on a git row: select it.
+    GitClick(String),
+    /// Double click on a git row: open it in a read-only view pane, exactly as the explorer
+    /// does — one behaviour for "open this file", reached from two lists.
+    GitOpen(String),
+    /// Right click on a git row: the explorer's own file menu, anchored at `1`, `2`.
+    GitContext(String, f32, f32),
+    /// Re-run `git status`. Nothing watches the repository, so this is how a human says "I
+    /// just committed something in a pane".
+    GitRefresh,
     /// Open `path` in a terminal pane running tool `tool` — "open in a terminal with vi".
     /// The pane is a `Tool` pane, so it gets the tool's brand and icon like any other.
     OpenPathWith {
@@ -562,7 +578,37 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         Command::FilesSetQuery(q) => state.files_set_query(q),
         Command::FilesSetRoot(dir) => state.files_set_root(std::path::PathBuf::from(dir)),
         Command::FilesUp => state.files_go_up(),
-        Command::FilesRefresh => state.rebuild_files(),
+        Command::FilesRefresh => {
+            // Entering the mode (or pressing refresh) re-anchors first: the explorer is
+            // rooted on the SELECTED pane, and focus may well have moved while another
+            // mode was on screen.
+            state.sync_left_root(crate::paneview::LEFT_MODE_FILES);
+            state.rebuild_files();
+        }
+        // ---- left panel: Git mode (J) ----
+        Command::GitRefresh => {
+            state.sync_left_root(crate::paneview::LEFT_MODE_GIT);
+            state.rebuild_git();
+        }
+        Command::GitClick(path) => state.git_click(&path),
+        Command::GitOpen(path) => {
+            // Resolved here and re-dispatched rather than duplicated: a git row and an
+            // explorer row must open a file the same way, and there is one implementation.
+            let Some(abs) = state.git_abs(&path) else {
+                return Effect::None;
+            };
+            return dispatch(
+                state,
+                Command::FilesOpen(abs.to_string_lossy().into_owned()),
+                mgr,
+            );
+        }
+        Command::GitContext(path, x, y) => {
+            if let Some(abs) = state.git_abs(&path) {
+                state.git_click(&path);
+                state.open_file_context(&abs, x, y);
+            }
+        }
         Command::FilesOpen(path) => {
             let p = std::path::PathBuf::from(&path);
             if p.is_dir() {

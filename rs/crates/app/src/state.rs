@@ -920,6 +920,11 @@ pub struct State {
     /// The Files explorer's root — the project the human is looking at, not the whole disk.
     /// `None` until the mode is first opened, when it is derived from the focused pane's cwd.
     pub files_root: Option<PathBuf>,
+    /// The focused pane's cwd that [`State::files_root`] was derived from. The explorer and
+    /// the git view are anchored to the SELECTED pane (K), so this is what tells them the
+    /// anchor has moved: while it still matches the focused pane, an explicitly chosen root
+    /// (`files_go_up`, a re-root) is the human's and is left alone.
+    pub files_root_from: Option<String>,
     /// Which directories are expanded. Absolute paths, so an expansion survives the tree
     /// being rebuilt from disk (which happens on every event that can change it).
     pub files_expanded: BTreeSet<PathBuf>,
@@ -937,6 +942,14 @@ pub struct State {
     /// stale line number can never ride along to an unrelated open.
     pub files_target_line: Option<u32>,
     pub files_target_col: Option<u32>,
+    // ---- left panel: Git mode (J) ----
+    /// The working tree the panel last read, rooted at the same project the explorer is
+    /// rooted at. A stored projection for the same reason `files_rows` is one: reading it
+    /// means running `git status`, which must happen on an event and never per frame.
+    pub git: crate::gitpanel::GitStatus,
+    /// The selected row, as a REPO-RELATIVE path (git's own identity for the file), for the
+    /// same index-is-not-identity reason `files_sel` is a path.
+    pub git_sel: Option<String>,
     /// A one-shot request to switch the left panel to a given mode, consumed by the resync.
     /// The strip's selection lives in the UI as an `in-out` property (switching views is not
     /// a `State` mutation), so a command that needs to change it leaves a note instead of
@@ -1136,12 +1149,15 @@ impl State {
             esc_fired: false,
             ctx: None,
             files_root: None,
+            files_root_from: None,
             files_expanded: BTreeSet::new(),
             files_sel: None,
             files_query: String::new(),
             files_rows: Vec::new(),
             files_target_line: None,
             files_target_col: None,
+            git: crate::gitpanel::GitStatus::none(),
+            git_sel: None,
             left_mode_request: None,
             closed_tabs: Vec::new(),
             reminders: Vec::new(),
@@ -3310,13 +3326,7 @@ impl State {
     /// only then the home directory. A tree rooted at `/` is technically the whole disk and
     /// practically useless.
     fn default_files_root(&self) -> PathBuf {
-        let cwd = self
-            .active_tab()
-            .panes
-            .get(self.active_tab().focused)
-            .and_then(|p| p.cwd.clone())
-            .filter(|c| !c.is_empty());
-        if let Some(cwd) = cwd {
+        if let Some(cwd) = self.focused_cwd() {
             if let Some(root) = crate::sidebar::git_root_of(&cwd) {
                 return root;
             }
@@ -3329,12 +3339,59 @@ impl State {
             .unwrap_or_else(|| PathBuf::from("."))
     }
 
+    /// The focused pane's live cwd, or `None` when it has none yet (a pane whose shell has
+    /// not reported one — the panel must not root itself on an empty string).
+    fn focused_cwd(&self) -> Option<String> {
+        self.active_tab()
+            .panes
+            .get(self.active_tab().focused)
+            .and_then(|p| p.cwd.clone())
+            .filter(|c| !c.is_empty())
+    }
+
     /// The explorer's root, deriving and remembering one on first use.
     pub fn files_root(&mut self) -> PathBuf {
         if self.files_root.is_none() {
             self.files_root = Some(self.default_files_root());
         }
         self.files_root.clone().unwrap_or_default()
+    }
+
+    /// Re-anchor the explorer (and with it the git view) on the SELECTED pane (K).
+    ///
+    /// Both left-panel views describe the pane you are looking at, so focusing a pane in a
+    /// different project moves them there. Three guards keep that from being expensive or
+    /// rude, in order:
+    ///
+    /// * the anchor cwd is compared first, so the common tick — nothing moved — costs one
+    ///   string compare and touches no filesystem;
+    /// * a `cd` that stays inside the same repository derives the same root, and a root that
+    ///   did not move is not re-applied, so the tree you had open does not collapse under you;
+    /// * an explicit re-root (`files_go_up`, a chosen directory) leaves the anchor alone and
+    ///   therefore survives until the selected pane itself changes. That root is the human's.
+    ///
+    /// `mode` is the panel's current mode, because re-reading the working tree means running
+    /// `git`: it is spawned when the git view is the one on screen, and otherwise left for
+    /// [`Command::GitRefresh`](crate::command::Command::GitRefresh), which fires on every
+    /// entry into the mode anyway.
+    pub fn sync_left_root(&mut self, mode: i32) {
+        let cwd = self.focused_cwd();
+        if self.files_root_from == cwd && self.files_root.is_some() {
+            return;
+        }
+        self.files_root_from = cwd;
+        let want = self.default_files_root();
+        if self.files_root.as_deref() == Some(want.as_path()) {
+            return;
+        }
+        self.files_set_root(want);
+        if mode == crate::paneview::LEFT_MODE_GIT {
+            self.rebuild_git();
+        } else {
+            // Stale by construction: the next entry into the mode re-reads it.
+            self.git = crate::gitpanel::GitStatus::none();
+            self.git_sel = None;
+        }
     }
 
     /// Re-read the tree (or re-run the query) from disk and re-project the rows. Every
@@ -3457,6 +3514,47 @@ impl State {
         }
         self.ctx = Some(crate::contextmenu::file_menu(self, path, x, y));
         self.dirty = true;
+    }
+
+    // ---- left panel: Git mode (J) ----
+    //
+    // A read-only view of one repository's working tree. It roots itself wherever the
+    // explorer is rooted, so the two left-panel views can never disagree about which
+    // project you are looking at, and going up in Files moves Git with it.
+    //
+    // Nothing watches the repository — same as the explorer. The status is re-read when the
+    // mode is entered and when the header's refresh is pressed, and at no other time: a
+    // panel that shelled out to `git` on a timer would spawn a process behind a human who
+    // had walked away from the machine.
+
+    /// Re-run `git status` for the current root and store the projection.
+    pub fn rebuild_git(&mut self) {
+        let root = self.files_root();
+        self.git = crate::gitpanel::status_for(&root.to_string_lossy()).unwrap_or_default();
+        // A path that is no longer reported cannot stay selected — the rows it would be
+        // highlighting are gone.
+        if self
+            .git_sel
+            .as_deref()
+            .is_some_and(|p| !self.git.rows.iter().any(|r| r.path == p))
+        {
+            self.git_sel = None;
+        }
+        self.dirty = true;
+    }
+
+    /// A single click on a git row: select it. Selecting is all a click does, exactly as in
+    /// the explorer — the row's verbs live on the double-click (open) and the row menu.
+    pub fn git_click(&mut self, path: &str) {
+        self.git_sel = Some(path.to_string());
+        self.dirty = true;
+    }
+
+    /// The absolute path of a repo-relative git row, or `None` when there is no repo. Every
+    /// git row callback goes through here: what the UI holds is git's relative path, and
+    /// every command downstream (open, reveal, the file menu) speaks absolute paths.
+    pub fn git_abs(&self, path: &str) -> Option<PathBuf> {
+        self.git.root.as_ref().map(|r| r.join(path))
     }
 
     // ---- sidebar / projects ----
@@ -8301,5 +8399,173 @@ mod browser_routing_tests {
         st.settings.browser_app = "com.example.browser.that.is.not.installed".into();
         assert!(st.settings.browser_launcher().is_none());
         assert!(!st.settings.browser_asks());
+    }
+}
+
+/// The left panel's GIT mode (Request J) — the wiring between the panel and
+/// [`crate::gitpanel`], which the parser's own tests cannot see.
+#[cfg(test)]
+mod git_mode {
+    use super::*;
+
+    fn fresh() -> State {
+        State::new(theme::load_font(1.0))
+    }
+
+    /// The mode strip and `mode_tools[mode - LEFT_MODE_TOOL_BASE]` only agree if the fixed
+    /// slots are exactly the ones the tools start after. Adding a fourth built-in without
+    /// moving the base would silently point every favourite one tool to the left.
+    #[test]
+    fn the_fixed_modes_end_where_the_tools_begin() {
+        use crate::paneview::*;
+        assert_eq!(LEFT_MODE_WORKSPACE, 0);
+        assert_eq!(LEFT_MODE_FILES, 1);
+        assert_eq!(LEFT_MODE_GIT, 2);
+        assert_eq!(LEFT_MODE_TOOL_BASE, LEFT_MODE_GIT + 1);
+    }
+
+    /// The icon sentinels are matched EXACTLY in Slint, so each built-in needs a value of
+    /// its own and none may collide with a registry icon id (which is positive) or with the
+    /// workspace grid (which is 0).
+    #[test]
+    fn each_built_in_glyph_has_its_own_sentinel() {
+        use crate::paneview::{LEFT_MODE_FILES_ICON, LEFT_MODE_GIT_ICON};
+        assert_ne!(LEFT_MODE_FILES_ICON, LEFT_MODE_GIT_ICON);
+        assert!(LEFT_MODE_FILES_ICON < 0 && LEFT_MODE_GIT_ICON < 0);
+    }
+
+    /// A git row carries git's REPO-RELATIVE path; everything downstream (opening the file,
+    /// the context menu) speaks the filesystem's. `git_abs` is the only place those meet.
+    #[test]
+    fn git_abs_resolves_a_row_against_the_repo_root() {
+        let mut st = fresh();
+        assert!(
+            st.git_abs("src/main.rs").is_none(),
+            "with no repository there is no path to resolve against"
+        );
+        st.git.root = Some(PathBuf::from("/tmp/repo"));
+        assert_eq!(
+            st.git_abs("src/main.rs"),
+            Some(PathBuf::from("/tmp/repo/src/main.rs"))
+        );
+    }
+
+    /// The explorer follows the SELECTED pane (K): its root is derived from the focused
+    /// pane's cwd, and moves when that pane's cwd moves to another project. A `cd` that
+    /// stays inside the same repository derives the same root and must NOT re-root — that
+    /// would collapse the tree under a human who only changed directory.
+    #[test]
+    fn the_root_follows_the_selected_pane_but_not_a_cd_inside_it() {
+        use crate::paneview::LEFT_MODE_FILES;
+        let base = std::env::temp_dir().join(format!("hp-anchor-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (a, b) = (base.join("a"), base.join("b"));
+        std::fs::create_dir_all(a.join("sub")).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let git = |root: &Path, args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .expect("git runs")
+        };
+        if !git(&a, &["init"]).status.success() {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // no git on this machine
+        }
+        git(&b, &["init"]);
+
+        let mut st = fresh();
+        if st.active_tab().panes.is_empty() {
+            let _ = std::fs::remove_dir_all(&base);
+            return; // no placeholder pane to anchor on
+        }
+        let set_cwd = |st: &mut State, p: &Path| {
+            let i = st.active_tab().focused;
+            st.active_tab_mut().panes[i].cwd = Some(p.to_string_lossy().into_owned());
+        };
+
+        set_cwd(&mut st, &a);
+        st.sync_left_root(LEFT_MODE_FILES);
+        let root_a = st.files_root.clone().expect("rooted on the selected pane");
+        assert!(root_a.ends_with("a"), "rooted at {root_a:?}, wanted the a repo");
+
+        // A cd deeper into the SAME repository derives the same root: expansions survive.
+        st.files_expanded.insert(a.join("sub"));
+        set_cwd(&mut st, &a.join("sub"));
+        st.sync_left_root(LEFT_MODE_FILES);
+        assert_eq!(st.files_root.as_deref(), Some(root_a.as_path()));
+        assert!(
+            st.files_expanded.contains(&a.join("sub")),
+            "a cd inside the root must not collapse the tree"
+        );
+
+        // A pane in a different project moves the panel there.
+        set_cwd(&mut st, &b);
+        st.sync_left_root(LEFT_MODE_FILES);
+        assert!(
+            st.files_root.as_deref().is_some_and(|r| r.ends_with("b")),
+            "rooted at {:?}, wanted the b repo",
+            st.files_root
+        );
+
+        // An explicitly chosen root is the human's: it survives every tick until the
+        // selected pane itself moves.
+        st.files_go_up();
+        let manual = st.files_root.clone().unwrap();
+        st.sync_left_root(LEFT_MODE_FILES);
+        st.sync_left_root(LEFT_MODE_FILES);
+        assert_eq!(st.files_root.as_deref(), Some(manual.as_path()));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The panel roots itself where the explorer is rooted, so the two views can never
+    /// disagree about which project is on screen — and a selection that the refreshed
+    /// status no longer reports is dropped rather than left pointing at nothing.
+    #[test]
+    fn rebuild_reads_the_explorers_root_and_drops_a_stale_selection() {
+        let root = std::env::temp_dir().join(format!("hp-state-git-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .output()
+                .expect("git runs")
+        };
+        if !git(&["init", "-b", "trunk"]).status.success() {
+            let _ = std::fs::remove_dir_all(&root);
+            return; // no git on this machine — nothing to assert against
+        }
+        std::fs::write(root.join("loose.txt"), "hi").unwrap();
+
+        let mut st = fresh();
+        st.files_root = Some(root.clone());
+        st.git_sel = Some("gone.txt".into());
+        st.rebuild_git();
+
+        assert!(st.git.is_repo());
+        assert_eq!(st.git.branch, "trunk");
+        let un: Vec<_> = st
+            .git
+            .section(crate::gitpanel::Section::Untracked)
+            .map(|r| r.path.as_str())
+            .collect();
+        assert_eq!(un, vec!["loose.txt"]);
+        assert_eq!(
+            st.git_sel, None,
+            "a selection the refreshed status no longer reports must not survive it"
+        );
+
+        // A selection git *does* report survives the same rebuild.
+        st.git_click("loose.txt");
+        st.rebuild_git();
+        assert_eq!(st.git_sel.as_deref(), Some("loose.txt"));
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

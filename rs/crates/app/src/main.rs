@@ -31,6 +31,7 @@ mod crash;
 mod devices;
 mod drag;
 mod filetree;
+mod gitpanel;
 mod glow;
 mod history_scan;
 mod keybindings;
