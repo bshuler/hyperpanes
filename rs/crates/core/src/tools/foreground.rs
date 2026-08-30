@@ -196,7 +196,9 @@ fn exec_path(pid: i32) -> Option<String> {
     if n <= 0 {
         return None;
     }
-    std::str::from_utf8(&buf[..n as usize]).ok().map(str::to_owned)
+    std::str::from_utf8(&buf[..n as usize])
+        .ok()
+        .map(str::to_owned)
 }
 
 /// The full argv of `pid`, NUL-separated, via `KERN_PROCARGS2`.
@@ -299,7 +301,9 @@ fn foreground_command(pid: i32) -> Option<String> {
 #[cfg(target_os = "linux")]
 fn foreground_command(pid: i32) -> Option<String> {
     if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
-        let text = String::from_utf8_lossy(&raw).trim_end_matches('\0').to_string();
+        let text = String::from_utf8_lossy(&raw)
+            .trim_end_matches('\0')
+            .to_string();
         if !text.is_empty() {
             return Some(text);
         }
@@ -402,7 +406,10 @@ mod tests {
         let real = "node /Users/x/.local/lib/node_modules/@openai/codex/bin/codex.js";
         assert_eq!(id(real), Some("codex"));
         assert_eq!(id("node\0/Users/x/.local/bin/codex"), Some("codex"));
-        assert_eq!(id("/opt/homebrew/bin/node /Users/x/bin/aider.js"), Some("aider"));
+        assert_eq!(
+            id("/opt/homebrew/bin/node /Users/x/bin/aider.js"),
+            Some("aider")
+        );
         assert_eq!(id("python3 -m gemini"), Some("gemini"));
         // Its own flags are skipped on the way.
         assert_eq!(id("node --enable-source-maps /x/codex.js"), Some("codex"));
@@ -414,7 +421,10 @@ mod tests {
 
     #[test]
     fn a_nul_separated_argv_keeps_paths_with_spaces_whole() {
-        assert_eq!(id("/Applications/My Tools/bin/claude\0--resume"), Some("claude"));
+        assert_eq!(
+            id("/Applications/My Tools/bin/claude\0--resume"),
+            Some("claude")
+        );
         // The whitespace fallback cannot, which is why the OS side never uses it.
         assert_eq!(id("/Applications/My Tools/bin/claude --resume"), None);
     }
@@ -441,7 +451,10 @@ mod tests {
             .count();
         // If this ever exceeds one, the assertions above need a second look — that is the
         // point of pinning it.
-        assert!(ambiguous <= 1, "more than one tool now has a truncatable binary name");
+        assert!(
+            ambiguous <= 1,
+            "more than one tool now has a truncatable binary name"
+        );
         assert!(by_truncated_bin("").is_none());
     }
 
@@ -506,7 +519,12 @@ mod tests {
         /// Open a pty, run `argv` in it, and ask what the kernel says is running there.
         fn probe(argv: &[&str]) -> Probed {
             let pair = native_pty_system()
-                .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
                 .expect("openpty");
             let mut cmd = CommandBuilder::new(argv[0]);
             for a in &argv[1..] {
@@ -552,7 +570,12 @@ mod tests {
         #[test]
         fn an_empty_pty_still_answers_without_panicking() {
             let pair = native_pty_system()
-                .openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 })
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
                 .expect("openpty");
             let fd = pair.master.as_raw_fd().expect("a unix master has an fd");
             // No session leader has claimed the terminal yet, so there is no foreground

@@ -578,6 +578,34 @@ impl SessionRegistry {
         self.sessions.lock().unwrap().keys().cloned().collect()
     }
 
+    /// What is running in `uid`'s foreground *right now*, asked of the kernel
+    /// ([`tools::foreground`](crate::tools::foreground)).
+    ///
+    /// `None` means the question could not be asked — an unknown uid, a pty that exposes
+    /// no descriptor (a mock), or a platform with no foreground process group — never
+    /// "nothing is running". A caller that treats the two alike would erase a pane's
+    /// identity on every platform that cannot answer.
+    ///
+    /// The descriptor is copied out and the map lock released before the syscalls, so a
+    /// probe of one session never blocks writes to another.
+    pub fn foreground_name(&self, uid: &str) -> Option<String> {
+        #[cfg(unix)]
+        {
+            // `handoff_info` is the one accessor that already exposes the master; reading
+            // it does not disturb the pty (the handoff is `relinquish`, a separate step).
+            let fd = {
+                let map = self.sessions.lock().unwrap();
+                map.get(uid)?.pty.handoff_info()?.master_fd
+            };
+            crate::tools::foreground::foreground_name(fd)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = uid;
+            None
+        }
+    }
+
     /// Recent output for a re-attaching view (the rolling replay buffer).
     pub fn replay(&self, uid: &str) -> Option<String> {
         let map = self.sessions.lock().unwrap();
@@ -845,6 +873,21 @@ impl SessionManager {
         match self {
             SessionManager::InProcess(r) => r.has(uid),
             SessionManager::Daemon(d) => d.has(uid),
+        }
+    }
+
+    /// What is running in `uid`'s foreground right now — the kernel's answer, wherever the
+    /// pty happens to live: read directly in-process, read from the daemon's pushed
+    /// snapshot otherwise. Either way a plain in-memory read, safe on a UI tick.
+    ///
+    /// `None` means the question has no answer here (an unknown uid, a platform with no
+    /// foreground process group, a daemon that predates the field) — never "nothing is
+    /// running". Per `docs/tool-panes-plan.md` §D5 the answer may upgrade a pane's chrome
+    /// and must never rewrite what the pane relaunches.
+    pub fn foreground_name(&self, uid: &str) -> Option<String> {
+        match self {
+            SessionManager::InProcess(r) => r.foreground_name(uid),
+            SessionManager::Daemon(d) => d.foreground_name(uid),
         }
     }
 
@@ -1796,6 +1839,32 @@ mod tests {
             "a session that cannot cross must be killed, not stranded in a dying process"
         );
         assert!(reg.uids().is_empty());
+    }
+
+    /// `foreground_name` answers `None` for both "no such session" and "this pty exposes no
+    /// descriptor" — the honest *no answer*. A caller that read it as "nothing is running"
+    /// would downgrade a pane's identity on every platform and every mock that cannot ask.
+    #[tokio::test]
+    async fn a_pty_that_exposes_no_descriptor_gives_no_foreground_answer() {
+        let (etx, _erx) = unbounded_channel::<SessionEvent>();
+        let reg = SessionRegistry::new(etx);
+        let factory: SpawnFn =
+            Box::new(|_spec, _sink| Ok(Box::new(MockPty::default()) as Box<dyn Pty>));
+        reg.create_with(
+            SpawnOptions {
+                uid: "s1".into(),
+                ..Default::default()
+            },
+            factory,
+        )
+        .expect("create");
+
+        assert_eq!(reg.foreground_name("s1"), None, "the mock has no master fd");
+        assert_eq!(
+            reg.foreground_name("nobody"),
+            None,
+            "and an unknown uid is not a panic"
+        );
     }
 
     #[tokio::test]

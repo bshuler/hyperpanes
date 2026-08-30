@@ -287,6 +287,12 @@ fn bind_with_retry(
     }
 }
 
+/// How often the daemon re-asks the kernel what each pane is running. Slow enough to be
+/// free (two syscalls per session), fast enough that a pane's chrome follows the command
+/// the human just typed. Nothing goes on the wire unless an answer actually changed.
+#[cfg(unix)]
+const FOREGROUND_POLL: Duration = Duration::from_secs(1);
+
 /// How long the successor waits for each handoff message. Bounds a wedged or
 /// non-understanding incumbent so a takeover can never hang daemon startup.
 #[cfg(unix)]
@@ -656,6 +662,42 @@ impl Daemon {
                 // `send` errors only when there are zero receivers — fine, just means no
                 // client is currently attached; the event is simply not delivered live.
                 let _ = bus_tx.send(ev);
+            }
+        });
+
+        // Foreground watcher: the pane's *current* program is a fact only this process can
+        // read (the pty master is ours), and no event announces it — a shell emits `133;C`
+        // *before* it forks, so the honest moment to ask the kernel is a moment later, not
+        // at the marker. So it is sampled on a slow timer and pushed **only when the answer
+        // changes**: an idle desktop costs one `TIOCGPGRP` per session per second and puts
+        // nothing on the wire, and a client never polls.
+        let registry_fg = registry.clone();
+        let cwds_fg = Arc::clone(&cwds);
+        let notices_fg = notices.clone();
+        tokio::spawn(async move {
+            let mut last: std::collections::HashMap<String, Option<String>> = Default::default();
+            let mut tick = tokio::time::interval(FOREGROUND_POLL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tick.tick().await;
+                let now: std::collections::HashMap<String, Option<String>> = registry_fg
+                    .uids()
+                    .into_iter()
+                    .map(|uid| {
+                        let fg = registry_fg.foreground_name(&uid);
+                        (uid, fg)
+                    })
+                    .collect();
+                if now == last {
+                    continue;
+                }
+                last = now;
+                // The whole snapshot, not a delta — the same idempotent push every other
+                // session change uses, so a client folds it with no new code path.
+                let _ = notices_fg.send(DaemonMsg::SessionsChanged(session_metas(
+                    &registry_fg,
+                    &cwds_fg,
+                )));
             }
         });
 
@@ -1178,6 +1220,9 @@ fn session_metas(
                 alive: true,
                 cols,
                 rows,
+                // The pty is ours, so we are the only process that can answer this; the
+                // GUI reads it to tell a pane running `claude` from one at a prompt.
+                foreground: registry.foreground_name(&uid),
                 uid,
             }
         })

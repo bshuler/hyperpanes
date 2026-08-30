@@ -680,6 +680,9 @@ fn session_metas(
                 alive: true,
                 cols,
                 rows,
+                // Windows has no foreground process group to ask about; `None` is "no
+                // answer", which is what a reader must treat it as.
+                foreground: None,
                 uid,
             }
         })

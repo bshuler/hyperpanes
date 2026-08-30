@@ -161,6 +161,23 @@ pub struct SessionMeta {
     /// Current pty grid height — see [`cols`](Self::cols).
     #[serde(default)]
     pub rows: Option<u16>,
+    /// The program running in this pane's **foreground process group** right now,
+    /// normalised by [`tools::foreground`](crate::tools::foreground) — `Some("claude")`,
+    /// `Some("zsh")` at a prompt.
+    ///
+    /// The pty lives in the daemon, so only the daemon can ask the kernel this; a client
+    /// that wants to know reads it from here. Per `docs/tool-panes-plan.md` §D5 the answer
+    /// may upgrade a pane's chrome and must never rewrite what the pane relaunches.
+    ///
+    /// `None` means **no answer**, not "nothing is running": a daemon that predates the
+    /// field, a platform with no pgrp, a session whose pty exposes no descriptor. A reader
+    /// must leave its previous belief alone on `None` rather than treat it as a downgrade —
+    /// otherwise a platform that can never answer would erase every other detection signal.
+    ///
+    /// ADDITIVE, `#[serde(default)]` — see [`cols`](Self::cols) for why that needs no
+    /// `PROTO_VER` bump.
+    #[serde(default)]
+    pub foreground: Option<String>,
 }
 
 /// A request from a client to the daemon. Fire-and-forget for mutators; request/response
@@ -517,6 +534,7 @@ mod tests {
                 alive: true,
                 cols: Some(120),
                 rows: Some(40),
+                foreground: Some("claude".into()),
             }]),
             DaemonMsg::Created { uid: "s9".into() },
             DaemonMsg::Replay {
@@ -559,6 +577,7 @@ mod tests {
                 alive: true,
                 cols: Some(120),
                 rows: Some(34),
+                foreground: None,
             }]),
         ];
         for m in &msgs {

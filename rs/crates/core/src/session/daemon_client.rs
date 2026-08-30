@@ -86,6 +86,10 @@ struct Shadow {
     last_output_at: Option<u64>,
     /// Last sniffed cwd (from `Cwd` events), if any.
     cwd: Option<String>,
+    /// What the daemon last reported running in this pane's foreground
+    /// ([`SessionMeta::foreground`](crate::session::proto::SessionMeta::foreground)).
+    /// `None` is "no answer yet", never "nothing is running".
+    foreground: Option<String>,
     /// **M7.** This shadow was inserted *locally* (by [`DaemonSessionManager::create`]) and
     /// the daemon has not yet confirmed it in a `SessionsChanged` snapshot. A snapshot may
     /// not delete a pending shadow: the create frame and the snapshot race on the wire, and
@@ -101,6 +105,7 @@ impl Shadow {
             output_bytes: 0,
             last_output_at: None,
             cwd: None,
+            foreground: None,
             pending: false,
         }
     }
@@ -382,6 +387,7 @@ impl DaemonSessionManager {
                 if meta.cwd.is_some() {
                     shadow.cwd = meta.cwd.clone();
                 }
+                shadow.foreground = meta.foreground.clone();
             }
         }
         // Attach each survivor to (a) subscribe this connection to its live events and (b)
@@ -471,6 +477,20 @@ impl DaemonSessionManager {
             .unwrap()
             .get(uid)
             .and_then(|s| s.last_output_at)
+    }
+
+    /// What the daemon last reported running in this pane's foreground — from the shadow
+    /// (no I/O). The daemon pushes a fresh snapshot whenever an answer changes, so this is
+    /// current without anyone polling the socket.
+    ///
+    /// `None` is "no answer" (an unknown uid, a daemon that predates the field, a platform
+    /// with no foreground group), never "nothing is running".
+    pub fn foreground_name(&self, uid: &str) -> Option<String> {
+        self.shadows
+            .lock()
+            .unwrap()
+            .get(uid)
+            .and_then(|s| s.foreground.clone())
     }
 
     /// Serialize the pane's current screen — a bounded `RenderScreen`/`Screen` round-trip
@@ -740,13 +760,20 @@ fn reconcile_snapshot(
     for meta in metas {
         let shadow = shadows.entry(meta.uid.clone()).or_insert_with(Shadow::new);
         shadow.pending = false;
-        shadow.output_bytes = meta.output_bytes;
+        // A snapshot is built without the event bus's lock, so it can be a few chunks
+        // behind the `Data` events already folded here. The cursor is monotonic, so take
+        // the later of the two rather than letting a push walk it backwards.
+        shadow.output_bytes = shadow.output_bytes.max(meta.output_bytes);
         if meta.last_output_at.is_some() {
             shadow.last_output_at = meta.last_output_at;
         }
         if meta.cwd.is_some() {
             shadow.cwd = meta.cwd.clone();
         }
+        // Unconditional, unlike cwd: `None` here is the daemon's honest "no answer", and
+        // a reader is required to treat it as such — carrying a stale name forward would
+        // outlive the command that produced it.
+        shadow.foreground = meta.foreground.clone();
     }
 }
 
@@ -1247,6 +1274,59 @@ mod tests {
 
     fn shadows() -> Arc<Mutex<HashMap<String, Shadow>>> {
         Arc::default()
+    }
+
+    fn meta(uid: &str, foreground: Option<&str>) -> crate::session::proto::SessionMeta {
+        crate::session::proto::SessionMeta {
+            uid: uid.to_string(),
+            cwd: None,
+            output_bytes: 0,
+            last_output_at: None,
+            alive: true,
+            cols: None,
+            rows: None,
+            foreground: foreground.map(str::to_string),
+        }
+    }
+
+    /// The daemon owns the pty, so its snapshot is the only place a client can learn what
+    /// a pane is running. Folding it must be plain assignment — including back to `None`,
+    /// which is how the daemon says "the shell has the terminal again".
+    #[test]
+    fn a_snapshot_carries_the_foreground_name_in_both_directions() {
+        let s = shadows();
+        reconcile_snapshot(&s, &[meta("u1", Some("claude"))]);
+        assert_eq!(
+            s.lock().unwrap().get("u1").unwrap().foreground.as_deref(),
+            Some("claude")
+        );
+
+        reconcile_snapshot(&s, &[meta("u1", None)]);
+        assert_eq!(
+            s.lock().unwrap().get("u1").unwrap().foreground,
+            None,
+            "a stale name would outlive the command that produced it"
+        );
+    }
+
+    /// A snapshot is built without the event bus's lock, so it can lag the `Data` events
+    /// already folded here. The output cursor is monotonic; a late push must not rewind it
+    /// (a rewound cursor re-sends bytes the terminal has already drawn).
+    #[test]
+    fn a_late_snapshot_never_walks_the_output_cursor_backwards() {
+        let s = shadows();
+        apply_event_to_shadow(
+            &s,
+            &SessionEvent::Data {
+                uid: "u1".into(),
+                data: "abcd".into(),
+                cursor: 4,
+            },
+        );
+        let mut stale = meta("u1", None);
+        stale.output_bytes = 2;
+        reconcile_snapshot(&s, &[stale]);
+        assert_eq!(s.lock().unwrap().get("u1").unwrap().output_bytes, 4);
     }
 
     #[test]

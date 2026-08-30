@@ -674,6 +674,7 @@ mod tests {
             alive: true,
             cols: None,
             rows: None,
+            foreground: None,
         }
     }
 
