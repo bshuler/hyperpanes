@@ -59,6 +59,35 @@ pub enum Overlay {
 // scheme (in-process `pane-N` from a process-global counter — same cross-window uniqueness
 // the old `state.rs` counter guaranteed — vs daemon UUID for cross-RUN uniqueness, which
 // re-attach needs). See `session_manager::fresh_uid` and the plan's "uid stability".
+//
+// EXCEPT for non-pty view panes (file browser / viewer / markdown — `PaneKind::is_pty()`
+// false), which mint `view-N` here instead. A view pane has no pty, so handing it a
+// backend uid would put a phantom in front of `pane_load`, `has`, and the multi-window
+// `claim_session`/`release_session` arbitration — a uid the daemon would be asked about
+// forever and could never answer for. The `view-` prefix cannot alias either backend
+// scheme (`pane-N` / `pane-<uuid>`), which is what makes the gate a total function rather
+// than a convention. See the plan's D3.
+
+/// Process-global counter for `view-N`, matching `next_inproc_uid`'s rationale: two windows
+/// sharing one process must never mint the same view uid.
+static NEXT_VIEW_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// `view-0`, `view-1`, … — pane identity for a pane with no session behind it.
+fn fresh_view_uid() -> String {
+    format!(
+        "view-{}",
+        NEXT_VIEW_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    )
+}
+
+/// `mgr.kill(uid)` for a pane that actually has a session. A view pane's uid was never
+/// registered with the backend, so killing it would ask the daemon about a session it has
+/// never heard of. Every close/evict path routes through here so the gate is in ONE place.
+fn kill_session_of(mgr: &SessionManager, uid: &str, kind: &PaneKind) {
+    if kind.is_pty() {
+        mgr.kill(uid);
+    }
+}
 
 /// A session detached from its window for re-hosting in another (Wave-1 multi-window
 /// plumbing). Carries only the session `uid` + chrome; the PTY stays alive centrally in
@@ -1263,15 +1292,29 @@ impl State {
         idx: usize,
         opts: NewPaneOpts,
     ) -> Option<PaneState> {
-        // Mint via the backend so a daemon-backed pane gets a cross-run-unique uid (it may
-        // outlive this GUI run and be re-attached by uid next launch); in-process keeps the
-        // `pane-N` form. See `SessionManager::fresh_uid` / the plan's "uid stability".
-        let uid = mgr.fresh_uid();
         let palette = self.settings.frame_palette;
         let cwd = opts.cwd.filter(|c| !c.is_empty());
         let accent = opts.accent;
         // A command to run instead of an interactive shell ("" → interactive).
         let command = opts.command.filter(|c| !c.is_empty());
+        // What this pane IS is decided before anything else, because it decides the two
+        // questions below: which uid scheme, and whether a pty is spawned at all (D3).
+        // An explicit kind wins; otherwise the program we were asked to run names it.
+        let kind = opts.kind.clone().unwrap_or_else(|| {
+            command
+                .as_deref()
+                .map(PaneKind::for_command)
+                .unwrap_or_default()
+        });
+        // Mint via the backend so a daemon-backed pane gets a cross-run-unique uid (it may
+        // outlive this GUI run and be re-attached by uid next launch); in-process keeps the
+        // `pane-N` form. See `SessionManager::fresh_uid` / the plan's "uid stability".
+        // A view pane has no session to identify, so it mints locally instead.
+        let uid = if kind.is_pty() {
+            mgr.fresh_uid()
+        } else {
+            fresh_view_uid()
+        };
         // Shell: an explicit pick from the dialog is used verbatim; otherwise honour the
         // default-shell preference ("" = prefer pwsh when available, else core's default).
         let shell = match opts.shell {
@@ -1302,23 +1345,27 @@ impl State {
             })
             .flatten();
         let (cols, rows) = self.spawn_cells();
-        Self::spawn_session_async(
-            mgr,
-            SpawnOptions {
-                uid: uid.clone(),
-                cols: Some(cols),
-                rows: Some(rows),
-                pane_id: Some(uid.clone()),
-                cwd,
-                // Cloned so the resolved spawn spec is also kept on the PaneState (below) for the
-                // relaunch snapshot.
-                shell: shell.clone(),
-                command: command.clone(),
-                env: opts.env.clone(),
-                integration,
-                ..Default::default()
-            },
-        );
+        // A view pane renders into the same `surface` waist with nothing behind it — no pty,
+        // no backend registration, so no phantom session for the daemon to answer for (D3).
+        if kind.is_pty() {
+            Self::spawn_session_async(
+                mgr,
+                SpawnOptions {
+                    uid: uid.clone(),
+                    cols: Some(cols),
+                    rows: Some(rows),
+                    pane_id: Some(uid.clone()),
+                    cwd,
+                    // Cloned so the resolved spawn spec is also kept on the PaneState (below) for
+                    // the relaunch snapshot.
+                    shell: shell.clone(),
+                    command: command.clone(),
+                    env: opts.env.clone(),
+                    integration,
+                    ..Default::default()
+                },
+            );
+        }
         let mut pane = TerminalPane::new(
             cols as usize,
             rows as usize,
@@ -1377,17 +1424,12 @@ impl State {
             // The resolved shell program → its short header badge (computed once here).
             shell_label: shell_label(&shell_path),
             // Remember the spawn spec so the relaunch snapshot can re-run this program. A New
-            // Pane dialog carries no argv, so `spawn_args` stays None.
-            // An explicit kind wins; otherwise the program we were asked to run names it.
-            kind: opts.kind.clone().unwrap_or_else(|| {
-                command
-                    .as_deref()
-                    .map(PaneKind::for_command)
-                    .unwrap_or_default()
-            }),
-            spawn_command: command,
+            // Pane dialog carries no argv, so `spawn_args` stays None. A view pane never ran a
+            // program, so it records none — the snapshot restores it from its `kind` alone.
+            spawn_command: kind.is_pty().then_some(command).flatten(),
             spawn_args: None,
-            spawn_shell: shell,
+            spawn_shell: kind.is_pty().then_some(shell).flatten(),
+            kind,
         })
     }
 
@@ -1516,7 +1558,7 @@ impl State {
     pub fn close_pane_in(&mut self, ti: usize, idx: usize, mgr: &SessionManager) -> bool {
         match self.take_pane_in(ti, idx) {
             Some((ps, alive)) => {
-                mgr.kill(&ps.uid);
+                kill_session_of(mgr, &ps.uid, &ps.kind);
                 alive
             }
             None => true,
@@ -2005,13 +2047,13 @@ impl State {
         if self.tabs.len() <= 1 {
             // Last tab: kill its sessions and signal quit.
             for p in &self.tabs[idx].panes {
-                mgr.kill(&p.uid);
+                kill_session_of(mgr, &p.uid, &p.kind);
             }
             return false;
         }
         let tab = self.tabs.remove(idx);
         for p in &tab.panes {
-            mgr.kill(&p.uid);
+            kill_session_of(mgr, &p.uid, &p.kind);
         }
         if self.active >= self.tabs.len() {
             self.active = self.tabs.len() - 1;
@@ -3933,6 +3975,10 @@ impl State {
     /// is erased first — same clamp-safe sequence as typing — so the paste REPLACES it.
     pub fn paste_pane(&mut self, idx: usize, mgr: &SessionManager) {
         let payload = self.active_tab_mut().panes.get_mut(idx).and_then(|p| {
+            // Nothing to paste INTO on a view pane — there is no pty on the other end (D3).
+            if !p.kind.is_pty() {
+                return None;
+            }
             let text = p.pane.paste_from_clipboard()?;
             // Erase a prompt-line selection so the paste lands in its place; elsewhere just
             // drop the highlight (it must clear on paste, and a lingering "live" selection
@@ -3958,7 +4004,7 @@ impl State {
         // is text-only. Mirrors the explicit Alt+V gesture (`paste_image_focused`). Today a
         // Ctrl+V on an image-only clipboard was a silent no-op, so this only adds behavior.
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
-            if p.pane.clipboard_has_image() {
+            if p.kind.is_pty() && p.pane.clipboard_has_image() {
                 let uid = p.uid.clone();
                 p.pane.set_toast("Pasting image…");
                 mgr.write(&uid, "\u{16}");
@@ -3973,7 +4019,7 @@ impl State {
     /// documents for "your terminal intercepts Ctrl+V". Unconditional (the user knows there's an
     /// image): the app simply lets the focused program resolve the clipboard.
     pub fn paste_image_focused(&mut self, idx: usize, mgr: &SessionManager) {
-        if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
+        if let Some(p) = self.active_tab_mut().panes.get_mut(idx).filter(|p| p.kind.is_pty()) {
             let uid = p.uid.clone();
             p.pane.set_toast("Pasting image…");
             mgr.write(&uid, "\u{16}");
@@ -4074,6 +4120,9 @@ impl State {
         env: Option<hyperpanes_core::session::spawn::EnvMap>,
     ) {
         let (cols, rows) = match self.active_tab().panes.get(idx) {
+            // A view pane has no session to restart — restarting it would spawn a shell into a
+            // pane that renders no pty, and strand the `view-` uid it was found by (D3).
+            Some(p) if !p.kind.is_pty() => return,
             Some(p) => p.applied,
             None => return,
         };
@@ -4446,7 +4495,7 @@ impl State {
         while self.closed_tabs.len() > CLOSED_STACK_CAP {
             let evicted = self.closed_tabs.remove(0);
             for p in &evicted.panes {
-                mgr.kill(&p.uid);
+                kill_session_of(mgr, &p.uid, &p.kind);
             }
         }
     }
@@ -5103,6 +5152,22 @@ impl State {
         });
         let (cols, rows) = self.spawn_cells();
 
+        // A recorded kind is what the pane WAS, and outranks re-deriving it from the
+        // command: detection may have upgraded a shell pane to a tool pane after it was
+        // spawned, and that upgrade is precisely what the snapshot exists to preserve.
+        // Only a spec with no recorded kind — every file written before this feature —
+        // falls back to naming the kind from the program. Read here, before the re-attach
+        // decision, because a non-pty view pane skips that decision entirely (D3).
+        let kind = match spec.pane_kind() {
+            PaneKind::Terminal => spec
+                .command
+                .as_deref()
+                .map(PaneKind::for_command)
+                .unwrap_or_default(),
+            k => k,
+        };
+        let is_view = !kind.is_pty();
+
         // ---- M2 re-attach decision (session-daemon-plan "Reconnect / re-attach") ----
         // When the backend is the daemon AND the snapshot recorded this pane's session uid
         // AND that session is STILL ALIVE in the daemon (the program survived the last GUI
@@ -5114,11 +5179,17 @@ impl State {
         // The decision itself lives in core (`SessionManager::pane_load`) so every load path —
         // relaunch restore, Open workspace, Open set (M6) — branches identically, and so it can
         // be tested against a real daemon (`daemon_client::tests`).
-        let load = mgr.pane_load(spec.uid.as_deref());
-        let reattach = load.is_reattach();
-        // The restored pane keeps its snapshot uid when re-attaching (so it identifies the
-        // surviving session); a fresh spawn mints a new backend-appropriate uid.
-        let uid = load.uid().to_string();
+        // A view pane never had a session, so it never asks the backend about one — that
+        // question is exactly the phantom D3 exists to prevent. Its recorded uid is also
+        // deliberately NOT reused: `view-N` comes from a per-run counter, so honouring a
+        // restored `view-3` could collide with the next pane this run mints. Nothing keys
+        // off a view uid across runs, so a fresh one costs nothing and closes the class.
+        let (reattach, uid) = if is_view {
+            (false, fresh_view_uid())
+        } else {
+            let load = mgr.pane_load(spec.uid.as_deref());
+            (load.is_reattach(), load.uid().to_string())
+        };
 
         // ---- Claude conversation resume (the dead-session fallback) ----
         // The snapshot carries the pane's live conversation id as meta (claude_panes::META_KEY,
@@ -5215,7 +5286,7 @@ impl State {
             if let Some(replay) = mgr.replay(&uid) {
                 pane.feed(&replay);
             }
-        } else {
+        } else if !is_view {
             Self::spawn_session_async(
                 mgr,
                 SpawnOptions {
@@ -5249,19 +5320,6 @@ impl State {
             .map(|s| Settings::clamp_font(s as f32))
             .unwrap_or(self.settings.font_px);
         let font = theme::load_font_at(&self.settings.font_path(), font_px, self.last_scale);
-        // A recorded kind is what the pane WAS, and outranks re-deriving it from the
-        // command: detection may have upgraded a shell pane to a tool pane after it was
-        // spawned, and that upgrade is precisely what the snapshot exists to preserve.
-        // Only a spec with no recorded kind — every file written before this feature —
-        // falls back to naming the kind from the program.
-        let kind = match spec.pane_kind() {
-            PaneKind::Terminal => spec
-                .command
-                .as_deref()
-                .map(PaneKind::for_command)
-                .unwrap_or_default(),
-            k => k,
-        };
         Some(PaneState {
             uid,
             kind,
@@ -5302,9 +5360,9 @@ impl State {
             shell_label: shell_label(&shell_path),
             // Carry the spawned program forward so a later relaunch snapshot still records it
             // (the spec's command/args + the resolved shell).
-            spawn_command: spec.command.clone(),
-            spawn_args: spec.args.clone(),
-            spawn_shell: shell,
+            spawn_command: (!is_view).then(|| spec.command.clone()).flatten(),
+            spawn_args: (!is_view).then(|| spec.args.clone()).flatten(),
+            spawn_shell: (!is_view).then_some(shell).flatten(),
         })
     }
 }
@@ -6321,6 +6379,155 @@ mod reminder_tests {
         // a Custom 90 min from 23:00 rolls over midnight too.
         let (d, l) = due_for(23 * 3600, ReminderOffset::Custom(90));
         assert_eq!((d, l.as_str()), (90 * 60_000, "tomorrow 00:30"));
+    }
+}
+
+#[cfg(test)]
+mod view_pane_tests {
+    //! D3 — a non-pty view pane (file browser / viewer / markdown) is pane identity WITHOUT
+    //! session identity. `PaneState.uid` is doing four jobs at once — the `SessionManager`
+    //! registry key, `HYPERPANES_PANE_ID`, the Claude hook's marker filename, and the
+    //! `PaneSpec` re-attach key — so handing a view pane a backend uid would put a phantom
+    //! in front of `pane_load`, `has`, and the cross-window `claim_session` arbitration:
+    //! a uid the daemon is asked about forever and can never answer for.
+    //!
+    //! These tests pin the two halves of the fix: the uid SCHEME (`view-N`, which cannot
+    //! alias `pane-N` or `pane-<uuid>`) and the GATE (`kind.is_pty()` in front of every
+    //! backend call). The second is what actually matters; the first is what makes it
+    //! checkable.
+    use super::*;
+
+    fn mgr() -> SessionManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionManager::new(tx)
+    }
+
+    fn view_opts(kind: PaneKind) -> NewPaneOpts {
+        NewPaneOpts {
+            kind: Some(kind),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_view_pane_mints_a_view_uid_not_a_session_uid() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        let uid = st
+            .add_pane_opts(&m, view_opts(PaneKind::FileBrowser))
+            .expect("view pane added");
+        assert!(
+            uid.starts_with("view-"),
+            "a pane with no pty must not carry a backend uid, got {uid}"
+        );
+    }
+
+    // Spawns a real pty (that is the point — the contrast case), so it needs a runtime.
+    #[tokio::test]
+    async fn a_terminal_pane_still_mints_a_session_uid() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        let uid = st
+            .add_pane_opts(&m, NewPaneOpts::default())
+            .expect("terminal pane added");
+        assert!(
+            uid.starts_with("pane-"),
+            "a pty-backed pane keeps the backend scheme, got {uid}"
+        );
+    }
+
+    #[test]
+    fn view_uids_are_unique_within_a_window() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        let a = st.add_pane_opts(&m, view_opts(PaneKind::Markdown)).unwrap();
+        let b = st.add_pane_opts(&m, view_opts(PaneKind::Markdown)).unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_view_pane_records_no_program_to_relaunch() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        // Even asked to run something, a pane declared a view runs nothing: the explicit
+        // kind is the authority, and a relaunch must not resurrect a program the pane
+        // never started.
+        st.add_pane_opts(
+            &m,
+            NewPaneOpts {
+                kind: Some(PaneKind::FileViewer),
+                command: Some("claude".into()),
+                ..Default::default()
+            },
+        );
+        let p = st.active_tab().panes.last().unwrap();
+        assert_eq!(p.kind, PaneKind::FileViewer);
+        assert_eq!(p.spawn_command, None, "a view pane relaunches no program");
+        assert_eq!(p.spawn_shell, None);
+    }
+
+    #[test]
+    fn a_view_pane_is_not_registered_with_the_backend() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        let uid = st.add_pane_opts(&m, view_opts(PaneKind::FileBrowser)).unwrap();
+        assert!(
+            !m.has(&uid),
+            "a view pane must leave no session behind it for the manager to answer for"
+        );
+    }
+
+    #[test]
+    fn restarting_a_view_pane_does_nothing() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        let uid = st.add_pane_opts(&m, view_opts(PaneKind::Markdown)).unwrap();
+        st.restart_pane(0, &m);
+        let p = st.active_tab().panes.last().unwrap();
+        assert_eq!(p.uid, uid, "a restart must not strand the pane's identity");
+        assert_eq!(p.kind, PaneKind::Markdown, "nor change what the pane is");
+        assert!(!m.has(&p.uid), "nor spawn a shell into a pane with no pty");
+    }
+
+    #[test]
+    fn a_restored_view_pane_asks_the_backend_nothing() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        st.attach_panes_from_specs(
+            &m,
+            &[PaneSpec {
+                // The recorded uid is deliberately ignored: `view-N` is per-run, so honouring
+                // a stale one could collide with the next pane this run mints.
+                uid: Some("view-99".into()),
+                meta: Some(
+                    [(
+                        hyperpanes_core::tools::kind::META_KIND_KEY.to_string(),
+                        "view:markdown".to_string(),
+                    )]
+                        .into_iter()
+                        .collect(),
+                ),
+                ..Default::default()
+            }],
+        );
+        let p = st.active_tab().panes.last().unwrap();
+        assert_eq!(p.kind, PaneKind::Markdown, "the recorded kind is restored");
+        assert!(p.uid.starts_with("view-"));
+        assert!(!m.has(&p.uid), "restore must not spawn a pty for a view pane");
+    }
+
+    #[test]
+    fn closing_a_view_pane_kills_no_session() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        // Two views, so the close is not the last pane of the last tab — and so the whole
+        // test stays pty-free, which is itself the assertion: none of this needs a runtime.
+        st.add_pane_opts(&m, view_opts(PaneKind::Markdown));
+        let view = st.add_pane_opts(&m, view_opts(PaneKind::FileBrowser)).unwrap();
+        // The gate is `kill_session_of`; what it protects is the daemon being asked to kill a
+        // uid it never issued.
+        assert!(st.close_pane_in(0, 1, &m), "window survives the close");
+        assert!(!st.active_tab().panes.iter().any(|p| p.uid == view));
     }
 }
 
