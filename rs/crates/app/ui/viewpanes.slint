@@ -201,10 +201,13 @@ component ViewRowView inherits Rectangle {
 
     // --- 3 (and anything unknown): a plain line, with the viewer's line number ---
     if root.item.role == 3 || root.item.role > 11 : HorizontalLayout {
-        padding-left: 6px;
+        // Markdown prose lands on this role too, and it carries no line number.
+        // Reserving the gutter for it indents every paragraph ~40px past the
+        // headings and bullets around it, which reads as accidental centring.
+        padding-left: root.item.detail == "" ? 8px : 6px;
         padding-right: 8px;
         spacing: 8px;
-        Text {
+        if root.item.detail != "" : Text {
             // A fixed gutter so the numbers form a column instead of ragging with
             // their digit count.
             width: 34px;
