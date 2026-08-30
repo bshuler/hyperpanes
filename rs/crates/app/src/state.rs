@@ -792,6 +792,20 @@ pub struct State {
     /// Whether the projects flyout (behind the 📁 icon) is currently expanded. The rail
     /// itself is gated by `settings.show_sidebar`; this is just the flyout panel state.
     pub sidebar_open: bool,
+    /// Whether the LEFT slide-out panel (workspace tree / library / detached sessions) is
+    /// open. Like `sidebar_open` this is pure window UI state — not persisted — and the
+    /// panel is a sibling of the pane area, so opening it shrinks the panes rather than
+    /// covering them. See `crate::leftpanel` + `ui/leftpanel.slint`.
+    pub left_panel_open: bool,
+    /// This window's last-seen `left_panel_open`, so the projection can spot the closed→open
+    /// edge and rescan the workspace library exactly once. Per WINDOW (not a module global):
+    /// `resync` runs per window, and two windows disagreeing about the panel would otherwise
+    /// flip a shared flag every tick and rescan the directory every frame.
+    pub left_panel_seen_open: bool,
+    /// When this window last aged the panel's liveness dots. Also per window, for the same
+    /// reason — a shared stamp is consumed by whichever window is pumped first, freezing
+    /// every other window's dots. See `leftpanel::heartbeat_due`.
+    pub left_panel_beat: Option<std::time::Instant>,
     // ---- command palette working state ----
     /// The registry snapshot built when the palette opened.
     palette_entries: Vec<Entry>,
@@ -976,6 +990,9 @@ impl State {
             pending_goals: Vec::new(),
             goal_account_cursor: 0,
             sidebar_open: false,
+            left_panel_open: false,
+            left_panel_seen_open: false,
+            left_panel_beat: None,
             palette_entries: Vec::new(),
             palette_view: Vec::new(),
             palette_sel: 0,
@@ -2872,6 +2889,94 @@ impl State {
         self.dirty = true;
     }
 
+    // ---- the left slide-out panel (mux plan M5) ----
+
+    /// Toggle the left panel; refresh the workspace library when opening it (the same
+    /// closed→open refresh the projects flyout does, so a workspace saved from another
+    /// window shows up without a restart).
+    pub fn toggle_left_panel(&mut self) {
+        self.left_panel_open = !self.left_panel_open;
+        if self.left_panel_open {
+            crate::leftpanel::refresh_library();
+        }
+        self.dirty = true;
+    }
+
+    /// Focus pane `idx` of tab `ti` from the panel's workspace tree: switch to that tab
+    /// first (a tree click on a background tab's pane means "take me there"), then focus.
+    /// Out-of-range indices are ignored — they arrive from a UI model snapshot.
+    pub fn focus_pane_in_tab(&mut self, ti: usize, idx: usize) {
+        if ti >= self.tabs.len() || idx >= self.tabs[ti].panes.len() {
+            return;
+        }
+        self.switch_tab(ti);
+        self.focus_pane(idx);
+    }
+
+    /// Every session uid THIS window is holding ALIVE — laid out in any tab, parked as a
+    /// reminder, or sitting on the reopen (closed-tab) stack. The left panel subtracts these
+    /// to decide which live sessions are detached.
+    ///
+    /// The set is [`Self::session_uids`]'s, deliberately: that is the list this window kills
+    /// when it closes, i.e. the exact inventory of sessions it is responsible for. A closed
+    /// tab's panes belong in it — their PTYs are still running so "Reopen closed tab" can
+    /// bring them back — and leaving them out would offer them in the panel's DETACHED list,
+    /// where one click would re-host a session the reopen stack still points at (reopening
+    /// the tab afterwards would then duplicate the uid in two panes).
+    pub fn claimed_uids(&self) -> std::collections::HashSet<String> {
+        self.session_uids().into_iter().collect()
+    }
+
+    /// Save the active tab into the panel's workspace library (no file dialog — that's what
+    /// the library is for). Named after the tab; a collision gets a numeric suffix rather
+    /// than overwriting the earlier snapshot.
+    pub fn save_workspace_to_library(&mut self) {
+        let file = self.to_workspace_file();
+        let name = self.active_tab().title.to_string();
+        if crate::leftpanel::save_to_library(&name, &file).is_none() {
+            eprintln!("[hyperpanes] failed to save workspace into the library");
+        }
+        self.dirty = true;
+    }
+
+    /// Load library row `i` (the panel's LIBRARY list order): read the file and append its
+    /// groups as new tabs, exactly as the "Open workspace…" dialog path does.
+    pub fn open_workspace_from_library(&mut self, i: usize, mgr: &SessionManager) {
+        let Some(entry) = crate::leftpanel::library().into_iter().nth(i) else {
+            return;
+        };
+        let Some(file) = read_workspace(&entry.path) else {
+            eprintln!(
+                "[hyperpanes] {} is not a valid workspace",
+                entry.path.display()
+            );
+            // The row is stale (deleted or corrupted since the scan) — rescan so it goes.
+            crate::leftpanel::refresh_library();
+            self.dirty = true;
+            return;
+        };
+        self.load_workspace(file, mgr);
+    }
+
+    /// Adopt detached session `uid` into the active tab: a re-attach, not a respawn — the
+    /// spec carries the uid, so `make_pane_from_spec` re-hosts the live session and seeds
+    /// the fresh grid from its replay buffer. Ignored if this window is already holding the
+    /// session anywhere — laid out, parked as a reminder, or on the reopen stack (see
+    /// [`Self::claimed_uids`]); adopting one of those would give the same uid two homes.
+    pub fn adopt_detached_session(&mut self, uid: &str, mgr: &SessionManager) {
+        if uid.is_empty() || self.claimed_uids().contains(uid) {
+            return;
+        }
+        self.attach_panes_from_specs(
+            mgr,
+            &[PaneSpec {
+                uid: Some(uid.to_string()),
+                ..Default::default()
+            }],
+        );
+        self.dirty = true;
+    }
+
     /// Reload the cached project rail from core after the control plane changed
     /// `projects.json` off the UI thread (an MCP `add_project` / rename / recolor / remove,
     /// or a project-opening pane bumping recency). Same refresh seam the in-app project
@@ -3793,7 +3898,13 @@ impl State {
     /// session stays alive centrally for replay-primed re-host). An emptied tab is dropped by
     /// [`Self::take_pane_in`], which also fixes the active index.
     fn detach_pane_idx(&mut self, idx: usize) -> Option<DetachedPane> {
-        let (ps, _alive) = self.take_pane_in(self.active, idx)?;
+        self.detach_pane_in(self.active, idx)
+    }
+
+    /// [`Self::detach_pane_idx`] for an arbitrary tab — the left panel's workspace tree can
+    /// drag a pane out of a BACKGROUND tab, which the active-tab-only path can't express.
+    fn detach_pane_in(&mut self, ti: usize, idx: usize) -> Option<DetachedPane> {
+        let (ps, _alive) = self.take_pane_in(ti, idx)?;
         Some(DetachedPane {
             uid: ps.uid,
             title: ps.title,
@@ -3916,6 +4027,49 @@ impl State {
         };
         let mut target = target;
         if self.tabs.len() < before && src < target {
+            target -= 1;
+        }
+        if target >= self.tabs.len() {
+            return;
+        }
+        self.adopt_into_tab(mgr, dp, target);
+    }
+
+    /// Move pane `idx` of tab `from` into tab `target` — the general form of
+    /// [`Self::move_pane_to_tab`], which can only move out of the ACTIVE tab. Used by the
+    /// left panel's workspace tree, where any pane of any tab can be dragged onto any other
+    /// tab. Like the menu path it neither switches tabs nor restarts the PTY (the session is
+    /// detached and re-hosted replay-primed), and it handles the source tab being dropped
+    /// when its last pane leaves (which shifts `target` when the source sat before it).
+    ///
+    /// Both indices are re-validated here because they arrive from a UI model snapshot: the
+    /// tree the user dragged in is whatever `resync` last projected, and a session could
+    /// have exited in between.
+    pub fn move_pane_between_tabs(
+        &mut self,
+        from: usize,
+        idx: usize,
+        target: usize,
+        mgr: &SessionManager,
+    ) {
+        if from >= self.tabs.len() || target >= self.tabs.len() || from == target {
+            return;
+        }
+        if idx >= self.tabs[from].panes.len() {
+            return;
+        }
+        // Moving out of the active tab is exactly the menu path — reuse it so the two can
+        // never drift apart.
+        if from == self.active {
+            self.move_pane_to_tab(idx, target, mgr);
+            return;
+        }
+        let before = self.tabs.len();
+        let Some(dp) = self.detach_pane_in(from, idx) else {
+            return;
+        };
+        let mut target = target;
+        if self.tabs.len() < before && from < target {
             target -= 1;
         }
         if target >= self.tabs.len() {
@@ -5663,5 +5817,226 @@ mod reminder_tests {
         // a Custom 90 min from 23:00 rolls over midnight too.
         let (d, l) = due_for(23 * 3600, ReminderOffset::Custom(90));
         assert_eq!((d, l.as_str()), (90 * 60_000, "tomorrow 00:30"));
+    }
+}
+
+#[cfg(test)]
+mod left_panel_tests {
+    //! M5 — the left slide-out panel's STATE side: the workspace tree's click-to-focus and
+    //! drag-between-tabs, the "what is this window holding?" question the DETACHED section
+    //! subtracts, and the guards on adopt. The projection itself (`paneview::resync`) and
+    //! the panel's geometry live in `ui/leftpanel.slint`; everything reachable without a
+    //! window is pinned here.
+    use super::*;
+
+    fn fresh() -> State {
+        State::new(theme::load_font(1.0))
+    }
+
+    fn mgr() -> SessionManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionManager::new(tx)
+    }
+
+    fn det(uid: &str) -> DetachedPane {
+        DetachedPane {
+            uid: uid.into(),
+            title: uid.into(),
+            subtitle: None,
+            pinned_accent: None,
+            show_frame: None,
+            show_dot: None,
+            font_px: 14.0,
+            spawn_command: None,
+            spawn_args: None,
+            spawn_shell: None,
+        }
+    }
+
+    /// A window of `tabs` tabs, tab *i* holding the uids in `tabs[i]`. Built without
+    /// spawning anything: `adopt_pane*` re-hosts a detached pane, which is all a tree test
+    /// needs. Leaves the LAST tab active (that is what `adopt_pane_as_tab` does).
+    fn window(m: &SessionManager, tabs: &[&[&str]]) -> State {
+        let mut st = fresh();
+        for (i, uids) in tabs.iter().enumerate() {
+            if i > 0 {
+                st.adopt_pane_as_tab(m, det(uids[0]));
+                for u in &uids[1..] {
+                    st.adopt_pane(m, det(u));
+                }
+            } else {
+                for u in uids.iter() {
+                    st.adopt_pane(m, det(u));
+                }
+            }
+        }
+        st
+    }
+
+    fn uids_in(st: &State, ti: usize) -> Vec<String> {
+        st.tabs[ti]
+            .panes
+            .iter()
+            .map(|p| p.uid.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn tree_click_switches_to_the_tab_then_focuses_the_pane() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"], &["b0"]]);
+        assert_eq!(st.active, 1, "the helper leaves the last tab active");
+
+        // A click on a BACKGROUND tab's second pane means "take me there".
+        st.focus_pane_in_tab(0, 1);
+        assert_eq!(st.active, 0);
+        assert_eq!(st.active_tab().focused, 1);
+
+        // Out-of-range indices arrive from a UI model snapshot — they must be ignored, not
+        // clamped onto the wrong pane.
+        st.focus_pane_in_tab(9, 0);
+        assert_eq!((st.active, st.active_tab().focused), (0, 1));
+        st.focus_pane_in_tab(1, 5);
+        assert_eq!(
+            (st.active, st.active_tab().focused),
+            (0, 1),
+            "no tab switch either"
+        );
+    }
+
+    #[test]
+    fn drag_moves_a_pane_between_two_background_tabs() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"], &["b0"], &["c0"]]);
+        assert_eq!(st.active, 2);
+
+        // Neither end of the drag is the active tab — the case `move_pane_to_tab` cannot
+        // express, and the reason `move_pane_between_tabs` exists.
+        st.move_pane_between_tabs(0, 0, 1, &m);
+        assert_eq!(uids_in(&st, 0), ["a1"]);
+        assert_eq!(
+            uids_in(&st, 1),
+            ["b0", "a0"],
+            "appended at the end of the target"
+        );
+        assert_eq!(st.active, 2, "a tree drag never steals the active tab");
+        // A move is a re-host, not a respawn: the session is still this window's.
+        assert!(st.claimed_uids().contains("a0"));
+    }
+
+    #[test]
+    fn dragging_the_last_pane_out_drops_the_tab_and_shifts_the_target() {
+        let m = mgr();
+        // Tab 0 holds a single pane; dragging it into tab 1 empties tab 0, which is dropped —
+        // so the target index the UI sent (1) now names a DIFFERENT tab. Without the shift
+        // the pane lands in the wrong workspace, which is the whole bug this guards.
+        let mut st = window(&m, &[&["a0"], &["b0"], &["c0"]]);
+        assert_eq!(st.active, 2);
+
+        st.move_pane_between_tabs(0, 0, 1, &m);
+        assert_eq!(st.tabs.len(), 2, "the emptied source tab is dropped");
+        assert_eq!(
+            uids_in(&st, 0),
+            ["b0", "a0"],
+            "landed in the tab that WAS index 1"
+        );
+        assert_eq!(uids_in(&st, 1), ["c0"]);
+        assert_eq!(st.active, 1, "the active tab followed its own shift");
+    }
+
+    #[test]
+    fn dragging_out_of_the_active_tab_takes_the_shared_move_path() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"], &["b0"]]);
+        assert_eq!(st.active, 1);
+
+        st.move_pane_between_tabs(1, 0, 0, &m);
+        // Tab 1 emptied → dropped; its pane is now in tab 0.
+        assert_eq!(st.tabs.len(), 1);
+        assert_eq!(uids_in(&st, 0), ["a0", "a1", "b0"]);
+        assert_eq!(st.active, 0);
+    }
+
+    #[test]
+    fn a_stale_drag_is_ignored_rather_than_clamped() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"], &["b0"]]);
+        let before: Vec<Vec<String>> = (0..st.tabs.len()).map(|i| uids_in(&st, i)).collect();
+
+        st.move_pane_between_tabs(0, 0, 0, &m); // onto itself
+        st.move_pane_between_tabs(9, 0, 1, &m); // source tab gone
+        st.move_pane_between_tabs(0, 9, 1, &m); // pane gone (session exited mid-drag)
+        st.move_pane_between_tabs(0, 0, 9, &m); // target tab gone
+
+        let after: Vec<Vec<String>> = (0..st.tabs.len()).map(|i| uids_in(&st, i)).collect();
+        assert_eq!(before, after, "no snapshot-stale drag may move anything");
+    }
+
+    #[test]
+    fn claimed_uids_covers_every_place_a_session_is_held() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"], &["b0", "b1"]]);
+
+        // laid out in a background tab AND in the active one
+        let claimed = st.claimed_uids();
+        for u in ["a0", "a1", "b0", "b1"] {
+            assert!(claimed.contains(u), "{u} is laid out");
+        }
+
+        // parked as a reminder — still alive, so still claimed
+        st.remind_pane(0, ReminderOffset::Min15);
+        assert_eq!(st.reminders.len(), 1);
+        assert!(st.claimed_uids().contains("b0"));
+
+        // …and on the reopen (closed-tab) stack, whose PTYs stay alive for reopen. Missing
+        // these would offer them in the DETACHED list and let one click give a uid two homes.
+        st.close_tab_menu(0, &m);
+        assert!(
+            !st.closed_tabs.is_empty(),
+            "closing parked the tab for reopen"
+        );
+        let claimed = st.claimed_uids();
+        assert!(
+            claimed.contains("a0") && claimed.contains("a1"),
+            "{claimed:?}"
+        );
+        // Exactly the set this window kills when it closes — no more, no less.
+        let killed: std::collections::HashSet<String> = st.session_uids().into_iter().collect();
+        assert_eq!(claimed, killed);
+    }
+
+    #[test]
+    fn adopt_refuses_a_session_this_window_already_holds() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"], &["b0"]]);
+        let before = st.claimed_uids();
+
+        st.adopt_detached_session("", &m); // no uid
+        st.adopt_detached_session("a0", &m); // laid out in a background tab
+        st.adopt_detached_session("b0", &m); // laid out in the active tab
+        assert_eq!(st.claimed_uids(), before);
+        assert_eq!(uids_in(&st, 1), ["b0"], "no duplicate pane appeared");
+
+        // A pane on the reopen stack is held too — adopting it would give the uid two homes.
+        st.close_tab_menu(0, &m);
+        let before = st.claimed_uids();
+        st.adopt_detached_session("a0", &m);
+        assert_eq!(st.claimed_uids(), before);
+        assert_eq!(st.active_tab().panes.len(), 1, "nothing was re-hosted");
+    }
+
+    #[test]
+    fn toggling_the_panel_is_pure_window_state() {
+        let mut st = fresh();
+        assert!(!st.left_panel_open);
+        st.dirty = false;
+        st.toggle_left_panel();
+        assert!(st.left_panel_open && st.dirty);
+        st.dirty = false;
+        st.toggle_left_panel();
+        assert!(!st.left_panel_open && st.dirty);
+        // The panel is a sibling of the pane area, not an overlay: toggling it must never
+        // touch the overlay slot (which is what would dim the terminals behind a scrim).
+        assert!(matches!(st.overlay, Overlay::None));
     }
 }

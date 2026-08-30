@@ -288,3 +288,78 @@ export struct FramePaletteOption {
     active: bool,
     colors: [color],
 }
+
+// ===== M5: the left slide-out panel (see leftpanel.slint / app/src/leftpanel.rs) =====
+
+// One pane row under a tab in the panel's workspace tree. `uid` is the pane's session uid
+// (index-free identity, used by the drag + the detached-list subtraction); `tint` is the
+// pane's accent; `live` is the LIVENESS dot's strength (1 = output right now, fading to 0
+// across `leftpanel::LIVE_WINDOW_MS`), computed from the SAME activity source the idle glow
+// uses (`SessionManager::last_output_at` vs `glow::now_epoch_ms`) — not a second source.
+// `idle` mirrors the pane's own idle-glow arming (an AI pane quiet past the alert
+// threshold), so the tree flags the pane that's waiting for you.
+// Declared before `LeftTabRow` because that struct references it (Slint resolves struct
+// types top-to-bottom within a file — no forward references).
+export struct LeftPaneRow {
+    uid: string,
+    title: string,
+    tint: color,
+    focused: bool,
+    live: float,
+    idle: bool,
+}
+
+// One tab (workspace group) in the panel's tree: its title plus its panes.
+export struct LeftTabRow {
+    title: string,
+    active: bool,
+    panes: [LeftPaneRow],
+}
+
+// One saved workspace in the library section. `path` is the file on disk (the row's real
+// identity — the click still travels by index, resolved against the same cached list the
+// projection built); `detail` is a dim one-liner ("4 panes · 2h ago").
+export struct LeftWorkspaceRow {
+    name: string,
+    path: string,
+    detail: string,
+}
+
+// One live session that no window in this process is showing — adoptable with one click.
+// `uid` is the session uid (the adopt key: index-free, so a row click can't race a list
+// change); `detail` is a dim one-liner ("pane-1a2b… · 5m ago").
+export struct LeftSessionRow {
+    uid: string,
+    label: string,
+    detail: string,
+    live: float,
+}
+
+// The controller ↔ left-panel bridge. A GLOBAL (not AppWindow props) so the feature stays
+// self-contained in leftpanel.slint/types.slint: the projection (`paneview::resync`) pushes
+// `open` + the three sections' rows, and `app.rs` subscribes to the callbacks via
+// `app.global::<LeftPanelAdapter>()` — the same self-contained wiring `RemindersAdapter`
+// uses, with no new callbacks threaded through app.slint's component tree.
+export global LeftPanelAdapter {
+    // Whether the panel is showing (mirrors `State::left_panel_open`; the width binding
+    // lives in app.slint, exactly like the right rail's).
+    in property <bool> open;
+    // Section 1: this window's tabs, in tab-strip order, each carrying its panes.
+    in property <[LeftTabRow]> tabs;
+    // Section 2: the saved-workspace library (newest-first).
+    in property <[LeftWorkspaceRow]> workspaces;
+    // Section 3: live sessions no window is showing (newest-first).
+    in property <[LeftSessionRow]> detached;
+    // Panel header ×  → close the panel.
+    callback toggle();
+    // A pane row clicked → switch to tab `0` and focus its pane `1`.
+    callback focus-pane(int, int);
+    // A pane row dragged onto another tab → move pane `1` of tab `0` into tab `2`.
+    callback move-pane(int, int, int);
+    // A library row clicked → load saved workspace `0` (index into `workspaces`).
+    callback open-workspace(int);
+    // The library header's ＋ → save the active tab into the library.
+    callback save-workspace();
+    // A detached row clicked → adopt session `0` into the active tab.
+    callback adopt-session(string);
+}

@@ -33,6 +33,7 @@ mod drag;
 mod glow;
 mod history_scan;
 mod keybindings;
+mod leftpanel;
 mod pair;
 mod palette;
 mod paneview;

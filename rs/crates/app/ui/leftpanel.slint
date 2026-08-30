@@ -1,0 +1,634 @@
+// The left slide-out panel (mux plan M5) — the workspace tree, the saved-workspace
+// library, and the detached (adoptable) sessions.
+//
+//   ┌─────────────┬──────────  a 300px panel living to the LEFT of the pane area, a real
+//   │ PANELS     ×│  panes     SIBLING of it (exactly like the right-edge rail): NOT an
+//   │ ▾ WORKSPACE │            overlay, so there is no scrim and the panes are never
+//   │  ▾ term 1   │            dimmed — the pane area simply shrinks. Toggled by a
+//   │    ● claude │            `Command` (`ToggleLeftPanel`, Seam #2); every row it draws
+//   │    ● shell  │            is projected by `paneview::resync` (Seam #1) into the
+//   │ ▾ LIBRARY  💾            `LeftPanelAdapter` global, mirroring the way the rail's
+//   │ ▾ DETACHED  │            reminder section is fed.
+//   └─────────────┴──────────
+//
+// Section 1 — WORKSPACE: a two-level tree (tab → its panes). Clicking a pane switches to
+// its tab and focuses it; DRAGGING a pane onto another tab's group moves it there (the
+// panel hit-tests the drop itself, in absolute window coordinates, and hands the
+// controller a (from-tab, pane, to-tab) triple). Each pane carries a liveness dot fed by
+// the same activity source the idle glow uses.
+// Section 2 — LIBRARY: the saved workspaces on disk; one click loads one, the header's
+// save button writes the current tab into the library.
+// Section 3 — DETACHED: live sessions no window in this process is showing; one click
+// adopts one back into the active tab.
+//
+// Every icon here is DRAWN geometry (Path / composed Rectangles), never a font glyph:
+// Slint on Windows silently drops codepoints the resolved font lacks (the df73005 chevron
+// failure), so a PUA icon renders as nothing at all.
+
+import { Theme } from "theme.slint";
+import { LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSessionRow, LeftPanelAdapter } from "types.slint";
+
+// A disclosure chevron: pointing down when the section is open, right when it is closed.
+component ChevronGlyph inherits Path {
+    in property <color> ink;
+    in property <bool> open;
+    width: 10px;
+    height: 10px;
+    viewbox-width: 12;
+    viewbox-height: 12;
+    stroke: ink;
+    stroke-width: 1.7px;
+    fill: transparent;
+    commands: root.open
+        ? "M 2.5 4.5 L 6 8 L 9.5 4.5"
+        : "M 4.5 2.5 L 8 6 L 4.5 9.5";
+}
+
+// The panel's × (close) — two crossed strokes.
+component CloseGlyph inherits Path {
+    in property <color> ink;
+    width: 12px;
+    height: 12px;
+    viewbox-width: 12;
+    viewbox-height: 12;
+    stroke: ink;
+    stroke-width: 1.5px;
+    fill: transparent;
+    commands: "M 2 2 L 10 10 M 10 2 L 2 10";
+}
+
+// A floppy-disk "save" glyph (stroked body + shutter + label) for the LIBRARY header.
+component SaveGlyph inherits Path {
+    in property <color> ink;
+    width: 14px;
+    height: 14px;
+    viewbox-width: 16;
+    viewbox-height: 16;
+    stroke: ink;
+    stroke-width: 1.3px;
+    fill: transparent;
+    commands: "M 2.5 2.5 L 11 2.5 L 13.5 5 L 13.5 13.5 L 2.5 13.5 Z M 5.5 2.5 L 5.5 6.3 L 10.3 6.3 L 10.3 2.5 M 4.8 13.5 L 4.8 9.3 L 11.2 9.3 L 11.2 13.5";
+}
+
+// An "adopt" glyph: an arrow entering a bracket — take this loose session INTO the window.
+component AdoptGlyph inherits Path {
+    in property <color> ink;
+    width: 14px;
+    height: 14px;
+    viewbox-width: 16;
+    viewbox-height: 16;
+    stroke: ink;
+    stroke-width: 1.3px;
+    fill: transparent;
+    commands: "M 2 8 L 9.5 8 M 6.4 4.9 L 9.6 8 L 6.4 11.1 M 11.5 3 L 14 3 L 14 13 L 11.5 13";
+}
+
+// The per-pane liveness dot. Its strength is the controller's `live` (1 = output right
+// now, fading toward 0 across the liveness window — computed in `leftpanel::liveness`
+// from `SessionManager::last_output_at`, the SAME source the idle glow reads; there is no
+// second activity source in the app). A pane whose idle glow has armed (an AI pane quiet
+// past the alert threshold) overrides the fade with a ringed accent dot, so the tree flags
+// the pane that is waiting for you even when it is scrolled off screen.
+component LiveDot inherits Rectangle {
+    in property <float> live;
+    in property <bool> idle;
+    in property <color> tint;
+    width: 9px;
+    height: 9px;
+    border-radius: 4.5px;
+    background: root.idle ? Theme.accent : root.tint;
+    // never fully invisible: a quiet pane still needs its color chip.
+    opacity: root.idle ? 1.0 : max(0.22, root.live);
+    border-width: root.idle ? 1.5px : 0px;
+    border-color: Theme.text;
+}
+
+// One pane row in the workspace tree. Click = focus; press-and-drag = move to another tab
+// (the drag is reported in ABSOLUTE window coordinates, which the tab groups hit-test).
+component PaneRowView inherits Rectangle {
+    in property <LeftPaneRow> pane;
+    // True while this row is the one being dragged (dims it, so the drop target reads).
+    in property <bool> dragging;
+    callback activate();
+    callback drag-moved(length);   // absolute y of the pointer
+    callback drag-released();
+
+    // Whether the current press has already turned into a drag — set once past the 4px of
+    // slop, and consulted by `clicked` so releasing a drag over the source row does not
+    // also focus it (Slint delivers `clicked` after the pointer-up).
+    property <bool> dragged: false;
+    property <length> press-y: 0;
+
+    height: 26px;
+    border-radius: 5px;
+    background: root.dragging ? Theme.surface : (ta.has-hover ? Theme.surface2 : transparent);
+    opacity: root.dragging ? 0.55 : 1.0;
+
+    ta := TouchArea {
+        mouse-cursor: pointer;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) {
+                root.dragged = false;
+                // Imperative read inside an event handler, NOT a reactive binding: reading
+                // `absolute-position` from a binding during layout trips Slint's recursion
+                // guard (see the note in topbar.slint).
+                root.press-y = self.absolute-position.y + self.mouse-y;
+            }
+            if (e.kind == PointerEventKind.up && root.dragged) {
+                root.drag-released();
+            }
+        }
+        moved => {
+            if (self.pressed) {
+                // 4px of slop, so a shaky click still focuses instead of arming a drag.
+                if (self.absolute-position.y + self.mouse-y > root.press-y + 4px
+                    || self.absolute-position.y + self.mouse-y < root.press-y - 4px) {
+                    root.dragged = true;
+                }
+                if (root.dragged) {
+                    root.drag-moved(self.absolute-position.y + self.mouse-y);
+                }
+            }
+        }
+        clicked => {
+            if (!root.dragged) { root.activate(); }
+        }
+    }
+
+    HorizontalLayout {
+        padding-left: 22px;      // indent, under the tab's chevron
+        padding-right: 8px;
+        spacing: 7px;
+
+        VerticalLayout {
+            alignment: center;
+            LiveDot {
+                live: root.pane.live;
+                idle: root.pane.idle;
+                tint: root.pane.tint;
+            }
+        }
+
+        Text {
+            text: root.pane.title;
+            color: root.pane.focused ? Theme.text : Theme.subtext;
+            font-size: 12px;
+            font-weight: root.pane.focused ? 700 : 400;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+            overflow: elide;
+        }
+    }
+}
+
+// One tab group in the workspace tree: the tab header plus its pane rows. The WHOLE group
+// is the drop zone for a pane drag (a far easier target than the header alone), and it
+// hit-tests itself: `drop-hover` compares the panel's published absolute drag-y against
+// this group's own absolute rect. The `&&` is ordered so `absolute-position` is only a
+// dependency WHILE a drag is in flight, and the result feeds colors only — never geometry,
+// no conditional child inserted into a layout — so it cannot close a layout cycle.
+component TabRowView inherits Rectangle {
+    in property <LeftTabRow> tab;
+    in property <bool> drag-active;
+    in property <length> drag-y;
+    in property <bool> is-source;      // the drag started in this tab → not a drop target
+    in property <int> drag-pane;       // pane index being dragged (only when `is-source`)
+    callback activate(int);            // pane index clicked
+    callback drag-moved(int, length);  // (pane index, absolute y)
+    callback drag-released();
+    callback hover-changed(bool);      // this group became / stopped being the drop target
+
+    property <bool> expanded: true;
+    property <bool> drop-hover: root.drag-active && !root.is-source
+        && root.drag-y >= root.absolute-position.y
+        && root.drag-y <= root.absolute-position.y + root.height;
+
+    changed drop-hover => { root.hover-changed(root.drop-hover); }
+
+    border-radius: 6px;
+    border-width: root.drop-hover ? 1px : 0px;
+    border-color: Theme.accent;
+    background: root.drop-hover ? Theme.surface : transparent;
+
+    VerticalLayout {
+        spacing: 1px;
+
+        // ---- tab header ----
+        Rectangle {
+            height: 28px;
+            border-radius: 5px;
+            background: hta.has-hover ? Theme.surface2 : transparent;
+
+            hta := TouchArea {
+                mouse-cursor: pointer;
+                // Clicking the header focuses the tab through its FIRST pane: the tree has
+                // no separate "switch tab" command, because focusing a pane already
+                // switches to the tab that owns it.
+                clicked => { root.activate(0); }
+            }
+
+            HorizontalLayout {
+                padding-left: 2px;
+                padding-right: 8px;
+                spacing: 4px;
+
+                // expand toggle (drawn chevron, never a font glyph)
+                Rectangle {
+                    width: 18px;
+                    ChevronGlyph {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        open: root.expanded;
+                        ink: cta.has-hover ? Theme.accent : Theme.subtext;
+                    }
+                    cta := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { root.expanded = !root.expanded; }
+                    }
+                }
+
+                Text {
+                    text: root.tab.title;
+                    color: root.tab.active ? Theme.text : Theme.subtext;
+                    font-size: 13px;
+                    font-weight: root.tab.active ? 700 : 400;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                    overflow: elide;
+                }
+
+                // pane-count chip
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 18px;
+                        height: 15px;
+                        border-radius: 7px;
+                        background: Theme.surface2;
+                        Text {
+                            text: root.tab.panes.length;
+                            color: Theme.subtext;
+                            font-size: 9px;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                            width: 100%;
+                            height: 100%;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- the tab's panes ----
+        if root.expanded : VerticalLayout {
+            spacing: 1px;
+            for p[j] in root.tab.panes : PaneRowView {
+                pane: p;
+                dragging: root.is-source && root.drag-pane == j;
+                activate => { root.activate(j); }
+                drag-moved(y) => { root.drag-moved(j, y); }
+                drag-released => { root.drag-released(); }
+            }
+        }
+    }
+}
+
+// One saved workspace in the library section.
+component WorkspaceRowView inherits Rectangle {
+    in property <LeftWorkspaceRow> ws;
+    callback activate();
+    height: 36px;
+    border-radius: 5px;
+    background: wa.has-hover ? Theme.surface2 : transparent;
+
+    wa := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activate(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.ws.name;
+                color: Theme.text;
+                font-size: 12px;
+                overflow: elide;
+            }
+            Text {
+                text: root.ws.detail;
+                color: Theme.subtext;
+                font-size: 10px;
+                overflow: elide;
+            }
+        }
+    }
+}
+
+// One adoptable session in the detached section (click anywhere on the row to adopt it).
+component SessionRowView inherits Rectangle {
+    in property <LeftSessionRow> sess;
+    callback activate();
+    height: 36px;
+    border-radius: 5px;
+    background: sa.has-hover ? Theme.surface2 : transparent;
+
+    sa := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.activate(); }
+    }
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 7px;
+
+        VerticalLayout {
+            alignment: center;
+            LiveDot {
+                live: root.sess.live;
+                idle: false;
+                tint: Theme.faint;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            Text {
+                text: root.sess.label;
+                color: Theme.text;
+                font-size: 12px;
+                overflow: elide;
+            }
+            Text {
+                text: root.sess.detail;
+                color: Theme.subtext;
+                font-size: 10px;
+                overflow: elide;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            AdoptGlyph { ink: sa.has-hover ? Theme.accent : Theme.faint; }
+        }
+    }
+}
+
+// A section heading ("WORKSPACE" / "LIBRARY" / "DETACHED") with its disclosure chevron and
+// an optional trailing action button (the library's save-the-current-tab button).
+component SectionHead inherits Rectangle {
+    in property <string> label;
+    in property <bool> open;
+    in property <bool> has-action;
+    callback toggled();
+    callback acted();
+    height: 22px;
+
+    // Declared FIRST so the action button's own TouchArea (declared later, on top) wins
+    // its clicks; this one is also narrowed to leave the button's corner alone.
+    hta := TouchArea {
+        x: 0;
+        width: root.has-action ? parent.width - 24px : parent.width;
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+    }
+
+    HorizontalLayout {
+        spacing: 4px;
+
+        Rectangle {
+            width: 18px;
+            ChevronGlyph {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                open: root.open;
+                ink: hta.has-hover ? Theme.text : Theme.subtext;
+            }
+        }
+
+        Text {
+            text: root.label;
+            color: Theme.subtext;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: 0.5px;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+
+        if root.has-action : VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 20px;
+                height: 20px;
+                border-radius: 4px;
+                background: aa.has-hover ? Theme.surface2 : transparent;
+                SaveGlyph {
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    ink: aa.has-hover ? Theme.text : Theme.subtext;
+                }
+                aa := TouchArea {
+                    mouse-cursor: pointer;
+                    clicked => { root.acted(); }
+                }
+            }
+        }
+    }
+}
+
+export component LeftPanel inherits Rectangle {
+    // ---- in-flight pane drag (workspace tree) ----
+    // `drag-y` is the pointer's ABSOLUTE y, published by the dragged row's TouchArea; each
+    // tab group compares it against its own absolute rect and reports itself as the drop
+    // target through `hover-changed`. Model INDICES (not uids) travel to the controller:
+    // the snapshot the user is looking at is exactly what `resync` last projected, and the
+    // controller re-validates both indices before touching any state.
+    property <bool> dragging: false;
+    property <int> drag-tab: -1;
+    property <int> drag-pane: -1;
+    property <length> drag-y: 0;
+    property <int> drop-tab: -1;
+
+    // per-section disclosure — local UI state, like the sidebar's per-row expansion
+    property <bool> tree-open: true;
+    property <bool> lib-open: true;
+    property <bool> det-open: true;
+
+    background: Theme.mantle;
+    clip: true;
+
+    // eat stray clicks, so they never fall through to whatever is behind the panel
+    TouchArea {}
+
+    // hairline separating the panel from the pane area on its right
+    Rectangle {
+        x: parent.width - 1px;
+        width: 1px;
+        height: 100%;
+        background: Theme.border;
+    }
+
+    VerticalLayout {
+        padding: 8px;
+        padding-right: 9px;      // 8px + the hairline
+        spacing: 4px;
+
+        // ---- panel header: title + close ----
+        HorizontalLayout {
+            height: 22px;
+            spacing: 4px;
+            Text {
+                text: "PANELS";
+                color: Theme.subtext;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+                vertical-alignment: center;
+                horizontal-stretch: 1;
+            }
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 20px;
+                    height: 20px;
+                    border-radius: 4px;
+                    background: xa.has-hover ? Theme.surface2 : transparent;
+                    CloseGlyph {
+                        x: (parent.width - self.width) / 2;
+                        y: (parent.height - self.height) / 2;
+                        ink: xa.has-hover ? Theme.text : Theme.subtext;
+                    }
+                    xa := TouchArea {
+                        mouse-cursor: pointer;
+                        clicked => { LeftPanelAdapter.toggle(); }
+                    }
+                }
+            }
+        }
+
+        // ===== section 1: the workspace tree (tabs → panes) =====
+        SectionHead {
+            label: "WORKSPACE";
+            open: root.tree-open;
+            toggled => { root.tree-open = !root.tree-open; }
+        }
+
+        if root.tree-open : Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+            Flickable {
+                width: 100%;
+                height: 100%;
+                viewport-width: self.width;
+                viewport-height: treebody.preferred-height;
+                treebody := VerticalLayout {
+                    alignment: start;
+                    spacing: 2px;
+                    for t[i] in LeftPanelAdapter.tabs : TabRowView {
+                        tab: t;
+                        drag-active: root.dragging;
+                        drag-y: root.drag-y;
+                        drag-pane: root.drag-pane;
+                        is-source: root.drag-tab == i;
+                        activate(j) => { LeftPanelAdapter.focus-pane(i, j); }
+                        drag-moved(j, y) => {
+                            root.dragging = true;
+                            root.drag-tab = i;
+                            root.drag-pane = j;
+                            root.drag-y = y;
+                        }
+                        drag-released => {
+                            // Resolve against whichever group last reported itself hovered.
+                            if (root.drop-tab >= 0 && root.drop-tab != i) {
+                                LeftPanelAdapter.move-pane(i, root.drag-pane, root.drop-tab);
+                            }
+                            root.dragging = false;
+                            root.drag-tab = -1;
+                            root.drag-pane = -1;
+                            root.drop-tab = -1;
+                        }
+                        hover-changed(on) => {
+                            if (on) {
+                                root.drop-tab = i;
+                            } else if (root.drop-tab == i) {
+                                root.drop-tab = -1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ===== section 2: the saved-workspace library =====
+        SectionHead {
+            label: "LIBRARY";
+            open: root.lib-open;
+            has-action: true;
+            toggled => { root.lib-open = !root.lib-open; }
+            acted => { LeftPanelAdapter.save-workspace(); }
+        }
+
+        if root.lib-open && LeftPanelAdapter.workspaces.length == 0 : Text {
+            text: "No saved workspaces yet — the save button above writes this tab into the library.";
+            color: Theme.subtext;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+
+        if root.lib-open : Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+            Flickable {
+                width: 100%;
+                height: 100%;
+                viewport-width: self.width;
+                viewport-height: libbody.preferred-height;
+                libbody := VerticalLayout {
+                    alignment: start;
+                    spacing: 2px;
+                    for w[i] in LeftPanelAdapter.workspaces : WorkspaceRowView {
+                        ws: w;
+                        activate => { LeftPanelAdapter.open-workspace(i); }
+                    }
+                }
+            }
+        }
+
+        // ===== section 3: detached (adoptable) sessions =====
+        SectionHead {
+            label: "DETACHED";
+            open: root.det-open;
+            toggled => { root.det-open = !root.det-open; }
+        }
+
+        if root.det-open && LeftPanelAdapter.detached.length == 0 : Text {
+            text: "No orphaned sessions. A session that outlives its window lands here, one click from being adopted back.";
+            color: Theme.subtext;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+
+        if root.det-open : Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+            Flickable {
+                width: 100%;
+                height: 100%;
+                viewport-width: self.width;
+                viewport-height: detbody.preferred-height;
+                detbody := VerticalLayout {
+                    alignment: start;
+                    spacing: 2px;
+                    for s in LeftPanelAdapter.detached : SessionRowView {
+                        sess: s;
+                        activate => { LeftPanelAdapter.adopt-session(s.uid); }
+                    }
+                }
+            }
+        }
+    }
+}

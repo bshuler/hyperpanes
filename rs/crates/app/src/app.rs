@@ -918,6 +918,19 @@ impl App {
         //     unchanged list costs nothing at either tick cadence).
         self.pump_reminders(&windows);
 
+        // 2f. Left panel (M5): republish the session uids every window in this process is
+        //     hosting, so the panel's DETACHED section can subtract them. Cheap (a string
+        //     set over the live panes) and done once for all windows, before the renders
+        //     that project it. Sessions held by ANOTHER hyperpanes process are still listed
+        //     as adoptable — see `leftpanel::claimed_by_other_processes`, the M7 seam.
+        {
+            let mut claims: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for w in &windows {
+                claims.extend(w.state.borrow().claimed_uids());
+            }
+            crate::leftpanel::publish_window_claims(claims);
+        }
+
         // 3. Render each window from its own state. Aggregate per-window activity so the
         //    adaptive cadence (#3) can tell a busy frame (streaming output / animation) from a
         //    truly idle one (a bare cursor blink does NOT count as work — see `paneview::pump`).
@@ -2755,6 +2768,86 @@ impl App {
                     }
                 });
         }
+        // ---- the left slide-out panel (mux plan M5): the LeftPanelAdapter callbacks ----
+        // Same shape as the reminder bridge above: the panel's UI is entirely inside
+        // leftpanel.slint and talks through its global, so no AppWindow callback is added
+        // for it. Every one of these turns straight into a `Command` (Seam #2).
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_toggle(move || {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::ToggleLeftPanel);
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_focus_pane(move |ti, i| {
+                    if let Some(w) = app.window_by_id(id) {
+                        if ti >= 0 && i >= 0 {
+                            app.run_command(&w, Command::LeftFocusPane(ti as usize, i as usize));
+                        }
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_move_pane(move |from, i, to| {
+                    if let Some(w) = app.window_by_id(id) {
+                        if from >= 0 && i >= 0 && to >= 0 {
+                            app.run_command(
+                                &w,
+                                Command::LeftMovePane(from as usize, i as usize, to as usize),
+                            );
+                        }
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_open_workspace(move |i| {
+                    if let Some(w) = app.window_by_id(id) {
+                        if i >= 0 {
+                            app.run_command(&w, Command::LeftOpenWorkspace(i as usize));
+                        }
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_save_workspace(move || {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::LeftSaveWorkspace);
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_adopt_session(move |uid| {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::LeftAdoptSession(uid.to_string()));
+                    }
+                });
+        }
+
         // The Reminder flyout's Custom-duration parser — a PURE bridge (no state access,
         // no borrows): the inline input validates per keystroke and, on Enter, encodes the
         // minutes through the frozen `pick(int)` channel (decoded in `State::ctx_command`).

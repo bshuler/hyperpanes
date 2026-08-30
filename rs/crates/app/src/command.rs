@@ -249,6 +249,19 @@ pub enum Command {
     /// Submit the Add-Project dialog with the typed directory path (validated in state;
     /// a bad path keeps the dialog open with an inline error).
     SubmitAddProject(String),
+    // ---- the left slide-out panel (mux plan M5) ----
+    /// Show/hide the left panel (workspace tree · library · detached sessions).
+    ToggleLeftPanel,
+    /// Workspace tree: focus pane `1` of tab `0` (switching to that tab first).
+    LeftFocusPane(usize, usize),
+    /// Workspace tree: drag pane `1` of tab `0` onto tab `2` (re-host, no PTY restart).
+    LeftMovePane(usize, usize, usize),
+    /// Library: load saved workspace row `0` as new tabs.
+    LeftOpenWorkspace(usize),
+    /// Library: save the active tab into the workspace library (no file dialog).
+    LeftSaveWorkspace,
+    /// Detached: adopt live session uid `0` into the active tab (re-attach + replay).
+    LeftAdoptSession(String),
 }
 
 /// A side effect the controller must apply outside the state (UI/window layer). The
@@ -493,6 +506,13 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         Command::RemoveProject(i) => state.remove_project(i),
         Command::OpenAddProject => state.open_add_project(),
         Command::SubmitAddProject(path) => state.submit_add_project(&path),
+        // ---- the left slide-out panel ----
+        Command::ToggleLeftPanel => state.toggle_left_panel(),
+        Command::LeftFocusPane(ti, i) => state.focus_pane_in_tab(ti, i),
+        Command::LeftMovePane(from, i, to) => state.move_pane_between_tabs(from, i, to, mgr),
+        Command::LeftOpenWorkspace(i) => state.open_workspace_from_library(i, mgr),
+        Command::LeftSaveWorkspace => state.save_workspace_to_library(),
+        Command::LeftAdoptSession(uid) => state.adopt_detached_session(&uid, mgr),
     }
     Effect::None
 }
