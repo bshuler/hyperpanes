@@ -427,7 +427,7 @@ fn pane_item(
 
 /// Recompute the active tab's pane rects (and reflow any pane whose pixel size
 /// changed). Honors zoom (solo the zoomed pane full-area).
-fn relayout_active(state: &mut State, area: (f32, f32), scale: f32, mgr: &SessionManager) {
+fn relayout_active(state: &mut State, area: (f32, f32), scale: f32) {
     let (aw, ah) = area;
     let active = state.active;
     // Fullscreen solos the focused pane (OS fullscreen + bars hidden in app.slint), like
@@ -442,6 +442,7 @@ fn relayout_active(state: &mut State, area: (f32, f32), scale: f32, mgr: &Sessio
         p.visible = false;
     }
 
+    let now = Instant::now();
     let place = |p: &mut PaneState, x: f32, y: f32, w: f32, h: f32| {
         // Inset each pane within its tile → the inter-pane gap + edge margin.
         let gx = x + PANE_GAP;
@@ -465,10 +466,11 @@ fn relayout_active(state: &mut State, area: (f32, f32), scale: f32, mgr: &Sessio
         let th = (gh - PANE_CHROME_H).max(1.0);
         let (cols, rows) = cells_for_px(tw * scale, th * scale, p.font.cell_w, p.font.cell_h);
         if (cols, rows) != p.applied {
-            if p.pane.resize(cols, rows) {
-                mgr.resize(&p.uid, cols as u16, rows as u16);
-            }
+            p.pane.resize(cols, rows);
             p.applied = (cols, rows);
+            // Restart the debounce clock: the pty is told only once this has stopped moving
+            // (see `flush_pty_resizes`). The LOCAL grid reflows right now, which is lossless.
+            p.pty_since = now;
             // The grid rewrapped — recompute any open search so its highlights track the
             // reflowed text instead of drifting against stale match coordinates.
             p.pane.search_reflow();
@@ -558,6 +560,39 @@ pub const LEFT_MODE_TOOL_BASE: i32 = 3;
 pub const LEFT_MODE_FILES_ICON: i32 = -1;
 pub const LEFT_MODE_GIT_ICON: i32 = -2;
 
+/// How long the computed grid size must hold still before the pty is told about it.
+///
+/// A pty resize is a SIGWINCH, and a shell answers one by repositioning its prompt and
+/// erasing to the end of the display (zsh: `\r\e[A\e[A…\e[J`) — so every intermediate size
+/// the layout passes through on its way to the final one costs the user real scrollback.
+/// Startup is the worst case: the window opens at its preferred size, the OS then restores
+/// the saved frame, and each pass used to fire its own SIGWINCH. On a re-attach that meant
+/// the last command's OUTPUT was erased out of the restored pane — the process survived, the
+/// thing you restarted the app to look at did not.
+///
+/// Long enough to swallow that churn and an interactive window drag, short enough that a
+/// deliberate resize reaches the shell before it can be noticed.
+const PTY_RESIZE_SETTLE: Duration = Duration::from_millis(300);
+
+/// Push any pane whose grid has finished moving to its session, and nothing sooner.
+///
+/// Runs every tick — NOT from [`resync`], which only runs on a dirty state and would leave a
+/// settled size pending indefinitely on an idle app.
+fn flush_pty_resizes(state: &mut State, mgr: &SessionManager, now: Instant) {
+    for tab in &mut state.tabs {
+        for p in &mut tab.panes {
+            if p.applied != p.pty && now.duration_since(p.pty_since) >= PTY_RESIZE_SETTLE {
+                // Degenerate sizes never reach a pty (a pane that has not been laid out yet
+                // sits at (0, 0) — telling the shell that would be a lie, not a resize).
+                if p.applied.0 >= 2 && p.applied.1 >= 1 {
+                    mgr.resize(&p.uid, p.applied.0 as u16, p.applied.1 as u16);
+                    p.pty = p.applied;
+                }
+            }
+        }
+    }
+}
+
 pub fn resync(
     state: &mut State,
     app: &AppWindow,
@@ -566,7 +601,7 @@ pub fn resync(
     scale: f32,
     mgr: &SessionManager,
 ) {
-    relayout_active(state, area, scale, mgr);
+    relayout_active(state, area, scale);
 
     // tab strip
     let active = state.active;
@@ -1630,6 +1665,11 @@ pub fn pump(
         active = true;
     }
 
+    // Tell the ptys about any grid size that has stopped moving. Outside the `dirty` gate on
+    // purpose: the last layout pass of a resize is the one that leaves a size pending, and it
+    // is also the one after which nothing dirties the state again.
+    flush_pty_resizes(state, mgr, Instant::now());
+
     // ---- cursor blink (~530 ms) ----
     let blink_changed = if state.last_blink.elapsed() >= Duration::from_millis(530) {
         state.cursor_on = !state.cursor_on;
@@ -1855,4 +1895,108 @@ pub fn pump(
     }
 
     PumpResult { rendered, active }
+}
+
+#[cfg(test)]
+mod pty_resize_tests {
+    //! The pty is told about a grid size only once that size has stopped moving.
+    //!
+    //! Every SIGWINCH costs the user scrollback: a shell answers one by repositioning its
+    //! prompt and erasing to the end of the display. Startup passes through at least one
+    //! intermediate size (the window opens at its preferred size before the OS restores the
+    //! saved frame), and pushing those cost a re-attached pane the output of the last command
+    //! it ran — which is precisely what a restart-to-see-changes is supposed to preserve.
+    use super::*;
+    use crate::state::DetachedPane;
+    use hyperpanes_core::tools::PaneKind;
+
+    fn fresh() -> State {
+        State::new(crate::theme::load_font(1.0))
+    }
+
+    fn mgr() -> SessionManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionManager::new(tx)
+    }
+
+    fn det(uid: &str) -> DetachedPane {
+        DetachedPane {
+            uid: uid.into(),
+            title: "t".into(),
+            subtitle: None,
+            pinned_accent: None,
+            show_frame: None,
+            show_dot: None,
+            font_px: 14.0,
+            spawn_command: None,
+            spawn_args: None,
+            spawn_shell: None,
+            kind: PaneKind::default(),
+            tool_session: None,
+        }
+    }
+
+    /// A size that is still moving is never pushed; the one it settles on is pushed once.
+    #[test]
+    fn only_a_settled_grid_size_reaches_the_pty() {
+        let mut st = fresh();
+        let m = mgr();
+        st.adopt_pane(&m, det("a"));
+        let start = Instant::now();
+        {
+            let p = &mut st.active_tab_mut().panes[0];
+            p.pty = (47, 18); // what the session already has
+            p.applied = (100, 30); // an intermediate layout pass
+            p.pty_since = start;
+        }
+
+        // Still inside the settle window: nothing goes out, however many ticks run.
+        flush_pty_resizes(&mut st, &m, start + PTY_RESIZE_SETTLE - Duration::from_millis(1));
+        assert_eq!(
+            st.active_tab().panes[0].pty,
+            (47, 18),
+            "an intermediate size must not reach the shell"
+        );
+
+        // The layout moves again, back to what the pty already has — the clock restarts and
+        // the push that was about to fire is now a no-op, which is the startup case exactly.
+        {
+            let p = &mut st.active_tab_mut().panes[0];
+            p.applied = (47, 18);
+            p.pty_since = start + Duration::from_millis(50);
+        }
+        flush_pty_resizes(&mut st, &m, start + Duration::from_secs(5));
+        assert_eq!(
+            st.active_tab().panes[0].pty,
+            (47, 18),
+            "settling back on the size the pty already has costs zero SIGWINCH"
+        );
+
+        // A real, settled change does go out.
+        {
+            let p = &mut st.active_tab_mut().panes[0];
+            p.applied = (60, 20);
+            p.pty_since = start + Duration::from_secs(5);
+        }
+        flush_pty_resizes(&mut st, &m, start + Duration::from_secs(10));
+        assert_eq!(st.active_tab().panes[0].pty, (60, 20));
+    }
+
+    /// A pane the pump has never laid out sits at (0, 0). That is "no size yet", not a grid,
+    /// and handing it to a pty would be a lie rather than a resize.
+    #[test]
+    fn an_unlaid_out_pane_is_never_reported() {
+        let mut st = fresh();
+        let m = mgr();
+        st.adopt_pane(&m, det("a"));
+        let start = Instant::now();
+        {
+            let p = &mut st.active_tab_mut().panes[0];
+            p.pty = (47, 18);
+            p.applied = (0, 0);
+            p.pty_since = start;
+        }
+        flush_pty_resizes(&mut st, &m, start + Duration::from_secs(10));
+        assert_eq!(st.active_tab().panes[0].pty, (47, 18));
+    }
 }

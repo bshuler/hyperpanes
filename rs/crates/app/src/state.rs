@@ -569,8 +569,18 @@ pub struct PaneState {
     pub show_dot: Option<bool>,
     pub accent: Color,
     pub pane: TerminalPane,
-    /// Cell dims currently applied to the bound session (to detect a real reflow).
+    /// Cell dims currently applied to the LOCAL grid (to detect a real reflow).
     pub applied: (usize, usize),
+    /// Cell dims last reported to the session backend (the pty's own idea of its size).
+    ///
+    /// Split from [`applied`](Self::applied) because the two must not move together. Telling
+    /// the pty is a SIGWINCH, and a shell answers one by reclaiming the rows it thinks its
+    /// prompt occupies and erasing to the end of the display — zsh emits a literal
+    /// `\r\e[A\e[A…\e[J`. Do that while the layout is still settling and it eats the last
+    /// command's output. Reflowing the local grid, by contrast, is lossless.
+    pub pty: (usize, usize),
+    /// When [`applied`](Self::applied) last moved — the debounce clock for pushing `pty`.
+    pub pty_since: std::time::Instant,
     /// The latest rendered terminal image.
     pub surface: Image,
     /// Placement in logical px, recomputed on relayout.
@@ -1493,6 +1503,8 @@ impl State {
             accent: accent.unwrap_or_else(|| theme::accent_for(idx, palette)),
             pane,
             applied: (cols as usize, rows as usize),
+            pty: (cols as usize, rows as usize),
+            pty_since: std::time::Instant::now(),
             surface: Image::default(),
             rect: (0.0, 0.0, 0.0, 0.0),
             visible: true,
@@ -1734,6 +1746,8 @@ impl State {
                 .unwrap_or_else(|| theme::accent_for(at, palette)),
             pane,
             applied: (cols as usize, rows as usize),
+            pty: (cols as usize, rows as usize),
+            pty_since: std::time::Instant::now(),
             surface: Image::default(),
             rect: (0.0, 0.0, 0.0, 0.0),
             visible: true,
@@ -4737,6 +4751,10 @@ impl State {
             stale_uid = Some(old);
             p.pane = newgrid;
             p.applied = (cols as usize, rows as usize);
+            // A restart spawns a brand-new pty AT this size, so the backend already agrees —
+            // recording it keeps the debounced push from firing a pointless SIGWINCH.
+            p.pty = (cols as usize, rows as usize);
+            p.pty_since = std::time::Instant::now();
             p.started = false;
             p.startup = None;
             p.shell_title = String::new();
@@ -4820,6 +4838,8 @@ impl State {
             accent,
             pane,
             applied: (cols as usize, rows as usize),
+            pty: (cols as usize, rows as usize),
+            pty_since: std::time::Instant::now(),
             surface: Image::default(),
             rect: (0.0, 0.0, 0.0, 0.0),
             visible: true,
@@ -6001,6 +6021,8 @@ impl State {
             accent: pinned.unwrap_or_else(|| theme::accent_for(idx, palette)),
             pane,
             applied: (cols as usize, rows as usize),
+            pty: (cols as usize, rows as usize),
+            pty_since: std::time::Instant::now(),
             surface: Image::default(),
             rect: (0.0, 0.0, 0.0, 0.0),
             visible: true,
