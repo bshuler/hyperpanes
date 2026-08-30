@@ -64,6 +64,18 @@ pub struct PaneSpec {
     /// when on (a plain pane omits it). New here (no TS sibling), so it trails the ported fields.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub talk: Option<bool>,
+    /// A human-written line about the work this pane is for — *why* it exists, not what it
+    /// runs. `command` says `claude`; `note` says "chasing the pty resize race".
+    ///
+    /// It is the field that makes a months-old repo-local project file
+    /// ([`crate::workspace::project`]) worth reopening: geometry and commands are
+    /// reconstructible from habit, intent is not, and intent survives whether or not the
+    /// process it described is still alive. Ordinary workspace snapshots may carry it too —
+    /// it is a property of the pane, not of where the file happens to live.
+    ///
+    /// New here (no TS sibling), so it trails the ported fields.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl PaneSpec {

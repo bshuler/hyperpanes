@@ -383,13 +383,14 @@ impl SessionProvider for CopilotProvider {
             Ok(p) => p,
             Err(b) => return ResumePlan::Blocked(b),
         };
+        // The flag itself lives in `tools::resume_args`, with the note on why a
+        // space-separated id binds to Copilot's *optional*-value `--resume`.
+        let Some(args) = crate::tools::resume_args(TOOL_ID, &session.id) else {
+            return ResumePlan::Blocked(ResumeBlocked::Unsupported { tool_id: TOOL_ID });
+        };
         ResumePlan::Ready(ResumeCommand {
             program,
-            // `-r, --resume[=value]` — an *optional*-value option, so whether a
-            // space-separated id binds to it was worth checking rather than assuming.
-            // It does: `copilot --resume <uuid> mcp --help` runs the `mcp` subcommand,
-            // where the same line without `--resume` treats the uuid as a command.
-            args: vec!["--resume".to_string(), session.id.clone()],
+            args,
             cwd,
         })
     }

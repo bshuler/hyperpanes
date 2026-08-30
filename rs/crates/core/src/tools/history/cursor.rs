@@ -266,12 +266,14 @@ impl SessionProvider for CursorProvider {
             Ok(p) => p,
             Err(b) => return ResumePlan::Blocked(b),
         };
-        // `cursor-agent --resume [chatId]`, verified against `--help` on 2026.08.25-3e8eec8.
-        // The cwd is not decoration: `chats/` is keyed by a hash of it, so the same id
-        // resumes nothing anywhere else.
+        // The flag itself lives in `tools::resume_args`. The cwd is not decoration:
+        // `chats/` is keyed by a hash of it, so the same id resumes nothing anywhere else.
+        let Some(args) = crate::tools::resume_args(TOOL_ID, &session.id) else {
+            return ResumePlan::Blocked(ResumeBlocked::Unsupported { tool_id: TOOL_ID });
+        };
         ResumePlan::Ready(ResumeCommand {
             program,
-            args: vec!["--resume".to_string(), session.id.clone()],
+            args,
             cwd,
         })
     }

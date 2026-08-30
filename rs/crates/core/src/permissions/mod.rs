@@ -6,16 +6,25 @@
 //! `~/Library`, a global hotkey — the ask is a two-line call rather than a per-OS research
 //! project bolted on under deadline.
 //!
-//! Deliberately conservative for now: [`status`] answers `NotApplicable` where the OS has
-//! no such concept and `Undetermined` where it does, rather than guessing. A real probe
-//! (`CGPreflightScreenCaptureAccess` and friends on macOS) needs framework bindings this
-//! crate does not carry yet, and a *wrong* "granted" is worse than an honest "don't know" —
-//! the caller's fallback for `Undetermined` and `Denied` is the same: offer [`request`].
+//! Deliberately conservative: [`status`] answers `NotApplicable` where the OS has no such
+//! concept, a real answer where the OS can be asked without side effects, and `Undetermined`
+//! everywhere else — never a guess. A *wrong* "granted" is worse than an honest "don't know",
+//! and it costs the caller nothing to be told "don't know", because the fallback for
+//! `Undetermined` and `Denied` is the same: offer [`request`].
 //!
-//! On macOS a grant is keyed to the *signing identity*, so on today's unsigned bundle any
-//! grant the user makes is revoked by the next rebuild. That is a packaging question
-//! (open question Q1 in `docs/tool-panes-plan.md`), not a code one, and it does not change
-//! this surface.
+//! macOS is the only one of the three with a real per-app permission database, and it is the
+//! only one that answers `Granted` for anything: `CGPreflightScreenCaptureAccess`,
+//! `AXIsProcessTrusted`, and an open-and-drop of a TCC-protected file. Windows and Linux gate
+//! almost none of this for a desktop app, and inventing a probe there would only manufacture
+//! a "denied" nobody can act on.
+//!
+//! Two ways to ask, and they are not interchangeable. [`prompt`] raises the OS's own one-shot
+//! consent dialog and belongs at the moment the feature needs the right; [`request`] takes
+//! the user to the Settings pane and is the recovery path for when the dialog is spent.
+//!
+//! On macOS a grant is keyed to the *signing identity*, which is why `packaging/macos/
+//! bundle.sh` signs with a Developer ID when one is available: an ad-hoc signature changes
+//! on every rebuild and takes every grant with it.
 //!
 //! Shape follows `docs/ports-seams.md`. Owned by track `tool-panes` (Wave 0).
 
@@ -102,8 +111,18 @@ pub fn status(right: Right) -> Grant {
     platform::status(right)
 }
 
-/// Take the user to where they can grant `right` — a system prompt where the OS offers one,
-/// otherwise the exact Settings pane, so nobody has to be told to "go find it".
+/// Raise the OS's own consent dialog for `right` and report the answer.
+///
+/// For the caller this is the *first* thing to try, and only from the feature that needs the
+/// right, at the moment it needs it — macOS shows each of these dialogs once ever, so one
+/// raised from a settings list is one the feature will never get. Where the OS has no such
+/// dialog this is just [`status`], which is why a caller can reach for it unconditionally.
+pub fn prompt(right: Right) -> Grant {
+    platform::prompt(right)
+}
+
+/// Take the user to where they can grant `right` — the exact Settings pane, so nobody has to
+/// be told to "go find it". This is the path for after [`prompt`] has been spent.
 ///
 /// `Ok(())` means we got them there, *not* that they granted anything; re-read [`status`]
 /// afterwards. `Err` on an OS with no such gate, so a caller that ignores `NotApplicable`
@@ -136,15 +155,24 @@ mod tests {
     }
 
     #[test]
-    fn status_never_panics_and_never_claims_a_grant_we_have_not_checked() {
+    fn status_never_panics_and_settles_on_one_answer() {
+        // Every answer is legal now that three of the macOS probes are real — what is not
+        // legal is a status that changes under repeated reads, which would mean the probe is
+        // observing something other than the grant.
         for r in Right::all() {
             let g = status(*r);
-            assert_ne!(
-                g,
-                Grant::Granted,
-                "{:?}: nothing probes for real yet, so a Granted here would be a lie",
-                r
-            );
+            assert_eq!(g, status(*r), "{:?} must not flap", r);
+        }
+    }
+
+    #[test]
+    fn a_right_this_os_never_gates_cannot_be_prompted_into_existence() {
+        // `prompt` is safe to call blind, so it must not invent a grant on an OS that has no
+        // dialog to raise — it degrades to `status` and keeps `NotApplicable` intact.
+        for r in Right::all() {
+            if status(*r) == Grant::NotApplicable {
+                assert_eq!(prompt(*r), Grant::NotApplicable, "{:?}", r);
+            }
         }
     }
 

@@ -8,10 +8,21 @@
 # non-zero on any failure, puts ALL artifacts under rs/packaging/out/.
 #
 # Must work both on the Mac mini and on a GitHub macos-latest (arm64) runner:
-# only stock tools are used (cargo, sips, iconutil, hdiutil, plutil).
+# only stock tools are used (cargo, sips, iconutil, hdiutil, plutil, codesign).
 #
-# The bundle is unsigned — see README.md in this directory for the Gatekeeper
-# quarantine note end users need.
+# Signing and notarization are both opt-in through the environment, and both
+# degrade to a warning rather than a failure, so this stays runnable on a machine
+# with no certificate at all:
+#
+#   HYPERPANES_SIGN_ID        codesign identity. Defaults to the first
+#                             "Developer ID Application" in the login keychain,
+#                             then to ad-hoc ("-") with a warning.
+#   HYPERPANES_NOTARY_PROFILE `xcrun notarytool store-credentials` profile name.
+#                             Unset -> notarization is skipped.
+#
+# An ad-hoc signature is not nothing: it is what lets macOS attach TCC grants to
+# the app at all. It just changes on every rebuild, so the grants do too — which
+# is exactly the problem a real Developer ID solves.
 set -euo pipefail
 
 VERSION="${1:-}"
@@ -23,6 +34,19 @@ if [[ "$VERSION" == v* ]]; then
     echo "error: <version> must not carry a leading 'v' (got '$VERSION')" >&2
     exit 2
 fi
+
+# Fail before doing any work if someone has exported a password expecting this
+# script to pick it up. It never will: notarization authenticates only through a
+# keychain profile, so a password in the environment is a misunderstanding worth
+# stopping for rather than silently ignoring.
+for leaked in HYPERPANES_NOTARY_PASSWORD APPLE_APP_SPECIFIC_PASSWORD AC_PASSWORD; do
+    if [[ -n "${!leaked:-}" ]]; then
+        echo "error: $leaked is set. This script never accepts a password." >&2
+        echo "       Run: xcrun notarytool store-credentials <profile-name>" >&2
+        echo "       then set HYPERPANES_NOTARY_PROFILE=<profile-name>." >&2
+        exit 2
+    fi
+done
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"          # repo root (rs/packaging/macos -> ../../..)
@@ -53,30 +77,29 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/hyperpanes"
 chmod 755 "$APP/Contents/MacOS/hyperpanes"
 
-# Shell-integration scripts (cwd OSC -> project tint / clickable paths; mirrors
-# what installer.nsi ships next to hyperpanes.exe on Windows).
-# core::shell_integration::shell_integration_dir() resolves, relative to the
-# RUNNING BINARY: exe_dir/resources/shell-integration, then exe_dir/shell-integration.
-# In a bundle exe_dir is Contents/MacOS, so the copy the app actually finds today
-# lives under Contents/MacOS/resources/. The Contents/Resources copy is where a
-# bundle-aware lookup (exe_dir/../Resources) would expect it — shipped too so a
-# future one-line core fix needs no packaging change.
-for d in "$APP/Contents/MacOS/resources/shell-integration" "$APP/Contents/Resources/shell-integration"; do
-    mkdir -p "$d"
-    cp "$ROOT/resources/shell-integration/hp-init.ps1" "$d/"
-    cp "$ROOT/resources/shell-integration/hp-init.sh" "$d/"
-    cp -R "$ROOT/resources/shell-integration/zdotdir" "$d/"
-done
+# Two lookups have to be satisfied at once, and they disagree about where a
+# resource lives. Both resolve relative to the RUNNING BINARY, i.e. Contents/MacOS:
+# core::shell_integration::shell_integration_dir() and submit_new_goal() want
+# exe_dir/resources/..., while a bundle-aware lookup wants exe_dir/../Resources/....
+#
+# This used to be answered by shipping two copies. It cannot be any more: codesign
+# treats every directory under Contents/MacOS as nested code and refuses to sign a
+# bundle whose Contents/MacOS holds a SKILL.md ("code object is not signed at all").
+# So the files live in Contents/Resources, where a signature seals them properly,
+# and Contents/MacOS/resources is a relative symlink onto it — sealed as a symlink,
+# never descended into. Both lookups land on the same bytes, and there is now only
+# one set of them.
+mkdir -p "$APP/Contents/Resources/shell-integration"
+cp "$ROOT/resources/shell-integration/hp-init.ps1" "$APP/Contents/Resources/shell-integration/"
+cp "$ROOT/resources/shell-integration/hp-init.sh" "$APP/Contents/Resources/shell-integration/"
+cp -R "$ROOT/resources/shell-integration/zdotdir" "$APP/Contents/Resources/shell-integration/"
 
-# Goal-orchestrator personas (goals system). submit_new_goal resolves both
-# exe_dir/resources/claude/goal-orchestrator (Contents/MacOS/...) and the bundle-aware
-# exe_dir/../Resources/claude/goal-orchestrator (Contents/Resources/...) — ship both.
-for d in "$APP/Contents/MacOS/resources/claude/goal-orchestrator" "$APP/Contents/Resources/claude/goal-orchestrator"; do
-    mkdir -p "$d"
-    cp "$ROOT/resources/claude/goal-orchestrator/SKILL.md" "$d/"
-    cp "$ROOT/resources/claude/goal-orchestrator/SPEC.md" "$d/"
-    cp "$ROOT/resources/claude/goal-orchestrator/IMPL.md" "$d/"
-done
+mkdir -p "$APP/Contents/Resources/claude/goal-orchestrator"
+cp "$ROOT/resources/claude/goal-orchestrator/SKILL.md" "$APP/Contents/Resources/claude/goal-orchestrator/"
+cp "$ROOT/resources/claude/goal-orchestrator/SPEC.md" "$APP/Contents/Resources/claude/goal-orchestrator/"
+cp "$ROOT/resources/claude/goal-orchestrator/IMPL.md" "$APP/Contents/Resources/claude/goal-orchestrator/"
+
+ln -s ../Resources "$APP/Contents/MacOS/resources"
 
 echo "==> generating hyperpanes.icns from build/icon.png"
 # Source icon is 512x512 (build/icon.png — same art as the Windows icon.ico).
@@ -97,6 +120,11 @@ sips -z 512 512   "$SRC_ICON" --out "$ICONSET/icon_512x512.png"    >/dev/null
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/hyperpanes.icns"
 
 echo "==> writing Info.plist"
+# The NS*UsageDescription strings below are the text macOS puts in the consent
+# dialog, so they are written to be read by the person deciding, not by us.
+# Screen Recording, Accessibility and Full Disk Access have no such key — Apple
+# fixes their dialog text — which is why `core::permissions::request` deep-links
+# into the Settings pane for those three instead.
 # CFBundleVersion must be period-separated numbers; strip any prerelease suffix
 # (0.1.0-test -> 0.1.0). The full string stays in CFBundleShortVersionString.
 BUNDLE_VERSION="${VERSION%%-*}"
@@ -115,6 +143,18 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key> <string>$VERSION</string>
     <key>LSMinimumSystemVersion</key>  <string>11.0</string>
     <key>NSHighResolutionCapable</key> <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Hyperpanes uses the microphone only while you are dictating into a pane, and stops listening the moment you stop.</string>
+    <key>NSAppleEventsUsageDescription</key>
+    <string>Hyperpanes sends Apple events so a pane can hand a file or a link to the editor or browser you picked, instead of opening it here.</string>
+    <key>NSDesktopFolderUsageDescription</key>
+    <string>Hyperpanes needs this to open a workspace, or start a terminal, in a project you keep on your Desktop.</string>
+    <key>NSDocumentsFolderUsageDescription</key>
+    <string>Hyperpanes needs this to open a workspace, or start a terminal, in a project you keep in Documents.</string>
+    <key>NSDownloadsFolderUsageDescription</key>
+    <string>Hyperpanes needs this to open a workspace, or start a terminal, in a project you keep in Downloads.</string>
+    <key>NSRemovableVolumesUsageDescription</key>
+    <string>Hyperpanes needs this to open a workspace, or start a terminal, in a project you keep on an external drive.</string>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>
@@ -151,12 +191,96 @@ cat > "$APP/Contents/Info.plist" <<PLIST
 PLIST
 plutil -lint "$APP/Contents/Info.plist"
 
+# ---------------------------------------------------------------- code signing
+# Identity resolution, in order: the environment, then the login keychain, then
+# ad-hoc. Only the identity NAME is ever printed — it is not a secret, but the
+# key behind it is, and nothing here reads, prompts for, or writes one. Signing
+# happens entirely through the keychain, which is where the key stays.
+#
+# entitlements.plist carries no XML comments because AMFI, the parser codesign
+# hands it to, rejects them outright ("syntax error near line 4"), so the reasons
+# for its two keys live here instead.
+#
+# Both are hardened-runtime gates that close *before* TCC gets to ask. Without
+# them macOS refuses the microphone and Apple events outright and the user never
+# sees a dialog to say yes to; with them the user is still asked and still free
+# to say no. They are the packaging half of core::permissions::Right::Microphone
+# and Right::Automation.
+#
+# Deliberately absent: `allow-jit` and `allow-unsigned-executable-memory` —
+# nothing in this build generates code at runtime (Metal via wgpu, the bundled
+# SQLite amalgamation, no scripting engine), and turning off W^X in a process
+# that hosts the user's shells needs a better reason than "just in case".
+# `disable-library-validation` — the binary is statically linked and loads no
+# dylibs of its own. `app-sandbox` — Hyperpanes runs the user's shells and opens
+# the user's repositories, which is the opposite of a container; Full Disk Access
+# is a grant the user makes in Settings, not an entitlement we can claim.
+ENTITLEMENTS="$SCRIPT_DIR/entitlements.plist"
+plutil -lint "$ENTITLEMENTS"
+
+SIGN_ID="${HYPERPANES_SIGN_ID:-}"
+if [[ -z "$SIGN_ID" ]]; then
+    # `find-identity` prints every usable identity; take the first Developer ID
+    # Application line and nothing else. Apple Development / Apple Distribution
+    # certs are deliberately not accepted: neither notarizes, and shipping one
+    # would produce a build that looks signed and still fails Gatekeeper.
+    SIGN_ID="$(security find-identity -v -p codesigning 2>/dev/null \
+        | awk -F'"' '/"Developer ID Application/ { print $2; exit }')"
+fi
+
+SIGN_TIMESTAMP=(--timestamp)
+if [[ -z "$SIGN_ID" ]]; then
+    SIGN_ID="-"
+    SIGN_TIMESTAMP=(--timestamp=none)   # ad-hoc has no identity to timestamp
+    echo "" >&2
+    echo "WARNING: no Developer ID Application certificate found — signing AD-HOC." >&2
+    echo "WARNING: Gatekeeper will refuse this build on any Mac but this one, and" >&2
+    echo "WARNING: macOS will drop every permission grant the moment it is rebuilt." >&2
+    echo "WARNING: Set HYPERPANES_SIGN_ID, or install a Developer ID, for a release." >&2
+    echo "" >&2
+else
+    echo "==> signing identity: $SIGN_ID"
+fi
+
+echo "==> signing Hyperpanes.app (hardened runtime)"
+# No nested Mach-O to sign first: the binary is statically linked and everything
+# else under Contents is scripts, markdown and an icns. Hence no --deep.
+codesign --force --options runtime "${SIGN_TIMESTAMP[@]}" \
+    --entitlements "$ENTITLEMENTS" \
+    --sign "$SIGN_ID" "$APP"
+codesign --verify --strict --verbose=2 "$APP"
+
 echo "==> creating dmg"
 DMG_STAGE="$STAGE/dmg-root"
 mkdir -p "$DMG_STAGE"
-cp -R "$APP" "$DMG_STAGE/"
+# ditto, not cp: it is the copy that carries extended attributes across intact,
+# and a signature that loses them is a signature that fails to verify.
+ditto "$APP" "$DMG_STAGE/Hyperpanes.app"
 ln -s /Applications "$DMG_STAGE/Applications"
 rm -f "$DMG"
 hdiutil create -volname "Hyperpanes" -srcfolder "$DMG_STAGE" -ov -format UDZO "$DMG"
+codesign --force "${SIGN_TIMESTAMP[@]}" --sign "$SIGN_ID" "$DMG"
+
+# ---------------------------------------------------------------- notarization
+# Opt-in and never on the ad-hoc path, where Apple would reject the submission
+# anyway. Credentials come only from a keychain profile created out of band with
+# `xcrun notarytool store-credentials <name>`; an Apple ID password or
+# app-specific password must never reach this script, its arguments, or its
+# environment, and the check below refuses to continue if one has been exported
+# in the hope that it would; the guard for that is at the top of the script.
+
+NOTARY_PROFILE="${HYPERPANES_NOTARY_PROFILE:-}"
+if [[ -z "$NOTARY_PROFILE" ]]; then
+    echo "==> notarization skipped (HYPERPANES_NOTARY_PROFILE unset)"
+elif [[ "$SIGN_ID" == "-" ]]; then
+    echo "==> notarization skipped (ad-hoc signature: Apple only notarizes Developer ID)"
+elif ! xcrun --find notarytool >/dev/null 2>&1; then
+    echo "==> notarization skipped (xcrun notarytool unavailable — needs Xcode 13+)"
+else
+    echo "==> notarizing $DMG as profile '$NOTARY_PROFILE' (this waits on Apple)"
+    xcrun notarytool submit "$DMG" --keychain-profile "$NOTARY_PROFILE" --wait
+    xcrun stapler staple "$DMG"
+    xcrun stapler validate "$DMG"
+fi
 
 echo "==> done: $DMG"

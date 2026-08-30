@@ -14,7 +14,7 @@
 //!
 //! Owned by track `tool-panes` (Wave 0).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(windows)]
 #[path = "windows.rs"]
@@ -117,9 +117,132 @@ pub fn list_browsers() -> Vec<BrowserApp> {
     platform::list_browsers()
 }
 
+// ---- the browser shim (T10) ----
+
+// The unix shim. `BROWSER` is a *command*, and every convention for reading it splits
+// on whitespace, so the path it names must be one token — hence a generated script at a
+// fixed, space-free location rather than an inline command line.
+//
+// `printf` takes the URL as a `%s` argument and never as part of the format, so a `%`
+// in a query string stays a `%` instead of becoming a conversion. `$OPENER` is
+// substituted at generation time because the fallback differs per OS.
+#[cfg_attr(windows, allow(dead_code))]
+const UNIX_SHIM: &str = r#"#!/bin/sh
+# hyperpanes browser shim — generated on launch; edits here are overwritten.
+#
+# Exported as $BROWSER into every pane's pty. Hands each URL back to hyperpanes over
+# the pane's OWN terminal, which is why there is no socket, port or token in here: the
+# tty already says which pane asked, and only a process holding that tty can speak.
+for url do
+	# The subshell is what makes the failure quiet: when /dev/tty cannot be opened the
+	# complaint comes from the *shell* running the redirect, not from printf, so only a
+	# nested shell's stderr can be silenced — and a stray line on the tool's stderr is
+	# exactly what a shim must never produce.
+	if (printf '\033]1337;HyperpanesOpenURL=%s\007' "$url" > /dev/tty) 2>/dev/null; then
+		continue
+	fi
+	# No controlling terminal — a detached child, or a tool run outside hyperpanes
+	# entirely. Hand the link to the OS rather than swallowing it.
+	$OPENER "$url" > /dev/null 2>&1 &
+done
+exit 0
+"#;
+
+// Windows gets a shim so the path is always there to point at, but nothing exports it:
+// see `session::spawn::build_env`. It opens the URL directly, which is the honest
+// behaviour when there is no `/dev/tty` to hand it back through.
+#[cfg_attr(not(windows), allow(dead_code))]
+const WINDOWS_SHIM: &str = "@echo off\r\n\
+:loop\r\n\
+if \"%~1\"==\"\" goto :eof\r\n\
+start \"\" \"%~1\"\r\n\
+shift\r\n\
+goto loop\r\n";
+
+/// Where the generated `BROWSER` shim lives. A fixed path inside the app's own data
+/// directory: stable across launches, so a pane spawned by an older run still names a
+/// script that exists, and free of spaces on every platform we support.
+pub fn browser_shim_path() -> PathBuf {
+    let bin = crate::persistence::paths::user_data_dir().join("bin");
+    #[cfg(windows)]
+    {
+        bin.join("hp-open.cmd")
+    }
+    #[cfg(not(windows))]
+    {
+        bin.join("hp-open")
+    }
+}
+
+/// Write the `BROWSER` shim and return its path.
+///
+/// Rewritten on every call rather than skipped when present: the shim is part of the
+/// binary's contract with [`crate::session::openurl`], and an upgraded build that kept
+/// running a stale script would emit a sequence this build no longer parses.
+pub fn ensure_browser_shim() -> std::io::Result<PathBuf> {
+    let path = browser_shim_path();
+
+    #[cfg(windows)]
+    let body = WINDOWS_SHIM.to_string();
+    #[cfg(target_os = "macos")]
+    let body = UNIX_SHIM.replace("$OPENER", "open");
+    #[cfg(not(any(windows, target_os = "macos")))]
+    let body = UNIX_SHIM.replace("$OPENER", "xdg-open");
+
+    crate::persistence::paths::write_atomic(&path, body.as_bytes())?;
+
+    // After the rename, not before: `write_atomic` renames a fresh temp file over the
+    // target, so the mode belongs to the new inode.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    }
+
+    Ok(path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_shim_path_is_a_single_space_free_token() {
+        let p = browser_shim_path();
+        assert!(p.is_absolute(), "{p:?}");
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, if cfg!(windows) { "hp-open.cmd" } else { "hp-open" });
+        assert_eq!(p.parent().unwrap().file_name().unwrap(), "bin");
+    }
+
+    #[test]
+    fn generating_the_shim_yields_an_executable_script() {
+        let p = ensure_browser_shim().expect("shim");
+        let body = std::fs::read_to_string(&p).expect("read back");
+        assert!(body.contains("HyperpanesOpenURL"), "{body}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&p).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755, "{mode:o}");
+            assert!(body.starts_with("#!/bin/sh"), "{body}");
+            // The placeholder must not survive into the script, or the fallback would
+            // run a program called `$OPENER`.
+            assert!(!body.contains("$OPENER"), "{body}");
+        }
+        // Rewriting is the documented contract, so a second call must still succeed.
+        ensure_browser_shim().expect("shim again");
+    }
+
+    /// The two halves of the feature have to agree on the byte sequence; nothing else
+    /// checks that the generated script and the scanner were written from the same idea.
+    #[test]
+    fn the_shim_emits_what_the_scanner_parses() {
+        let emitted = "\u{1b}]1337;HyperpanesOpenURL=https://round.test/x\u{07}";
+        let (urls, _) = crate::session::openurl::parse_osc_open_url("", emitted);
+        assert_eq!(urls, vec!["https://round.test/x"]);
+        assert!(UNIX_SHIM.contains("]1337;HyperpanesOpenURL=%s"), "{UNIX_SHIM}");
+    }
 
     #[test]
     fn ordinary_urls_are_openable() {

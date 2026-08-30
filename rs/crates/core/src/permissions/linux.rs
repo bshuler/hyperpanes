@@ -8,6 +8,13 @@
 //!
 //! `WAYLAND_DISPLAY` is the same signal `drag/linux.rs` already keys off, so the two agree
 //! about which session type we are in.
+//!
+//! Nothing here probes, and that is the honest answer rather than a gap. The portal's
+//! `ScreenCast` interface has no "do I already have this" call — a grant is a session token
+//! handed back by a picker the user just answered, not state we can read — and the remaining
+//! rights are ungated for a native build, so there is no state to read at all. A Flatpak or
+//! Snap of Hyperpanes would change that; if one is ever shipped, this file is where the
+//! sandbox-aware answers go.
 
 use super::{Grant, Right};
 
@@ -34,6 +41,12 @@ pub fn status(right: Right) -> Grant {
         // Flatpak/snap sandboxes gate these, but a native build has whatever its uid has.
         _ => Grant::NotApplicable,
     }
+}
+
+/// The portal raises its own picker when the capture starts, so there is nothing for us to
+/// raise ahead of it — asking twice would only mean two dialogs for one grant.
+pub fn prompt(right: Right) -> Grant {
+    status(right)
 }
 
 pub fn request(right: Right) -> Result<(), String> {

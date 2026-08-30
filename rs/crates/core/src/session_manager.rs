@@ -1092,6 +1092,10 @@ fn build_spec(opts: &SpawnOptions) -> PtySpec {
         integration_env: &integration_env,
         pane_id: opts.pane_id.as_deref(),
         control_file: resolved_control_file.as_deref(),
+        // No shim from here: `build_spec` is reached by the headless CLI and the daemon
+        // as well as the GUI, and only a host that is actually scanning pane output for
+        // `openurl` sequences may promise a tool that `BROWSER` will be answered.
+        browser_shim: None,
     });
 
     PtySpec {

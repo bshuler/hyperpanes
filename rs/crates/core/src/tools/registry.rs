@@ -265,6 +265,18 @@ pub static TOOLS: &[ToolDef] = &[
 /// title is a hint that *something* is running, not evidence of *what*.
 pub static GENERIC_AI_TOKENS: &[&str] = &["llm", "chatgpt", "agent"];
 
+/// The editors, in the order the "Open in…" chooser offers them (D15). A list rather than a
+/// flag on [`ToolDef`] because it is an *ordering* as well as a membership test, and an
+/// ordering has nowhere to live on an individual entry. Modal editors lead because a human
+/// who has one installed almost always means that one; `edit` trails because on the systems
+/// where it exists it is the fallback, not the choice.
+pub static EDITOR_IDS: &[&str] = &["vim", "emacs", "nano", "edit"];
+
+/// The editor entries, in chooser order.
+pub fn editors() -> impl Iterator<Item = &'static ToolDef> {
+    EDITOR_IDS.iter().filter_map(|id| by_id(id))
+}
+
 /// Look a tool up by its stable id.
 pub fn by_id(id: &str) -> Option<&'static ToolDef> {
     TOOLS.iter().find(|t| t.id == id)
@@ -318,7 +330,18 @@ pub fn ai_tokens() -> Vec<&'static str> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    #[test]
+    fn every_editor_id_names_a_real_entry() {
+        // The chooser iterates this list; a typo would silently drop an editor rather than
+        // fail, so the count is asserted as well as the lookup.
+        assert_eq!(editors().count(), EDITOR_IDS.len());
+        for id in EDITOR_IDS {
+            assert!(by_id(id).is_some(), "{id} is not in TOOLS");
+        }
+    }
 
     #[test]
     fn no_two_tools_claim_the_same_binary_name() {

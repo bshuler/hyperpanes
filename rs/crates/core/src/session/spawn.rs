@@ -296,6 +296,11 @@ pub struct EnvInputs<'a> {
     /// `None` (or empty) omits the var entirely rather than injecting an empty string
     /// — see [`resolve_control_file`], which callers should use to produce this.
     pub control_file: Option<&'a str>,
+    /// Path to the generated `BROWSER` shim — set as `BROWSER` so a tool in this pane
+    /// hands its links back to hyperpanes instead of straight to the OS. `None` leaves
+    /// `BROWSER` exactly as inherited. See [`crate::open::ensure_browser_shim`], which
+    /// callers should use to produce this.
+    pub browser_shim: Option<&'a str>,
 }
 
 /// Resolve the `HYPERPANES_CONTROL_FILE` value for a spawned child: `explicit` (e.g.
@@ -332,6 +337,19 @@ fn resolve_control_file_with(
 /// merge `process.env` ◁ `opts.env` ◁ `integrationEnv`, force `TERM`/`COLORTERM`,
 /// drop Electron's leaked `GOOGLE_API_KEY`, inject `HYPERPANES_PANE_ID`, and point at
 /// the control discovery file ONLY when no scoped token is present.
+/// Environment variables an agent harness sets on its own children to say "you are running
+/// inside a tool call, not at a human's terminal". Inheriting one into a pane makes the tool
+/// running there misreport its own situation, so [`build_env`] drops the inherited value.
+///
+/// Deliberately narrow: markers only. Credentials and configuration a human exported
+/// (`ANTHROPIC_API_KEY`, `CLAUDE_CONFIG_DIR`, …) are theirs and are passed through.
+pub const HARNESS_MARKERS: &[&str] = &[
+    "CLAUDECODE",
+    "CLAUDE_CODE_CHILD_SESSION",
+    "CLAUDE_CODE_ENTRYPOINT",
+    "CLAUDE_CODE_SSE_PORT",
+];
+
 pub fn build_env(inputs: &EnvInputs<'_>) -> EnvMap {
     let mut env: EnvMap = inputs.process_env.clone();
     if let Some(o) = inputs.opts_env {
@@ -355,6 +373,25 @@ pub fn build_env(inputs: &EnvInputs<'_>) -> EnvMap {
         }
     }
 
+    // An agent harness marks its own child processes so nested copies of the tool can tell
+    // they are not the top-level session. Hyperpanes launched FROM inside such a child (a
+    // terminal opened by an agent, a `cargo run` in an agent's shell) inherits those marks
+    // and would hand them to every pane it spawns — so `claude` in a pane comes up with
+    // transcript saving disabled, believing itself to be somebody's subprocess. The pane is
+    // a fresh interactive session and none of that is true of it.
+    //
+    // Same shape as the GOOGLE_API_KEY scrub above: only the INHERITED value is dropped. A
+    // caller that set the variable deliberately (`opts_env`, shell integration) is stating
+    // something about this pane, and keeps it.
+    for key in HARNESS_MARKERS {
+        let inherited = inputs.process_env.get(*key);
+        let explicit = inputs.opts_env.is_some_and(|o| o.contains_key(*key))
+            || inputs.integration_env.contains_key(*key);
+        if !explicit && inherited.is_some() {
+            env.remove(*key);
+        }
+    }
+
     if let Some(pane_id) = inputs.pane_id {
         env.insert("HYPERPANES_PANE_ID".into(), pane_id.to_string());
     }
@@ -366,6 +403,24 @@ pub fn build_env(inputs: &EnvInputs<'_>) -> EnvMap {
     if !env.contains_key("HYPERPANES_CONTROL_TOKEN") {
         if let Some(control_file) = inputs.control_file.filter(|v| !v.is_empty()) {
             env.insert("HYPERPANES_CONTROL_FILE".into(), control_file.to_string());
+        }
+    }
+
+    // `BROWSER` names the command a CLI tool runs to show the user a link, so pointing
+    // it at our shim IS the URL-interception feature (Q3) — which means the value the
+    // user's login shell exported is deliberately overridden, not respected. A per-pane
+    // `opts_env` entry still wins: an explicit choice for this pane outranks ours, where
+    // an inherited one is just what the environment happened to hold.
+    //
+    // Unix only. Windows has no `BROWSER` convention for tools to read and no `/dev/tty`
+    // for the shim to answer through, so exporting it there would only mislead.
+    if cfg!(unix) {
+        if let Some(shim) = inputs.browser_shim.filter(|v| !v.is_empty()) {
+            let explicit = inputs.opts_env.is_some_and(|o| o.contains_key("BROWSER"))
+                || inputs.integration_env.contains_key("BROWSER");
+            if !explicit {
+                env.insert("BROWSER".into(), shim.to_string());
+            }
         }
     }
 
@@ -632,6 +687,66 @@ mod tests {
         );
     }
 
+    // ---- build_env: the agent-harness markers ----
+
+    #[test]
+    fn an_inherited_harness_marker_never_reaches_the_pane() {
+        let proc_env = map(&[
+            ("CLAUDECODE", "1"),
+            ("CLAUDE_CODE_CHILD_SESSION", "abc"),
+            ("CLAUDE_CODE_ENTRYPOINT", "cli"),
+            ("CLAUDE_CODE_SSE_PORT", "51551"),
+        ]);
+        let integ = map(&[]);
+        let env = build_env(&EnvInputs {
+            process_env: &proc_env,
+            opts_env: None,
+            integration_env: &integ,
+            pane_id: None,
+            control_file: None,
+            browser_shim: None,
+        });
+        for key in HARNESS_MARKERS {
+            assert!(!env.contains_key(*key), "{key} leaked into the pane");
+        }
+    }
+
+    #[test]
+    fn a_marker_the_caller_set_on_purpose_survives() {
+        let proc_env = map(&[("CLAUDECODE", "1")]);
+        let integ = map(&[]);
+        let opts = map(&[("CLAUDECODE", "deliberate")]);
+        let env = build_env(&EnvInputs {
+            process_env: &proc_env,
+            opts_env: Some(&opts),
+            integration_env: &integ,
+            pane_id: None,
+            control_file: None,
+            browser_shim: None,
+        });
+        assert_eq!(env.get("CLAUDECODE").map(String::as_str), Some("deliberate"));
+    }
+
+    #[test]
+    fn scrubbing_markers_leaves_a_humans_own_claude_settings_alone() {
+        let proc_env = map(&[
+            ("CLAUDECODE", "1"),
+            ("ANTHROPIC_API_KEY", "sk-not-a-marker"),
+            ("CLAUDE_CONFIG_DIR", "/home/me/.claude"),
+        ]);
+        let integ = map(&[]);
+        let env = build_env(&EnvInputs {
+            process_env: &proc_env,
+            opts_env: None,
+            integration_env: &integ,
+            pane_id: None,
+            control_file: None,
+            browser_shim: None,
+        });
+        assert!(env.contains_key("ANTHROPIC_API_KEY"));
+        assert!(env.contains_key("CLAUDE_CONFIG_DIR"));
+    }
+
     // ---- build_env (scoped-token suppression + GOOGLE_API_KEY + paneId) ----
 
     #[test]
@@ -644,6 +759,7 @@ mod tests {
             integration_env: &integ,
             pane_id: None,
             control_file: None,
+            browser_shim: None,
         });
         assert!(!env.contains_key("HYPERPANES_CONTROL_FILE"));
     }
@@ -658,6 +774,7 @@ mod tests {
             integration_env: &integ,
             pane_id: None,
             control_file: Some(""),
+            browser_shim: None,
         });
         assert!(!env.contains_key("HYPERPANES_CONTROL_FILE"));
     }
@@ -672,6 +789,7 @@ mod tests {
             integration_env: &integ,
             pane_id: Some("pane-7"),
             control_file: Some("/data/control.json"),
+            browser_shim: None,
         });
         assert_eq!(
             env.get("HYPERPANES_CONTROL_FILE").map(String::as_str),
@@ -696,6 +814,7 @@ mod tests {
             integration_env: &integ,
             pane_id: None,
             control_file: Some("/data/control.json"),
+            browser_shim: None,
         });
         assert_eq!(
             env.get("HYPERPANES_CONTROL_TOKEN").map(String::as_str),
@@ -714,6 +833,7 @@ mod tests {
             integration_env: &integ,
             pane_id: None,
             control_file: Some("/data/control.json"),
+            browser_shim: None,
         });
         assert!(!env.contains_key("GOOGLE_API_KEY"));
     }
@@ -730,10 +850,68 @@ mod tests {
             integration_env: &integ,
             pane_id: None,
             control_file: Some("/data/control.json"),
+            browser_shim: None,
         });
         assert_eq!(
             env.get("GOOGLE_API_KEY").map(String::as_str),
             Some("real-user-key")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_env_points_browser_at_the_shim() {
+        // The inherited value is exactly what this feature exists to override.
+        let proc_env = map(&[("BROWSER", "/usr/bin/firefox")]);
+        let integ = map(&[]);
+        let env = build_env(&EnvInputs {
+            process_env: &proc_env,
+            opts_env: None,
+            integration_env: &integ,
+            pane_id: None,
+            control_file: None,
+            browser_shim: Some("/data/bin/hp-open"),
+        });
+        assert_eq!(
+            env.get("BROWSER").map(String::as_str),
+            Some("/data/bin/hp-open")
+        );
+    }
+
+    #[test]
+    fn build_env_lets_an_explicit_per_pane_browser_win() {
+        let proc_env = map(&[]);
+        let integ = map(&[]);
+        let opts = map(&[("BROWSER", "/opt/chosen-browser")]);
+        let env = build_env(&EnvInputs {
+            process_env: &proc_env,
+            opts_env: Some(&opts),
+            integration_env: &integ,
+            pane_id: None,
+            control_file: None,
+            browser_shim: Some("/data/bin/hp-open"),
+        });
+        assert_eq!(
+            env.get("BROWSER").map(String::as_str),
+            Some("/opt/chosen-browser")
+        );
+    }
+
+    #[test]
+    fn build_env_leaves_browser_alone_without_a_shim() {
+        let proc_env = map(&[("BROWSER", "/usr/bin/firefox")]);
+        let integ = map(&[]);
+        let env = build_env(&EnvInputs {
+            process_env: &proc_env,
+            opts_env: None,
+            integration_env: &integ,
+            pane_id: None,
+            control_file: None,
+            browser_shim: None,
+        });
+        assert_eq!(
+            env.get("BROWSER").map(String::as_str),
+            Some("/usr/bin/firefox")
         );
     }
 

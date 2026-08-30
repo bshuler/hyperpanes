@@ -136,9 +136,14 @@ impl SessionProvider for ClaudeProvider {
             Ok(p) => p,
             Err(b) => return ResumePlan::Blocked(b),
         };
+        // One authority for every tool's resume shape, so a provider and the relaunch path
+        // (which has no provider to ask on a cold start) can never disagree.
+        let Some(args) = crate::tools::resume_args(TOOL_ID, &session.id) else {
+            return ResumePlan::Blocked(ResumeBlocked::Unsupported { tool_id: TOOL_ID });
+        };
         ResumePlan::Ready(ResumeCommand {
             program,
-            args: vec!["--resume".to_string(), session.id.clone()],
+            args,
             cwd,
         })
     }

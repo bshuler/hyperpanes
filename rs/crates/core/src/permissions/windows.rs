@@ -5,6 +5,14 @@
 //! `NotApplicable` — a caller that checks before capturing must not be left waiting for a
 //! grant that will never arrive. What *is* gated lives under Settings › Privacy, reachable
 //! through the `ms-settings:` protocol handler.
+//!
+//! Even those two are only half-gated for us. The capability API that answers them —
+//! `AppCapabilityAccess` — reports on *packaged* (MSIX) apps; a plain Win32 binary like ours
+//! is covered by the "let desktop apps access…" master switch, which the API does not
+//! surface. So the two settings-backed rights stay `Undetermined`: we can send the user to
+//! the switch, but we cannot read it, and a fabricated `Denied` would be worse than saying so.
+//! There is likewise no in-process consent dialog to raise, which is why `prompt` here is
+//! nothing but a status read.
 
 use std::process::{Command, Stdio};
 
@@ -39,6 +47,12 @@ pub fn status(right: Right) -> Grant {
         Some(_) => Grant::Undetermined,
         None => Grant::NotApplicable,
     }
+}
+
+/// Nothing to raise: Windows shows its privacy consent dialogs to packaged apps, and a Win32
+/// desktop binary is simply allowed or not by the Settings switch.
+pub fn prompt(right: Right) -> Grant {
+    status(right)
 }
 
 pub fn request(right: Right) -> Result<(), String> {

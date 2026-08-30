@@ -38,6 +38,7 @@ fn kitchen_sink() -> WorkspaceFile {
         ])),
         uid: Some("pane-3".into()),
         talk: Some(true),
+        note: Some("chasing the pty resize race".into()),
     };
     let group = GroupSpec {
         title: Some("build".into()),
