@@ -178,6 +178,7 @@ pub fn write_project<P: AsRef<Path>>(
     let path = project_file_path(root.as_ref());
     let mut safe = workspace.clone();
     scrub_secrets(&mut safe);
+    strip_uids(&mut safe);
 
     let mut doc = serde_json::to_value(io::WorkspaceEnvelope::wrap(safe))
         .map_err(|e| format!("{}: {e}", path.display()))?;
@@ -285,6 +286,18 @@ pub fn scrub_secrets(file: &mut WorkspaceFile) -> usize {
         }
     });
     removed
+}
+
+/// Drop every pane's live session uid.
+///
+/// A uid identifies a session on *this* machine in *this* run: it is meaningless in a
+/// clone, it churns the diff of a version-controlled file on every save, and on the
+/// in-process backend the ids are positional (`pane-3`), so a months-old file could
+/// otherwise ask to re-attach to whatever `pane-3` happens to be running today. What
+/// belongs here is which windows to open and what they run — a reader with no uid
+/// spawns from the recorded command, which is the right answer in a checkout.
+fn strip_uids(file: &mut WorkspaceFile) {
+    for_each_pane_mut(file, |pane| pane.uid = None);
 }
 
 // ===== portability =====
@@ -722,6 +735,43 @@ mod tests {
             ws.panes.as_ref().unwrap()[0].meta.as_ref().unwrap().len(),
             4
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A live session uid is a fact about this machine and this run. It must not travel
+    /// in a version-controlled file: it means nothing in a clone, and on the in-process
+    /// backend the ids are positional, so a months-old `pane-0` could ask to adopt an
+    /// unrelated session that happens to hold that id today.
+    #[test]
+    fn a_live_session_uid_never_reaches_the_working_tree() {
+        let root = temp_root("uid");
+        let ws = WorkspaceFile {
+            panes: Some(vec![PaneSpec {
+                command: Some("claude".into()),
+                uid: Some("pane-0".into()),
+                ..Default::default()
+            }]),
+            groups: Some(vec![GroupSpec {
+                panes: vec![PaneSpec {
+                    command: Some("agent".into()),
+                    uid: Some("sess-91f3".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }]),
+            ..Default::default()
+        };
+
+        let path = write_project(&root, &ws).unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(!raw.contains("pane-0"), "{raw}");
+        assert!(!raw.contains("sess-91f3"), "{raw}");
+        // What the file is *for* survives.
+        assert!(raw.contains("claude"), "{raw}");
+        assert!(raw.contains("agent"), "{raw}");
+        // The caller's own value is untouched — stripping is the writer's job.
+        assert_eq!(ws.panes.as_ref().unwrap()[0].uid.as_deref(), Some("pane-0"));
 
         let _ = std::fs::remove_dir_all(&root);
     }
