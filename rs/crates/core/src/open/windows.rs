@@ -78,7 +78,10 @@ const KNOWN: &[(&str, &str, &[(&str, &str)])] = &[
         "edge",
         "Microsoft Edge",
         &[
-            ("ProgramFiles(x86)", r"Microsoft\Edge\Application\msedge.exe"),
+            (
+                "ProgramFiles(x86)",
+                r"Microsoft\Edge\Application\msedge.exe",
+            ),
             ("ProgramFiles", r"Microsoft\Edge\Application\msedge.exe"),
         ],
     ),

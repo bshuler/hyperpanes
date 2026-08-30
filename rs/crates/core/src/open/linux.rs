@@ -85,9 +85,17 @@ pub fn reveal_path(path: &Path) -> Result<(), String> {
 /// (our id, display name, [binaries to look for on PATH, in preference order])
 const KNOWN: &[(&str, &str, &[&str])] = &[
     ("firefox", "Firefox", &["firefox", "firefox-esr"]),
-    ("chrome", "Google Chrome", &["google-chrome", "google-chrome-stable"]),
+    (
+        "chrome",
+        "Google Chrome",
+        &["google-chrome", "google-chrome-stable"],
+    ),
     ("chromium", "Chromium", &["chromium", "chromium-browser"]),
-    ("edge", "Microsoft Edge", &["microsoft-edge", "microsoft-edge-stable"]),
+    (
+        "edge",
+        "Microsoft Edge",
+        &["microsoft-edge", "microsoft-edge-stable"],
+    ),
     ("brave", "Brave", &["brave-browser", "brave"]),
     ("vivaldi", "Vivaldi", &["vivaldi-stable", "vivaldi"]),
     ("opera", "Opera", &["opera"]),

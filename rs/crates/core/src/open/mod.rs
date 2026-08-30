@@ -72,7 +72,9 @@ pub fn is_openable_url(url: &str) -> bool {
 /// silently doing nothing.
 pub fn open_url(url: &str) -> Result<(), String> {
     if !is_openable_url(url) {
-        return Err(format!("refusing to open {url:?}: not an http/https/mailto URL"));
+        return Err(format!(
+            "refusing to open {url:?}: not an http/https/mailto URL"
+        ));
     }
     platform::open_url(url)
 }
@@ -81,7 +83,9 @@ pub fn open_url(url: &str) -> Result<(), String> {
 /// than the OS default. Same refusal rules as [`open_url`].
 pub fn open_url_with(launcher: &str, url: &str) -> Result<(), String> {
     if !is_openable_url(url) {
-        return Err(format!("refusing to open {url:?}: not an http/https/mailto URL"));
+        return Err(format!(
+            "refusing to open {url:?}: not an http/https/mailto URL"
+        ));
     }
     if launcher.trim().is_empty() {
         return Err("no browser launcher given".to_string());
@@ -202,6 +206,41 @@ pub fn ensure_browser_shim() -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// Point a pane's per-pane env at the `BROWSER` shim, so a tool running in that pane
+/// hands its links back to hyperpanes instead of straight to the OS.
+///
+/// [`crate::session::spawn::build_env`] can take the shim as an input, but the one path
+/// that reaches it — `session_manager::build_spec` — deliberately supplies `None`,
+/// because the headless CLI and the daemon reach it too and neither scans pane output
+/// for the shim's reply. A host that *does* scan (the GUI) promises the shim here
+/// instead: a per-pane env entry overrides the inherited `BROWSER` exactly the same way,
+/// and — unlike a new `SpawnOptions` field — it already crosses the daemon wire.
+///
+/// A `BROWSER` the caller set explicitly for this pane is left alone: an explicit choice
+/// for one pane outranks ours, where an inherited one is just what the environment
+/// happened to hold. Off unix this is a no-op (and writes nothing), matching `build_env`:
+/// Windows has no `BROWSER` convention for tools to read and no `/dev/tty` for the shim
+/// to answer through, so exporting it there would only mislead.
+///
+/// Best-effort by design — if the shim cannot be written, the pane still spawns and
+/// links simply take the OS default, which is what would have happened anyway.
+pub fn with_browser_shim(
+    env: Option<crate::session::spawn::EnvMap>,
+) -> Option<crate::session::spawn::EnvMap> {
+    if !cfg!(unix) {
+        return env;
+    }
+    if env.as_ref().is_some_and(|e| e.contains_key("BROWSER")) {
+        return env;
+    }
+    let Ok(shim) = ensure_browser_shim() else {
+        return env;
+    };
+    let mut env = env.unwrap_or_default();
+    env.insert("BROWSER".into(), shim.to_string_lossy().into_owned());
+    Some(env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -211,7 +250,14 @@ mod tests {
         let p = browser_shim_path();
         assert!(p.is_absolute(), "{p:?}");
         let name = p.file_name().unwrap().to_string_lossy().into_owned();
-        assert_eq!(name, if cfg!(windows) { "hp-open.cmd" } else { "hp-open" });
+        assert_eq!(
+            name,
+            if cfg!(windows) {
+                "hp-open.cmd"
+            } else {
+                "hp-open"
+            }
+        );
         assert_eq!(p.parent().unwrap().file_name().unwrap(), "bin");
     }
 
@@ -241,7 +287,10 @@ mod tests {
         let emitted = "\u{1b}]1337;HyperpanesOpenURL=https://round.test/x\u{07}";
         let (urls, _) = crate::session::openurl::parse_osc_open_url("", emitted);
         assert_eq!(urls, vec!["https://round.test/x"]);
-        assert!(UNIX_SHIM.contains("]1337;HyperpanesOpenURL=%s"), "{UNIX_SHIM}");
+        assert!(
+            UNIX_SHIM.contains("]1337;HyperpanesOpenURL=%s"),
+            "{UNIX_SHIM}"
+        );
     }
 
     #[test]
@@ -300,5 +349,42 @@ mod tests {
             assert!(!b.name.is_empty(), "{b:?}");
             assert!(!b.launcher.is_empty(), "{b:?}");
         }
+    }
+
+    /// The GUI's promise of the shim has to land in the map the spawn actually uses —
+    /// and has to keep its hands off a `BROWSER` the pane was given deliberately.
+    #[test]
+    #[cfg(unix)]
+    fn a_pane_that_names_no_browser_is_pointed_at_the_shim() {
+        let env = with_browser_shim(None).expect("shim inserted");
+        assert_eq!(
+            env.get("BROWSER").map(String::as_str),
+            Some(browser_shim_path().to_string_lossy().as_ref())
+        );
+
+        let mut given = crate::session::spawn::EnvMap::new();
+        given.insert("FOO".into(), "bar".into());
+        let env = with_browser_shim(Some(given)).expect("shim inserted");
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+        assert!(env.contains_key("BROWSER"));
+    }
+
+    #[test]
+    fn a_browser_chosen_for_this_pane_outranks_the_shim() {
+        let mut given = crate::session::spawn::EnvMap::new();
+        given.insert("BROWSER".into(), "/usr/bin/lynx".into());
+        let env = with_browser_shim(Some(given)).expect("kept");
+        assert_eq!(
+            env.get("BROWSER").map(String::as_str),
+            Some("/usr/bin/lynx")
+        );
+    }
+
+    /// Windows has no `BROWSER` convention and no `/dev/tty` for the shim to answer
+    /// through, so promising one there would only mislead the tool reading it.
+    #[test]
+    #[cfg(windows)]
+    fn off_unix_nothing_is_promised() {
+        assert!(with_browser_shim(None).is_none());
     }
 }
