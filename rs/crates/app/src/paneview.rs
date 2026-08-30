@@ -25,6 +25,7 @@ use crate::{
     AppWindow, ClaudeSessionItem, CtxTab, DividerItem, FramePaletteOption, HiRect, KeybindingItem,
     LayoutOption, LeftModeRow, LeftPaneRow, LeftPanelAdapter, LeftSessionItem, LeftSessionRow,
     LeftSetRow, LeftTabRow,
+    PaneViewRow,
     LeftWorkspaceRow, MenuEntry, PaletteItem, PaneItem, PrefBrowserRow, PrefOption, PrefToolRow,
     ProjectItem, TabItem,
     WorktreeRow,
@@ -315,6 +316,25 @@ fn pane_item(
     };
     // Ambient-AI line: the typewriter-revealed prefix of the engine's summary, shown only
     // when there's no manual subtitle (which always wins) and the pane isn't muted.
+    // Family B (non-PTY) panes: the row projection for the file browser / viewer /
+    // markdown preview. Gated on the kind rather than computed unconditionally
+    // because `model_for` stats the target, and this runs once per pane per tick —
+    // a terminal pane must not pay a syscall for a view it does not have.
+    let is_view = matches!(
+        kind,
+        PaneKind::FileBrowser | PaneKind::FileViewer | PaneKind::Markdown
+    );
+    let (view_rows, view_title): (ModelRc<PaneViewRow>, SharedString) = if is_view {
+        (
+            crate::viewpane::model_for(&ps.uid, kind, ps.cwd.as_deref()),
+            crate::viewpane::view_title(kind, ps.cwd.as_deref()).into(),
+        )
+    } else {
+        (
+            ModelRc::from(Rc::new(VecModel::from(Vec::<PaneViewRow>::new()))),
+            SharedString::new(),
+        )
+    };
     let manual_subtitle = ps.subtitle.as_ref().is_some_and(|s| !s.is_empty());
     let ai_subtitle: SharedString = if manual_subtitle || ps.ai_muted || ps.ai.full.is_empty() {
         SharedString::new()
@@ -384,6 +404,8 @@ fn pane_item(
             // No brand: fall back to the pane's own accent so the mark is never invisible.
             None => ps.accent,
         },
+        view_rows,
+        view_title,
     }
 }
 

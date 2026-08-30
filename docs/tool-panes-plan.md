@@ -314,11 +314,18 @@ this machine — a realistic fixture.
 
 Provider status:
 - **Claude** — wraps `SessionCache`. Ships Wave 1.
-- **Cursor** — `~/.cursor/chats/<workspace-hash>/<uuid>/store.db` (SQLite) plus a
-  plain `prompt_history.json`. `rusqlite 0.32` is **already a bundled core
-  dependency** (`core/Cargo.toml:33`), so no new crate. Wave 2.
-- **Copilot** — `~/.copilot/session-state/<uuid>/` plus a global
-  `~/.copilot/session-store.db`. Wave 2.
+- **Cursor** — landed Wave 2, and the layout above was **wrong**. `~/.cursor/chats/`
+  does exist, but its `<workspace-hash>` is literally `md5(cwd)` — a one-way hash, so
+  it can never name a project. The resumable text lives in
+  `~/.cursor/projects/<Encoded-Cwd>/agent-transcripts/*.jsonl`, where `<Encoded-Cwd>`
+  is Claude's own encoding **minus the leading `-`**. `store.db` is not read at all;
+  no `rusqlite` is needed on this path. `branch` is always `None` for Cursor rows, so
+  the panel must render a row that has no branch. `empty-window` appears as a project
+  sentinel and correctly resolves to `DecodedUnverified` → blocked.
+- **Copilot** — landed Wave 2. `~/.copilot/session-store.db`, opened read-only and
+  **immutable** (`file:///…?mode=ro&immutable=1`) — a plain read-write open checkpoints
+  the user's WAL out from under a running Copilot. All rows verify as
+  `TranscriptExact`; `--resume <id>` was confirmed empirically.
 - **Codex** — layout unverifiable; see Q4.
 
 ### D10 — URL routing, in three separable layers
@@ -845,3 +852,84 @@ so a *forgotten* token list still fails.
 **Gate: MET.** `cargo test --manifest-path rs/Cargo.toml` — 901 lib tests, all 10
 integration targets ok. `cargo test --manifest-path rs/crates/app/Cargo.toml --bins` green.
 Landed as `1351616` (test-target fixes), `5eb23a8` (the provider), and the panel wiring.
+
+### Wave 2 · B4 (T9 / F4b) — Family B view panes — 2026-08-30
+
+**Status: landed, green.**
+
+`app/src/viewpane.rs` is the whole non-PTY half of D1. A Family B pane has no pty, no
+backend registration, and no session: `make_pane` branches on `kind.is_pty()` and mints a
+local `view-N` uid instead of asking the manager for one, so the daemon is never asked to
+answer for a pane that does not exist.
+
+Three decisions the code forced:
+
+**The projection is cached per uid, by refcount — not rebuilt per tick.** `sync_model`
+(`paneview.rs:204`) rewrites every row via `set_row_data` whenever the row counts match, so
+a per-pane model that is rebuilt each pump would re-walk a directory ~60 times a second.
+`viewpane` therefore parks one `ModelRc` per uid and hands the same handle back until the
+target changes. "Did it change?" is answered by a generation counter rather than
+`ModelRc::ptr_eq`, which **does not exist** in this slint revision (git rev `9463a107`,
+i-slint-core 1.17.0) — the counter is read only by the tests, hence its `cfg` gating.
+
+**The cache is released at the one choke point, not at each removal site.** `viewpane::forget`
+is called from `State::forget_pane_runtime`, which Wave 1 · A2 had already established as
+the single funnel every removal path flows through (`take_pane_in` wraps `take_pane_inner`
+precisely so no exit path can skip it). The two removals that bypass that funnel —
+pane-restart, which mints a fresh uid anyway, and the parked-reminder `Exit` path — already
+call it explicitly. Sprinkling the release at call sites would have leaked every browser
+pane ever opened for the life of the window.
+
+**A click is decided in Rust, not in `.slint`.** `on_pane_view_activate` resolves the row
+against *the same cached projection the view was drawn from*, so an index can never resolve
+against a different listing than the one clicked. A directory (and `..`) retargets the SAME
+pane via `Command::ViewNavigate` — a browser navigating is not a new pane, so its uid and
+kind are untouched; a file opens a NEW viewer pane, because clicking a file must not destroy
+the listing you clicked it from. Markdown gets the preview and everything else the plain
+viewer, chosen by extension so one click never means two things.
+
+**The gap the build surfaced.** Nothing in the UI could *create* a Family B pane — the kind
+existed, the projection existed, the navigation existed, and the feature was unreachable by
+a human and therefore untestable end-to-end. `Command::OpenFileBrowser(i)` and a
+**"Browse Files"** row in the pane context menu close that: deliberately adjacent to
+"Open Folder" (`Command::RevealPaneCwd`), because they are the same gesture — same starting
+directory, one landing in the OS file explorer and one in a pane.
+
+`std-widgets.slint`'s `ListView` compiles fine in this project, so the hand-rolled
+`Flickable` fallback the plan hedged on was never needed.
+
+### Wave 2 · B1 (Cursor) + B2 (Copilot) history providers — 2026-08-30
+
+**Status: landed, green.** Two agents, isolated worktrees, core-only. Both were told to
+leave `core/src/tools/history/mod.rs` alone and report the lines to add; the orchestrator
+owns that file, so neither run could conflict with the other.
+
+**Cursor — §D9's stated layout was wrong.** `~/.cursor/chats/<workspace-hash>/` is real, but
+`<workspace-hash>` is literally `md5(cwd)`: a one-way hash names no project, so that tree can
+never drive a per-project panel. The resumable text is in
+`~/.cursor/projects/<Encoded-Cwd>/agent-transcripts/*.jsonl`, and `<Encoded-Cwd>` is Claude's
+own encoding **minus the leading `-`**. `store.db` is not opened at all — the `rusqlite`
+dependency the plan reserved for this provider is unused on this path. Two panel-facing
+consequences: `branch` is always `None` for Cursor rows, so a row with no branch must render;
+and `empty-window` is a real project sentinel that correctly lands as `DecodedUnverified`,
+i.e. blocked.
+
+**Copilot — the database is opened immutable, and that is not a detail.** `~/.copilot/session-store.db`
+is opened as `file:///…?mode=ro&immutable=1`. A plain read-write open was verified to
+checkpoint the user's WAL out from under a running Copilot — reading someone's history must
+not mutate it. `substr(col, 1, FULL_TEXT_MAX + 1)` pushed into SQL took a warm scan from
+~124 ms to ~13 ms, because the full transcript text is never worth materialising to then
+truncate in Rust. All 920 rows on this machine verify as `TranscriptExact`, and `--resume <id>`
+was confirmed empirically without starting a session.
+
+**Two corrections landed with them.** `registry.rs` listed `alt_bins: &["cursor", "agent"]`
+for `cursor-agent`; `resolve_program` walks `bin` then `alt_bins` in order, so on a box with
+the Cursor **IDE** but not the agent it would have resolved the IDE launcher and emitted an
+invalid `cursor --resume <id>`. `cursor` is a different program and is gone. And
+`HistoryKind::CursorSqlite` is now `CursorJsonl` with a doc comment naming the path that is
+actually read — a name that lies about the format is a trap for the next provider author.
+
+**Follow-up left open, deliberately:** `clean_summary` / `push_full_text` / `truncate_chars`
+are private in `claude_history.rs` and are now duplicated in the Copilot provider. Making
+them `pub(crate)` and deleting the copies is a clean, separable change; doing it inside a
+parallel wave would have collided with B1.

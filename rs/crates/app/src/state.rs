@@ -1875,6 +1875,11 @@ impl State {
     pub fn forget_pane_runtime(&mut self, uid: &str) {
         self.sniffed_tool.remove(uid);
         self.agent_live.remove(uid);
+        // A Family B view pane also parks a projected row list keyed by this uid. It
+        // lives outside `State` (it is a Slint model, not app state), so it has to be
+        // released on the same path — otherwise every browser pane ever opened stays
+        // resident for the life of the window.
+        crate::viewpane::forget(uid);
     }
 
     /// The identity a pane is **drawn** with: its own `kind` when it has one, else
@@ -1923,6 +1928,29 @@ impl State {
             }
             self.dirty = true;
         }
+    }
+
+    /// Point Family B pane `idx` at `target` — the file browser descending into a
+    /// directory, or climbing to `..`.
+    ///
+    /// This is a *retarget*, not a new pane: the uid, the kind and the pane's own
+    /// label all stay put, and the breadcrumb the view draws is what tells the user
+    /// where they are. A view pane's target lives in `cwd`, which already round-trips
+    /// through `PaneSpec`, so navigating is persisted for free.
+    ///
+    /// Refuses anything that is not a file browser. A viewer's rows are inert, so the
+    /// only way to reach this with the wrong kind is a stale click racing a retarget —
+    /// and the honest answer to that is to do nothing.
+    pub fn view_navigate(&mut self, idx: usize, target: String) {
+        let t = self.active_tab_mut();
+        let Some(p) = t.panes.get_mut(idx) else {
+            return;
+        };
+        if !matches!(p.kind, PaneKind::FileBrowser) || p.cwd.as_deref() == Some(target.as_str()) {
+            return;
+        }
+        p.cwd = Some(target);
+        self.dirty = true;
     }
 
     /// Move focus in `dir`. When soloed (zoom, fullscreen, or single), cycle the pane order.

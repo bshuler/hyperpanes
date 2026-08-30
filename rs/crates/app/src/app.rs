@@ -2674,6 +2674,67 @@ impl App {
             });
         }
 
+        // A row of a Family B (non-PTY) view pane was clicked. Two outcomes, decided
+        // here rather than in `.slint` so the rule is testable: a directory (or the
+        // "..") retargets the SAME browser pane, and a file opens a NEW viewer pane —
+        // clicking a file must not destroy the listing you clicked it from.
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app.on_pane_view_activate(move |pane, row| {
+                let Some(w) = app.window_by_id(id) else {
+                    return;
+                };
+                // Resolve the pane's uid under a read-only borrow, dropped before any
+                // dispatch (borrow rule #18).
+                let uid = {
+                    let st = w.state.borrow();
+                    st.tabs
+                        .get(st.active)
+                        .and_then(|t| t.panes.get(pane as usize))
+                        .map(|p| p.uid.clone())
+                };
+                let Some(uid) = uid else { return };
+                // The projection the view was drawn from — the same cache, so the index
+                // cannot resolve against a different list than the one clicked.
+                let Some(r) = crate::viewpane::row_at(&uid, row as usize) else {
+                    return;
+                };
+                if !r.activatable() {
+                    return;
+                }
+                if r.role == crate::viewpane::role::DIR || r.role == crate::viewpane::role::PARENT {
+                    app.run_command(
+                        &w,
+                        Command::ViewNavigate(pane as usize, r.path.display().to_string()),
+                    );
+                    return;
+                }
+                let opts = NewPaneOpts {
+                    // The file's own name is the pane label; the view draws the full
+                    // location in its breadcrumb.
+                    label: r
+                        .path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .or_else(|| Some("File".to_string())),
+                    // A view pane's target IS its cwd — see `State::view_navigate`.
+                    cwd: Some(r.path.display().to_string()),
+                    command: None,
+                    shell: None,
+                    accent: None,
+                    show_frame: None,
+                    show_dot: None,
+                    env: None,
+                    startup: None,
+                    // Markdown gets the preview, everything else the plain viewer —
+                    // decided by extension so the same click never means two things.
+                    kind: Some(crate::viewpane::kind_for_file(&r.path)),
+                };
+                app.run_command(&w, Command::SubmitNewPane(opts));
+            });
+        }
+
         // tabs
         cb0!(on_new_tab, Command::NewTab);
         cb_usize!(on_select_tab, Command::SwitchTab);

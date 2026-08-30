@@ -3,6 +3,24 @@
 
 import { HiRect } from "@widgets";
 
+// One row of a Family B (non-PTY) view pane: the file browser, the file viewer or
+// the markdown preview. All three share this shape because ALL of the parsing
+// happens Rust-side in `src/viewpane.rs`; `role` is the only thing the view reads,
+// and it selects styling and nothing else. Keep the numbers in lock-step with
+// `viewpane::role` — an unrecognised role falls back to the plain-line style.
+//   0 ".."  1 dir  2 file  3 line  4 h1  5 h2  6 h3  7 code  8 bullet  9 quote
+//   10 rule  11 notice (an app-generated advisory: truncated, empty, unreadable)
+export struct PaneViewRow {
+    role: int,
+    text: string,
+    // The dim trailing column: a size + age in a listing, a line number in the
+    // viewer, "" in markdown.
+    detail: string,
+    // Whether clicking this row opens something. Decided Rust-side so the view
+    // never has to re-derive it from `role`.
+    activatable: bool,
+}
+
 // One tiled pane: the rendered terminal surface + its placement + chrome state.
 export struct PaneItem {
     surface: image,
@@ -102,6 +120,12 @@ export struct PaneItem {
     // The tool's brand accent, used for the mark only. The pane's own `accent` still owns
     // the frame/halo, so branding never overrides the user's palette.
     tool-brand: color,
+    // ---- Family B (non-PTY) views: the file browser / viewer / markdown preview ----
+    // The projected rows for a `kind >= 2` pane, already parsed and styled-by-role
+    // Rust-side. Empty for every PTY-backed pane, which renders its surface instead.
+    view-rows: [PaneViewRow],
+    // The view's header line (the target's last two path components). "" = not a view.
+    view-title: string,
 }
 
 // One tab (workspace group) chip in the strip.

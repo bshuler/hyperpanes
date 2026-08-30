@@ -6,6 +6,7 @@ import { Theme } from "theme.slint";
 import { PaneItem, DividerItem, PaletteItem, PrefOption, FramePaletteOption } from "types.slint";
 import { TerminalPane, KeyMsg, ToolIcon } from "@widgets";
 import { TipArea } from "tooltip.slint";
+import { ViewPane } from "viewpanes.slint";
 
 // A draggable resize seam. Reports the cursor's offset from the seam centre each
 // move; the controller converts that to a size-fraction delta and re-tiles, which
@@ -291,6 +292,11 @@ export component PaneView inherits Rectangle {
     callback pane-search-next(int);
     callback pane-search-prev(int);
     callback pane-search-closed(int);
+    // A row of a Family B (non-PTY) view pane was clicked → (pane index, row index).
+    // The row index resolves against the controller's own cached projection, which is
+    // the same one it handed to the view — a stale index can only miss, never open the
+    // wrong path.
+    callback pane-view-activate(int, int);
     // Wave-2 overlay callbacks (each maps to a Command in the controller).
     callback palette-query(string);
     callback palette-nav(int);
@@ -579,6 +585,12 @@ export component PaneView inherits Rectangle {
                             return reject;
                         }
                     tp := TerminalPane {
+                        // A Family B (non-PTY) pane has no surface to show — the
+                        // `ViewPane` below covers this slot. The widget is still
+                        // instantiated unconditionally because the header's
+                        // click-to-focus calls `tp.focus()`, and Slint cannot
+                        // reference an element that lives inside an `if`.
+                        visible: pane.kind < 2;
                         x: 4px;
                         y: 2px;
                         width: parent.width - 4px;
@@ -642,6 +654,23 @@ export component PaneView inherits Rectangle {
                         link-activated(x, y, ctrl) => {
                             root.focus-pane(idx);
                             root.pane-link-activated(idx, x, y, ctrl);
+                        }
+                    }
+                    // The non-PTY views (kind 2 file browser, 3 file viewer, 4
+                    // markdown). `kind` is the merged identity the controller
+                    // projects, and `view-rows` is empty for every PTY pane, so
+                    // this is the single place Family B diverges from Family A.
+                    if pane.kind >= 2 && pane.kind <= 4 : ViewPane {
+                        x: 4px;
+                        y: 2px;
+                        width: parent.width - 4px;
+                        height: parent.height - 4px;
+                        rows: pane.view-rows;
+                        title: pane.view-title;
+                        accent: pane.accent;
+                        activate(i) => {
+                            root.focus-pane(idx);
+                            root.pane-view-activate(idx, i);
                         }
                     }
                     }

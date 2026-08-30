@@ -27,8 +27,12 @@ use std::path::PathBuf;
 use crate::claude_history::{HistorySource, ProjectOrigin};
 
 pub mod claude;
+pub mod copilot;
+pub mod cursor;
 
 pub use claude::ClaudeProvider;
+pub use copilot::CopilotProvider;
+pub use cursor::CursorProvider;
 
 /// One resumable conversation, from any tool: a `ClaudeSession` plus the provenance that a
 /// cross-tool, cross-project list needs — which tool it came from, and which project it was

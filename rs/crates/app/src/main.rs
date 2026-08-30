@@ -45,6 +45,7 @@ mod state;
 mod tetris;
 mod theme;
 mod update;
+mod viewpane;
 mod window;
 mod worker;
 

@@ -306,6 +306,7 @@ pub fn pane_menu(state: &State, idx: usize, x: f32, y: f32, in_taskbar: bool) ->
     b.item("Restart", Command::RestartPane(idx));
     b.item("Refresh Env", Command::RefreshEnvPane(idx));
     b.item("Open Folder", Command::RevealPaneCwd(idx));
+    b.item("Browse Files", Command::OpenFileBrowser(idx));
     b.sep();
     b.row(
         "Copy",

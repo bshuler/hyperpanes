@@ -189,6 +189,8 @@ export component AppWindow inherits Window {
     callback pane-search-next(int);
     callback pane-search-prev(int);
     callback pane-search-closed(int);
+    // A row of a Family B (non-PTY) view pane was clicked → (pane index, row index).
+    callback pane-view-activate(int, int);
     // tabs
     callback select-tab(int);
     callback close-tab(int);
@@ -384,6 +386,7 @@ export component AppWindow inherits Window {
                 pane-search-next(i) => { root.pane-search-next(i); }
                 pane-search-prev(i) => { root.pane-search-prev(i); }
                 pane-search-closed(i) => { root.pane-search-closed(i); }
+                pane-view-activate(i, r) => { root.pane-view-activate(i, r); }
             }
 
             // Shown whenever the setting is on AND not fullscreen (mirrors

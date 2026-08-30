@@ -71,6 +71,15 @@ pub enum Command {
     GoalRemoveImage(usize),
     CloseFocused,
     ClosePane(usize),
+    /// A directory row of a Family B file-browser pane was activated: point pane
+    /// `usize` at the new directory. The pane keeps its kind and its uid — a browser
+    /// navigating is not a new pane — so nothing about the session model moves.
+    ViewNavigate(usize, String),
+    /// Open a Family B file-browser pane rooted at pane `usize`'s live cwd. The in-app
+    /// twin of [`Command::RevealPaneCwd`]: same starting directory, but the listing lands
+    /// in a pane instead of the OS file explorer. This is the only way a human can reach
+    /// a non-PTY view pane, so it is deliberately next to "Open Folder" in the pane menu.
+    OpenFileBrowser(usize),
     FocusPane(usize),
     FocusDir(Direction),
     // layout
@@ -373,6 +382,7 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
             }
         }
         Command::FocusPane(i) => state.focus_pane(i),
+        Command::ViewNavigate(i, target) => state.view_navigate(i, target),
         Command::FocusDir(d) => state.focus_dir(d),
         Command::SetLayout(l) => state.set_layout(l),
         Command::CycleLayout => {
@@ -431,6 +441,43 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
                     crate::dbg_log(&format!("RevealPaneCwd {cwd}: {e}"));
                 }
             }
+        }
+        Command::OpenFileBrowser(i) => {
+            // The pane's live cwd if shell integration reported one, else its configured
+            // cwd, else home — a browser with nowhere to start is worse than one that
+            // starts somewhere obvious.
+            let start = state
+                .active_tab()
+                .panes
+                .get(i)
+                .and_then(|p| p.cwd.clone().filter(|c| !c.is_empty()))
+                .or_else(|| {
+                    std::env::var("HOME")
+                        .ok()
+                        .or_else(|| std::env::var("USERPROFILE").ok())
+                });
+            let label = start
+                .as_deref()
+                .map(std::path::Path::new)
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .or_else(|| Some("Files".to_string()));
+            state.add_pane_opts(
+                mgr,
+                NewPaneOpts {
+                    label,
+                    // A view pane's target IS its cwd — see `State::view_navigate`.
+                    cwd: start,
+                    command: None,
+                    shell: None,
+                    accent: None,
+                    show_frame: None,
+                    show_dot: None,
+                    env: None,
+                    startup: None,
+                    kind: Some(hyperpanes_core::tools::kind::PaneKind::FileBrowser),
+                },
+            );
         }
         Command::SearchPane(i) => state.open_search(i),
         Command::SearchFocused => {

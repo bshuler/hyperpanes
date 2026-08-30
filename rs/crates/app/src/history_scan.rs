@@ -141,6 +141,16 @@ fn provider_for(
                 overrides.clone(),
             ),
         )),
+        hyperpanes_core::tools::history::cursor::TOOL_ID => Some(Box::new(
+            hyperpanes_core::tools::history::cursor::CursorProvider::with_overrides(
+                overrides.clone(),
+            ),
+        )),
+        hyperpanes_core::tools::history::copilot::TOOL_ID => Some(Box::new(
+            hyperpanes_core::tools::history::copilot::CopilotProvider::with_overrides(
+                overrides.clone(),
+            ),
+        )),
         _ => None,
     }
 }

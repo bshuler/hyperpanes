@@ -20,8 +20,10 @@ pub enum HistoryKind {
     None,
     /// `~/.claude/projects/<slug>/<uuid>.jsonl`
     ClaudeJsonl,
-    /// `~/.cursor/chats/<workspace-hash>/<uuid>/store.db`
-    CursorSqlite,
+    /// `~/.cursor/projects/<Encoded-Cwd>/agent-transcripts/*.jsonl`. NOT the `chats/`
+    /// tree the plan first named: that directory is keyed by `md5(cwd)`, a one-way hash
+    /// that can never name a project. No SQLite is involved on this path.
+    CursorJsonl,
     /// `~/.copilot/session-state/<uuid>/` + `~/.copilot/session-store.db`
     CopilotSqlite,
     /// `~/.codex/codex.sqlite` — the thread store Codex 0.151 keeps its rollouts in.
@@ -89,11 +91,15 @@ pub static TOOLS: &[ToolDef] = &[
         // `agent` is what the official installer symlinks into ~/.local/bin. It is a
         // *binary* name only — never a detect token, because "agent" in a pane title
         // names no tool at all (see GENERIC_AI_TOKENS).
-        alt_bins: &["cursor", "agent"],
+        // `cursor` is deliberately NOT here: that name belongs to the Cursor *IDE*
+        // launcher, a different program. `resolve_program` walks `bin` then `alt_bins`
+        // in order, so listing it would make a box with the IDE but no agent emit an
+        // invalid `cursor --resume <id>`.
+        alt_bins: &["agent"],
         icon: TOOL_ICON_BASE + 1,
         brand: (0x6E, 0x7B, 0x8B),
         detect_tokens: &["cursor-agent"],
-        history: HistoryKind::CursorSqlite,
+        history: HistoryKind::CursorJsonl,
     },
     ToolDef {
         id: "codex",
