@@ -208,7 +208,11 @@ pub fn list_dir(dir: &Path) -> Vec<ViewRow> {
             skipped += 1;
             continue;
         }
-        let age = md.modified().ok().map(|m| age_label(m, now)).unwrap_or_default();
+        let age = md
+            .modified()
+            .ok()
+            .map(|m| age_label(m, now))
+            .unwrap_or_default();
         if md.is_dir() {
             dirs.push(ViewRow {
                 role: role::DIR,
@@ -396,7 +400,8 @@ fn is_rule(trimmed: &str) -> bool {
 /// arm is a ready-made [`role::NOTICE`] row so every caller reports failure the
 /// same way.
 fn read_text(file: &Path) -> Result<String, ViewRow> {
-    let md = fs::metadata(file).map_err(|e| ViewRow::inert(role::NOTICE, format!("Cannot read: {e}")))?;
+    let md = fs::metadata(file)
+        .map_err(|e| ViewRow::inert(role::NOTICE, format!("Cannot read: {e}")))?;
     if md.is_dir() {
         return Err(ViewRow::inert(role::NOTICE, "That is a directory"));
     }
@@ -406,7 +411,8 @@ fn read_text(file: &Path) -> Result<String, ViewRow> {
             format!("File is {} — too large to preview", size_label(md.len())),
         ));
     }
-    let bytes = fs::read(file).map_err(|e| ViewRow::inert(role::NOTICE, format!("Cannot read: {e}")))?;
+    let bytes =
+        fs::read(file).map_err(|e| ViewRow::inert(role::NOTICE, format!("Cannot read: {e}")))?;
     // A NUL in the first block is the same heuristic `grep` uses for "binary".
     if bytes.iter().take(8_000).any(|b| *b == 0) {
         return Err(ViewRow::inert(role::NOTICE, "Binary file — not previewed"));
@@ -447,7 +453,10 @@ fn size_label(bytes: u64) -> String {
 /// "3m", "5h", "2d", "Aug 30" — the same shape the left panel's session rows use,
 /// so the two lists read as one product.
 fn age_label(t: SystemTime, now: u64) -> String {
-    let then = t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let then = t
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
     if then == 0 || then > now {
         return String::new();
     }
@@ -663,7 +672,11 @@ mod tests {
         let missing = std::env::temp_dir().join("hp-viewpane-nope-does-not-exist");
         let _ = fs::remove_dir_all(&missing);
 
-        for rows in [list_dir(&missing), read_lines(&missing), markdown_blocks(&missing)] {
+        for rows in [
+            list_dir(&missing),
+            read_lines(&missing),
+            markdown_blocks(&missing),
+        ] {
             assert_eq!(rows.len(), 1, "one notice row, not an empty pane");
             assert_eq!(rows[0].role, role::NOTICE);
             assert!(rows[0].text.starts_with("Cannot read:"), "{}", rows[0].text);
@@ -775,7 +788,11 @@ mod tests {
         // call from the per-frame pump.
         let again = model_for(uid, &PaneKind::FileViewer, Some(&target));
         assert_eq!(again.row_count(), 1);
-        assert_eq!(generation(uid), Some(g1), "an unchanged target must not reproject");
+        assert_eq!(
+            generation(uid),
+            Some(g1),
+            "an unchanged target must not reproject"
+        );
 
         // Rewrite with a different length: the fingerprint moves even if the
         // filesystem's mtime resolution would not have caught the edit.
@@ -824,7 +841,10 @@ mod tests {
         assert_eq!(size_label(3 * 1024 * 1024 * 1024), "3.0 GB");
 
         let now = 1_000_000u64;
-        assert_eq!(age_label(UNIX_EPOCH + std::time::Duration::from_secs(now), now), "now");
+        assert_eq!(
+            age_label(UNIX_EPOCH + std::time::Duration::from_secs(now), now),
+            "now"
+        );
         assert_eq!(
             age_label(UNIX_EPOCH + std::time::Duration::from_secs(now - 300), now),
             "5m"
@@ -834,7 +854,10 @@ mod tests {
             "2h"
         );
         assert_eq!(
-            age_label(UNIX_EPOCH + std::time::Duration::from_secs(now - 3 * 86_400), now),
+            age_label(
+                UNIX_EPOCH + std::time::Duration::from_secs(now - 3 * 86_400),
+                now
+            ),
             "3d"
         );
         // A clock skewed into the future must not underflow into a huge age.
@@ -848,7 +871,11 @@ mod tests {
     fn a_long_line_is_clipped_on_char_boundaries() {
         let wide = "é".repeat(MAX_LINE_CHARS + 50);
         let out = clip(&wide);
-        assert_eq!(out.chars().count(), MAX_LINE_CHARS + 1, "the ellipsis is the +1");
+        assert_eq!(
+            out.chars().count(),
+            MAX_LINE_CHARS + 1,
+            "the ellipsis is the +1"
+        );
         assert!(out.ends_with('…'));
         // CRLF must not leave a visible carriage return.
         assert_eq!(clip("hi\r"), "hi");

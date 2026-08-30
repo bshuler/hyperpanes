@@ -224,7 +224,10 @@ pub fn score(query: &str, cand: &str) -> Option<i32> {
     }
     let c: Vec<char> = cand.chars().collect();
     // Everything below the last separator is the file name.
-    let name_start = c.iter().rposition(|&ch| ch == '/' || ch == '\\').map_or(0, |i| i + 1);
+    let name_start = c
+        .iter()
+        .rposition(|&ch| ch == '/' || ch == '\\')
+        .map_or(0, |i| i + 1);
     let mut total = 0i32;
     let mut ci = 0usize;
     let mut run = 0i32;
@@ -292,7 +295,11 @@ pub fn find(root: &Path, query: &str) -> Vec<FileRow> {
             if is_dir && FINDER_SKIP.contains(&name.as_str()) {
                 continue;
             }
-            let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().replace('\\', "/");
+            let rel = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
             if let Some(s) = score(q, &rel) {
                 hits.push((s, path.clone(), is_dir));
             }
@@ -384,7 +391,10 @@ mod tests {
     fn ancestors_within_names_exactly_the_directories_to_open() {
         let root = PathBuf::from("/a/b");
         let got = ancestors_within(&root, Path::new("/a/b/c/d/e.txt"));
-        assert_eq!(got, vec![PathBuf::from("/a/b/c/d"), PathBuf::from("/a/b/c")]);
+        assert_eq!(
+            got,
+            vec![PathBuf::from("/a/b/c/d"), PathBuf::from("/a/b/c")]
+        );
         // A path outside the root expands nothing rather than walking to `/`.
         assert!(ancestors_within(&root, Path::new("/x/y.txt")).is_empty());
     }

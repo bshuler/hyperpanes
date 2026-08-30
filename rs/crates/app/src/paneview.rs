@@ -24,12 +24,8 @@ use crate::theme;
 use crate::{
     AppWindow, ClaudeSessionItem, CtxTab, DividerItem, FramePaletteOption, HiRect, KeybindingItem,
     LayoutOption, LeftFileRow, LeftModeRow, LeftPaneRow, LeftPanelAdapter, LeftSessionItem,
-    LeftSessionRow,
-    LeftSetRow, LeftTabRow,
-    PaneViewRow,
-    LeftWorkspaceRow, MenuEntry, PaletteItem, PaneItem, PrefBrowserRow, PrefOption, PrefToolRow,
-    ProjectItem, TabItem,
-    WorktreeRow,
+    LeftSessionRow, LeftSetRow, LeftTabRow, LeftWorkspaceRow, MenuEntry, PaletteItem, PaneItem,
+    PaneViewRow, PrefBrowserRow, PrefOption, PrefToolRow, ProjectItem, TabItem, WorktreeRow,
 };
 
 /// Thickness (logical px) of the draggable divider hit-area.
@@ -1108,9 +1104,7 @@ pub fn resync(
                             .get(t.focused)
                             .or_else(|| t.panes.first())
                             .map(|p| p.accent)
-                            .unwrap_or_else(|| {
-                                crate::theme::accent_for(ti, palette)
-                            }),
+                            .unwrap_or_else(|| crate::theme::accent_for(ti, palette)),
                         panes: ModelRc::from(model),
                     }
                 })
@@ -1245,7 +1239,8 @@ pub fn resync(
             // Mode 0 is the workspace tree and asks the providers nothing: a human who never
             // opens a tool mode never pays for a transcript scan. Everything below is served
             // from `leftpanel`'s cache — the scan itself runs on the history-scan thread.
-            let mode_tool = mode_tools.get((lp.get_mode() as usize).wrapping_sub(LEFT_MODE_TOOL_BASE as usize));
+            let mode_tool =
+                mode_tools.get((lp.get_mode() as usize).wrapping_sub(LEFT_MODE_TOOL_BASE as usize));
             // An empty list while the scan is still running is not "this tool has no
             // history" — the panel says so rather than reporting a verdict early.
             lp.set_sessions_scanning(
@@ -1253,27 +1248,25 @@ pub fn resync(
             );
             let sess_rows: Vec<LeftSessionItem> = match mode_tool {
                 None => Vec::new(),
-                Some(tool_id) => crate::leftpanel::tool_sessions(
-                    tool_id,
-                    &state.settings.tool_paths,
-                    now_ms,
-                )
-                .into_iter()
-                .map(|r| LeftSessionItem {
-                    blocked: !r.resumable(),
-                    id: r.id.into(),
-                    // The heading is the project's own directory name, not its whole path:
-                    // the panel is ~260px wide and the tail is the part that identifies it.
-                    group: r
-                        .project
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| r.project.display().to_string())
-                        .into(),
-                    label: r.summary.into(),
-                    detail: r.detail.into(),
-                })
-                .collect(),
+                Some(tool_id) => {
+                    crate::leftpanel::tool_sessions(tool_id, &state.settings.tool_paths, now_ms)
+                        .into_iter()
+                        .map(|r| LeftSessionItem {
+                            blocked: !r.resumable(),
+                            id: r.id.into(),
+                            // The heading is the project's own directory name, not its whole path:
+                            // the panel is ~260px wide and the tail is the part that identifies it.
+                            group: r
+                                .project
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| r.project.display().to_string())
+                                .into(),
+                            label: r.summary.into(),
+                            detail: r.detail.into(),
+                        })
+                        .collect()
+                }
             };
             sync_model(&ui.lp_sessions, sess_rows);
         }
