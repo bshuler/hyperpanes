@@ -351,16 +351,39 @@ impl App {
             if uids.is_empty() {
                 continue;
             }
-            let answers: Vec<(String, Option<String>)> = uids
+            // The directory rides along with the program name. It has to be sniffed the
+            // same way, because the reported route does not fire: a pane's cwd otherwise
+            // arrives only as `SessionEvent::Cwd`, parsed from OSC 7, and a plain `zsh`
+            // emits none — so every pane spawned without an explicit directory had `cwd:
+            // None` for its whole life, and the left panel, which roots itself on the
+            // focused pane's cwd, had nothing to follow and sat on `$HOME`.
+            let answers: Vec<(String, Option<String>, Option<String>)> = uids
                 .into_iter()
                 .map(|uid| {
                     let fg = self.mgr.foreground_name(&uid);
-                    (uid, fg)
+                    let cwd = self.mgr.foreground_cwd(&uid);
+                    (uid, fg, cwd)
                 })
                 .collect();
-            let mut st = w.state.borrow_mut();
-            for (uid, fg) in answers {
-                st.note_pane_foreground(&uid, fg.as_deref());
+            // Only panes that actually moved, so the expensive half — git-root walk,
+            // project upsert, AI notification — is paid per `cd` and not per tick.
+            let mut moved: Vec<(String, String)> = Vec::new();
+            {
+                let mut st = w.state.borrow_mut();
+                for (uid, fg, cwd) in answers {
+                    st.note_pane_foreground(&uid, fg.as_deref());
+                    if let Some(cwd) = cwd {
+                        if st.set_pane_cwd(&uid, &cwd) {
+                            moved.push((uid, cwd));
+                        }
+                    }
+                }
+            }
+            for (uid, cwd) in moved {
+                // Scoped like the OSC 7 handler's: the borrow is dropped before the AI
+                // engine is touched.
+                let project = w.state.borrow_mut().note_pane_cwd(&uid, &cwd);
+                self.ai.send(crate::ai::AiMsg::Cwd { uid, cwd, project });
             }
         }
     }

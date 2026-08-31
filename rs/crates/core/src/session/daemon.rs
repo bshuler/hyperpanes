@@ -675,17 +675,24 @@ impl Daemon {
         let cwds_fg = Arc::clone(&cwds);
         let notices_fg = notices.clone();
         tokio::spawn(async move {
-            let mut last: std::collections::HashMap<String, Option<String>> = Default::default();
+            let mut last: std::collections::HashMap<String, (Option<String>, Option<String>)> =
+                Default::default();
             let mut tick = tokio::time::interval(FOREGROUND_POLL);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 tick.tick().await;
-                let now: std::collections::HashMap<String, Option<String>> = registry_fg
+                // Name *and* directory: a `cd` is the commonest change of all and moves
+                // neither the pgrp nor its program name, so keying the push on the name
+                // alone would leave a pane's cwd frozen at whatever it was when some
+                // unrelated program last started or stopped.
+                type Sample = (Option<String>, Option<String>);
+                let now: std::collections::HashMap<String, Sample> = registry_fg
                     .uids()
                     .into_iter()
                     .map(|uid| {
                         let fg = registry_fg.foreground_name(&uid);
-                        (uid, fg)
+                        let cwd = registry_fg.foreground_cwd(&uid);
+                        (uid, (fg, cwd))
                     })
                     .collect();
                 if now == last {
@@ -1223,6 +1230,9 @@ fn session_metas(
                 // The pty is ours, so we are the only process that can answer this; the
                 // GUI reads it to tell a pane running `claude` from one at a prompt.
                 foreground: registry.foreground_name(&uid),
+                // Where that program *is*. Kept beside the reported cwd rather than folded
+                // into it — see `SessionMeta::fg_cwd` for why the two must not be merged.
+                fg_cwd: registry.foreground_cwd(&uid),
                 uid,
             }
         })

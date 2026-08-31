@@ -683,6 +683,7 @@ fn session_metas(
                 // Windows has no foreground process group to ask about; `None` is "no
                 // answer", which is what a reader must treat it as.
                 foreground: None,
+                fg_cwd: None,
                 uid,
             }
         })

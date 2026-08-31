@@ -178,6 +178,21 @@ pub struct SessionMeta {
     /// `PROTO_VER` bump.
     #[serde(default)]
     pub foreground: Option<String>,
+    /// Where that foreground process group currently *is* — the kernel's answer, sampled
+    /// on the same timer as [`foreground`](Self::foreground).
+    ///
+    /// Deliberately NOT folded into [`cwd`](Self::cwd), which is the last cwd a shell
+    /// *reported* via OSC 7. The two disagree honestly: over `ssh`, OSC 7 names a path on
+    /// the far host while the kernel names the local `ssh` client's directory. Merging them
+    /// would make the pair flap once per sample and would corrupt the reported cwd that
+    /// resume metadata is written from. So they are two fields, and a reader picks the one
+    /// that answers its question — "where does this pane relaunch" takes `cwd`, "where is
+    /// this pane right now" takes this.
+    ///
+    /// ADDITIVE, `#[serde(default)]` — see [`cols`](Self::cols) for why that needs no
+    /// `PROTO_VER` bump.
+    #[serde(default)]
+    pub fg_cwd: Option<String>,
 }
 
 /// A request from a client to the daemon. Fire-and-forget for mutators; request/response
@@ -535,6 +550,7 @@ mod tests {
                 cols: Some(120),
                 rows: Some(40),
                 foreground: Some("claude".into()),
+                fg_cwd: None,
             }]),
             DaemonMsg::Created { uid: "s9".into() },
             DaemonMsg::Replay {
@@ -578,6 +594,7 @@ mod tests {
                 cols: Some(120),
                 rows: Some(34),
                 foreground: None,
+                fg_cwd: None,
             }]),
         ];
         for m in &msgs {

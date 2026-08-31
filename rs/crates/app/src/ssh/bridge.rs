@@ -475,6 +475,7 @@ mod tests {
             cols: Some(120),
             rows: Some(40),
             foreground: None,
+            fg_cwd: None,
         }
     }
 

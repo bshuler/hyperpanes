@@ -606,6 +606,29 @@ impl SessionRegistry {
         }
     }
 
+    /// The working directory of this session's foreground process group, asked of the
+    /// kernel — see [`tools::foreground::foreground_cwd`](crate::tools::foreground::foreground_cwd).
+    ///
+    /// Sampled rather than reported, and that is the point: a pane's cwd otherwise only
+    /// ever arrives as a `SessionEvent::Cwd` parsed out of OSC 7, which a plain `zsh` never
+    /// emits — so a pane spawned without an explicit directory had no cwd at all. `None`
+    /// keeps the same meaning as its neighbour above: no answer, never "no directory".
+    pub fn foreground_cwd(&self, uid: &str) -> Option<String> {
+        #[cfg(unix)]
+        {
+            let fd = {
+                let map = self.sessions.lock().unwrap();
+                map.get(uid)?.pty.handoff_info()?.master_fd
+            };
+            crate::tools::foreground::foreground_cwd(fd)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = uid;
+            None
+        }
+    }
+
     /// Recent output for a re-attaching view (the rolling replay buffer).
     pub fn replay(&self, uid: &str) -> Option<String> {
         let map = self.sessions.lock().unwrap();
@@ -888,6 +911,18 @@ impl SessionManager {
         match self {
             SessionManager::InProcess(r) => r.foreground_name(uid),
             SessionManager::Daemon(d) => d.foreground_name(uid),
+        }
+    }
+
+    /// Where the pane's foreground process group currently *is*, by the same split: read
+    /// from the kernel in-process, read from the daemon's pushed snapshot otherwise.
+    ///
+    /// This is the answer the left panel roots itself on when it follows the focused pane,
+    /// and it is a live sample — a `cd` moves it without the shell having to cooperate.
+    pub fn foreground_cwd(&self, uid: &str) -> Option<String> {
+        match self {
+            SessionManager::InProcess(r) => r.foreground_cwd(uid),
+            SessionManager::Daemon(d) => d.foreground_cwd(uid),
         }
     }
 

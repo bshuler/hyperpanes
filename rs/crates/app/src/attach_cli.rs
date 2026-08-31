@@ -636,6 +636,7 @@ mod tests {
             cols,
             rows,
             foreground: None,
+            fg_cwd: None,
         }
     }
 

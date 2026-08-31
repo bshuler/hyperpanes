@@ -90,6 +90,11 @@ struct Shadow {
     /// ([`SessionMeta::foreground`](crate::session::proto::SessionMeta::foreground)).
     /// `None` is "no answer yet", never "nothing is running".
     foreground: Option<String>,
+    /// Where that foreground group is
+    /// ([`SessionMeta::fg_cwd`](crate::session::proto::SessionMeta::fg_cwd)) — the kernel's
+    /// live answer, kept apart from [`cwd`](Self::cwd), which is the last one a shell
+    /// *reported*.
+    fg_cwd: Option<String>,
     /// The pty's grid `(cols, rows)` as the daemon last reported it
     /// ([`SessionMeta::cols`](crate::session::proto::SessionMeta::cols)).
     ///
@@ -118,6 +123,7 @@ impl Shadow {
             last_output_at: None,
             cwd: None,
             foreground: None,
+            fg_cwd: None,
             dims: None,
             pending: false,
         }
@@ -401,6 +407,7 @@ impl DaemonSessionManager {
                     shadow.cwd = meta.cwd.clone();
                 }
                 shadow.foreground = meta.foreground.clone();
+                shadow.fg_cwd = meta.fg_cwd.clone();
                 shadow.dims = meta.cols.zip(meta.rows);
             }
         }
@@ -528,6 +535,17 @@ impl DaemonSessionManager {
             .unwrap()
             .get(uid)
             .and_then(|s| s.foreground.clone())
+    }
+
+    /// Where that foreground program is — same shadow, same freshness guarantee, and the
+    /// same meaning for `None`. The daemon owns the pty, so it is the only process that can
+    /// ask the kernel; this is how the GUI reads the answer.
+    pub fn foreground_cwd(&self, uid: &str) -> Option<String> {
+        self.shadows
+            .lock()
+            .unwrap()
+            .get(uid)
+            .and_then(|s| s.fg_cwd.clone())
     }
 
     /// Serialize the pane's current screen — a bounded `RenderScreen`/`Screen` round-trip
@@ -811,6 +829,8 @@ fn reconcile_snapshot(
         // a reader is required to treat it as such — carrying a stale name forward would
         // outlive the command that produced it.
         shadow.foreground = meta.foreground.clone();
+        // Rides with `foreground`: same sample, same tick, same honest `None`.
+        shadow.fg_cwd = meta.fg_cwd.clone();
         // Same rule as `foreground`, for the same reason: a daemon that cannot answer says
         // `None`, and a stale grid size is worse than no size — it would seed a replay at a
         // width the pty stopped using.
@@ -1327,6 +1347,7 @@ mod tests {
             cols: None,
             rows: None,
             foreground: foreground.map(str::to_string),
+            fg_cwd: None,
         }
     }
 
@@ -1347,6 +1368,30 @@ mod tests {
             s.lock().unwrap().get("u1").unwrap().foreground,
             None,
             "a stale name would outlive the command that produced it"
+        );
+    }
+
+    /// The sniffed directory folds the same way, and — the point of it being its own field
+    /// — without disturbing the *reported* one. A pane inside `ssh` has both at once and
+    /// they name different machines; letting a snapshot's `fg_cwd` overwrite `cwd` would
+    /// corrupt what resume metadata is written from.
+    #[test]
+    fn a_snapshot_carries_the_sniffed_directory_without_touching_the_reported_one() {
+        let s = shadows();
+        let mut reported = meta("u1", Some("ssh"));
+        reported.cwd = Some("/on/the/far/host".into());
+        reconcile_snapshot(&s, &[reported]);
+
+        let mut sniffed = meta("u1", Some("ssh"));
+        sniffed.fg_cwd = Some("/here".into());
+        reconcile_snapshot(&s, &[sniffed]);
+        let shadows = s.lock().unwrap();
+        let shadow = shadows.get("u1").unwrap();
+        assert_eq!(shadow.fg_cwd.as_deref(), Some("/here"));
+        assert_eq!(
+            shadow.cwd.as_deref(),
+            Some("/on/the/far/host"),
+            "the sniffed directory must not overwrite the reported one"
         );
     }
 

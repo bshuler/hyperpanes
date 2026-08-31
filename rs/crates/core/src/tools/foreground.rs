@@ -359,6 +359,88 @@ pub fn foreground_tool(fd: PtyFd) -> Option<&'static ToolDef> {
     }
 }
 
+/// The current working directory of `pid`, asked of the kernel.
+///
+/// `PROC_PIDVNODEPATHINFO` hands back the vnode *and its path* for both the process's
+/// cwd and its root in one call, so the directory arrives already resolved — no
+/// readlink, no walk, no shell cooperation. The path field is declared
+/// `[[c_char; 32]; 32]` rather than `[c_char; 1024]` only because of an old-rustc array
+/// workaround in `libc`; it is one contiguous 1024-byte NUL-terminated buffer, which is
+/// why it is read here as a flat byte slice.
+#[cfg(target_os = "macos")]
+fn process_cwd(pid: i32) -> Option<String> {
+    // SAFETY: `proc_vnodepathinfo` is plain POD — every field is an integer or a byte
+    // array — so an all-zero value is a valid one to hand the kernel as an out-param.
+    let mut info: libc::proc_vnodepathinfo = unsafe { std::mem::zeroed() };
+    let size = size_of::<libc::proc_vnodepathinfo>() as i32;
+    // SAFETY: the buffer is exactly `size` bytes and the flavor is the one whose struct
+    // it is. A dead or unreadable pid is a short/negative return, not UB — which is what
+    // makes this safe to call on a UI tick against a pane that may have just exited.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDVNODEPATHINFO,
+            0,
+            (&mut info as *mut libc::proc_vnodepathinfo).cast(),
+            size,
+        )
+    };
+    // A partial answer is not a shorter answer: the kernel either fills the struct or
+    // reports failure, so anything but the full size means the path field is garbage.
+    if n != size {
+        return None;
+    }
+    let raw = &info.pvi_cdir.vip_path;
+    // SAFETY: `vip_path` is a 32x32 array of `c_char` occupying 1024 contiguous bytes;
+    // `c_char` and `u8` share size and alignment, so this reads the same bytes.
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<u8>(), size_of_val(raw)) };
+    let end = bytes.iter().position(|b| *b == 0)?;
+    let path = std::str::from_utf8(&bytes[..end]).ok()?;
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
+/// The current working directory of `pid`, from `/proc`.
+#[cfg(target_os = "linux")]
+fn process_cwd(pid: i32) -> Option<String> {
+    let link = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
+    let path = link.to_str()?;
+    (!path.is_empty()).then(|| path.to_owned())
+}
+
+/// No route on this platform — same reasoning as [`foreground_command`]'s fallback: a
+/// wrong directory is worse than none, and re-rooting a file panel on one would be
+/// visibly wrong.
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+fn process_cwd(_pid: i32) -> Option<String> {
+    None
+}
+
+/// The working directory of whatever is running in the foreground of the pty on `fd`.
+///
+/// The shell's own cwd, in the ordinary case — a shell sitting at its prompt *is* the
+/// foreground group — and the running program's while one is up, which is the honest
+/// answer to "where is this pane": `cd`-ing inside a subshell is exactly what the panel
+/// should follow.
+///
+/// This exists because the other route does not fire. A pane's cwd otherwise arrives
+/// only as [`SessionEvent::Cwd`](crate::session::SessionEvent::Cwd), parsed from OSC 7
+/// or OSC 9;9, and a plain `zsh` emits neither, so a pane spawned without an explicit
+/// directory reported `None` forever. The kernel always knows.
+///
+/// Cheap enough for a UI tick, like its neighbours: two syscalls, no subprocess, no wait.
+pub fn foreground_cwd(fd: PtyFd) -> Option<String> {
+    #[cfg(unix)]
+    {
+        process_cwd(foreground_pgrp(fd)?)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = fd;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,6 +585,26 @@ mod tests {
 
     /// The FFI half, against a real pty with a known process in it.
     #[cfg(unix)]
+    /// The FFI half of [`foreground_cwd`], asked of the one process every platform can
+    /// answer for: this one. It proves the struct size, the flavor and — on macOS — the
+    /// flattening of `vip_path`'s `[[c_char; 32]; 32]` back into one NUL-terminated buffer,
+    /// which is the part that would silently return a 32-byte fragment if it were wrong.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn the_kernel_can_name_this_process_own_directory() {
+        let got = process_cwd(std::process::id() as i32).expect("own cwd");
+        let got = std::path::PathBuf::from(got);
+        assert!(got.is_absolute(), "not absolute: {got:?}");
+        assert!(got.is_dir(), "not a directory: {got:?}");
+        // Not compared against `current_dir()` by equality: the test binary is one process
+        // and another test in it may `chdir`. Depth is the check that cannot race — a
+        // truncated read would come back as a 31-character prefix, not a real directory.
+        assert!(
+            got.components().count() > 1,
+            "suspiciously shallow: {got:?}"
+        );
+    }
+
     mod live {
         use super::*;
         use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -518,6 +620,12 @@ mod tests {
 
         /// Open a pty, run `argv` in it, and ask what the kernel says is running there.
         fn probe(argv: &[&str]) -> Probed {
+            probe_in(argv, "/")
+        }
+
+        /// [`probe`], with the child started in a directory of the caller's choosing —
+        /// which is the whole question [`foreground_cwd`] answers.
+        fn probe_in(argv: &[&str], cwd: &str) -> Probed {
             let pair = native_pty_system()
                 .openpty(PtySize {
                     rows: 24,
@@ -532,7 +640,7 @@ mod tests {
             }
             // `portable-pty` falls back to `$HOME` when no cwd is set, and other tests in
             // this binary point `HOME` at a path that does not exist.
-            cmd.cwd("/");
+            cmd.cwd(cwd);
             let child = pair.slave.spawn_command(cmd).expect("spawn");
             let fd = pair.master.as_raw_fd().expect("a unix master has an fd");
             let want_pgrp = child.process_id().map(|p| p as i32);
@@ -565,6 +673,38 @@ mod tests {
             assert!(tool_for_foreground_name("sleep").is_none());
             let _ = child.kill();
             let _ = child.wait();
+        }
+
+        /// The directory follows the *foreground* program, not the pane's birth argument —
+        /// which is what makes the answer survive a `cd` that no shell ever announces.
+        #[test]
+        fn a_real_pty_reports_the_directory_its_program_is_in() {
+            // Resolved, because the kernel answers with a resolved path: on macOS `/tmp` is
+            // a symlink to `/private/tmp`, so comparing against the unresolved spelling
+            // would fail on the symlink and not on the probe.
+            let want = std::fs::canonicalize(std::env::temp_dir()).expect("temp dir");
+            let (_name, pair, mut child) = probe_in(&["/bin/sleep", "30"], want.to_str().unwrap());
+            let fd = pair.master.as_raw_fd().expect("a unix master has an fd");
+            assert_eq!(foreground_cwd(fd).map(std::path::PathBuf::from), Some(want));
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
+        /// The pty with nothing in it has no foreground group, and therefore no directory —
+        /// `None`, not the probing process's own cwd, which would be a plausible wrong
+        /// answer the left panel would happily root itself on.
+        #[test]
+        fn an_empty_pty_has_no_directory() {
+            let pair = native_pty_system()
+                .openpty(PtySize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .expect("openpty");
+            let fd = pair.master.as_raw_fd().expect("a unix master has an fd");
+            assert!(foreground_cwd(fd).is_none());
         }
 
         #[test]

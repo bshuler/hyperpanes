@@ -2365,6 +2365,30 @@ impl State {
     /// A clean pane outside any repo is left untouched (stays frame/dot OFF).
     /// Returns the resolved git project (root path + name) so the caller can feed the
     /// ambient-AI engine's `on_cwd`; `None` when the cwd isn't inside a git repo.
+    /// Record the directory a pane is **in**, reporting whether it actually moved.
+    ///
+    /// Split out of [`note_pane_cwd`](Self::note_pane_cwd) because the two answer different
+    /// questions and only one of them is cheap. This one writes two fields; that one walks
+    /// the tree looking for a `.git`, upserts the project store and rebuilds the project
+    /// list. The kernel sniff runs on a timer over every pane, so it asks this first and
+    /// only pays for the rest on a real `cd` — which is also what keeps a pane's label from
+    /// being re-derived on every tick.
+    pub fn set_pane_cwd(&mut self, uid: &str, cwd: &str) -> bool {
+        let Some((ti, pi)) = self.find_pane(uid) else {
+            return false;
+        };
+        let p = &mut self.tabs[ti].panes[pi];
+        if p.cwd.as_deref() == Some(cwd) {
+            return false;
+        }
+        // Both, as the OSC 7 path does: the widget resolves clickable paths against its
+        // copy, and the control read-model's `/state` reads the pane's.
+        p.pane.set_cwd(Some(cwd.to_string()));
+        p.cwd = Some(cwd.to_string());
+        self.dirty = true;
+        true
+    }
+
     pub fn note_pane_cwd(&mut self, uid: &str, cwd: &str) -> Option<AiProjectRef> {
         let root = sidebar::git_root_of(cwd)?;
         let project = projects::upsert_project_by_root(&root.to_string_lossy());

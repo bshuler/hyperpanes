@@ -21,7 +21,9 @@ pub mod registry;
 /// one authority on each tool's resume argv.
 pub mod session_mark;
 
-pub use foreground::{foreground_name, foreground_tool, tool_for_foreground_name, PtyFd};
+pub use foreground::{
+    foreground_cwd, foreground_name, foreground_tool, tool_for_foreground_name, PtyFd,
+};
 pub use kind::{PaneKind, META_KIND_KEY};
 pub use registry::{by_bin, by_id, by_title, HistoryKind, ToolDef, TOOLS, TOOL_ICON_BASE};
 pub use session_mark::{resume_args, ToolSessionMark, META_SESSION_CWD_KEY, META_SESSION_KEY};
