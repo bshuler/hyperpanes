@@ -474,7 +474,7 @@ pub fn tab_menu(state: &State, idx: usize, x: f32, y: f32) -> CtxMenu {
     let mut b = Build::new();
     let only = state.tabs.len() < 2;
     let is_last = idx + 1 >= state.tabs.len();
-    let no_closed = state.closed_tabs.is_empty();
+    let no_closed = state.closed.is_empty();
 
     let new_sc = state.keymap.label_for("tab.new").unwrap_or_default();
 
@@ -527,7 +527,7 @@ pub fn tab_menu(state: &State, idx: usize, x: f32, y: f32) -> CtxMenu {
         Some(Command::CloseTabsToRight(idx)),
     );
     b.row(
-        "Reopen Closed Tab",
+        "Reopen Closed",
         "",
         0,
         false,

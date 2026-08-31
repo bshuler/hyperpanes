@@ -60,6 +60,10 @@ pub enum Overlay {
     /// picking routes through [`State::pick_browser`]. Dismissing drops the URL on the
     /// floor, which is the point: "ask" means the human may also answer "not this one".
     AskBrowser,
+    /// The close-confirmation card. Holds the close the user asked for in
+    /// [`State::pending_close`] until they answer; answering routes through
+    /// [`State::confirm_close_go`] / the ordinary dismiss path (which cancels).
+    ConfirmClose,
 }
 
 // Pane/session uid minting moved to the backend: `SessionManager::fresh_uid` picks the
@@ -133,7 +137,7 @@ pub struct DetachedPane {
 }
 
 /// A whole tab detached for re-hosting (the tab menu's "Move to New Window") or parked on the
-/// closed-tab stack (for "Reopen Closed Tab"). Like [`DetachedPane`] the sessions stay alive
+/// recently-closed history (for "Reopen Closed"). Like [`DetachedPane`] the sessions stay alive
 /// centrally, so re-hosting is a replay-into-fresh-grids, never a restart.
 #[derive(Debug, Clone)]
 pub struct DetachedTab {
@@ -148,6 +152,109 @@ pub struct DetachedTab {
     /// maximized pane instead of dropping the zoom.
     pub zoomed: Option<usize>,
     pub panes: Vec<DetachedPane>,
+}
+
+/// What one entry of the recently-closed history holds — a closed *pane* or a closed *tab*.
+///
+/// Both keep their sessions ALIVE centrally: a close parks through the detach machinery, not
+/// the kill path, which is what makes reopening a re-dock of the running shell rather than a
+/// respawn of a fresh one. That aliveness is also the obligation: an entry evicted by the cap,
+/// and every entry still parked when the window closes, must have its sessions killed — see
+/// [`State::push_closed`] and [`State::session_uids`].
+#[derive(Debug, Clone)]
+pub enum ClosedWhat {
+    Pane(Box<DetachedPane>),
+    Tab(Box<DetachedTab>),
+}
+
+/// One row of the recently-closed history: what was closed, plus what the list needs to draw
+/// it and address it.
+#[derive(Debug, Clone)]
+pub struct ClosedItem {
+    pub what: ClosedWhat,
+    /// Identity for a row click. Index-free for the same reason the reminder rows key on
+    /// `uid`: the list can shift between the frame the human clicked and the click arriving
+    /// (another close pushes, the cap evicts), and an index would then restore the wrong row.
+    pub id: i32,
+    /// When it was closed, in epoch ms — the list's relative-age column.
+    pub at_ms: u64,
+}
+
+impl ClosedItem {
+    /// The live panes this entry is keeping alive (one for a pane, all of them for a tab).
+    /// Borrowed as a slice so the kill loops read the same for both variants.
+    pub fn panes(&self) -> &[DetachedPane] {
+        match &self.what {
+            ClosedWhat::Pane(p) => std::slice::from_ref(&**p),
+            ClosedWhat::Tab(t) => &t.panes,
+        }
+    }
+
+    /// The history row's title.
+    pub fn label(&self) -> SharedString {
+        match &self.what {
+            ClosedWhat::Pane(p) => p.title.clone(),
+            ClosedWhat::Tab(t) => t.title.clone(),
+        }
+    }
+
+    /// Whether this entry is a whole tab (drives the row's icon + "N panes" line).
+    pub fn is_tab(&self) -> bool {
+        matches!(self.what, ClosedWhat::Tab(_))
+    }
+
+    /// The row's tint — the first pane's pinned accent, if it has one.
+    pub fn accent(&self) -> Option<Color> {
+        self.panes().first().and_then(|p| p.pinned_accent)
+    }
+}
+
+/// How many closed panes/tabs stay reopenable. Everything past this is evicted *and killed*,
+/// so the number is a live-session budget, not just a list length.
+pub const CLOSED_STACK_CAP: usize = 20;
+
+/// How long ago a history entry was closed, for its row's second line. Coarse on purpose:
+/// the first minute is one bucket ("just now") so a fresh close doesn't re-push the whole
+/// list into Slint once a second (the pump's signature includes this string).
+pub fn rel_age(now_ms: u64, at_ms: u64) -> String {
+    let secs = now_ms.saturating_sub(at_ms) / 1000;
+    match secs {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86_399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86_400),
+    }
+}
+
+/// Process-global counter for [`ClosedItem::id`] — same rationale as `NEXT_VIEW_UID`: two
+/// windows in one process must never mint the same row id.
+static NEXT_CLOSED_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
+
+fn fresh_closed_id() -> i32 {
+    NEXT_CLOSED_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Which pane/tab a [`PendingClose`] is about, named by a **session uid** rather than an
+/// index. The confirm card is modal but the world underneath is not — a background shell can
+/// exit and renumber the tabs while the question is on screen — so the answer is re-resolved
+/// against the uid at confirm time and simply does nothing if that pane is already gone. A
+/// tab is named by its first pane's uid, which is as stable an identity as a tab has.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CloseTarget {
+    Pane(String),
+    Tab(String),
+}
+
+/// A close the human asked for, held while the confirm card asks whether they meant it.
+#[derive(Debug, Clone)]
+pub struct PendingClose {
+    pub target: CloseTarget,
+    /// What is about to close, in the card's headline ("claude", "Tab 2 — 3 panes").
+    pub title: SharedString,
+    /// True when this close ENDS THE WINDOW: the last pane of the last tab has nowhere to be
+    /// parked (the history dies with the window), so it is a real kill and the card says so.
+    /// This is also why such a close is confirmed even with the confirm preference off.
+    pub final_close: bool,
 }
 
 /// A single preferences edit, carried by `Command::ApplySetting`. Keeps the `Command`
@@ -1143,12 +1250,22 @@ pub struct State {
     /// a `State` mutation), so a command that needs to change it leaves a note instead of
     /// reaching into Slint from the middle of a borrow.
     pub left_mode_request: Option<i32>,
-    /// Most-recently-closed tabs (sessions kept alive centrally) for "Reopen Closed Tab",
-    /// newest last. Capped — evicted entries' sessions are killed.
-    pub closed_tabs: Vec<DetachedTab>,
+    /// The recently-closed history — panes AND tabs in ONE list, newest last, sessions kept
+    /// alive centrally so reopening re-docks the running shell. One list rather than two
+    /// because "reopen the last thing I closed" is only answerable if both kinds share an
+    /// order: with separate stacks, closing a pane after a tab makes the tab unreachable by
+    /// the keyboard command. Capped at [`CLOSED_STACK_CAP`] — evicted entries are killed.
+    /// NOT persisted: sessions don't survive a relaunch, so neither can their history.
+    pub closed: Vec<ClosedItem>,
+    /// Whether the rail's RECENTLY CLOSED section is expanded (mirrors `reminders_open`;
+    /// the two are mutually exclusive sections of the same widened rail).
+    pub closed_open: bool,
+    /// The close waiting on the confirm card's answer (`None` when it isn't up). Held as a
+    /// target rather than a closure so the answer runs back through the ordinary command path.
+    pub pending_close: Option<PendingClose>,
     // ---- reminder panes (Track F) ----
     /// Panes parked "until a chosen time": removed from the layout but their sessions stay
-    /// alive centrally (the same detach machinery as `closed_tabs`). The app tick marks
+    /// alive centrally (the same detach machinery as the `closed` history). The app tick marks
     /// entries `fired` when due; clicking a bell-list row re-docks the pane into the active
     /// tab and removes its entry. NOT persisted — sessions don't survive a relaunch, so
     /// reminders die with them (matching the session lifecycle).
@@ -1349,7 +1466,9 @@ impl State {
             git: crate::gitpanel::GitStatus::none(),
             git_sel: None,
             left_mode_request: None,
-            closed_tabs: Vec::new(),
+            closed: Vec::new(),
+            closed_open: false,
+            pending_close: None,
             reminders: Vec::new(),
             reminders_open: false,
             sniffed_tool: std::collections::HashMap::new(),
@@ -1830,11 +1949,6 @@ impl State {
         Some(uid)
     }
 
-    /// Close pane `idx` in the active tab (see [`Self::close_pane_in`]).
-    pub fn close_pane(&mut self, idx: usize, mgr: &SessionManager) -> bool {
-        self.close_pane_in(self.active, idx, mgr)
-    }
-
     /// Remove pane `idx` of tab `ti` **without** killing its session, returning the
     /// removed [`PaneState`] and whether the window still has panes (`false` = the
     /// workspace emptied → the caller should close the window). An emptied non-last tab
@@ -1912,6 +2026,37 @@ impl State {
             }
             None => true,
         }
+    }
+
+    /// Close pane `idx` of tab `ti` **reopenably**: park it on the recently-closed history with
+    /// its session alive, so the × is undoable instead of fatal. Returns whether the window
+    /// still has panes.
+    ///
+    /// The last pane of the last tab falls through to the real [`Self::close_pane_in`]: there
+    /// is nowhere to park it: the history lives in this `State` and dies with the window, so
+    /// parking would leak the PTY rather than preserve it. That close is the one genuinely
+    /// irreversible one, which is why it is also the one always confirmed.
+    pub fn close_pane_menu(&mut self, ti: usize, idx: usize, mgr: &SessionManager) -> bool {
+        if self.ends_window_pane(ti, idx) {
+            return self.close_pane_in(ti, idx, mgr);
+        }
+        match self.detach_pane_in(ti, idx) {
+            Some(det) => {
+                self.push_closed(ClosedWhat::Pane(Box::new(det)), mgr);
+                true
+            }
+            None => true,
+        }
+    }
+
+    /// Whether closing pane `idx` of tab `ti` empties the whole window (the only pane of the
+    /// only tab) — the close that quits, and cannot be parked.
+    fn ends_window_pane(&self, ti: usize, idx: usize) -> bool {
+        self.tabs.len() <= 1
+            && self
+                .tabs
+                .get(ti)
+                .is_some_and(|t| t.panes.len() <= 1 && idx < t.panes.len())
     }
 
     /// Detach the focused pane of the active tab for re-hosting in another window:
@@ -2154,12 +2299,12 @@ impl State {
         self.tabs
             .iter()
             .flat_map(|t| t.panes.iter().map(|p| p.uid.clone()))
-            // Tabs parked on the closed-tab stack keep their sessions alive (for reopen), so
-            // they must be killed when the window closes too — else they'd leak.
+            // Panes/tabs parked on the recently-closed history keep their sessions alive (for
+            // reopen), so they must be killed when the window closes too — else they'd leak.
             .chain(
-                self.closed_tabs
+                self.closed
                     .iter()
-                    .flat_map(|t| t.panes.iter().map(|p| p.uid.clone())),
+                    .flat_map(|c| c.panes().iter().map(|p| p.uid.clone())),
             )
             // Parked reminder panes also keep their sessions alive — kill them on close too.
             .chain(self.reminders.iter().map(|r| r.pane.uid.clone()))
@@ -2800,6 +2945,9 @@ impl State {
             self.add_project_error.clear();
             self.ask_url.clear();
             self.ask_browsers.clear();
+            // Dismissing the confirm card IS the cancel: the close it was holding is dropped
+            // on the floor, exactly like the browser chooser's URL.
+            self.pending_close = None;
             if was_goal {
                 self.refocus_active_pane_scope();
             }
@@ -3947,6 +4095,8 @@ impl State {
         self.sidebar_open = !self.sidebar_open;
         if self.sidebar_open {
             self.projects = sidebar::list();
+            self.reminders_open = false;
+            self.closed_open = false;
         }
         self.dirty = true;
     }
@@ -3976,12 +4126,12 @@ impl State {
     }
 
     /// Every session uid THIS window is holding ALIVE — laid out in any tab, parked as a
-    /// reminder, or sitting on the reopen (closed-tab) stack. The left panel subtracts these
+    /// reminder, or sitting on the recently-closed history. The left panel subtracts these
     /// to decide which live sessions are detached.
     ///
     /// The set is [`Self::session_uids`]'s, deliberately: that is the list this window kills
     /// when it closes, i.e. the exact inventory of sessions it is responsible for. A closed
-    /// tab's panes belong in it — their PTYs are still running so "Reopen closed tab" can
+    /// tab's or pane's session belongs in it — its PTY is still running so "Reopen Closed" can
     /// bring them back — and leaving them out would offer them in the panel's DETACHED list,
     /// where one click would re-host a session the reopen stack still points at (reopening
     /// the tab afterwards would then duplicate the uid in two panes).
@@ -5178,7 +5328,7 @@ impl State {
 
     /// Adopt a detached session at the end of tab `ti` **without** changing the active tab
     /// (re-host into a background tab — replay-primed, no PTY restart). Used by move-to-tab +
-    /// reopen-closed-tab.
+    /// reopen-closed.
     fn adopt_into_tab(&mut self, mgr: &SessionManager, det: DetachedPane, ti: usize) {
         if ti >= self.tabs.len() {
             return;
@@ -5448,13 +5598,18 @@ impl State {
         self.dirty = true;
     }
 
-    /// Park a closed tab on the reopen stack, capping it (evicted entries' sessions are killed).
-    fn push_closed(&mut self, tab: DetachedTab, mgr: &SessionManager) {
-        const CLOSED_STACK_CAP: usize = 10;
-        self.closed_tabs.push(tab);
-        while self.closed_tabs.len() > CLOSED_STACK_CAP {
-            let evicted = self.closed_tabs.remove(0);
-            for p in &evicted.panes {
+    /// Park a closed pane or tab on the recently-closed history, capping it. Eviction is the
+    /// point where a close finally becomes irreversible, so it is also where the sessions the
+    /// entry was keeping alive are killed — the cap is a budget of live off-layout PTYs.
+    fn push_closed(&mut self, what: ClosedWhat, mgr: &SessionManager) {
+        self.closed.push(ClosedItem {
+            what,
+            id: fresh_closed_id(),
+            at_ms: crate::glow::now_epoch_ms(),
+        });
+        while self.closed.len() > CLOSED_STACK_CAP {
+            let evicted = self.closed.remove(0);
+            for p in evicted.panes() {
                 kill_session_of(mgr, &p.uid, &p.kind);
             }
         }
@@ -5515,7 +5670,7 @@ impl State {
     pub fn close_tab_menu(&mut self, idx: usize, mgr: &SessionManager) -> bool {
         if self.tabs.len() >= 2 {
             if let Some((det, _)) = self.detach_tab(idx) {
-                self.push_closed(det, mgr);
+                self.push_closed(ClosedWhat::Tab(Box::new(det)), mgr);
             }
             true
         } else {
@@ -5545,12 +5700,9 @@ impl State {
         }
     }
 
-    /// Reopen the most-recently closed tab (replay-primed; its sessions were kept alive), as a
-    /// fresh tab switched to. No-op when the stack is empty.
-    pub fn reopen_closed_tab(&mut self, mgr: &SessionManager) {
-        let Some(det) = self.closed_tabs.pop() else {
-            return;
-        };
+    /// Re-host a parked tab as a fresh tab, switched to (replay-primed; its sessions were
+    /// kept alive). Split out of the reopen command so a history-row click can reach it too.
+    fn reopen_tab(&mut self, mgr: &SessionManager, det: DetachedTab) {
         let mut tab = Tab::empty(det.title.clone());
         tab.layout = det.layout;
         self.tabs.push(tab);
@@ -6458,7 +6610,7 @@ impl State {
 
 /// Track F: reminder panes — park a live pane until a chosen time. Its own `impl` block so
 /// the feature reads as one unit. Parking reuses the detach machinery (the session stays
-/// alive centrally, exactly like `closed_tabs`); restoring reuses `adopt_pane` (replay-primed
+/// alive centrally, exactly like the `closed` history); restoring reuses `adopt_pane` (replay-primed
 /// re-dock into the ACTIVE tab). All methods follow the mutate→set-dirty seam.
 impl State {
     /// Park active-tab pane `idx` until `offset` from now: remove it from the layout WITHOUT
@@ -6489,6 +6641,7 @@ impl State {
         self.reminders_open = !self.reminders_open;
         if self.reminders_open {
             self.sidebar_open = false;
+            self.closed_open = false;
         }
         self.dirty = true;
     }
@@ -6536,6 +6689,171 @@ impl State {
         let r = self.reminders.remove(i);
         self.reminders_open = false;
         self.adopt_pane(mgr, r.pane); // focuses the pane + sets dirty
+    }
+}
+
+/// Closing a pane or tab: the confirmation that precedes it and the history that survives it.
+/// Its own `impl` block so the feature reads as one unit.
+///
+/// The shape is deliberate. A confirm dialog and an undo list are two answers to the same
+/// worry — "I didn't mean to close that" — and answering it twice is how a workspace ends up
+/// nagging on every ×. So the close itself is made *reversible* first: closing parks the pane
+/// or tab with its session still running, and reopening re-docks that same shell rather than
+/// respawning one. The card is then only the second line of defence, and the one close it can
+/// never be undone for — the last pane of the last tab, which quits — is confirmed
+/// unconditionally, preference or not.
+impl State {
+    // ---- asking first ----
+
+    /// The × on a pane. Puts the confirm card up (and returns `true` — nothing has closed
+    /// yet); closes straight through when the card is switched off and the close is undoable.
+    pub fn request_close_pane(&mut self, ti: usize, idx: usize, mgr: &SessionManager) -> bool {
+        let Some(ps) = self.tabs.get(ti).and_then(|t| t.panes.get(idx)) else {
+            return true;
+        };
+        let pending = PendingClose {
+            target: CloseTarget::Pane(ps.uid.to_string()),
+            title: ps.title.clone(),
+            final_close: self.ends_window_pane(ti, idx),
+        };
+        if self.skip_confirm(&pending) {
+            return self.close_pane_menu(ti, idx, mgr);
+        }
+        self.ask_close(pending);
+        true
+    }
+
+    /// [`Self::request_close_pane`] for the focused pane of the active tab (the keybinding).
+    pub fn request_close_focused(&mut self, mgr: &SessionManager) -> bool {
+        let ti = self.active;
+        let idx = self.tabs[ti].focused;
+        self.request_close_pane(ti, idx, mgr)
+    }
+
+    /// The × on a tab — same contract as [`Self::request_close_pane`].
+    pub fn request_close_tab(&mut self, idx: usize, mgr: &SessionManager) -> bool {
+        let Some(t) = self.tabs.get(idx) else {
+            return true;
+        };
+        // A tab has no uid of its own, so it borrows its first pane's: the most stable name
+        // available for "this tab" once the indices underneath may have shifted.
+        let Some(first) = t.panes.first() else {
+            return self.close_tab_menu(idx, mgr);
+        };
+        let n = t.panes.len();
+        let pending = PendingClose {
+            target: CloseTarget::Tab(first.uid.to_string()),
+            title: if n > 1 {
+                format!("{} — {n} panes", t.title).into()
+            } else {
+                t.title.clone()
+            },
+            final_close: self.tabs.len() <= 1,
+        };
+        if self.skip_confirm(&pending) {
+            return self.close_tab_menu(idx, mgr);
+        }
+        self.ask_close(pending);
+        true
+    }
+
+    /// Whether this close may go through unasked: only when the human turned the card off
+    /// AND the close is one the history can undo. A window-ending close always asks.
+    fn skip_confirm(&self, pending: &PendingClose) -> bool {
+        !self.settings.confirm_close && !pending.final_close
+    }
+
+    /// Raise the confirm card over whatever else was open.
+    fn ask_close(&mut self, pending: PendingClose) {
+        self.pending_close = Some(pending);
+        self.overlay = Overlay::ConfirmClose;
+        self.dirty = true;
+    }
+
+    /// The card's "Close" button. Re-resolves the held uid against the CURRENT layout — a
+    /// background shell can exit and renumber the tabs while the question is on screen — so a
+    /// target that is already gone simply closes the card. Returns whether the window lives.
+    pub fn confirm_close_go(&mut self, mgr: &SessionManager) -> bool {
+        let Some(pending) = self.pending_close.take() else {
+            self.close_overlay_now();
+            return true;
+        };
+        self.close_overlay_now();
+        match pending.target {
+            CloseTarget::Pane(uid) => match self.find_pane(&uid) {
+                Some((ti, idx)) => self.close_pane_menu(ti, idx, mgr),
+                None => true,
+            },
+            CloseTarget::Tab(uid) => match self.find_pane(&uid) {
+                Some((ti, _)) => self.close_tab_menu(ti, mgr),
+                None => true,
+            },
+        }
+    }
+
+    /// The card's "Don't ask again" checkbox. Persisted with the other prefs; it only ever
+    /// governs the undoable closes (see [`Self::skip_confirm`]).
+    pub fn set_confirm_close(&mut self, on: bool) {
+        if self.settings.confirm_close != on {
+            self.settings.confirm_close = on;
+            prefs::save(&self.settings);
+            self.dirty = true;
+        }
+    }
+
+    // ---- the history ----
+
+    /// Toggle the rail's RECENTLY CLOSED section (collapsing the other two — one panel at a
+    /// time, mirroring the bell and the projects flyout).
+    pub fn toggle_closed(&mut self) {
+        self.closed_open = !self.closed_open;
+        if self.closed_open {
+            self.sidebar_open = false;
+            self.reminders_open = false;
+        }
+        self.dirty = true;
+    }
+
+    /// Reopen the most recently closed pane or tab — the keyboard/menu command. No-op on an
+    /// empty history.
+    pub fn reopen_closed(&mut self, mgr: &SessionManager) {
+        let Some(item) = self.closed.pop() else {
+            return;
+        };
+        self.restore_item(item, mgr);
+    }
+
+    /// A history-row click. Keyed by the row's id rather than its index so a click can't race
+    /// a concurrent close (which pushes) or an eviction (which shifts everything down).
+    pub fn restore_closed(&mut self, id: i32, mgr: &SessionManager) {
+        let Some(i) = self.closed.iter().position(|c| c.id == id) else {
+            return;
+        };
+        let item = self.closed.remove(i);
+        self.closed_open = false;
+        self.restore_item(item, mgr);
+    }
+
+    /// Re-host one history entry: a pane re-docks into the ACTIVE tab (the same replay-primed
+    /// `adopt_pane` the bell uses), a tab comes back as its own tab, switched to.
+    fn restore_item(&mut self, item: ClosedItem, mgr: &SessionManager) {
+        match item.what {
+            ClosedWhat::Pane(p) => self.adopt_pane(mgr, *p), // focuses the pane + sets dirty
+            ClosedWhat::Tab(t) => self.reopen_tab(mgr, *t),
+        }
+    }
+
+    /// The × on a history row: give up on this entry for good, killing the sessions it was
+    /// holding open. Same finality as an eviction, just asked for.
+    pub fn discard_closed(&mut self, id: i32, mgr: &SessionManager) {
+        let Some(i) = self.closed.iter().position(|c| c.id == id) else {
+            return;
+        };
+        let item = self.closed.remove(i);
+        for p in item.panes() {
+            kill_session_of(mgr, &p.uid, &p.kind);
+        }
+        self.dirty = true;
     }
 }
 
@@ -7172,7 +7490,10 @@ mod session_file_tests {
         let mut st = fresh();
         let m = mgr();
         st.adopt_pane(&m, det("only", 14.0));
-        assert!(!st.close_pane(0, &m), "workspace emptied → caller quits");
+        assert!(
+            !st.close_pane_in(st.active, 0, &m),
+            "workspace emptied → caller quits"
+        );
         assert!(
             st.active_tab().panes.is_empty(),
             "empty tab left while closing"
@@ -8646,13 +8967,10 @@ mod left_panel_tests {
         assert_eq!(st.reminders.len(), 1);
         assert!(st.claimed_uids().contains("b0"));
 
-        // …and on the reopen (closed-tab) stack, whose PTYs stay alive for reopen. Missing
+        // …and on the recently-closed history, whose PTYs stay alive for reopen. Missing
         // these would offer them in the DETACHED list and let one click give a uid two homes.
         st.close_tab_menu(0, &m);
-        assert!(
-            !st.closed_tabs.is_empty(),
-            "closing parked the tab for reopen"
-        );
+        assert!(!st.closed.is_empty(), "closing parked the tab for reopen");
         let claimed = st.claimed_uids();
         assert!(
             claimed.contains("a0") && claimed.contains("a1"),
@@ -9382,5 +9700,305 @@ mod keyboard_focus_tests {
         st.editing_pane = -1;
         st.sync_pane_keyboard_focus();
         assert_ne!(seq(&st), before);
+    }
+}
+
+#[cfg(test)]
+mod close_history_tests {
+    //! The × on a pane or a tab: what it asks, and what it takes back.
+    //!
+    //! Two rules carry the whole feature and are pinned here. **A close is reversible** —
+    //! the pane/tab is parked with its shell still running, so it must stay in
+    //! `session_uids` (the window's kill list) until it is reopened or discarded; anything
+    //! else either leaks a PTY or kills a session the history still offers. And **the one
+    //! close nothing can undo asks anyway** — the last pane of the last tab ends the
+    //! window, so the preference must not be able to silence it.
+    use super::*;
+
+    fn fresh() -> State {
+        let mut st = State::new(theme::load_font(1.0));
+        // `State::new` reads the real user prefs; the confirm tests set this explicitly so
+        // they say what they mean regardless of what is on this machine's disk.
+        st.settings.confirm_close = true;
+        st
+    }
+
+    fn mgr() -> SessionManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionManager::new(tx)
+    }
+
+    fn det(uid: &str) -> DetachedPane {
+        DetachedPane {
+            uid: uid.into(),
+            title: uid.into(),
+            subtitle: None,
+            pinned_accent: None,
+            show_frame: None,
+            show_dot: None,
+            font_px: 14.0,
+            spawn_command: None,
+            spawn_args: None,
+            spawn_shell: None,
+            kind: PaneKind::default(),
+            tool_session: None,
+            cwd: None,
+        }
+    }
+
+    /// A window of `tabs` tabs holding the given uids, last tab active.
+    fn window(m: &SessionManager, tabs: &[&[&str]]) -> State {
+        let mut st = fresh();
+        for (i, uids) in tabs.iter().enumerate() {
+            for (j, u) in uids.iter().enumerate() {
+                if i > 0 && j == 0 {
+                    st.adopt_pane_as_tab(m, det(u));
+                } else {
+                    st.adopt_pane(m, det(u));
+                }
+            }
+        }
+        st
+    }
+
+    fn laid_out(st: &State) -> Vec<String> {
+        st.tabs
+            .iter()
+            .flat_map(|t| t.panes.iter().map(|p| p.uid.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn closing_a_pane_parks_it_instead_of_killing_it() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"]]);
+
+        assert!(st.close_pane_menu(0, 0, &m), "the window lives on");
+        assert_eq!(laid_out(&st), ["a1"]);
+        assert_eq!(st.closed.len(), 1);
+        // Still this window's responsibility: its PTY is running off-layout.
+        assert!(
+            st.session_uids().iter().any(|u| u == "a0"),
+            "a parked pane stays on the window's kill list"
+        );
+
+        st.reopen_closed(&m);
+        assert!(st.closed.is_empty());
+        assert!(laid_out(&st).contains(&"a0".to_string()), "it came back");
+    }
+
+    /// Panes and tabs share ONE ordered history — with two stacks, "reopen the last thing I
+    /// closed" would be unanswerable, and closing a pane after a tab would strand the tab.
+    #[test]
+    fn panes_and_tabs_share_one_ordered_history() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"], &["b0", "b1"]]);
+
+        st.close_tab_menu(0, &m); // the tab first…
+        st.close_pane_menu(st.active, 0, &m); // …then a pane, which must come back first
+        assert_eq!(st.closed.len(), 2);
+        assert!(st.closed[0].is_tab(), "the tab is the older entry");
+        assert!(!st.closed[1].is_tab(), "the pane is the newer entry");
+
+        st.reopen_closed(&m);
+        assert_eq!(st.tabs.len(), 1, "the pane came back, not the tab");
+        assert!(laid_out(&st).contains(&"b0".to_string()));
+        st.reopen_closed(&m);
+        assert_eq!(st.tabs.len(), 2, "and the tab is still reachable");
+        assert!(st.closed.is_empty());
+    }
+
+    /// A row click names its entry by id, never by position: a close landing (push) or an
+    /// eviction (shift) between the frame the human saw and the click arriving must not
+    /// restore something else.
+    #[test]
+    fn a_history_row_is_restored_by_id_not_by_index() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1", "a2"]]);
+
+        st.close_pane_menu(0, 0, &m); // a0
+        let wanted = st.closed[0].id;
+        st.close_pane_menu(0, 0, &m); // a1 — pushes on top, shifting nothing the human saw
+
+        st.restore_closed(wanted, &m);
+        assert!(laid_out(&st).contains(&"a0".to_string()), "the clicked row");
+        assert_eq!(st.closed.len(), 1);
+        assert_eq!(st.closed[0].label(), "a1");
+
+        // An id that is already gone is a no-op, not a panic or a wrong restore.
+        st.restore_closed(wanted, &m);
+        assert_eq!(st.closed.len(), 1);
+    }
+
+    #[test]
+    fn discarding_a_row_drops_it_for_good() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"]]);
+        st.close_pane_menu(0, 0, &m);
+        let id = st.closed[0].id;
+
+        st.discard_closed(id, &m);
+        assert!(st.closed.is_empty());
+        assert!(
+            !st.session_uids().iter().any(|u| u == "a0"),
+            "a discarded entry is no longer held alive"
+        );
+    }
+
+    /// The history is a live-session budget, not a log: the cap has to evict, and eviction
+    /// is where those sessions actually die.
+    #[test]
+    fn the_history_is_capped() {
+        let m = mgr();
+        let uids: Vec<String> = (0..CLOSED_STACK_CAP + 3).map(|i| format!("p{i}")).collect();
+        let refs: Vec<&str> = uids.iter().map(|s| s.as_str()).collect();
+        let mut st = window(&m, &[&refs]);
+
+        for _ in 0..CLOSED_STACK_CAP + 2 {
+            st.close_pane_menu(0, 0, &m);
+        }
+        assert_eq!(st.closed.len(), CLOSED_STACK_CAP);
+        assert_eq!(st.closed[0].label(), "p2", "the two oldest were evicted");
+    }
+
+    #[test]
+    fn the_x_asks_first_and_the_answer_does_the_closing() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"]]);
+
+        assert!(st.request_close_pane(0, 0, &m));
+        assert!(matches!(st.overlay, Overlay::ConfirmClose));
+        assert_eq!(laid_out(&st), ["a0", "a1"], "nothing closed on the ask");
+        assert_eq!(st.pending_close.as_ref().unwrap().title, "a0");
+        assert!(!st.pending_close.as_ref().unwrap().final_close);
+
+        assert!(st.confirm_close_go(&m));
+        assert!(matches!(st.overlay, Overlay::None));
+        assert!(st.pending_close.is_none());
+        assert_eq!(laid_out(&st), ["a1"]);
+        assert_eq!(st.closed.len(), 1);
+    }
+
+    /// Dismissing the card by any route — Esc, Cancel, the scrim — IS cancelling.
+    #[test]
+    fn dismissing_the_card_cancels_the_close() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"]]);
+
+        st.request_close_pane(0, 0, &m);
+        st.close_overlay();
+        assert!(
+            st.pending_close.is_none(),
+            "the close was dropped, not held"
+        );
+        assert_eq!(laid_out(&st), ["a0", "a1"]);
+        assert!(st.closed.is_empty());
+    }
+
+    /// The card holds a session uid, not an index. A background shell exiting while the
+    /// question is on screen renumbers everything; re-resolving is what stops the answer
+    /// from landing on the wrong pane.
+    #[test]
+    fn a_target_that_moved_is_still_the_right_one() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1", "a2"]]);
+
+        st.request_close_pane(0, 2, &m); // asking about a2…
+        st.close_pane_in(0, 0, &m); // …while a0 exits underneath, shifting a2 to index 1
+
+        st.confirm_close_go(&m);
+        assert_eq!(
+            laid_out(&st),
+            ["a1"],
+            "a2 closed, not whatever is at index 2"
+        );
+    }
+
+    #[test]
+    fn a_target_that_vanished_closes_nothing() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"]]);
+
+        st.request_close_pane(0, 0, &m);
+        st.close_pane_in(0, 0, &m); // the shell exited on its own first
+
+        assert!(st.confirm_close_go(&m), "the window lives");
+        assert_eq!(
+            laid_out(&st),
+            ["a1"],
+            "the survivor was not closed in its place"
+        );
+    }
+
+    /// The preference only ever governs the closes the history can undo.
+    #[test]
+    fn the_preference_skips_only_the_undoable_closes() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"]]);
+        st.settings.confirm_close = false;
+
+        assert!(st.request_close_pane(0, 0, &m));
+        assert!(matches!(st.overlay, Overlay::None), "no card");
+        assert_eq!(st.closed.len(), 1, "it closed straight through");
+
+        // …but the last pane of the last tab ends the window, and nothing brings that back.
+        assert!(st.request_close_pane(0, 0, &m), "asked, so still alive");
+        assert!(matches!(st.overlay, Overlay::ConfirmClose));
+        assert!(st.pending_close.as_ref().unwrap().final_close);
+        assert!(
+            !st.confirm_close_go(&m),
+            "confirming the last pane quits the window"
+        );
+    }
+
+    #[test]
+    fn closing_the_last_tab_asks_even_with_confirmations_off() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"], &["b0"]]);
+        st.settings.confirm_close = false;
+
+        st.request_close_tab(0, &m); // two tabs → undoable, goes straight through
+        assert!(matches!(st.overlay, Overlay::None));
+        assert_eq!(st.tabs.len(), 1);
+        assert_eq!(st.closed.len(), 1);
+
+        st.request_close_tab(0, &m); // the last one ends the window
+        assert!(matches!(st.overlay, Overlay::ConfirmClose));
+        assert!(st.pending_close.as_ref().unwrap().final_close);
+        assert_eq!(st.tabs.len(), 1, "nothing closed on the ask");
+    }
+
+    /// The card names what it is closing — a confirmation that doesn't is just a speed bump.
+    #[test]
+    fn a_multi_pane_tab_says_how_much_is_going() {
+        let m = mgr();
+        let mut st = window(&m, &[&["a0", "a1"], &["b0"]]);
+        st.request_close_tab(0, &m);
+        let title = st.pending_close.as_ref().unwrap().title.to_string();
+        assert!(title.ends_with("— 2 panes"), "{title}");
+    }
+
+    /// Only the RECENTLY CLOSED section may be open at a time — same rule the bell and the
+    /// projects flyout already follow.
+    #[test]
+    fn opening_the_history_collapses_the_other_rail_sections() {
+        let mut st = fresh();
+        st.sidebar_open = true;
+        st.reminders_open = true;
+
+        st.toggle_closed();
+        assert!(st.closed_open && !st.sidebar_open && !st.reminders_open);
+
+        st.toggle_reminders();
+        assert!(!st.closed_open, "the bell takes the rail back");
+    }
+
+    #[test]
+    fn ages_read_as_a_human_would_say_them() {
+        assert_eq!(rel_age(30_000, 0), "just now");
+        assert_eq!(rel_age(90_000, 0), "1m ago");
+        assert_eq!(rel_age(7_200_000, 0), "2h ago");
+        assert_eq!(rel_age(172_800_000, 0), "2d ago");
+        assert_eq!(rel_age(0, 5_000), "just now", "a clock that went backwards");
     }
 }

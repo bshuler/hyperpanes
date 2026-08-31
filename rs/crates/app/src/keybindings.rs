@@ -293,7 +293,7 @@ pub fn default_bindings() -> Vec<Binding> {
             true,
             Char('t'),
             "Tabs",
-            "Reopen closed tab",
+            "Reopen closed pane or tab",
             Command::ReopenClosedTab,
         ),
         // Panes
@@ -967,7 +967,7 @@ mod tests {
     #[test]
     fn exact_modifier_match_required() {
         let km = empty_keymap();
-        // Ctrl+Shift+T reopens a closed tab; plain T is not bound.
+        // Ctrl+Shift+T reopens the last close (pane or tab); plain T is not bound.
         assert!(km
             .match_chord(true, false, true, KeyTok::Char('t'))
             .is_some());

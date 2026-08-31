@@ -10,7 +10,7 @@
 // dispatched against the central `State` (see ARCHITECTURE.md).
 
 import { Theme } from "theme.slint";
-import { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, PrefToolRow, PrefBrowserRow, FramePaletteOption, KeybindingItem, MenuEntry, CtxTab, HistoryUi, ReminderItem, RemindersAdapter, LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSetRow, LeftSessionRow, LeftModeRow, LeftSessionItem, LeftPanelAdapter } from "types.slint";
+import { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, PrefToolRow, PrefBrowserRow, FramePaletteOption, KeybindingItem, MenuEntry, CtxTab, HistoryUi, ReminderItem, RemindersAdapter, ClosedItemUi, ClosedAdapter, LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSetRow, LeftSessionRow, LeftModeRow, LeftSessionItem, LeftPanelAdapter } from "types.slint";
 import { TopBar } from "topbar.slint";
 import { PaneView } from "paneview.slint";
 import { OverlayLayer } from "overlays.slint";
@@ -25,7 +25,7 @@ import { KeyMsg, HiRect } from "@widgets";
 // here only so the Rust controller can reach it via `global::<RemindersAdapter>()`; all its
 // UI lives in sidebar.slint. ReminderCustom likewise (the pane menu's custom-duration
 // parser bridge; UI in contextmenu.slint).
-export { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, PrefToolRow, PrefBrowserRow, KeybindingItem, MenuEntry, CtxTab, KeyMsg, HiRect, HistoryUi, ReminderItem, RemindersAdapter, ReminderCustom, LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSetRow, LeftSessionRow, LeftModeRow, LeftSessionItem, LeftPanelAdapter }
+export { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, PrefToolRow, PrefBrowserRow, KeybindingItem, MenuEntry, CtxTab, KeyMsg, HiRect, HistoryUi, ReminderItem, RemindersAdapter, ReminderCustom, ClosedItemUi, ClosedAdapter, LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSetRow, LeftSessionRow, LeftModeRow, LeftSessionItem, LeftPanelAdapter }
 
 export component AppWindow inherits Window {
     title: "hyperpanes";
@@ -109,6 +109,7 @@ export component AppWindow inherits Window {
     in property <bool> pref-auto-update: false;
     // session-daemon M3: "keep terminals running in the background when Hyperpanes closes".
     in property <bool> pref-keep-alive: true;
+    in property <bool> pref-confirm-close: true;
     in property <string> pref-update-status: "";
     in property <int> pref-update-phase: 0;
     in property <float> pref-update-progress: 0;
@@ -134,6 +135,12 @@ export component AppWindow inherits Window {
     // ---- "Open link with…" chooser (overlay kind 6) ----
     in property <string> ask-url;
     in property <[PrefBrowserRow]> ask-browsers;
+    // Close-confirmation card (overlay kind 7).
+    in property <string> cc-title;
+    in property <bool> cc-final;
+    in property <bool> cc-ask;
+    callback confirm-close-go();
+    callback set-confirm-close(bool);
     // ---- right-edge sidebar rail ----
     in property <[ProjectItem]> projects;
     in property <bool> show-sidebar: true;   // rail visible (gated; hidden in fullscreen)
@@ -399,9 +406,11 @@ export component AppWindow inherits Window {
             // `!fullscreenPaneId && showSidebar && <Sidebar/>`).
             if root.show-sidebar && !root.fullscreen : SidebarRail {
                 // single rail-width binding: a slim icon rail, widened in-place when the
-                // projects OR reminders section is open (the PaneView sibling shrinks to
-                // match; the two sections are mutually exclusive — see sidebar.slint).
-                width: (root.sidebar-open || RemindersAdapter.open) ? 280px : 44px;
+                // projects, reminders OR recently-closed section is open (the PaneView
+                // sibling shrinks to match; the three are mutually exclusive — see
+                // sidebar.slint).
+                width: (root.sidebar-open || RemindersAdapter.open || ClosedAdapter.open)
+                    ? 280px : 44px;
                 projects: root.projects;
                 projects-open: root.sidebar-open;
                 new-pane => { root.new-pane(); }
@@ -560,6 +569,7 @@ export component AppWindow inherits Window {
             app-version: root.pref-app-version;
             auto-update: root.pref-auto-update;
             keep-alive: root.pref-keep-alive;
+            confirm-close: root.pref-confirm-close;
             update-status: root.pref-update-status;
             update-phase: root.pref-update-phase;
             update-progress: root.pref-update-progress;
@@ -585,6 +595,11 @@ export component AppWindow inherits Window {
             ask-url: root.ask-url;
             ask-browsers: root.ask-browsers;
             browser-pick(i) => { root.pick-browser(i); }
+            cc-title: root.cc-title;
+            cc-final: root.cc-final;
+            cc-ask: root.cc-ask;
+            cc-confirm => { root.confirm-close-go(); }
+            cc-set-ask(on) => { root.set-confirm-close(on); }
             goal-images: root.goal-images;
             goal-text: root.goal-text;
             goal-field: root.goal-field;

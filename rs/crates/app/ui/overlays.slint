@@ -21,6 +21,7 @@ import { KeyMsg } from "@widgets";
 import { NewPaneDialog } from "newpane.slint";
 import { AddProjectDialog } from "addproject.slint";
 import { AskBrowserDialog } from "askbrowser.slint";
+import { ConfirmCloseDialog } from "confirmclose.slint";
 import { NewGoalDialog } from "newgoal.slint";
 import { TipArea } from "tooltip.slint";
 
@@ -465,6 +466,7 @@ export component OverlayLayer inherits Rectangle {
     in property <string> app-version: "";        // running build version (env CARGO_PKG_VERSION)
     in property <bool> auto-update: false;        // persisted "check on startup" toggle
     in property <bool> keep-alive: true;          // session-daemon M3: keep terminals alive on quit
+    in property <bool> confirm-close: true;       // ask before closing a pane or a tab
     in property <string> update-status: "";       // human status line from the updater
     in property <int> update-phase: 0;            // 0 idle · 1 checking · 2 up-to-date · 3 available · 4 downloading · 5 downloaded · 6 error
     in property <bool> update-notify-only: false; // Linux/macOS: no in-app install — "available" opens the releases page
@@ -493,6 +495,11 @@ export component OverlayLayer inherits Rectangle {
     in property <string> ask-url;            // the URL being routed
     in property <[PrefBrowserRow]> ask-browsers;
     callback browser-pick(int);              // index into `ask-browsers`
+    in property <string> cc-title;           // what the close confirmation is about
+    in property <bool> cc-final;             // …and whether it ends the window
+    in property <bool> cc-ask;               // the "ask before closing" preference
+    callback cc-confirm();
+    callback cc-set-ask(bool);
     callback pref-action(int, int);  // (kind, arg) — see state::Setting mapping
     callback pref-text(int, string); // (kind, value) — string-valued settings
     callback pref-done();            // commit the appearance draft + close (Done / Save)
@@ -1376,6 +1383,23 @@ export component OverlayLayer inherits Rectangle {
                 font-size: 11px;
             }
 
+            Rectangle { height: 1px; background: Theme.border; }
+
+            // ---- close confirmation ----
+            // The card itself carries an "Ask before closing" checkbox, but a card that has
+            // been switched off never appears again — this is the way back.
+            PrefToggle {
+                label: "Ask before closing a pane or a tab";
+                on: root.confirm-close;
+                toggled(v) => { root.pref-action(25, v ? 1 : 0); }
+            }
+            Text {
+                text: "a closed pane or tab is parked with its terminal still running and comes back from ↩ Recently Closed in the sidebar — turn this off to close without being asked (the last pane of the last tab still asks, because closing it ends the window for good)";
+                color: Theme.faint;
+                font-size: 11px;
+                wrap: word-wrap;
+            }
+
                         } // end General panel
 
                         // ================= Tools =================
@@ -1709,6 +1733,19 @@ export component OverlayLayer inherits Rectangle {
         url: root.ask-url;
         browsers: root.ask-browsers;
         pick(i) => { root.browser-pick(i); }
+        cancel => { root.dismiss(); }
+    }
+
+    // ===== close confirmation =====
+    if root.kind == 7 : ConfirmCloseDialog {
+        width: 100%;
+        height: 100%;
+        subject: root.cc-title;
+        final-close: root.cc-final;
+        ask: root.cc-ask;
+        confirm => { root.cc-confirm(); }
+        set-ask(on) => { root.cc-set-ask(on); }
+        // Dismissing IS cancelling — the held close is dropped, see `close_overlay_now`.
         cancel => { root.dismiss(); }
     }
 }

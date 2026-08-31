@@ -1033,8 +1033,8 @@ fn gui_uids_with_parked(windows: &[Rc<Window>]) -> HashSet<String> {
     let mut set = gui_uids(windows);
     for w in windows {
         let st = w.state.borrow();
-        for t in &st.closed_tabs {
-            for p in &t.panes {
+        for c in &st.closed {
+            for p in c.panes() {
                 set.insert(p.uid.clone());
             }
         }

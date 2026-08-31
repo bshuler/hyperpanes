@@ -20,7 +20,7 @@
 // self-contained — no new app-level wiring.
 
 import { Theme } from "theme.slint";
-import { ProjectItem, WorktreeRow, ClaudeSessionItem, HistoryUi, ReminderItem, RemindersAdapter } from "types.slint";
+import { ProjectItem, WorktreeRow, ClaudeSessionItem, HistoryUi, ReminderItem, RemindersAdapter, ClosedItemUi, ClosedAdapter } from "types.slint";
 import { TipArea } from "tooltip.slint";
 
 // "+" quick-pane glyph (two crossed bars — font-independent). `bar` sets the cross size
@@ -266,6 +266,21 @@ component BellGlyph inherits Path {
     fill: transparent;
     // dome (left lip → arc over the top → right lip), the bottom lip line, then the clapper.
     commands: "M 4.3 11 L 4.3 7.2 A 3.7 3.7 0 0 1 11.7 7.2 L 11.7 11 M 3 11 L 13 11 M 6.6 13 A 1.5 1.5 0 0 0 9.4 13";
+}
+
+// An undo-arrow glyph for the recently-closed history: an arc doubling back on itself with
+// an arrowhead. Font-independent, like the Bell/Folder/Trash glyphs.
+component UndoGlyph inherits Path {
+    in property <color> ink;
+    width: 16px;
+    height: 16px;
+    viewbox-width: 16;
+    viewbox-height: 16;
+    stroke: ink;
+    stroke-width: 1.4px;
+    fill: transparent;
+    // arrowhead pointing back left, then the arc sweeping right and down.
+    commands: "M 6 3 L 2.6 6.2 L 6 9.4 M 2.6 6.2 L 9.5 6.2 A 3.6 3.6 0 0 1 9.5 13.4 L 5.5 13.4";
 }
 
 // A magnifier glyph (stroked circle + handle) for the history search box. Font-independent,
@@ -713,6 +728,93 @@ component ReminderRowView inherits Rectangle {
     }
 }
 
+// ===== recently closed =====
+// One history entry: tint dot + title + what-and-when line, with a discard × on hover.
+// Clicking the row re-docks it (the shell is still running); the × gives up on it for good,
+// which is the only thing in this section that actually kills anything.
+component ClosedRowView inherits Rectangle {
+    in property <ClosedItemUi> item;
+    callback restore();
+    callback discard();
+    height: 40px;
+    border-radius: 5px;
+    background: ca.has-hover ? Theme.surface2 : transparent;
+
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 7px;
+
+        // pane tint dot — hollow for a tab, so the two kinds read apart at a glance.
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 10px;
+                height: 10px;
+                border-radius: root.item.is-tab ? 3px : 5px;
+                background: root.item.is-tab ? transparent : root.item.tint;
+                border-width: root.item.is-tab ? 1.5px : 0px;
+                border-color: root.item.tint;
+            }
+        }
+
+        VerticalLayout {
+            alignment: center;
+            horizontal-stretch: 1;
+            Text {
+                text: root.item.title;
+                color: Theme.text;
+                font-size: 12px;
+                overflow: elide;
+            }
+            Text {
+                text: (root.item.is-tab
+                        ? "tab · " + root.item.panes + (root.item.panes == 1 ? " pane" : " panes")
+                        : "pane")
+                    + " · " + root.item.age;
+                color: Theme.subtext;
+                font-size: 10px;
+                overflow: elide;
+            }
+        }
+
+        // discard — only on hover, because it is the irreversible half of the row.
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                border-radius: 4px;
+                visible: ca.has-hover || xa.has-hover;
+                background: xa.has-hover ? Theme.danger : transparent;
+                Text {
+                    text: "✕";
+                    color: xa.has-hover ? Theme.mantle : Theme.subtext;
+                    font-size: 10px;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                    x: 0; y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                }
+                xa := TipArea {
+                    tip: "Forget this — ends its terminal";
+                    side: 1;
+                    mouse-cursor: pointer;
+                    clicked => { root.discard(); }
+                }
+            }
+        }
+    }
+
+    ca := TipArea {
+        tip: "Reopen — its terminal is still running";
+        side: 1;
+        mouse-cursor: pointer;
+        clicked => { root.restore(); }
+    }
+}
+
 export component SidebarRail inherits Rectangle {
     in property <[ProjectItem]> projects;
     in property <bool> projects-open: false;
@@ -841,6 +943,7 @@ export component SidebarRail inherits Rectangle {
             // which collapses the projects flyout when the bell opens).
             clicked => {
                 if (RemindersAdapter.open) { RemindersAdapter.toggle(); }
+                if (ClosedAdapter.open) { ClosedAdapter.toggle(); }
                 root.toggle-projects();
             }
         }
@@ -945,6 +1048,107 @@ export component SidebarRail inherits Rectangle {
                         for r[i] in RemindersAdapter.rows : ReminderRowView {
                             rem: r;
                             restore => { RemindersAdapter.restore(r.uid); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // ===== recently closed: ↩ button + count badge + in-rail RECENTLY CLOSED section =====
+    // The undo half of the close confirmation (see confirmclose.slint): everything closed
+    // here still has its shell running, so a row click re-docks that session rather than
+    // spawning a new one. Same rail mechanics as the bell — data rides the ClosedAdapter
+    // global, and the three sections are mutually exclusive.
+    undo-btn := Rectangle {
+        x: root.width - root.rail-icons-w + 6px;   // anchored to the rail's right edge
+        y: 114px;                                   // below the 🔔 reminders button
+        width: 32px;
+        height: 32px;
+        border-radius: 7px;
+        background: (ClosedAdapter.open || ua.has-hover) ? Theme.surface2 : transparent;
+        UndoGlyph {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            ink: ClosedAdapter.open ? Theme.accent : (ua.has-hover ? Theme.text : Theme.subtext);
+        }
+        if ClosedAdapter.rows.length > 0 : Rectangle {
+            x: parent.width - self.width - 1px;
+            y: 1px;
+            width: 15px;
+            height: 14px;
+            border-radius: 7px;
+            background: Theme.accent;
+            Text {
+                text: ClosedAdapter.rows.length;
+                color: #11111b;
+                font-size: 9px;
+                font-weight: 700;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+            }
+        }
+        ua := TipArea {
+            tip: ClosedAdapter.open ? "Hide recently closed" : "Recently closed — reopen a pane or tab";
+            side: 1;
+            mouse-cursor: pointer;
+            clicked => { ClosedAdapter.toggle(); }
+        }
+    }
+
+    // The RECENTLY CLOSED section (IN-RAIL, same geometry as REMINDERS above). Gated on the
+    // other two so a stray both-open state can't draw two sections on top of each other.
+    if ClosedAdapter.open && !root.projects-open && !RemindersAdapter.open : Rectangle {
+        x: 0;
+        y: 0;
+        width: root.width - root.rail-icons-w;
+        height: root.height;
+        background: Theme.mantle;
+        clip: true;
+        // eat stray clicks so they don't fall through to a pane behind the section
+        TouchArea {}
+
+        // divider hairline separating the section from the icon column
+        Rectangle { x: parent.width - 1px; width: 1px; height: 100%; background: Theme.border; }
+
+        VerticalLayout {
+            padding: 8px;
+            spacing: 4px;
+
+            Text {
+                text: "RECENTLY CLOSED";
+                color: Theme.subtext;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0.5px;
+                height: 18px;
+                vertical-alignment: center;
+            }
+
+            if ClosedAdapter.rows.length == 0 : Text {
+                text: "Nothing closed yet. Panes and tabs you close land here with their terminals still running — click one to bring it back.";
+                color: Theme.subtext;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            Rectangle {
+                vertical-stretch: 1;
+                clip: true;
+                Flickable {
+                    width: 100%;
+                    height: 100%;
+                    viewport-width: self.width;
+                    viewport-height: closedbody.preferred-height;
+                    closedbody := VerticalLayout {
+                        alignment: start;
+                        spacing: 2px;
+                        for c[i] in ClosedAdapter.rows : ClosedRowView {
+                            item: c;
+                            restore => { ClosedAdapter.restore(c.id); }
+                            discard => { ClosedAdapter.discard(c.id); }
                         }
                     }
                 }

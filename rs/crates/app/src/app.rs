@@ -154,6 +154,8 @@ pub struct Window {
     /// Signature of the last reminder rows/open/fired set pushed into the `RemindersAdapter`
     /// global (Track F) — the same idle-render guard: an unchanged list writes nothing.
     pub last_reminders: Cell<Option<u64>>,
+    /// Same guard for the `ClosedAdapter` global's recently-closed rows.
+    pub last_closed: Cell<Option<u64>>,
 }
 
 /// The app: the window registry + the shared session engine + the shared event stream.
@@ -895,6 +897,7 @@ impl App {
             last_control: RefCell::new(None),
             last_update: RefCell::new(None),
             last_reminders: Cell::new(None),
+            last_closed: Cell::new(None),
         });
 
         self.wire(&win);
@@ -1063,15 +1066,15 @@ impl App {
                     break;
                 }
                 // A session can also be ALIVE without a laid-out pane: parked as a reminder
-                // (Track F) or on the reopenable closed-tab stack. Neither has a grid to
+                // (Track F) or on the recently-closed history. Neither has a grid to
                 // re-apply, but killing it as "closed mid-spawn" would silently dead-shell
                 // the pane when it's later restored/reopened (hit live by parking a pane
                 // within ~1s of its spawn).
                 if st.reminders.iter().any(|r| r.pane.uid == uid)
                     || st
-                        .closed_tabs
+                        .closed
                         .iter()
-                        .any(|t| t.panes.iter().any(|p| p.uid == uid))
+                        .any(|c| c.panes().iter().any(|p| p.uid == uid))
                 {
                     found = true;
                     break;
@@ -1149,6 +1152,7 @@ impl App {
         //     rows + bell state into the `RemindersAdapter` global (signature-gated, so an
         //     unchanged list costs nothing at either tick cadence).
         self.pump_reminders(&windows);
+        self.pump_closed(&windows);
 
         // 2f. Left panel (M5): republish the session uids every window in this process is
         //     hosting, so the panel's DETACHED section can subtract them. Cheap (a string
@@ -1573,6 +1577,61 @@ impl App {
             g.set_open(open);
             g.set_alert(alert);
             g.set_toasts(slint::ModelRc::from(Rc::new(slint::VecModel::from(toasts))));
+        }
+    }
+
+    /// Recently-closed pump (UI thread): mirror each window's close history into its
+    /// `ClosedAdapter` global. Signature-gated exactly like [`Self::pump_reminders`], with
+    /// the age bucket folded in so the "2m ago" line ticks over without re-pushing every
+    /// frame — the rows are otherwise frozen at close time.
+    fn pump_closed(&self, windows: &[Rc<Window>]) {
+        let now_ms = crate::glow::now_epoch_ms();
+        for w in windows {
+            let sig = {
+                let st = w.state.borrow();
+                let mut h: u64 = 0xcbf29ce484222325;
+                let mut mix = |bytes: &[u8]| {
+                    for b in bytes {
+                        h ^= *b as u64;
+                        h = h.wrapping_mul(0x100000001b3);
+                    }
+                };
+                mix(if st.closed_open { b"\x01" } else { b"\x00" });
+                for c in &st.closed {
+                    mix(&c.id.to_le_bytes());
+                    mix(crate::state::rel_age(now_ms, c.at_ms).as_bytes());
+                    mix(b"\x1e");
+                }
+                h
+            };
+            if w.last_closed.get() == Some(sig) {
+                continue;
+            }
+            w.last_closed.set(Some(sig));
+            let (rows, open) = {
+                let st = w.state.borrow();
+                let palette = st.settings.frame_palette;
+                // NEWEST FIRST: the history is pushed oldest-last, but it is read top-down
+                // and the thing just closed by accident is the one being reached for.
+                let rows: Vec<crate::ClosedItemUi> = st
+                    .closed
+                    .iter()
+                    .rev()
+                    .enumerate()
+                    .map(|(i, c)| crate::ClosedItemUi {
+                        id: c.id,
+                        title: c.label(),
+                        tint: c.accent().unwrap_or_else(|| theme::accent_for(i, palette)),
+                        age: crate::state::rel_age(now_ms, c.at_ms).into(),
+                        panes: c.panes().len() as i32,
+                        is_tab: c.is_tab(),
+                    })
+                    .collect();
+                (rows, st.closed_open)
+            };
+            let g = w.app.global::<crate::ClosedAdapter>();
+            g.set_rows(slint::ModelRc::from(Rc::new(slint::VecModel::from(rows))));
+            g.set_open(open);
         }
     }
 
@@ -3322,6 +3381,39 @@ impl App {
                     }
                 });
         }
+
+        // ---- recently closed: the ClosedAdapter global's callbacks ----
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app.global::<crate::ClosedAdapter>().on_toggle(move || {
+                if let Some(w) = app.window_by_id(id) {
+                    app.run_command(&w, Command::ToggleClosed);
+                }
+            });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::ClosedAdapter>()
+                .on_restore(move |cid| {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::RestoreClosed(cid));
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::ClosedAdapter>()
+                .on_discard(move |cid| {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::DiscardClosed(cid));
+                    }
+                });
+        }
         // ---- the left slide-out panel (mux plan M5): the LeftPanelAdapter callbacks ----
         // Same shape as the reminder bridge above: the panel's UI is entirely inside
         // leftpanel.slint and talks through its global, so no AppWindow callback is added
@@ -3666,6 +3758,30 @@ impl App {
         cb0!(on_palette_activate, Command::PaletteActivate);
         cb0!(on_overlay_dismiss, Command::CloseOverlay);
         cb0!(on_pref_done, Command::PrefsDone);
+
+        // The close-confirmation card. `confirm-close-go` is the only path that actually
+        // performs the close the human asked for; dismissing the overlay any other way
+        // (Esc, Cancel, the scrim) cancels it, because `close_overlay_now` drops the pending
+        // close. The checkbox writes the preference straight through, so turning it off in
+        // the card and confirming does both in one press.
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app.on_confirm_close_go(move || {
+                if let Some(w) = app.window_by_id(id) {
+                    app.run_command(&w, Command::ConfirmCloseGo);
+                }
+            });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app.on_set_confirm_close(move |on| {
+                if let Some(w) = app.window_by_id(id) {
+                    app.run_command(&w, Command::SetConfirmClose(on));
+                }
+            });
+        }
         cb_i32!(on_pref_confirm, Command::PrefsConfirm);
 
         // ---- keybindings editor: rebind capture + reset (act on state directly) ----
@@ -3885,6 +4001,7 @@ impl App {
             //   16 control API input · 17 auto-update · 18 check · 19 download · 20 install
             //   21 copy on select · 22 keep alive · 23 favourite tool (arg = registry index)
             //   24 browser mode (arg = 0 default / 1 app / 2 ask)
+            //   25 ask before closing a pane or tab
             // String-valued settings use `pref_text` and its own separate code space.
             win.app.on_pref_action(move |kind, arg| {
                 let Some(w) = app.window_by_id(id) else {
@@ -3974,6 +4091,13 @@ impl App {
                         Command::ApplySetting(crate::state::Setting::KeepAlive(arg != 0)),
                     );
                     w.app.set_pref_keep_alive(arg != 0);
+                    return;
+                }
+                // Ask-before-closing toggle (persisted through `set_confirm_close`, which is
+                // also what the card's own checkbox calls) — mirror the prop back immediately.
+                if kind == 25 {
+                    app.run_command(&w, Command::SetConfirmClose(arg != 0));
+                    w.app.set_pref_confirm_close(arg != 0);
                     return;
                 }
                 // Preferences → Tools: star/unstar. `arg` indexes `tools::TOOLS` rather than

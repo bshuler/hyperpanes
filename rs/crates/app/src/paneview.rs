@@ -749,8 +749,18 @@ pub fn resync(
         Overlay::AddProject => 4,
         Overlay::NewGoal => 5,
         Overlay::AskBrowser => 6,
+        Overlay::ConfirmClose => 7,
     };
     app.set_overlay_kind(kind);
+
+    // Close confirmation: what's about to close, and whether this is the close that ends the
+    // window (the card drops its reassurance and its "don't ask again" when it is — that one
+    // really is final). Only projected while the card is up.
+    if let Some(pc) = state.pending_close.as_ref() {
+        app.set_cc_title(pc.title.clone());
+        app.set_cc_final(pc.final_close);
+        app.set_cc_ask(state.settings.confirm_close);
+    }
 
     // "Open link with…" chooser: the held URL + the browser rows snapshotted at open. Only
     // refreshed while the card is up — `sync_model` rewrites every row, and there is no
@@ -1003,6 +1013,7 @@ pub fn resync(
     app.set_prefs_confirm(state.prefs_confirm);
     app.set_pref_clickable(state.settings.clickable_paths);
     app.set_pref_copy_on_select(state.settings.copy_on_select);
+    app.set_pref_confirm_close(state.settings.confirm_close);
     app.set_pref_editor(state.settings.editor_command.clone().into());
 
     // sidebar / projects: the rail gating + flyout state + rows

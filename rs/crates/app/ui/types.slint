@@ -331,6 +331,39 @@ export global RemindersAdapter {
     callback toast-dismiss(string);
 }
 
+// ===== recently closed =====
+
+// One entry in the rail's RECENTLY CLOSED history. `id` is the restore key — an id rather
+// than an index, because the list shifts under the cursor whenever another close pushes onto
+// it or the cap evicts from the bottom. `panes` is 1 for a closed pane and the pane count for
+// a closed tab; `is-tab` picks the row's icon and wording. `age` is the human "2m ago".
+export struct ClosedItemUi {
+    id: int,
+    title: string,
+    tint: color,
+    age: string,
+    panes: int,
+    is-tab: bool,
+}
+
+// The recently-closed bridge, a GLOBAL for the same reason `RemindersAdapter` is one: the
+// feature stays inside sidebar.slint/types.slint and the controller subscribes via
+// `app.global::<ClosedAdapter>()` rather than threading props through app.slint.
+export global ClosedAdapter {
+    // History entries, NEWEST FIRST — the list is read top-down and the thing you just
+    // closed by accident is the thing you are reaching for.
+    in property <[ClosedItemUi]> rows;
+    // Whether the in-rail RECENTLY CLOSED section is expanded (widens the rail, like the
+    // projects and reminders sections — see app.slint's rail-width binding).
+    in property <bool> open;
+    // ↩ icon clicked → toggle the section.
+    callback toggle();
+    // A row clicked → re-dock that pane/tab, replay-primed, and drop it from the history.
+    callback restore(int);
+    // A row's × clicked → give up on it for good (kills the sessions it held open).
+    callback discard(int);
+}
+
 // One option in a preferences picker (font family). `active` marks the current value.
 // One row in Preferences → Tools: every tool in the registry, favourited or not. `detected`
 // is where `PATH` found the binary ("" when it isn't installed) and `override` is the user's

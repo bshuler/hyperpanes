@@ -258,8 +258,18 @@ pub enum Command {
     CloseOtherTabs(usize),
     /// Close every tab to the right of tab `0`.
     CloseTabsToRight(usize),
-    /// Reopen the most-recently closed tab (replay-primed; no-op when none).
+    /// Reopen the most-recently closed pane or tab (replay-primed; no-op when none).
     ReopenClosedTab,
+    /// Toggle the rail's RECENTLY CLOSED history section.
+    ToggleClosed,
+    /// Reopen the history entry with id `0` (a row click — id, not index, so it can't race).
+    RestoreClosed(i32),
+    /// Drop history entry `0` for good, killing the sessions it held open.
+    DiscardClosed(i32),
+    /// The close-confirmation card's "Close" — carry out the close it was holding.
+    ConfirmCloseGo,
+    /// The card's "ask before closing" checkbox.
+    SetConfirmClose(bool),
     /// Set tab `0`'s layout to `1`.
     SetTabLayout(usize, Layout),
     /// Move the whole of tab `0` to a new OS window.
@@ -457,13 +467,15 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         }
         Command::GoalRemoveImage(i) => state.goal_remove_image(i),
         Command::CloseFocused => {
-            let f = state.active_tab().focused;
-            if !state.close_pane(f, mgr) {
+            // Asks first (unless the human turned that off), then parks rather than kills —
+            // see `State::request_close_pane`.
+            if !state.request_close_focused(mgr) {
                 return Effect::Quit;
             }
         }
         Command::ClosePane(i) => {
-            if !state.close_pane(i, mgr) {
+            let ti = state.active;
+            if !state.request_close_pane(ti, i, mgr) {
                 return Effect::Quit;
             }
         }
@@ -487,9 +499,9 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         Command::ResizeDivider { kind, index, delta } => state.resize_divider(kind, index, delta),
         Command::NewTab => state.new_tab(mgr),
         Command::CloseTab(i) => {
-            // Reopenable close: with ≥2 tabs the tab is parked (sessions alive) on the closed
-            // stack; closing the last tab still kills + quits.
-            if !state.close_tab_menu(i, mgr) {
+            // Asks first, then parks (sessions alive) on the recently-closed history; closing
+            // the last tab still kills + quits.
+            if !state.request_close_tab(i, mgr) {
                 return Effect::Quit;
             }
         }
@@ -743,7 +755,16 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         Command::DuplicateTab(i) => state.duplicate_tab(i, mgr),
         Command::CloseOtherTabs(i) => state.close_other_tabs(i, mgr),
         Command::CloseTabsToRight(i) => state.close_tabs_to_right(i, mgr),
-        Command::ReopenClosedTab => state.reopen_closed_tab(mgr),
+        Command::ReopenClosedTab => state.reopen_closed(mgr),
+        Command::ToggleClosed => state.toggle_closed(),
+        Command::RestoreClosed(id) => state.restore_closed(id, mgr),
+        Command::DiscardClosed(id) => state.discard_closed(id, mgr),
+        Command::ConfirmCloseGo => {
+            if !state.confirm_close_go(mgr) {
+                return Effect::Quit;
+            }
+        }
+        Command::SetConfirmClose(on) => state.set_confirm_close(on),
         Command::SetTabLayout(i, l) => state.set_tab_layout(i, l),
         Command::MoveTabToNewWindow(i) => {
             if let Some((tab, source_alive)) = state.detach_tab(i) {

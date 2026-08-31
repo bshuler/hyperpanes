@@ -1,0 +1,180 @@
+// The close confirmation — the card behind every × on a pane or a tab.
+//
+// A centred modal card (the same overlay-panel pattern as askbrowser.slint, mounted by
+// overlays.slint when `kind == 7`). What it says depends on what the close costs:
+//
+//   • an ordinary close is REVERSIBLE — the pane/tab is parked with its shell still running
+//     and comes back from the rail's ↩ history — so the card says so, and offers to stop
+//     asking. Confirming here is a courtesy, not a last chance.
+//   • the last pane of the last tab ENDS THE WINDOW. Nothing survives it, so the card says
+//     that instead, drops the "ask before closing" escape, and is shown even when the human
+//     turned confirmations off.
+//
+// Enter confirms, Esc cancels — the same two answers the buttons give.
+
+import { Theme } from "theme.slint";
+
+// A footer button. `primary` tints the confirming one; on a window-ending close it goes red,
+// because that is the one press this dialog exists to slow down.
+component CcButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> primary;
+    in property <bool> danger;
+    callback clicked;
+    height: 32px;
+    min-width: 92px;
+    border-radius: 7px;
+    background: root.primary
+        ? (root.danger
+            ? (ta.has-hover ? Theme.danger.brighter(0.25) : Theme.danger)
+            : (ta.has-hover ? Theme.accent.brighter(0.2) : Theme.accent))
+        : (ta.has-hover ? Theme.surface2 : Theme.surface);
+    border-width: 1px;
+    border-color: root.primary ? transparent : Theme.border;
+    HorizontalLayout {
+        padding-left: 14px;
+        padding-right: 14px;
+        Text {
+            text: root.label;
+            color: root.primary ? Theme.mantle : Theme.text;
+            font-size: 13px;
+            font-weight: root.primary ? 700 : 400;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+            horizontal-stretch: 1;
+        }
+    }
+    ta := TouchArea { mouse-cursor: pointer; clicked => { root.clicked(); } }
+}
+
+export component ConfirmCloseDialog inherits Rectangle {
+    // What is about to close, named the way the human sees it ("claude", "Tab 2 — 3 panes").
+    in property <string> subject;
+    // True when this close ends the window — see the header comment.
+    in property <bool> final-close;
+    // Current value of the "ask before closing" preference (the checkbox's state).
+    in property <bool> ask;
+    callback confirm();
+    callback set-ask(bool);
+    callback cancel();
+
+    // eat scrim clicks behind the card
+    TouchArea {}
+
+    // The card owns a focus scope so Enter/Esc land here rather than in the terminal still
+    // mounted below the scrim.
+    fs := FocusScope {
+        init => { fs.focus(); }
+        key-pressed(e) => {
+            if (e.text == Key.Escape) { root.cancel(); return EventResult.accept; }
+            if (e.text == Key.Return) { root.confirm(); return EventResult.accept; }
+            return EventResult.reject;
+        }
+    }
+
+    card := Rectangle {
+        width: 420px;
+        x: (parent.width - self.width) / 2;
+        y: max(60px, (parent.height - self.height) / 2);
+        height: body.preferred-height;
+        background: Theme.mantle;
+        border-radius: 12px;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-blur: 48px;
+        drop-shadow-color: Theme.scrim;
+        drop-shadow-offset-y: 18px;
+        TouchArea {} // keep clicks on the card from dismissing
+
+        body := VerticalLayout {
+            padding: 18px;
+            spacing: 12px;
+
+            Text {
+                text: root.final-close ? "Close the window?" : "Close this?";
+                color: Theme.text;
+                font-size: 15px;
+                font-weight: 700;
+            }
+
+            // The subject, spelled out — a confirmation that doesn't name what it's closing
+            // is just a speed bump.
+            Rectangle {
+                height: subj.preferred-height + 16px;
+                border-radius: 7px;
+                background: Theme.bg;
+                border-width: 1px;
+                border-color: Theme.border;
+                subj := Text {
+                    x: 10px;
+                    width: parent.width - 20px;
+                    y: 8px;
+                    text: root.subject;
+                    color: Theme.subtext;
+                    font-size: 12px;
+                    wrap: word-wrap;
+                }
+            }
+
+            Text {
+                text: root.final-close
+                    ? "This is the last pane, so the window closes with it. Its terminal ends — this one can't be undone."
+                    : "Its terminal keeps running. Bring it back any time from ↩ Recently Closed in the sidebar.";
+                color: root.final-close ? Theme.danger : Theme.subtext;
+                font-size: 12px;
+                wrap: word-wrap;
+            }
+
+            // Offered only for the reversible closes: switching this off must never be able
+            // to silence the one confirmation that matters.
+            //
+            // The row is a plain Rectangle, not a layout: a TouchArea sized to `parent` inside
+            // a HorizontalLayout would make the row's height depend on the layout that is
+            // measuring it, and Slint rejects the loop.
+            if !root.final-close : Rectangle {
+                height: 18px;
+                cbta := TouchArea { mouse-cursor: pointer; clicked => { root.set-ask(!root.ask); } }
+                HorizontalLayout {
+                    spacing: 8px;
+                    alignment: start;
+                    Rectangle {
+                        width: 16px;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: root.ask ? Theme.accent : (cbta.has-hover ? Theme.subtext : Theme.border);
+                        background: root.ask ? Theme.accent : Theme.surface;
+                        Path {
+                            width: 10px;
+                            height: 8px;
+                            viewbox-width: 12;
+                            viewbox-height: 10;
+                            visible: root.ask;
+                            stroke: Theme.mantle;
+                            stroke-width: 1.8px;
+                            fill: transparent;
+                            commands: "M 1 5.5 L 4.5 9 L 11 1";
+                        }
+                    }
+                    Text {
+                        text: "Ask before closing";
+                        color: cbta.has-hover ? Theme.text : Theme.subtext;
+                        font-size: 12px;
+                        vertical-alignment: center;
+                    }
+                }
+            }
+
+            HorizontalLayout {
+                spacing: 8px;
+                Rectangle { horizontal-stretch: 1; }
+                CcButton { label: "Cancel"; clicked => { root.cancel(); } }
+                CcButton {
+                    label: root.final-close ? "Close Window" : "Close";
+                    primary: true;
+                    danger: root.final-close;
+                    clicked => { root.confirm(); }
+                }
+            }
+        }
+    }
+}

@@ -207,6 +207,11 @@ pub struct Settings {
     /// that is no longer installed, falls back to the OS default rather than failing to
     /// open — losing a browser must never turn a link into a dead click.
     pub browser_app: String,
+    /// Whether closing a pane or tab asks first. **ON by default**: a × sits one pixel from
+    /// the controls people actually aim at, and the thing behind it is a running shell.
+    /// Turning it off only silences the *undoable* closes — the last pane of the last tab
+    /// ends the window and nothing can bring it back, so that one asks regardless.
+    pub confirm_close: bool,
 }
 
 /// [`Settings::browser_mode`] — hand the URL to the OS default handler.
@@ -240,6 +245,7 @@ impl Default for Settings {
             tool_paths: BTreeMap::new(),
             browser_mode: String::from(BROWSER_MODE_DEFAULT),
             browser_app: String::new(),
+            confirm_close: true,
         }
     }
 }
@@ -425,6 +431,7 @@ mod tests {
                 .collect(),
             browser_mode: BROWSER_MODE_ASK.into(),
             browser_app: "com.google.Chrome".into(),
+            confirm_close: false, // non-default (defaults to true)
         }
     }
 
