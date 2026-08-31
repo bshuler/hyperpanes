@@ -260,6 +260,7 @@ fn exec(
                         title,
                         layout,
                         panes,
+                        system: false,
                     };
                     if !model.insert_tab(window_id, tab) {
                         return Err(format!("window not found: {window_id}"));
@@ -1071,9 +1072,11 @@ mod tests {
     fn model_one_window() -> ReadModel {
         let mut m = ReadModel::new();
         m.add_window(WindowInfo {
+            keyboard_focus_pane: None,
             window_id: 1,
             active_tab_id: Some("t1".into()),
             tabs: vec![TabInfo {
+                system: false,
                 id: "t1".into(),
                 title: "Tab 1".into(),
                 layout: "auto".into(),

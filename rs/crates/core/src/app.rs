@@ -159,6 +159,7 @@ fn seed_windows(shared: &Arc<Shared>, windows: Vec<WindowSpec>, start_id: i64) {
     if windows.is_empty() {
         let tab_id = new_id();
         model.add_window(WindowInfo {
+            keyboard_focus_pane: None,
             window_id: start_id,
             active_tab_id: Some(tab_id.clone()),
             tabs: vec![TabInfo {
@@ -166,6 +167,7 @@ fn seed_windows(shared: &Arc<Shared>, windows: Vec<WindowSpec>, start_id: i64) {
                 title: "Tab 1".into(),
                 layout: "auto".into(),
                 panes: vec![],
+                system: false,
             }],
         });
         return;
@@ -196,12 +198,14 @@ fn seed_windows(shared: &Arc<Shared>, windows: Vec<WindowSpec>, start_id: i64) {
                 title,
                 layout,
                 panes,
+                system: g.system.unwrap_or(false),
             });
         }
         if active_tab_id.is_none() {
             active_tab_id = tabs.first().map(|t| t.id.clone());
         }
         model.add_window(WindowInfo {
+            keyboard_focus_pane: None,
             window_id,
             active_tab_id,
             tabs,

@@ -32,9 +32,11 @@ fn pane(id: &str, uid: &str) -> PaneInfo {
 /// tab (`"1:0"`) holding `panes`.
 fn gui_window(panes: Vec<PaneInfo>) -> WindowInfo {
     WindowInfo {
+        keyboard_focus_pane: None,
         window_id: 1,
         active_tab_id: Some("1:0".to_string()),
         tabs: vec![TabInfo {
+            system: false,
             id: "1:0".to_string(),
             title: "Tab 1".to_string(),
             layout: "auto".to_string(),
@@ -131,6 +133,7 @@ fn carryover_rehomes_into_active_tab_and_never_duplicates() {
     assert!(m.insert_tab(
         1,
         TabInfo {
+            system: false,
             id: "ctl-tab".to_string(),
             title: "grp".to_string(),
             layout: "auto".to_string(),

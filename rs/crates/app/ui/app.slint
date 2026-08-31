@@ -172,6 +172,9 @@ export component AppWindow inherits Window {
     // ---- outputs (Rust subscribes; each maps to a Command) ----
     callback key(int, KeyMsg);
     callback focus-pane(int);
+    // A pane's terminal FocusScope gained/lost the keyboard (confirmation for the
+    // controller's `refocus-seq` hand-off).
+    callback pane-focus-changed(int, bool);
     callback area-resized(length, length);
     callback divider-drag(int, bool, bool, length, length);
     callback pane-zoom(int);
@@ -375,6 +378,7 @@ export component AppWindow inherits Window {
                 taskbar-context(i, x, y) => { root.taskbar-context(i, x, y); }
                 key(i, m) => { root.key(i, m); }
                 focus-pane(i) => { root.focus-pane(i); }
+                pane-focus-changed(i, on) => { root.pane-focus-changed(i, on); }
                 area-resized(w, h) => { root.area-resized(w, h); }
                 divider-drag(i, main, vert, dx, dy) => { root.divider-drag(i, main, vert, dx, dy); }
                 pane-zoom(i) => { root.pane-zoom(i); }

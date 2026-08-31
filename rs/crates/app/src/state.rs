@@ -213,6 +213,13 @@ impl ClosedItem {
 /// so the number is a live-session budget, not just a list length.
 pub const CLOSED_STACK_CAP: usize = 20;
 
+/// How many consecutive pump ticks may attempt to hand the keyboard to a newly selected pane
+/// before giving up (see [`State::sync_pane_keyboard_focus`]). The hand-off normally lands on
+/// the first or second: the first can arrive before Slint has instantiated the pane's element,
+/// the second is after the repeater has caught up. The rest is headroom for a slow frame — and
+/// a hard stop, so a pane that can never take focus doesn't re-dirty the state forever.
+const KBD_FOCUS_TRIES: u8 = 8;
+
 /// How long ago a history entry was closed, for its row's second line. Coarse on purpose:
 /// the first minute is one bucket ("just now") so a fresh close doesn't re-push the whole
 /// list into Slint once a second (the pump's signature includes this string).
@@ -1109,6 +1116,20 @@ pub struct State {
     /// per-tick [`Self::sync_pane_keyboard_focus`] compares the current selection against
     /// this and only then bumps a `refocus_seq`.
     pub kbd_focus_on: Option<(usize, String)>,
+    /// The uid of the pane whose terminal `FocusScope` last reported `has-focus` — the
+    /// CONFIRMATION half of the hand-off above, fed by the widget's `focus-changed`.
+    ///
+    /// Without it the hand-off was fire-and-forget, and it silently missed whenever Slint had
+    /// just re-created the pane's repeated element (any tab switch between tabs with different
+    /// pane counts, and every app start): a `changed refocus-tick` never fires for a property's
+    /// INITIAL value, so the focus call was never made and the keystrokes stayed on the
+    /// previous pane until the user clicked. Also published on `/state` as the window's
+    /// `keyboardFocusPaneId`, which is how the fix is testable from outside the GUI.
+    pub kbd_focus_live: Option<String>,
+    /// Hand-offs left to attempt for the current selection. Set when the selection moves,
+    /// spent one per tick until the pane confirms focus. Bounded so a pane that can never take
+    /// focus (an unfocused window, a Family-B view pane with no terminal) cannot spin.
+    pub kbd_focus_tries: u8,
     /// Monotonic source for every `refocus_seq` bump. A per-pane counter is not enough:
     /// the pane model is rebuilt per active tab, so the value Slint compares against is
     /// whatever the OTHER tab's pane at that repeater slot last showed. Two independent
@@ -1411,6 +1432,8 @@ impl State {
             editing_tab: -1,
             editing_pane: -1,
             kbd_focus_on: None,
+            kbd_focus_live: None,
+            kbd_focus_tries: 0,
             refocus_clock: 0,
             last_blink: Instant::now(),
             cursor_on: true,
@@ -2281,15 +2304,59 @@ impl State {
         self.dirty = true;
     }
 
-    /// Move tab `from` to index `to` (in-strip tab reorder), keeping the same tab active.
-    pub fn reorder_tab(&mut self, from: usize, to: usize) {
-        let n = self.tabs.len();
-        if from >= n || to > n {
+    /// Keep the app-owned tab (the always-on "Hyperpane") pinned as tab #1.
+    ///
+    /// It is the tab every other tab is driven from, so it has a fixed home the same way a
+    /// browser's pinned tab does: you should never have to hunt for it. Called after the tab
+    /// is created and after a restore, because a workspace written before the pin existed can
+    /// carry it anywhere in the strip.
+    ///
+    /// The active tab travels with the shuffle, so pinning never changes which tab you are
+    /// looking at.
+    pub fn pin_system_tab_first(&mut self) {
+        let Some(idx) = self.tabs.iter().position(|t| t.system) else {
+            return;
+        };
+        if idx == 0 {
             return;
         }
-        let dest = if to > from { to - 1 } else { to };
+        let tab = self.tabs.remove(idx);
+        self.tabs.insert(0, tab);
+        // Everything the system tab jumped over shifted one to the right.
+        self.active = if self.active == idx {
+            0
+        } else if self.active < idx {
+            self.active + 1
+        } else {
+            self.active
+        };
+        self.editing_tab = -1;
+        self.dirty = true;
+    }
+
+    /// Move tab `from` to index `to` (in-strip tab reorder), keeping the same tab active.
+    ///
+    /// The app-owned tab is pinned first (see [`Self::pin_system_tab_first`]): it cannot be
+    /// dragged out of slot 0, and nothing can be dropped in front of it. Both are refused
+    /// silently — the drag simply doesn't take — rather than reordering and snapping back.
+    ///
+    /// Returns where the tab actually LANDED, which is not always `to`: a refused or clamped
+    /// move ends somewhere else, and the live tab-drag tracks the dragged tab by index. Take
+    /// the answer from here rather than assuming, or the rest of the drag moves the wrong tab.
+    pub fn reorder_tab(&mut self, from: usize, to: usize) -> usize {
+        let n = self.tabs.len();
+        if from >= n || to > n {
+            return from;
+        }
+        if self.tabs[from].system {
+            return from;
+        }
+        let mut dest = if to > from { to - 1 } else { to };
+        if dest == 0 && self.tabs.first().is_some_and(|t| t.system) {
+            dest = 1;
+        }
         if dest == from {
-            return;
+            return from;
         }
         let active_title_idx = self.active;
         let tab = self.tabs.remove(from);
@@ -2310,6 +2377,7 @@ impl State {
         };
         self.editing_tab = -1;
         self.dirty = true;
+        dest
     }
 
     /// Every live session uid this window hosts (used to kill them when the window
@@ -2812,6 +2880,9 @@ impl State {
                 ..Default::default()
             },
         );
+        // `new_tab_with` appends; the Hyperpane tab lives at the front. Pinning AFTER the
+        // seed keeps `add_pane_opts`' "active tab" contract intact.
+        self.pin_system_tab_first();
         true
     }
 
@@ -3279,16 +3350,50 @@ impl State {
             // No pane to hand it to (an empty tab). Forget the last one, so returning to
             // a populated tab counts as a move again.
             self.kbd_focus_on = None;
+            self.kbd_focus_tries = 0;
             return;
         };
-        let now = (self.active, p.uid.clone());
-        if self.kbd_focus_on.as_ref() == Some(&now) {
+        let uid = p.uid.clone();
+        let now = (self.active, uid.clone());
+        if self.kbd_focus_on.as_ref() != Some(&now) {
+            self.kbd_focus_on = Some(now);
+            self.kbd_focus_tries = KBD_FOCUS_TRIES;
+        }
+        if self.kbd_focus_tries == 0 {
             return;
         }
-        self.kbd_focus_on = Some(now);
+        // Confirmed by the widget — stop, and leave focus alone from here so a click into the
+        // left panel or a dialog keeps what it took.
+        if self.kbd_focus_live.as_deref() == Some(uid.as_str()) {
+            self.kbd_focus_tries = 0;
+            return;
+        }
+        // Not confirmed yet: bump again. One bump is not enough — the pane's element may not
+        // exist yet on the tick the selection moved (`sync_model` re-creates the whole
+        // repeater when the pane COUNT changes, which is exactly what a tab switch usually
+        // does), and an element created carrying the new seq never fires `changed`.
+        self.kbd_focus_tries -= 1;
         let seq = self.next_refocus();
         let f = self.active_tab().focused;
         self.active_tab_mut().panes[f].refocus_seq = seq;
+        self.dirty = true;
+    }
+
+    /// The widget reported that pane `idx` of the active tab gained (`on`) or lost the
+    /// keyboard. Confirms — or invalidates — the hand-off `sync_pane_keyboard_focus` asked for.
+    pub fn note_pane_focus(&mut self, idx: usize, on: bool) {
+        let Some(p) = self.active_tab().panes.get(idx) else {
+            return;
+        };
+        let uid = p.uid.clone();
+        if on {
+            self.kbd_focus_live = Some(uid);
+        } else if self.kbd_focus_live.as_deref() == Some(uid.as_str()) {
+            // Only the pane that currently holds it can give it up: on a move Slint may
+            // report the gain before the loss, and clearing unconditionally would erase the
+            // confirmation we just recorded for the new pane.
+            self.kbd_focus_live = None;
+        }
         self.dirty = true;
     }
 
@@ -4440,6 +4545,9 @@ impl State {
     /// the library is for). Named after the tab; a collision gets a numeric suffix rather
     /// than overwriting the earlier snapshot.
     pub fn save_workspace_to_library(&mut self) {
+        if self.refuse_saving_system_tab() {
+            return;
+        }
         let file = self.to_library_workspace_file();
         let name = self.active_tab().title.to_string();
         if crate::leftpanel::save_to_library(&name, &file).is_none() {
@@ -4629,6 +4737,10 @@ impl State {
     /// the file still means something on a machine that keeps its checkouts elsewhere.
     pub fn save_project(&mut self) {
         use hyperpanes_core::workspace::project;
+        if self.refuse_saving_system_tab() {
+            return;
+        }
+
         let f = self.active_tab().focused;
         // The focused pane's live cwd, else any pane in this tab that has reported one —
         // a tab whose focus happens to sit on a fresh pane still knows where it is.
@@ -6088,6 +6200,17 @@ impl State {
     /// ([`SessionManager::pane_load`]). A stale uid costs nothing: on the in-process backend,
     /// or once the session is gone, `pane_load` falls back to a fresh spawn from the recorded
     /// command/args/shell — exactly the old behaviour.
+    /// Refuse a "save the active tab" action when that tab is the pinned Hyperpane, saying
+    /// why. It is app-owned: it can't be closed and exactly one may exist, so a workspace
+    /// file describing it would only ever be a second one waiting to be opened.
+    fn refuse_saving_system_tab(&mut self) -> bool {
+        if !self.active_tab().system {
+            return false;
+        }
+        self.toast_active("the Hyperpane tab can't be saved");
+        true
+    }
+
     pub fn to_library_workspace_file(&self) -> WorkspaceFile {
         self.library_workspace_of(self.active_tab())
     }
@@ -6139,9 +6262,14 @@ impl State {
     }
 
     /// The library snapshot of tab `i`, or `None` when that tab has no panes — a 0-pane tab
-    /// describes nothing and must never be written as a set member.
+    /// describes nothing and must never be written as a set member. The pinned Hyperpane is
+    /// skipped for a second reason: it is app-owned, can never be closed, and exactly one may
+    /// exist, so a member describing it could only ever append a duplicate on open.
     fn library_workspace_of_tab(&self, i: usize) -> Option<WorkspaceFile> {
-        let t = self.tabs.get(i).filter(|t| !t.panes.is_empty())?;
+        let t = self
+            .tabs
+            .get(i)
+            .filter(|t| !t.panes.is_empty() && !t.system)?;
         Some(self.library_workspace_of(t))
     }
 
@@ -6242,6 +6370,9 @@ impl State {
     /// Save to the remembered [`Self::workspace_path`] when there is one (a silent write-back,
     /// the usual Save semantics), otherwise fall through to [`Self::save_workspace_as`].
     pub fn save_workspace(&mut self) {
+        if self.refuse_saving_system_tab() {
+            return;
+        }
         if let Some(path) = self.workspace_path.clone() {
             self.write_workspace_to(&path);
             return;
@@ -6254,6 +6385,9 @@ impl State {
     /// into the workspace library ([`paths::workspaces_dir`]) so saved workspaces gather in one
     /// place a set can reference. No-op if the dialog is cancelled.
     pub fn save_workspace_as(&mut self) {
+        if self.refuse_saving_system_tab() {
+            return;
+        }
         let file = self.to_library_workspace_file();
         let default_name = match &file.name {
             Some(n) if !n.is_empty() => format!("{}.hyperpanes", sets::slug(n)),
@@ -6515,6 +6649,13 @@ impl State {
 
     /// Build a tab from a `GroupSpec` (spawning a pane per spec) and append it.
     fn append_tab_from_group(&mut self, mgr: &SessionManager, g: GroupSpec) {
+        // Exactly one Hyperpane may exist — it is app-owned and can never be closed — so a
+        // file that describes one while we already have one must not append a second. This is
+        // checked BEFORE any pane is spawned: a duplicate that re-attached the live session
+        // would show the same terminal in two tabs, which is how the duplicates got here.
+        if group_is_hyperpane(&g) && self.tabs.iter().any(|t| t.system) {
+            return;
+        }
         let palette = self.settings.frame_palette;
         let title: SharedString = match g.title {
             Some(t) if !t.is_empty() => t.into(),
@@ -7269,6 +7410,20 @@ fn due_for(since_mid: u64, offset: ReminderOffset) -> (u64, String) {
 }
 
 /// Format a Slint [`Color`] as `#rrggbb` (the workspace-file pane color format).
+/// Does this saved group describe the app-owned Hyperpane tab? The `system` flag is
+/// authoritative; files written before that flag existed carry none, so a group whose panes
+/// all sit in the Hyperpane directory counts too — nothing else opens there by default.
+fn group_is_hyperpane(g: &GroupSpec) -> bool {
+    if g.system == Some(true) {
+        return true;
+    }
+    let dir = paths::hyperpane_dir();
+    !g.panes.is_empty()
+        && g.panes
+            .iter()
+            .all(|p| p.cwd.as_deref().is_some_and(|c| Path::new(c) == dir))
+}
+
 fn color_hex(c: Color) -> String {
     format!("#{:02x}{:02x}{:02x}", c.red(), c.green(), c.blue())
 }
@@ -9941,19 +10096,45 @@ mod keyboard_focus_tests {
         assert_ne!(back_on_a, on_b);
     }
 
-    /// A tick where nothing moved must not touch focus — otherwise every frame would yank
-    /// the keyboard back off whatever the user had clicked into.
+    /// A tick where nothing moved must stop touching focus once the widget has CONFIRMED it
+    /// holds the keyboard — otherwise every frame would yank the keyboard back off whatever
+    /// the user had clicked into.
     #[test]
-    fn a_quiet_tick_does_not_touch_focus() {
+    fn a_confirmed_hand_off_makes_every_later_tick_free() {
         let mut st = fresh();
         let m = mgr();
         st.adopt_pane_as_tab(&m, det("a"));
+        st.sync_pane_keyboard_focus();
+        // The widget answers: it really does hold the keyboard now.
+        let f = st.active_tab().focused;
+        st.note_pane_focus(f, true);
         st.sync_pane_keyboard_focus();
         let settled = seq(&st);
         for _ in 0..10 {
             st.sync_pane_keyboard_focus();
         }
-        assert_eq!(seq(&st), settled, "a still selection must cost nothing");
+        assert_eq!(seq(&st), settled, "a confirmed selection must cost nothing");
+    }
+
+    /// Until the widget confirms, the hand-off RETRIES — one bump per tick, because the
+    /// pane's Slint element may not exist yet on the tick the selection moved. The retry is
+    /// bounded: an element that never answers (a non-terminal pane, a hidden window) must not
+    /// leave us bumping focus every frame forever.
+    #[test]
+    fn an_unconfirmed_hand_off_retries_a_bounded_number_of_times() {
+        let mut st = fresh();
+        let m = mgr();
+        st.adopt_pane_as_tab(&m, det("a"));
+        let before = seq(&st);
+        for _ in 0..40 {
+            st.sync_pane_keyboard_focus();
+        }
+        let bumps = seq(&st) - before;
+        assert_eq!(
+            bumps,
+            KBD_FOCUS_TRIES as i32,
+            "an unanswered hand-off retries exactly KBD_FOCUS_TRIES times, then gives up"
+        );
     }
 
     /// Selecting a pane inside the SAME tab is a move too — Ctrl+arrow, a drag, a close.
@@ -10307,5 +10488,286 @@ mod close_history_tests {
         assert_eq!(rel_age(7_200_000, 0), "2h ago");
         assert_eq!(rel_age(172_800_000, 0), "2d ago");
         assert_eq!(rel_age(0, 5_000), "just now", "a clock that went backwards");
+    }
+}
+
+#[cfg(test)]
+mod system_tab_pin_tests {
+    //! The always-on "Hyperpane" tab is pinned to slot 0 — it is the tab every other tab is
+    //! driven from, so it has a fixed home the way a browser's pinned tab does. Three rules,
+    //! all enforced here rather than only in the UI (the control plane and the keyboard both
+    //! reach `reorder_tab` without going near a drag): it starts at the front, it can't be
+    //! dragged out of the front, and nothing can be dropped in front of it.
+    use super::*;
+
+    /// A tab strip of `(title, system)`, with no panes and no sessions — enough for the
+    /// ordering rules, which never look inside a tab.
+    fn strip(tabs: &[(&str, bool)]) -> State {
+        let mut s = State::new(theme::load_font(1.0));
+        s.tabs.clear();
+        for (title, system) in tabs {
+            let mut t = s.fresh_tab();
+            t.title = (*title).into();
+            t.system = *system;
+            s.tabs.push(t);
+        }
+        s
+    }
+
+    fn titles(s: &State) -> Vec<String> {
+        s.tabs.iter().map(|t| t.title.to_string()).collect()
+    }
+
+    #[test]
+    fn pinning_moves_the_system_tab_to_the_front() {
+        let mut s = strip(&[("a", false), ("b", false), ("hp", true), ("c", false)]);
+        s.pin_system_tab_first();
+        assert_eq!(titles(&s), ["hp", "a", "b", "c"]);
+    }
+
+    #[test]
+    fn pinning_keeps_you_looking_at_the_same_tab() {
+        // Every position relative to the tab being moved: before it, it, and after it.
+        for (active, expect) in [(0, "a"), (1, "b"), (2, "hp"), (3, "c")] {
+            let mut s = strip(&[("a", false), ("b", false), ("hp", true), ("c", false)]);
+            s.active = active;
+            s.pin_system_tab_first();
+            assert_eq!(
+                s.tabs[s.active].title.to_string(),
+                expect,
+                "active was {active}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinning_a_strip_that_is_already_pinned_or_has_no_system_tab_does_nothing() {
+        let mut s = strip(&[("hp", true), ("a", false)]);
+        s.active = 1;
+        s.pin_system_tab_first();
+        assert_eq!(titles(&s), ["hp", "a"]);
+        assert_eq!(s.active, 1);
+
+        let mut s = strip(&[("a", false), ("b", false)]);
+        s.pin_system_tab_first();
+        assert_eq!(titles(&s), ["a", "b"]);
+    }
+
+    #[test]
+    fn the_system_tab_cannot_be_dragged_out_of_slot_zero() {
+        let mut s = strip(&[("hp", true), ("a", false), ("b", false)]);
+        s.reorder_tab(0, 3);
+        assert_eq!(titles(&s), ["hp", "a", "b"], "the drag must simply not take");
+    }
+
+    #[test]
+    fn nothing_can_be_dropped_in_front_of_the_system_tab() {
+        let mut s = strip(&[("hp", true), ("a", false), ("b", false)]);
+        // A drop at the very front lands *after* the pin instead — which for "b" is a real
+        // move, and for "a" is no move at all.
+        s.reorder_tab(2, 0);
+        assert_eq!(titles(&s), ["hp", "b", "a"]);
+        s.reorder_tab(2, 0);
+        assert_eq!(titles(&s), ["hp", "a", "b"]);
+    }
+
+    #[test]
+    fn ordinary_tabs_still_reorder_normally() {
+        let mut s = strip(&[("hp", true), ("a", false), ("b", false), ("c", false)]);
+        s.active = 1;
+        s.reorder_tab(1, 4);
+        assert_eq!(titles(&s), ["hp", "b", "c", "a"]);
+        assert_eq!(s.tabs[s.active].title.to_string(), "a");
+    }
+}
+
+#[cfg(test)]
+mod hyperpane_uniqueness_tests {
+    //! The Hyperpane tab is app-owned: it can never be closed, and exactly one may exist. Two
+    //! halves enforce that. *Save side* — it is left out of every file the user can write
+    //! (workspace, library, set, repo project), because a file describing it could only ever
+    //! be a second one waiting to be opened. *Load side* — a group describing it is skipped
+    //! outright when one is already open, which is also the only thing that repairs the files
+    //! already on disk from before this rule existed.
+    use super::*;
+
+    fn fresh() -> State {
+        State::new(crate::theme::load_font(1.0))
+    }
+
+    fn mgr() -> SessionManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionManager::new(tx)
+    }
+
+    fn det(uid: &str) -> DetachedPane {
+        DetachedPane {
+            uid: uid.into(),
+            title: uid.into(),
+            subtitle: None,
+            pinned_accent: None,
+            show_frame: None,
+            show_dot: None,
+            font_px: 14.0,
+            spawn_command: None,
+            spawn_args: None,
+            spawn_shell: None,
+            kind: PaneKind::default(),
+            tool_session: None,
+            cwd: None,
+        }
+    }
+
+    /// A window of `(title, system)` tabs, each holding one pane —
+    /// `library_workspace_of_tab` skips a 0-pane tab for an unrelated reason, so a test about
+    /// the system flag has to give every tab something to describe.
+    fn strip(tabs: &[(&str, bool)]) -> State {
+        let mut s = fresh();
+        let m = mgr();
+        // Drop the empty starter tab so slot 0 is the first tab asked for.
+        s.tabs.clear();
+        s.active = 0;
+        for (title, system) in tabs {
+            s.adopt_pane_as_tab(&m, det(title));
+            let last = s.tabs.len() - 1;
+            s.tabs[last].title = (*title).into();
+            s.tabs[last].system = *system;
+        }
+        s.active = 0;
+        s
+    }
+
+    /// A saved group for the Hyperpane as the CURRENT writer would record it.
+    fn flagged_group() -> GroupSpec {
+        GroupSpec {
+            title: Some("Hyperpane".into()),
+            panes: vec![PaneSpec {
+                ..Default::default()
+            }],
+            system: Some(true),
+            ..Default::default()
+        }
+    }
+
+    /// …and as files written before the `system` flag existed recorded it: no flag, but every
+    /// pane sitting in the Hyperpane directory.
+    fn legacy_group() -> GroupSpec {
+        GroupSpec {
+            title: Some("Hyperpane".into()),
+            panes: vec![PaneSpec {
+                cwd: Some(paths::hyperpane_dir().to_string_lossy().into_owned()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_set_leaves_the_hyperpane_out() {
+        let s = strip(&[("Hyperpane", true), ("work", false)]);
+        assert!(
+            s.library_workspace_of_tab(0).is_none(),
+            "the pinned Hyperpane is not a saveable member"
+        );
+        assert!(
+            s.library_workspace_of_tab(1).is_some(),
+            "an ordinary tab still saves"
+        );
+    }
+
+    #[test]
+    fn saving_the_hyperpane_as_a_workspace_is_refused_with_a_reason() {
+        let mut s = strip(&[("Hyperpane", true), ("work", false)]);
+        s.active = 0;
+        assert!(s.refuse_saving_system_tab(), "refused while it is active");
+        s.active = 1;
+        assert!(
+            !s.refuse_saving_system_tab(),
+            "an ordinary active tab saves normally"
+        );
+    }
+
+    #[test]
+    fn a_flagged_group_is_recognized_as_the_hyperpane() {
+        assert!(group_is_hyperpane(&flagged_group()));
+    }
+
+    /// The legacy shape matters more than the flagged one: the duplicates already sitting in
+    /// `last-workspace.json` and in saved sets were written before the flag existed, so the
+    /// flag alone would never clean them up.
+    #[test]
+    fn a_legacy_flagless_group_in_the_hyperpane_directory_is_recognized_too() {
+        assert!(group_is_hyperpane(&legacy_group()));
+    }
+
+    #[test]
+    fn an_ordinary_group_is_not_mistaken_for_it() {
+        let g = GroupSpec {
+            title: Some("Hyperpane".into()),
+            panes: vec![PaneSpec {
+                cwd: Some("/Users/someone/code".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(
+            !group_is_hyperpane(&g),
+            "a same-named tab elsewhere on disk is just a tab"
+        );
+        assert!(
+            !group_is_hyperpane(&GroupSpec::default()),
+            "an empty group describes nothing"
+        );
+    }
+
+    /// Opening a file that carries a Hyperpane while one is already open must not add a
+    /// second — that is the bug: a set saved with the Hyperpane in it re-attached the same
+    /// live session into a duplicate tab on every re-open.
+    #[test]
+    fn loading_a_file_that_carries_a_hyperpane_never_adds_a_second() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        for g in [flagged_group(), legacy_group()] {
+            let mut s = strip(&[("Hyperpane", true), ("work", false)]);
+            let before = s.tabs.len();
+            s.load_workspace(
+                WorkspaceFile {
+                    groups: Some(vec![g]),
+                    ..Default::default()
+                },
+                &mgr(),
+            );
+            assert_eq!(
+                s.tabs.len(),
+                before,
+                "a second Hyperpane must never be appended"
+            );
+        }
+    }
+
+    /// …but the restore path still works: with no Hyperpane open yet, the saved one loads.
+    /// Crash recovery depends on this — `last-workspace.json` keeps it so its conversation
+    /// resumes where it was.
+    #[test]
+    fn a_saved_hyperpane_still_restores_when_none_is_open() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        let mut s = fresh();
+        s.load_workspace(
+            WorkspaceFile {
+                groups: Some(vec![flagged_group()]),
+                ..Default::default()
+            },
+            &mgr(),
+        );
+        assert_eq!(
+            s.tabs.iter().filter(|t| t.system).count(),
+            1,
+            "the saved Hyperpane restores, and restores as the system tab"
+        );
     }
 }

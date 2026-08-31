@@ -377,6 +377,12 @@ export component TerminalPane inherits Rectangle {
     // exact name. Fires for every button (left/right/middle) so a right-click-to-paste also
     // focuses, mirroring the Electron pane behavior.
     callback focus-requested();
+    // This pane's terminal FocusScope gained (true) or lost (false) the keyboard. The
+    // controller uses it to CONFIRM a focus hand-off it asked for via `refocus-tick`: a
+    // repeated element that Slint has just re-created never fires `changed refocus-tick`
+    // (the new value is its initial value), so an unconfirmed hand-off is retried rather
+    // than silently leaving the keystrokes on the pane the user just navigated away from.
+    callback focus-changed(bool);
     // A key was pressed while this pane had focus → encode to PTY bytes and write.
     callback key(KeyMsg);
     // The pane's on-screen size changed (logical px) → recompute cols/rows and resize.
@@ -748,6 +754,7 @@ export component TerminalPane inherits Rectangle {
             // Dropping focus while Ctrl is held would otherwise strand `ctrl-held` on (no
             // key-released arrives once focus moves away).
             if (!self.has-focus) { root.ctrl-held = false; }
+            root.focus-changed(self.has-focus);
         }
     }
 

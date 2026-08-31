@@ -1678,13 +1678,35 @@ fn tab_command(shared: &Arc<Shared>, info: &TokenInfo, ty: &str, cmd: &Value) ->
         }
         "closeTab" => match find_tab(shared, cmd) {
             Err(e) => e,
-            Ok((tab_id, _)) => queue_ui_op(
-                shared,
-                UiOp::CloseTab {
-                    tab_id: tab_id.clone(),
-                },
-                json!({ "ok": true, "queued": true, "tabId": tab_id }),
-            ),
+            Ok((tab_id, _)) => {
+                // Refuse an app-owned tab here rather than queueing it. `State::close_tab`
+                // would drop the op on the UI thread anyway, but by then we have already
+                // answered 202 — and a caller told "queued" has no way to learn the close
+                // never happened. 409: the tab exists, its state forbids the verb.
+                let system = shared
+                    .model
+                    .lock()
+                    .unwrap()
+                    .tab(&tab_id)
+                    .is_some_and(|t| t.system);
+                if system {
+                    jstatus(
+                        409,
+                        json!({
+                            "error": "the app owns this tab; the close is refused",
+                            "tabId": tab_id,
+                        }),
+                    )
+                } else {
+                    queue_ui_op(
+                        shared,
+                        UiOp::CloseTab {
+                            tab_id: tab_id.clone(),
+                        },
+                        json!({ "ok": true, "queued": true, "tabId": tab_id }),
+                    )
+                }
+            }
         },
         "renameTab" => {
             let title = match cmd.get("title").and_then(Value::as_str) {
@@ -1798,7 +1820,13 @@ async fn settings_patch(
     }
     let keys: Vec<&String> = obj.keys().collect();
     let body = json!({ "ok": true, "queued": true, "keys": keys });
-    queue_ui_op(&shared, UiOp::PatchSettings { patch: patch.clone() }, body)
+    queue_ui_op(
+        &shared,
+        UiOp::PatchSettings {
+            patch: patch.clone(),
+        },
+        body,
+    )
 }
 
 // ---- /projects ----------------------------------------------------------------------------
@@ -2044,9 +2072,11 @@ mod golden {
             speech_settings,
         );
         shared.model.lock().unwrap().add_window(WindowInfo {
+            keyboard_focus_pane: None,
             window_id: 1,
             active_tab_id: Some("t1".into()),
             tabs: vec![TabInfo {
+                system: false,
                 id: "t1".into(),
                 title: "Tab 1".into(),
                 layout: "auto".into(),
@@ -2365,7 +2395,7 @@ mod golden {
         // so only its shape is asserted, not the exact backend name.
         assert_eq!(
             body["windows"],
-            json!([{"windowId":1,"activeTabId":"t1","tabs":[{"id":"t1","title":"Tab 1","layout":"auto","panes":[]}]}])
+            json!([{"windowId":1,"activeTabId":"t1","keyboardFocusPaneId":null,"tabs":[{"id":"t1","title":"Tab 1","layout":"auto","panes":[]}]}])
         );
         assert_eq!(body["speech"]["muted"], json!(false));
         assert_eq!(body["speech"]["focusedOnly"], json!(false));
@@ -2781,6 +2811,59 @@ mod golden {
             .body(format!(r#"{{"type":"closePane","paneId":"{pane_id}"}}"#))
             .send()
             .await;
+    }
+
+    #[tokio::test]
+    async fn close_tab_refuses_the_app_owned_tab_rather_than_queueing_it() {
+        let s = boot(true).await;
+        // Two tabs on a second window: one the app owns (the always-on "Hyperpane"), one not.
+        // The pair is the point — the refusal has to be about THIS tab, not about the verb.
+        s.shared.model.lock().unwrap().add_window(WindowInfo {
+            window_id: 2,
+            active_tab_id: Some("sys".into()),
+            keyboard_focus_pane: None,
+            tabs: vec![
+                TabInfo {
+                    id: "sys".into(),
+                    title: "Hyperpane".into(),
+                    layout: "auto".into(),
+                    panes: vec![],
+                    system: true,
+                },
+                TabInfo {
+                    id: "ordinary".into(),
+                    title: "Tab 2".into(),
+                    layout: "auto".into(),
+                    panes: vec![],
+                    system: false,
+                },
+            ],
+        });
+
+        let r = post(
+            &s,
+            "/command",
+            &s.token,
+            r#"{"type":"closeTab","tabId":"sys"}"#,
+        )
+        .await;
+        // 409, not 202: the tab exists, its state forbids the verb. Answering 202 would tell
+        // the caller "queued" for a close the UI thread then silently drops — and a caller told
+        // "queued" has no way to learn it never happened.
+        assert_eq!(r.status().as_u16(), 409);
+        let body: Value = r.json().await.unwrap();
+        assert_eq!(body["tabId"], json!("sys"));
+        assert!(body["error"].as_str().unwrap().contains("refused"));
+
+        let r = post(
+            &s,
+            "/command",
+            &s.token,
+            r#"{"type":"closeTab","tabId":"ordinary"}"#,
+        )
+        .await;
+        assert_eq!(r.status().as_u16(), 202);
+        assert_eq!(r.json::<Value>().await.unwrap()["queued"], json!(true));
     }
 
     // ---- work queue routes -----------------------------------------------------------------

@@ -57,9 +57,11 @@ fn boot() -> u16 {
     let (shared, port) = serve_for_test(control_file, true, token).expect("serve");
     // Seed one window with one pane through the public read-model API.
     shared.model.lock().unwrap().add_window(WindowInfo {
+        keyboard_focus_pane: None,
         window_id: 1,
         active_tab_id: Some("t1".into()),
         tabs: vec![TabInfo {
+            system: false,
             id: "t1".into(),
             title: "Tab 1".into(),
             layout: "auto".into(),
@@ -105,7 +107,7 @@ fn state_is_byte_exact_over_a_real_socket() {
     // `backend` is environment-dependent (whatever TTS the test machine has on PATH, if
     // any) — this crate has no JSON parser available (public-API + std only), so the
     // known-exact prefix/suffix around that one variable value are checked directly.
-    let prefix = r##"{"windows":[{"windowId":1,"activeTabId":"t1","tabs":[{"id":"t1","title":"Tab 1","layout":"auto","panes":[{"id":"p1","sessionUid":"u1","label":"shell","color":"#3b82f6","status":"running","activity":"busy"}]}]}],"speech":{"muted":false,"focusedOnly":false,"backend":""##;
+    let prefix = r##"{"windows":[{"windowId":1,"activeTabId":"t1","keyboardFocusPaneId":null,"tabs":[{"id":"t1","title":"Tab 1","layout":"auto","panes":[{"id":"p1","sessionUid":"u1","label":"shell","color":"#3b82f6","status":"running","activity":"busy"}]}]}],"speech":{"muted":false,"focusedOnly":false,"backend":""##;
     let suffix = r#"","speakingPane":null}}"#;
     assert!(body.starts_with(prefix), "unexpected body: {body}");
     assert!(body.ends_with(suffix), "unexpected body: {body}");

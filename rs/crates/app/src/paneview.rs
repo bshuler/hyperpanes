@@ -219,12 +219,22 @@ impl Ui {
 /// Reuse is essential: `set_vec` destroys + recreates the repeated Slint elements,
 /// which would drop a divider's pointer grab mid-drag and reset pane focus.
 fn sync_model<T: Clone + 'static>(model: &VecModel<T>, items: Vec<T>) {
-    if model.row_count() == items.len() {
-        for (i, it) in items.into_iter().enumerate() {
+    // Grow/shrink at the tail and update the rest in place, rather than `set_vec`. `set_vec`
+    // replaces the whole model, which makes a Repeater DESTROY and re-create every element —
+    // and a freshly created element never fires a `changed` callback for its initial property
+    // value. That silently swallowed the keyboard hand-off (`refocus-seq`) on every tab switch
+    // where the pane count differed, and on the first pane of every launch. Incremental row
+    // edits keep the elements alive, so their `changed` handlers keep working.
+    while model.row_count() > items.len() {
+        model.remove(model.row_count() - 1);
+    }
+    let have = model.row_count();
+    for (i, it) in items.into_iter().enumerate() {
+        if i < have {
             model.set_row_data(i, it);
+        } else {
+            model.push(it);
         }
-    } else {
-        model.set_vec(items);
     }
 }
 

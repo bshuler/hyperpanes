@@ -1778,6 +1778,10 @@ impl App {
     /// `Tab::system`) needs nothing, and only a session that has none anywhere gets a fresh
     /// one. `hyperpane_done` then latches, so later windows never grow a second copy.
     fn ensure_hyperpane_tab(self: &Rc<Self>, st: &mut State) {
+        // A restored workspace can carry the tab anywhere in the strip (it was appended, not
+        // pinned, before the pin existed — and a saved reorder outlives the rule that now
+        // forbids it). Re-pin on every seed, whether or not we go on to create one.
+        st.pin_system_tab_first();
         if self.hyperpane_done.get() {
             return;
         }
@@ -2222,8 +2226,11 @@ impl App {
                     let slot = hover.tab_slot;
                     let dest = if slot > cur { slot - 1 } else { slot };
                     if dest != cur {
-                        src.state.borrow_mut().reorder_tab(cur, slot);
-                        *index = dest;
+                        // Track where it LANDED, not where we aimed: `reorder_tab` refuses a
+                        // move that would displace the pinned system tab, and a tracked index
+                        // that drifted from reality drags the wrong tab for the rest of the
+                        // gesture.
+                        *index = src.state.borrow_mut().reorder_tab(cur, slot);
                     }
                 }
             }
@@ -2890,6 +2897,21 @@ impl App {
             win.app.on_pane_link_moved(move |i, x, y| {
                 if let Some(win) = app.window_by_id(id) {
                     win.state.borrow_mut().pane_link_moved(i as usize, x, y);
+                }
+            });
+        }
+        {
+            // The terminal FocusScope reporting that it gained/lost the keyboard. This is the
+            // acknowledgement for `State::sync_pane_keyboard_focus`'s hand-off; `try_borrow_mut`
+            // because Slint may deliver it while the pump still holds the state (a missed ack
+            // just costs one more retry, and the retry is what makes the hand-off reliable).
+            let app = app.clone();
+            let id = win.id;
+            win.app.on_pane_focus_changed(move |i, on| {
+                if let Some(win) = app.window_by_id(id) {
+                    if let Ok(mut st) = win.state.try_borrow_mut() {
+                        st.note_pane_focus(i as usize, on);
+                    }
                 }
             });
         }

@@ -940,12 +940,21 @@ impl ControlHost {
                     title: tab.title.to_string(),
                     layout: crate::theme::layout_name(tab.layout).to_string(),
                     panes,
+                    system: tab.system,
                 });
             }
+            // The pane the terminal widget itself reported holding the keyboard — mapped uid →
+            // pane id like everything else here. See `WindowInfo::keyboard_focus_pane`: this is
+            // the CONFIRMED holder, not the selection, which is the whole point of publishing it.
+            let keyboard_focus_pane = st
+                .kbd_focus_live
+                .as_ref()
+                .map(|uid| pane_ids.get(uid).cloned().unwrap_or_else(|| uid.clone()));
             tree.push(WindowInfo {
                 window_id: wid,
                 active_tab_id,
                 tabs,
+                keyboard_focus_pane,
             });
         }
 
@@ -1265,6 +1274,7 @@ mod tests {
     fn model_with(panes: Vec<PaneInfo>) -> ReadModel {
         let mut m = ReadModel::new();
         m.add_window(WindowInfo {
+            keyboard_focus_pane: None,
             window_id: 1,
             active_tab_id: Some("1:0".to_string()),
             tabs: vec![TabInfo {
@@ -1272,6 +1282,7 @@ mod tests {
                 title: "Tab 1".to_string(),
                 layout: "auto".to_string(),
                 panes,
+                system: false,
             }],
         });
         m

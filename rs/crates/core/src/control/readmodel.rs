@@ -106,6 +106,10 @@ pub struct TabInfo {
     pub title: String,
     pub layout: String,
     pub panes: Vec<PaneInfo>,
+    /// The app owns this tab and refuses to close it — today only the always-on "Hyperpane".
+    /// Published so `closeTab` can refuse it up front, rather than answering 202 for a close
+    /// the UI thread will then quietly drop.
+    pub system: bool,
 }
 
 /// One window: its tabs + the active tab id.
@@ -114,6 +118,14 @@ pub struct WindowInfo {
     pub window_id: i64,
     pub active_tab_id: Option<String>,
     pub tabs: Vec<TabInfo>,
+    /// The pane whose terminal widget last reported that it actually holds the keyboard, as
+    /// confirmed by the widget itself — not the pane the controller merely *selected*.
+    ///
+    /// The two used to drift: a tab switch moved the selection but the keystrokes stayed on the
+    /// previous pane until the user clicked. Publishing the confirmed one is what makes that
+    /// bug observable (and its fix provable) from outside the GUI — `send`/`submit` write
+    /// straight to the pty and cannot tell a focused pane from an unfocused one.
+    pub keyboard_focus_pane: Option<String>,
 }
 
 /// A lightweight projection of a pane for the activity ticker / event fan-out.
@@ -638,9 +650,15 @@ impl ReadModel {
             if scope.is_some() && tabs.is_empty() {
                 continue;
             }
+            // Withheld when the pane it names didn't survive the scope filter — a scoped client
+            // gets `null` rather than the id of a pane it is not allowed to see.
+            let kbd = w.keyboard_focus_pane.clone().filter(|id| {
+                scope.is_none() || tabs.iter().any(|t| t.panes.iter().any(|p| &p.id == id))
+            });
             windows.push(WindowOut {
                 window_id: w.window_id,
                 active_tab_id: w.active_tab_id.clone(),
+                keyboard_focus_pane_id: kbd,
                 tabs,
             });
         }
@@ -673,6 +691,10 @@ pub struct StateOut {
 pub struct WindowOut {
     pub window_id: i64,
     pub active_tab_id: Option<String>, // string | null — always present
+    /// The pane the terminal widget confirmed holds the keyboard — `null` when nothing does
+    /// (an unfocused window, a dialog, a tab with no terminal pane). Distinct from the active
+    /// tab's focused pane, which is only what the app *asked* for.
+    pub keyboard_focus_pane_id: Option<String>, // string | null — always present
     pub tabs: Vec<TabOut>,
 }
 
@@ -780,9 +802,11 @@ mod tests {
     fn seeded() -> ReadModel {
         let mut m = ReadModel::new();
         m.add_window(WindowInfo {
+            keyboard_focus_pane: None,
             window_id: 1,
             active_tab_id: Some("t1".to_string()),
             tabs: vec![TabInfo {
+                system: false,
                 id: "t1".to_string(),
                 title: "Tab 1".to_string(),
                 layout: "auto".to_string(),
@@ -804,7 +828,7 @@ mod tests {
         // Optionals omitted; activity present; key ORDER preserved (struct order, not sorted).
         assert_eq!(
             s,
-            r##"{"windows":[{"windowId":1,"activeTabId":"t1","tabs":[{"id":"t1","title":"Tab 1","layout":"auto","panes":[{"id":"p1","sessionUid":"u1","label":"shell","color":"#888888","status":"running","activity":"busy"}]}]}]}"##
+            r##"{"windows":[{"windowId":1,"activeTabId":"t1","keyboardFocusPaneId":null,"tabs":[{"id":"t1","title":"Tab 1","layout":"auto","panes":[{"id":"p1","sessionUid":"u1","label":"shell","color":"#888888","status":"running","activity":"busy"}]}]}]}"##
         );
     }
 
@@ -844,9 +868,11 @@ mod tests {
         m.insert_pane(1, pane("p2", "u2"));
         // Add a second window with its own pane.
         m.add_window(WindowInfo {
+            keyboard_focus_pane: None,
             window_id: 2,
             active_tab_id: Some("t2".to_string()),
             tabs: vec![TabInfo {
+                system: false,
                 id: "t2".into(),
                 title: "Tab 2".into(),
                 layout: "auto".into(),
@@ -962,9 +988,11 @@ mod tests {
 
         // A tool pane names itself with the same string it writes to `meta["pane.kind"]`.
         m.add_window(WindowInfo {
+            keyboard_focus_pane: None,
             window_id: 2,
             active_tab_id: Some("t2".to_string()),
             tabs: vec![TabInfo {
+                system: false,
                 id: "t2".to_string(),
                 title: "Tab 2".to_string(),
                 layout: "auto".to_string(),
