@@ -180,7 +180,10 @@ pub fn ensure_registered() -> usize {
         let Some(script) = bundled_script(tool.dir, tool.script) else {
             continue; // not shipped in this build's layout — nothing to register
         };
-        let file = tool.settings_rel.iter().fold(home.clone(), |p, s| p.join(s));
+        let file = tool
+            .settings_rel
+            .iter()
+            .fold(home.clone(), |p, s| p.join(s));
         let cmd = script.to_string_lossy().to_string();
         match ensure_in_file(&file, &cmd, tool.versioned) {
             Ok(true) => {
@@ -367,7 +370,11 @@ mod tests {
 
         // Half a marker is no marker: resume is directory-scoped for all of them, so an id
         // without a directory resumes nothing.
-        std::fs::write(&path, r#"{"sessionId":"e91284c5-9826-4ae9-839c-f96b1ac7fbe7"}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"sessionId":"e91284c5-9826-4ae9-839c-f96b1ac7fbe7"}"#,
+        )
+        .unwrap();
         assert_eq!(read_pane_mark("cursor-agent", &pane), None);
 
         // And a hostile id never reaches the command line it would land on.

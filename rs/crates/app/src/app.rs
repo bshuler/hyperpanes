@@ -2133,8 +2133,7 @@ impl App {
         // lands the pane occupies the hovered tile, so the next tick resolves to itself and
         // does nothing until the cursor crosses into a different tile. The drop on release is
         // then already applied.
-        if is_pane && hover.win == Some(source_id) && !hover.over_strip && !hover.over_left_panel
-        {
+        if is_pane && hover.win == Some(source_id) && !hover.over_strip && !hover.over_left_panel {
             if let (Some(src), Some(dest)) = (self.window_by_id(source_id), hover.pane_idx) {
                 let uid = match &self.drag.borrow().as_ref().map(|d| d.kind.clone()) {
                     Some(DragKind::Pane { uid }) => Some(uid.clone()),

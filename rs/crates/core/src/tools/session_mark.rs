@@ -182,7 +182,10 @@ mod tests {
             .with_tool("cursor-agent");
         let mut meta = BTreeMap::new();
         m.write_into(&mut meta);
-        assert_eq!(meta.get(META_SESSION_TOOL_KEY).map(String::as_str), Some("cursor-agent"));
+        assert_eq!(
+            meta.get(META_SESSION_TOOL_KEY).map(String::as_str),
+            Some("cursor-agent")
+        );
         let back = ToolSessionMark::read(Some(&meta)).unwrap();
         assert_eq!(back, m);
         assert_eq!(back.tool_bin(), Some("cursor-agent"));

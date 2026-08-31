@@ -133,7 +133,10 @@ impl WindowGeometry {
         };
         // Even a frame that started on-screen must not hang so far right/down that the whole
         // title row leaves the display it was matched to.
-        let x = x.clamp(best.x - (w - MIN_VISIBLE).max(0), best.x + best.width - MIN_VISIBLE);
+        let x = x.clamp(
+            best.x - (w - MIN_VISIBLE).max(0),
+            best.x + best.width - MIN_VISIBLE,
+        );
         let y = y.clamp(best.y, best.y + best.height - MIN_VISIBLE);
         WindowGeometry {
             x: Some(x),
@@ -310,7 +313,10 @@ mod tests {
         let c = g.clamp_to_displays(&[LAPTOP]);
         let (x, y) = c.position().unwrap();
         let (w, h) = c.size().unwrap();
-        assert!(w <= LAPTOP.width && h <= LAPTOP.height, "shrunk to fit: {c:?}");
+        assert!(
+            w <= LAPTOP.width && h <= LAPTOP.height,
+            "shrunk to fit: {c:?}"
+        );
         assert!(x >= LAPTOP.x && x + w <= LAPTOP.x + LAPTOP.width, "{c:?}");
         assert!(y >= LAPTOP.y && y < LAPTOP.y + LAPTOP.height, "{c:?}");
     }

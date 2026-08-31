@@ -355,7 +355,10 @@ pub fn displays() -> Vec<(i32, i32, i32, i32)> {
     let Some(screen) = conn.setup().roots.get(screen_num) else {
         return Vec::new();
     };
-    let (w, h) = (screen.width_in_pixels as i32, screen.height_in_pixels as i32);
+    let (w, h) = (
+        screen.width_in_pixels as i32,
+        screen.height_in_pixels as i32,
+    );
     if w <= 0 || h <= 0 {
         return Vec::new();
     }

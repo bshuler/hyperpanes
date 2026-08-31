@@ -235,7 +235,8 @@ fn is_noise(line: &str) -> bool {
         "direction",
         "accTitle",
     ];
-    SKIP.iter().any(|p| line == p.trim_end() || line.starts_with(p))
+    SKIP.iter()
+        .any(|p| line == p.trim_end() || line.starts_with(p))
 }
 
 fn flowchart(src: &str, dir: Dir) -> Result<Diagram, String> {
@@ -281,7 +282,9 @@ fn statement(g: &mut Graph, line: &str) {
         let (label, after) = pipe_label(&chars, after).unwrap_or((op.label.clone(), after));
 
         // Find where the target token stops: at the next operator, or end of line.
-        let stop = next_edge(&chars, after).map(|(s, _)| s).unwrap_or(chars.len());
+        let stop = next_edge(&chars, after)
+            .map(|(s, _)| s)
+            .unwrap_or(chars.len());
         let tail = chars[after..stop].iter().collect::<String>();
         let to = node_token(g, &tail);
         if let (Some(a), Some(b)) = (from, to) {
@@ -448,7 +451,10 @@ fn pipe_label(chars: &[char], from: usize) -> Option<(String, usize)> {
     if j >= chars.len() {
         return None;
     }
-    Some((clean_text(&chars[start..j].iter().collect::<String>()), j + 1))
+    Some((
+        clean_text(&chars[start..j].iter().collect::<String>()),
+        j + 1,
+    ))
 }
 
 /// Read `id`, `id[Text]`, `id(Text)`, `id{Text}`, `id((Text))` … into the graph.
@@ -873,8 +879,18 @@ fn sequence(src: &str) -> Result<Diagram, String> {
         // Everything structural is skipped rather than refused: an `alt`/`loop`
         // block still has readable messages inside it.
         const SKIP: [&str; 12] = [
-            "alt ", "else", "opt ", "loop ", "par ", "and ", "end", "note ", "Note ", "rect ",
-            "activate ", "deactivate ",
+            "alt ",
+            "else",
+            "opt ",
+            "loop ",
+            "par ",
+            "and ",
+            "end",
+            "note ",
+            "Note ",
+            "rect ",
+            "activate ",
+            "deactivate ",
         ];
         if SKIP.iter().any(|p| line.starts_with(p)) {
             continue;
@@ -918,7 +934,8 @@ fn sequence(src: &str) -> Result<Diagram, String> {
     };
     for nd in &d.nodes {
         let cx = nd.x + nd.w / 2.0;
-        d.dashed.push_str(&dashes(cx, body_top + 4.0, cx, h - MARGIN));
+        d.dashed
+            .push_str(&dashes(cx, body_top + 4.0, cx, h - MARGIN));
     }
     for (i, m) in msgs.iter().enumerate() {
         let y = body_top + SEQ_ROW_H * (i as f32 + 0.8);
@@ -944,7 +961,8 @@ fn sequence(src: &str) -> Result<Diagram, String> {
                 d.lines.push_str(&leg);
             }
             if m.arrow {
-                d.heads.push_str(&arrowhead(out, y + 6.0, ax + 4.0, y + 6.0));
+                d.heads
+                    .push_str(&arrowhead(out, y + 6.0, ax + 4.0, y + 6.0));
             }
             let lw = m.text.chars().count() as f32 * 6.4 + 10.0;
             (ax, out, y - 24.0, lw)
@@ -1971,9 +1989,8 @@ mod tests {
 
     #[test]
     fn a_class_is_a_title_box_over_a_body_box_holding_its_members() {
-        let d = flow(
-            "classDiagram\n class Animal {\n +String name\n +run()\n }\n Animal <|-- Duck",
-        );
+        let d =
+            flow("classDiagram\n class Animal {\n +String name\n +run()\n }\n Animal <|-- Duck");
         // Animal is two boxes (title + body); Duck, memberless, is one.
         assert_eq!(d.nodes.len(), 3, "{:?}", d.nodes);
         let title = find(&d, "Animal");
@@ -1995,9 +2012,7 @@ mod tests {
 
     #[test]
     fn each_relationship_picks_the_marker_uml_gives_it() {
-        let d = flow(
-            "classDiagram\n A <|-- B\n C *-- D\n E o-- F\n G --> H\n I ..> J\n K ..|> L",
-        );
+        let d = flow("classDiagram\n A <|-- B\n C *-- D\n E o-- F\n G --> H\n I ..> J\n K ..|> L");
         // Hollow markers are the ones routed to `diamonds`, which is the only
         // stroked-and-surface-filled path there is: two triangles (<|--, ..|>)
         // plus one open diamond (o--).
@@ -2022,7 +2037,12 @@ mod tests {
     #[test]
     fn a_relationship_keeps_its_verb_in_the_middle_and_its_multiplicity_at_the_ends() {
         let d = flow("classDiagram\n Order \"1\" --> \"*\" Item : contains");
-        assert_eq!(d.nodes.len(), 2, "the quotes are multiplicity, not ids: {:?}", d.nodes);
+        assert_eq!(
+            d.nodes.len(),
+            2,
+            "the quotes are multiplicity, not ids: {:?}",
+            d.nodes
+        );
         let texts: Vec<&str> = d.labels.iter().map(|l| l.text.as_str()).collect();
         assert!(texts.contains(&"contains"), "{texts:?}");
         assert!(texts.contains(&"1") && texts.contains(&"*"), "{texts:?}");
@@ -2085,7 +2105,10 @@ mod tests {
         // CUSTOMER is title + body; ORDER, attribute-less, is one box.
         assert_eq!(d.nodes.len(), 3, "{:?}", d.nodes);
         let texts: Vec<&str> = d.labels.iter().map(|l| l.text.as_str()).collect();
-        assert!(texts.contains(&"string name") && texts.contains(&"string email"), "{texts:?}");
+        assert!(
+            texts.contains(&"string name") && texts.contains(&"string email"),
+            "{texts:?}"
+        );
         // The crow's foot is spelled out, because no primitive here draws one.
         assert!(texts.contains(&"1") && texts.contains(&"0..N"), "{texts:?}");
         assert!(texts.contains(&"places"), "{texts:?}");
@@ -2095,7 +2118,11 @@ mod tests {
     #[test]
     fn an_er_relationship_is_a_plain_run_with_no_arrowhead_on_either_end() {
         let d = flow("erDiagram\n A ||--|| B : is");
-        assert!(d.heads.is_empty(), "ER relationships are symmetric: {:?}", d.heads);
+        assert!(
+            d.heads.is_empty(),
+            "ER relationships are symmetric: {:?}",
+            d.heads
+        );
         assert!(d.diamonds.is_empty());
         assert!(!d.lines.is_empty());
     }
@@ -2106,7 +2133,11 @@ mod tests {
         assert!(!d.dashed.is_empty(), "{:?}", d.dashed);
         assert!(d.lines.is_empty());
         let texts: Vec<&str> = d.labels.iter().map(|l| l.text.as_str()).collect();
-        assert_eq!(texts.iter().filter(|t| **t == "0..N").count(), 2, "{texts:?}");
+        assert_eq!(
+            texts.iter().filter(|t| **t == "0..N").count(),
+            2,
+            "{texts:?}"
+        );
     }
 
     #[test]
@@ -2133,7 +2164,10 @@ mod tests {
         assert_eq!(d.nodes[0].x, d.nodes[1].x);
         assert!(d.nodes[1].y > d.nodes[0].y);
         assert!(d.nodes[0].w > d.nodes[1].w && d.nodes[1].w > d.nodes[2].w);
-        assert!((d.nodes[1].w - d.nodes[0].w / 2.0).abs() < 0.5, "half of Dogs");
+        assert!(
+            (d.nodes[1].w - d.nodes[0].w / 2.0).abs() < 0.5,
+            "half of Dogs"
+        );
         // Each percentage sits level with the bar it measures.
         for (i, n) in d.nodes.iter().enumerate() {
             let pct = &d.labels[2 + i * 2];
@@ -2163,8 +2197,16 @@ mod tests {
             assert!(d.w > 0.0 && d.h > 0.0, "{src:?}");
             for n in &d.nodes {
                 assert!(n.x >= 0.0 && n.y >= 0.0, "{n:?} in {src:?}");
-                assert!(n.x + n.w <= d.w + 0.5, "{n:?} overflows w={} in {src:?}", d.w);
-                assert!(n.y + n.h <= d.h + 0.5, "{n:?} overflows h={} in {src:?}", d.h);
+                assert!(
+                    n.x + n.w <= d.w + 0.5,
+                    "{n:?} overflows w={} in {src:?}",
+                    d.w
+                );
+                assert!(
+                    n.y + n.h <= d.h + 0.5,
+                    "{n:?} overflows h={} in {src:?}",
+                    d.h
+                );
             }
         }
     }
@@ -2274,7 +2316,9 @@ mod tests {
     fn the_first_rank_is_never_left_empty_by_a_back_edge() {
         // A [start] whose rank got pushed down used to leave rank 0 unoccupied,
         // opening a band of blank canvas above the whole diagram.
-        let d = flow("flowchart TD\n A[start] --> B{ok?}\n B -->|yes| C[ship]\n B -->|no| D[fix]\n D --> A");
+        let d = flow(
+            "flowchart TD\n A[start] --> B{ok?}\n B -->|yes| C[ship]\n B -->|no| D[fix]\n D --> A",
+        );
         let top = d.nodes.iter().map(|n| n.y).fold(f32::MAX, f32::min);
         assert_eq!(find(&d, "start").y, top);
         assert!(find(&d, "ok?").y > top);
@@ -2407,4 +2451,3 @@ mod tests {
         assert!(render(&src).is_err());
     }
 }
-

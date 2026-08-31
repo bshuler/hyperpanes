@@ -313,7 +313,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(LinkAction::Copy(p)) => eprintln!("[demo] Ctrl+click → copy: {p}"),
                 // The demo has no Preferences, so it does what "System default" would.
                 Some(LinkAction::OpenUrl(u)) => {
-                    eprintln!("[demo] click → url {u}: {:?}", hyperpanes_core::open::open_url(&u));
+                    eprintln!(
+                        "[demo] click → url {u}: {:?}",
+                        hyperpanes_core::open::open_url(&u)
+                    );
                 }
                 // The shell reveals the path in its left file tree; the demo has no panel, so it
                 // reports what it was handed.

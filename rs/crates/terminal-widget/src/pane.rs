@@ -365,7 +365,16 @@ impl TerminalPane {
         surf_w: f32,
         surf_h: f32,
         require_exists: bool,
-    ) -> Option<(ResolveResult, Option<u32>, Option<u32>, usize, usize, usize, f32, f32)> {
+    ) -> Option<(
+        ResolveResult,
+        Option<u32>,
+        Option<u32>,
+        usize,
+        usize,
+        usize,
+        f32,
+        f32,
+    )> {
         let (cell_w, cell_h, cols, rows) = self.cell_logical(surf_w, surf_h)?;
         if x < 0.0 || y < 0.0 {
             return None;
@@ -459,13 +468,7 @@ impl TerminalPane {
     /// rather than merely hovered. Same geometry as [`link_at`](Self::link_at), minus the
     /// on-disk requirement: the returned [`LinkHit::exists`] says which kind it is, so a caller
     /// can copy any path-shaped token while still refusing to reveal one that isn't there.
-    pub fn link_target_at(
-        &mut self,
-        x: f32,
-        y: f32,
-        surf_w: f32,
-        surf_h: f32,
-    ) -> Option<LinkHit> {
+    pub fn link_target_at(&mut self, x: f32, y: f32, surf_w: f32, surf_h: f32) -> Option<LinkHit> {
         if let Some((cand, start, end, row, cell_w, cell_h)) = self.url_under(x, y, surf_w, surf_h)
         {
             return Some(LinkHit {
@@ -1524,7 +1527,10 @@ mod tests {
         p.set_cwd(Some(dir.to_string_lossy().into_owned()));
         p.feed("gone.txt"); // never created
 
-        assert!(p.link_at(2.5, 0.5, 20.0, 2.0).is_none(), "no hover underline");
+        assert!(
+            p.link_at(2.5, 0.5, 20.0, 2.0).is_none(),
+            "no hover underline"
+        );
         let hit = p
             .link_target_at(2.5, 0.5, 20.0, 2.0)
             .expect("a deliberate lookup still finds it");

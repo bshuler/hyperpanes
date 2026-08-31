@@ -184,11 +184,9 @@ pub fn parse_status_v2(out: &str) -> GitStatus {
                     _ => {}
                 }
             }
-            "?" => st.rows.push(GitRow::new(
-                rest.to_string(),
-                '?',
-                Section::Untracked,
-            )),
+            "?" => st
+                .rows
+                .push(GitRow::new(rest.to_string(), '?', Section::Untracked)),
             // Ignored entries are only emitted with `--ignored`, which we never pass.
             "!" => {}
             "1" | "2" => {
@@ -208,8 +206,7 @@ pub fn parse_status_v2(out: &str) -> GitStatus {
                     continue;
                 }
                 if let Some(c) = code_of(xy[0]) {
-                    st.rows
-                        .push(GitRow::new(path.clone(), c, Section::Staged));
+                    st.rows.push(GitRow::new(path.clone(), c, Section::Staged));
                 }
                 if let Some(c) = code_of(xy[1]) {
                     st.rows.push(GitRow::new(path, c, Section::Changed));
@@ -266,10 +263,7 @@ mod tests {
 
     /// Records are NUL-*terminated*, so the fixture ends with one too.
     fn z(lines: &[&str]) -> String {
-        lines
-            .iter()
-            .map(|l| format!("{l}\0"))
-            .collect::<String>()
+        lines.iter().map(|l| format!("{l}\0")).collect::<String>()
     }
 
     #[test]
@@ -347,7 +341,11 @@ mod tests {
         assert_eq!(staged[0].path, "new/name.rs");
         assert_eq!(staged[0].code, 'R');
         let untracked: Vec<_> = st.section(Section::Untracked).collect();
-        assert_eq!(untracked.len(), 1, "the record after a rename is not a path");
+        assert_eq!(
+            untracked.len(),
+            1,
+            "the record after a rename is not a path"
+        );
         assert_eq!(untracked[0].path, "untracked.txt");
     }
 

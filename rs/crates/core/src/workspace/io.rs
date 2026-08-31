@@ -506,7 +506,10 @@ mod tests {
             },
         ] {
             assert!(has_panes(&empty), "shape check still true: {empty:?}");
-            assert!(!describes_panes(&empty), "content check must be false: {empty:?}");
+            assert!(
+                !describes_panes(&empty),
+                "content check must be false: {empty:?}"
+            );
         }
 
         // One real pane at each level is enough.

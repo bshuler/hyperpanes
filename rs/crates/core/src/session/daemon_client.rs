@@ -1819,7 +1819,6 @@ mod tests {
         mgr2.kill("surv");
     }
 
-
     // ---- M2 re-attach: the SessionManager-level decision the GUI restore branches on ----
     //
     // `state.rs::make_pane_from_spec` decides RE-ATTACH vs RE-SPAWN with exactly this

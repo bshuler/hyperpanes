@@ -578,7 +578,8 @@ fn fence_open(trimmed: &str) -> Option<(char, &str)> {
 /// more, and nothing else.
 fn fence_closes(line: &str, mark: char) -> bool {
     let t = line.trim();
-    t.chars().take_while(|c| *c == mark).count() >= 3 && t.trim_start_matches(mark).trim().is_empty()
+    t.chars().take_while(|c| *c == mark).count() >= 3
+        && t.trim_start_matches(mark).trim().is_empty()
 }
 
 /// A mermaid fence body, as either one diagram row or the code block it was.
@@ -1099,7 +1100,8 @@ fn flows(role: i32) -> bool {
 /// Inline markdown for the view. A source that will not parse still has to be
 /// readable, so it falls back to itself as plain text rather than vanishing.
 fn markdown_text(src: &str) -> slint::StyledText {
-    slint::StyledText::from_markdown(src).unwrap_or_else(|_| slint::StyledText::from_plain_text(src))
+    slint::StyledText::from_markdown(src)
+        .unwrap_or_else(|_| slint::StyledText::from_plain_text(src))
 }
 
 pub fn model_for(uid: &str, kind: &PaneKind, target: Option<&str>) -> ModelRc<PaneViewRow> {
@@ -1120,7 +1122,8 @@ pub fn model_for(uid: &str, kind: &PaneKind, target: Option<&str>) -> ModelRc<Pa
         // of a source file as inline markdown would mangle its `*`s and cost a
         // full parse per row to do it.
         let no_md = slint::StyledText::default();
-        let no_cells: ModelRc<PaneCell> = ModelRc::from(Rc::new(VecModel::from(Vec::<PaneCell>::new())));
+        let no_cells: ModelRc<PaneCell> =
+            ModelRc::from(Rc::new(VecModel::from(Vec::<PaneCell>::new())));
         let model: ModelRc<PaneViewRow> = ModelRc::from(Rc::new(VecModel::from(
             rows.iter()
                 .map(|r| PaneViewRow {
@@ -1375,11 +1378,7 @@ mod tests {
     #[test]
     fn a_paragraph_is_one_row_however_many_lines_it_was_typed_on() {
         let d = scratch("flow");
-        let f = write(
-            &d,
-            "doc.md",
-            "one\ntwo\nthree\n\nnext para\n",
-        );
+        let f = write(&d, "doc.md", "one\ntwo\nthree\n\nnext para\n");
 
         let rows = markdown_blocks(&f);
         let got: Vec<(i32, &str)> = rows.iter().map(|r| (r.role, r.text.as_str())).collect();
@@ -1531,8 +1530,14 @@ mod tests {
         // snake_case is a word, not emphasis; a link keeps its text and drops its
         // target; an escape yields the character it was hiding.
         assert_eq!(strip_inline("a *b* _c_ `d`"), "a b c d");
-        assert_eq!(strip_inline("call some_long_name now"), "call some_long_name now");
-        assert_eq!(strip_inline("see [the docs](http://x/y) here"), "see the docs here");
+        assert_eq!(
+            strip_inline("call some_long_name now"),
+            "call some_long_name now"
+        );
+        assert_eq!(
+            strip_inline("see [the docs](http://x/y) here"),
+            "see the docs here"
+        );
         assert_eq!(strip_inline("see [the docs][ref]"), "see the docs");
         assert_eq!(strip_inline("~~gone~~ and \\*kept\\*"), "gone and *kept*");
     }
@@ -1566,7 +1571,10 @@ mod tests {
         let rows = markdown_blocks(&f);
         let got: Vec<i32> = rows.iter().map(|r| r.role).collect();
         assert_eq!(got, vec![role::PROSE, role::DIAGRAM, role::PROSE]);
-        let dg = rows[1].diagram.as_ref().expect("the row carries its geometry");
+        let dg = rows[1]
+            .diagram
+            .as_ref()
+            .expect("the row carries its geometry");
         assert_eq!(dg.nodes.len(), 2);
         assert!(dg.w > 0.0 && dg.h > 0.0);
         // The source lines are gone: a diagram replaces its fence, it does not
@@ -1577,11 +1585,7 @@ mod tests {
     #[test]
     fn a_dialect_we_cannot_draw_falls_back_to_the_code_it_was() {
         let d = scratch("mermaid-fallback");
-        let f = write(
-            &d,
-            "doc.md",
-            "```mermaid\ngantt\n  title Roadmap\n```\n",
-        );
+        let f = write(&d, "doc.md", "```mermaid\ngantt\n  title Roadmap\n```\n");
 
         let rows = markdown_blocks(&f);
         assert!(!rows.iter().any(|r| r.role == role::DIAGRAM));

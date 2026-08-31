@@ -284,7 +284,10 @@ mod tests {
         // And it stays refused, even once one of the two would look like the "obvious"
         // answer — the extra ids never leave the store, so there is nothing to resolve.
         assert_eq!(
-            w.observe(t0(), [("aaaa-1111", "/tmp/proj"), ("bbbb-2222", "/tmp/proj")]),
+            w.observe(
+                t0(),
+                [("aaaa-1111", "/tmp/proj"), ("bbbb-2222", "/tmp/proj")]
+            ),
             Outcome::Stopped(Stopped::Ambiguous)
         );
     }
@@ -318,7 +321,10 @@ mod tests {
     fn a_pane_that_never_starts_a_conversation_stops_looking_on_a_bounded_budget() {
         let mut w = PaneWatch::new("cursor-agent", "/tmp/proj").unwrap();
         for _ in 0..MAX_OBSERVATIONS - 1 {
-            assert_eq!(w.observe(t0(), [("aaaa-1111", "/tmp/proj")]), Outcome::Watching);
+            assert_eq!(
+                w.observe(t0(), [("aaaa-1111", "/tmp/proj")]),
+                Outcome::Watching
+            );
         }
         assert_eq!(
             w.observe(t0(), [("aaaa-1111", "/tmp/proj")]),
@@ -358,7 +364,10 @@ mod tests {
     fn a_fresh_watch_is_due_at_once_but_not_again_until_the_interval_passes() {
         let mut w = PaneWatch::new("cursor-agent", "/tmp/proj").unwrap();
         let now = t0();
-        assert!(w.due(now), "the baseline must be taken as early as possible");
+        assert!(
+            w.due(now),
+            "the baseline must be taken as early as possible"
+        );
         w.observe(now, []);
         assert!(!w.due(now));
         assert!(w.due(now + SCAN_EVERY));

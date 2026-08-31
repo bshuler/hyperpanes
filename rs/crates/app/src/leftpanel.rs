@@ -791,7 +791,10 @@ mod tests {
             (PaneKind::Browser, pane_mark::BROWSER),
             // A tool id from a build newer than this one: still a terminal running
             // something, so it gets the prompt rather than a gap or a borrowed brand.
-            (PaneKind::Tool("tool-from-the-future".into()), pane_mark::TERMINAL),
+            (
+                PaneKind::Tool("tool-from-the-future".into()),
+                pane_mark::TERMINAL,
+            ),
         ];
         for (kind, want) in views {
             let got = pane_mark_kind(&kind);
