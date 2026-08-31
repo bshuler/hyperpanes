@@ -227,6 +227,9 @@ pub struct App {
     /// were last read. On the daemon backend the read is a shadow-map lookup, but the
     /// in-process backend does two syscalls per pane, so it never rides the 8 ms pump.
     last_foreground_sniff: Cell<Option<std::time::Instant>>,
+    /// Throttle for the tool-conversation adoption pass: when a pane last had its
+    /// hook marker read and its inference watch advanced.
+    last_session_adopt: Cell<Option<std::time::Instant>>,
 }
 
 /// How often (at most) a pane's rendered screen is re-fed to the ambient-AI engine. The
@@ -241,6 +244,13 @@ const SPRING_DELAY: std::time::Duration = std::time::Duration::from_millis(450);
 impl App {
     pub fn new(mgr: Arc<SessionManager>, erx: UnboundedReceiver<SessionEvent>) -> Rc<Self> {
         let control = crate::control_host::ControlHost::new(&mgr);
+        // Register the SessionStart/SessionEnd hooks for the tools that have them, next to
+        // the Claude registration `main` already does. Additive, idempotent and
+        // best-effort: a tool that isn't installed has no config directory, and a build
+        // whose bundled script is missing simply registers nothing (see
+        // `tools::session_hook`). Done here rather than lazily because the hook has to be
+        // in place BEFORE the user starts a tool, not after we notice they did.
+        hyperpanes_core::tools::session_hook::ensure_registered();
         Rc::new(App {
             mgr,
             windows: RefCell::new(Vec::new()),
@@ -268,6 +278,7 @@ impl App {
             last_autosave_json: RefCell::new(String::new()),
             last_prompt_delivery: Cell::new(None),
             last_foreground_sniff: Cell::new(None),
+            last_session_adopt: Cell::new(None),
         })
     }
 
@@ -384,6 +395,124 @@ impl App {
                 // engine is touched.
                 let project = w.state.borrow_mut().note_pane_cwd(&uid, &cwd);
                 self.ai.send(crate::ai::AiMsg::Cwd { uid, cwd, project });
+            }
+        }
+    }
+
+    /// Give a pane that became a tool pane **by hand** the conversation id it is in.
+    ///
+    /// # The gap this closes
+    ///
+    /// A pane opened out of the left panel's session list is handed one exact conversation
+    /// and records it as a [`ToolSessionMark`] at birth. A pane where the human opened a
+    /// plain shell and typed `claude` records nothing: its persisted kind stays `Terminal`
+    /// (the foreground sniff re-brands the chrome but deliberately never writes the kind),
+    /// and nothing was ever told which conversation started. On the next launch it comes
+    /// back as a shell in the right directory with the conversation gone.
+    ///
+    /// Two sources are consulted, in this order:
+    ///
+    /// 1. **The tool's own hook.** Claude, Cursor and Copilot all fire a session-start hook
+    ///    that inherits `HYPERPANES_PANE_ID` from the pane's environment and drops a marker
+    ///    naming the conversation. This is a *report*, not a deduction, so it is read first
+    ///    and it is read every pass — it lands within a second of the tool starting.
+    /// 2. **The scan-and-diff fallback** (`tools::session_infer`), for a pane no hook spoke
+    ///    for: a tool with no hook, a hook that could not be registered, or a tool whose
+    ///    config the human has locked down. It watches the tool's own history store for a
+    ///    conversation that appears in this pane's directory after the pane started.
+    ///
+    /// Adoption is one-way and once-only ([`State::adopt_tool_session`] fills an empty slot
+    /// and nothing else), so an id already on a pane — from the spawn, from a hook, or from
+    /// an earlier pass — is never swapped for a different one.
+    ///
+    /// Throttled well off the pump: source 1 is a `stat` per unidentified pane, and source 2
+    /// paces itself on its own scan interval regardless of how often it is polled.
+    fn adopt_tool_sessions(&self, windows: &[Rc<Window>]) {
+        const EVERY: Duration = Duration::from_secs(2);
+        let now = std::time::Instant::now();
+        if let Some(last) = self.last_session_adopt.get() {
+            if now.duration_since(last) < EVERY {
+                return;
+            }
+        }
+        self.last_session_adopt.set(Some(now));
+
+        let mut alive: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut overrides: std::collections::BTreeMap<String, String> = Default::default();
+        for w in windows {
+            // Collect under a short borrow, act after it: reading a marker touches the
+            // filesystem and `adopt` takes the state mutably.
+            let wants: Vec<(String, String, Option<String>)> = {
+                let st = w.state.borrow();
+                overrides = st.settings.tool_paths.clone();
+                let uids: Vec<String> = st
+                    .tabs
+                    .iter()
+                    .flat_map(|t| t.panes.iter())
+                    .filter(|p| p.kind.is_pty())
+                    .map(|p| p.uid.clone())
+                    .collect();
+                uids.into_iter()
+                    .filter_map(|uid| {
+                        st.tool_session_wanted(&uid)
+                            .map(|(tool, cwd)| (uid, tool, cwd))
+                    })
+                    .collect()
+            };
+            for (uid, tool, cwd) in wants {
+                alive.insert(uid.clone());
+                // The hook writes its marker under the PANE id the tool inherited, which is
+                // the daemon-facing id, not necessarily the local uid.
+                let pane_id = self
+                    .control
+                    .pane_id_for_uid(&uid)
+                    .unwrap_or_else(|| uid.clone());
+                let mark = match tool.as_str() {
+                    // Claude's marker predates the shared one and has its own shape and its
+                    // own reader; it is the same fact.
+                    "claude" => hyperpanes_core::claude_panes::read_pane_session(&pane_id)
+                        .and_then(|s| {
+                            // The marker's own cwd is the authority; the pane's live one is
+                            // only a stand-in for the markers written before it carried one.
+                            let dir = if s.cwd.is_empty() {
+                                cwd.as_deref().unwrap_or_default()
+                            } else {
+                                s.cwd.as_str()
+                            };
+                            hyperpanes_core::tools::ToolSessionMark::new(&s.session_id, dir)
+                                .map(|m| m.with_tool("claude"))
+                        }),
+                    other => hyperpanes_core::tools::session_hook::read_pane_mark(other, &pane_id),
+                };
+                match mark {
+                    Some(mark) => {
+                        if w.state.borrow_mut().adopt_tool_session(&uid, mark) {
+                            crate::history_scan::forget_pane(&uid);
+                            alive.remove(&uid);
+                        }
+                    }
+                    // No hook spoke for this pane. Watch the tool's store instead; the call
+                    // is idempotent, so re-asking every pass keeps the baseline it took the
+                    // first time. A pane that has not reported its cwd yet is left alone for
+                    // now — a baseline taken against the wrong directory would be worse than
+                    // a baseline taken a couple of seconds late.
+                    None => {
+                        if let Some(cwd) = cwd.as_deref() {
+                            crate::history_scan::watch_pane(&uid, &tool, cwd);
+                        }
+                    }
+                }
+            }
+        }
+        // Panes that closed, or that now know their conversation, stop being watched —
+        // otherwise the watch map grows with every pane the session ever opened.
+        crate::history_scan::retain_panes(&alive);
+
+        for (uid, mark) in crate::history_scan::poll_inference(&overrides) {
+            for w in windows {
+                if w.state.borrow_mut().adopt_tool_session(&uid, mark.clone()) {
+                    break;
+                }
             }
         }
     }
@@ -1125,6 +1254,9 @@ impl App {
         // 5c. D5 foreground sniff: what each pty pane is running *now* (throttled; a map
         //     read on the daemon backend). Upgrades/downgrades chrome only.
         self.sniff_foreground(&windows);
+        // 5d. Give a hand-started tool pane its conversation: read the hook markers, and
+        //     advance the scan-and-diff fallback for the panes no hook spoke for.
+        self.adopt_tool_sessions(&windows);
         self.deliver_pending_goals();
         self.service_restart_request();
 

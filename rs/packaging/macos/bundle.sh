@@ -99,6 +99,15 @@ cp "$ROOT/resources/claude/goal-orchestrator/SKILL.md" "$APP/Contents/Resources/
 cp "$ROOT/resources/claude/goal-orchestrator/SPEC.md" "$APP/Contents/Resources/claude/goal-orchestrator/"
 cp "$ROOT/resources/claude/goal-orchestrator/IMPL.md" "$APP/Contents/Resources/claude/goal-orchestrator/"
 
+# CLI-agent session hooks (tool-resume feature). These had never been bundled at all, so a
+# shipped .app registered no hook and every hand-started tool pane fell back to the
+# scan-and-diff heuristic. They go in Contents/Resources for the same signing reason as the
+# personas above, and are reached through the MacOS/resources symlink.
+for h in claude/hp-claude-session-hook.sh cursor/hp-cursor-session-hook.sh copilot/hp-copilot-session-hook.sh; do
+  mkdir -p "$APP/Contents/Resources/$(dirname "$h")"
+  install -m 755 "$ROOT/resources/$h" "$APP/Contents/Resources/$h"
+done
+
 ln -s ../Resources "$APP/Contents/MacOS/resources"
 
 echo "==> generating hyperpanes.icns from build/icon.png"

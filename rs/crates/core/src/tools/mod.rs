@@ -17,6 +17,12 @@ pub mod foreground;
 pub mod history;
 pub mod kind;
 pub mod registry;
+/// Per-tool `sessionStart`/`sessionEnd` hooks — cursor-agent's and Copilot CLI's answer to
+/// "which conversation is this pane in", plus the reader for the markers they write.
+pub mod session_hook;
+/// The last resort for a tool with NO hook: infer the pane's conversation from what newly
+/// appears in the tool's history store, and refuse to answer when more than one thing does.
+pub mod session_infer;
 /// The pane-meta pair that puts a restarted pane back into the same conversation, and the
 /// one authority on each tool's resume argv.
 pub mod session_mark;
@@ -26,4 +32,7 @@ pub use foreground::{
 };
 pub use kind::{PaneKind, META_KIND_KEY};
 pub use registry::{by_bin, by_id, by_title, HistoryKind, ToolDef, TOOLS, TOOL_ICON_BASE};
-pub use session_mark::{resume_args, ToolSessionMark, META_SESSION_CWD_KEY, META_SESSION_KEY};
+pub use session_infer::{Outcome as InferOutcome, PaneWatch};
+pub use session_mark::{
+    resume_args, ToolSessionMark, META_SESSION_CWD_KEY, META_SESSION_KEY, META_SESSION_TOOL_KEY,
+};

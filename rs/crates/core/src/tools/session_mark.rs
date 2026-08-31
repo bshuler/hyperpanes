@@ -3,15 +3,26 @@
 //! # Why this exists when `claude_panes` already did it
 //!
 //! Claude Code has a `SessionStart` hook, so Hyperpanes learns a Claude pane's live
-//! conversation id from the outside and records it under `claude.session`. No other tool
-//! offers a hook, and the ids still have to survive a relaunch — so the mark here is
-//! written from what Hyperpanes itself *did*: a pane spawned out of the left panel's
-//! session list was handed one exact conversation, and that is the one to come back to.
+//! conversation id from the outside and records it under `claude.session`. The ids still
+//! have to survive a relaunch for every *other* tool — so the mark here is the general
+//! form, written from any of three sources: a pane spawned out of the left panel's session
+//! list (Hyperpanes handed it one exact conversation), a per-tool session hook
+//! ([`crate::tools::session_hook`] — cursor-agent and Copilot CLI have one too), or the
+//! scan-and-diff inference of last resort ([`crate::tools::session_infer`]).
 //!
-//! The tool is deliberately **not** stored a second time. A pane's kind already rides in
-//! `meta["pane.kind"]` as [`crate::tools::PaneKind::Tool`], so the mark answers only
-//! "which conversation, in which directory" and the kind answers "in which tool". Two
-//! copies of the same fact would eventually disagree.
+//! # Why the tool id is optional rather than absent
+//!
+//! For a pane Hyperpanes *spawned* as a tool the kind already answers "which tool": it
+//! rides in `meta["pane.kind"]` as [`crate::tools::PaneKind::Tool`], and storing the same
+//! fact twice invites the two copies to disagree. That reasoning holds exactly as long as
+//! the pane has a tool kind.
+//!
+//! A **hand-started** tool pane does not. The human opened a plain shell and typed
+//! `cursor-agent`; the runtime sniff notices and re-brands the pane, but it deliberately
+//! never writes the persisted kind (what a pane *relaunches* is not inferred), so the
+//! snapshot records `Terminal`. For that pane the kind answers nothing, and a mark with no
+//! tool is a conversation id nobody can spend. So the tool is recorded only when it was
+//! learned from the outside — hook or inference — and read only where the kind is silent.
 //!
 //! # Why the directory is part of the mark
 //!
@@ -32,6 +43,12 @@ pub const META_SESSION_KEY: &str = "tool.session";
 /// Pane-meta key for the directory that conversation belongs to.
 pub const META_SESSION_CWD_KEY: &str = "tool.cwd";
 
+/// Pane-meta key for the tool the conversation belongs to — written only when the pane's
+/// own [`crate::tools::PaneKind`] cannot answer that (see the module doc). Absent on every
+/// mark written before this existed and on every spawned-as-a-tool pane, which is why it
+/// reads back as `Option`.
+pub const META_SESSION_TOOL_KEY: &str = "tool.id";
+
 /// One pane's remembered conversation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolSessionMark {
@@ -39,6 +56,9 @@ pub struct ToolSessionMark {
     pub id: String,
     /// The directory the conversation belongs to.
     pub cwd: String,
+    /// The registry id of the tool holding the conversation, when the pane's kind does
+    /// not already say. `None` is the ordinary case: ask the kind.
+    pub tool: Option<String>,
 }
 
 impl ToolSessionMark {
@@ -49,20 +69,48 @@ impl ToolSessionMark {
         (valid_session_id(id) && valid_resume_cwd(cwd)).then(|| ToolSessionMark {
             id: id.to_string(),
             cwd: cwd.to_string(),
+            tool: None,
         })
+    }
+
+    /// Name the tool this conversation belongs to. Only for a mark learned from OUTSIDE a
+    /// spawn — a hook marker or the scan-and-diff inference — where the pane is a plain
+    /// terminal as far as its persisted kind is concerned.
+    ///
+    /// An id no build in this binary knows is dropped rather than kept: the only consumer
+    /// resolves it in [`crate::tools::registry`] to get a program name, so an unresolvable
+    /// id is a value that can never be spent, and keeping it would only invite a later
+    /// reader to spend it unchecked.
+    pub fn with_tool(mut self, tool_id: &str) -> Self {
+        self.tool = crate::tools::registry::by_id(tool_id).map(|t| t.id.to_string());
+        self
     }
 
     /// Read a pane's mark back out of its `meta`. Re-validated rather than trusted: the
     /// file it came from is user-editable and the id lands on a command line.
     pub fn read(meta: Option<&BTreeMap<String, String>>) -> Option<Self> {
         let m = meta?;
-        Self::new(m.get(META_SESSION_KEY)?, m.get(META_SESSION_CWD_KEY)?)
+        let mark = Self::new(m.get(META_SESSION_KEY)?, m.get(META_SESSION_CWD_KEY)?)?;
+        Some(match m.get(META_SESSION_TOOL_KEY) {
+            Some(t) => mark.with_tool(t),
+            None => mark,
+        })
     }
 
     /// Record the mark in a pane's `meta`.
     pub fn write_into(&self, meta: &mut BTreeMap<String, String>) {
         meta.insert(META_SESSION_KEY.to_string(), self.id.clone());
         meta.insert(META_SESSION_CWD_KEY.to_string(), self.cwd.clone());
+        if let Some(t) = &self.tool {
+            meta.insert(META_SESSION_TOOL_KEY.to_string(), t.clone());
+        }
+    }
+
+    /// The program to run to re-enter this conversation when the pane's kind is silent:
+    /// the registry's binary name for the recorded tool. `'static`, so nothing a human
+    /// typed into `workspace.json` reaches a command line through here.
+    pub fn tool_bin(&self) -> Option<&'static str> {
+        crate::tools::registry::by_id(self.tool.as_deref()?).map(|t| t.bin)
     }
 }
 
@@ -123,6 +171,50 @@ mod tests {
         meta.insert(META_SESSION_KEY.to_string(), "aaaa-bbbb".to_string());
         meta.insert(META_SESSION_CWD_KEY.to_string(), "/has'quote".to_string());
         assert_eq!(ToolSessionMark::read(Some(&meta)), None);
+    }
+
+    #[test]
+    fn a_hand_started_pane_s_mark_carries_the_tool_its_kind_cannot_name() {
+        // The hand-started case: the pane persists as `Terminal`, so without this the id
+        // is a conversation nobody can spend.
+        let m = ToolSessionMark::new("aaaa-bbbb-cccc", "/tmp/proj")
+            .unwrap()
+            .with_tool("cursor-agent");
+        let mut meta = BTreeMap::new();
+        m.write_into(&mut meta);
+        assert_eq!(meta.get(META_SESSION_TOOL_KEY).map(String::as_str), Some("cursor-agent"));
+        let back = ToolSessionMark::read(Some(&meta)).unwrap();
+        assert_eq!(back, m);
+        assert_eq!(back.tool_bin(), Some("cursor-agent"));
+    }
+
+    #[test]
+    fn a_spawned_pane_s_mark_writes_no_tool_key_at_all() {
+        // A pane spawned AS a tool already records which one in `pane.kind`; a second copy
+        // of that fact is one that can drift. It must also stay byte-identical to what
+        // builds before the key existed wrote.
+        let m = ToolSessionMark::new("aaaa-bbbb-cccc", "/tmp/proj").unwrap();
+        let mut meta = BTreeMap::new();
+        m.write_into(&mut meta);
+        assert!(!meta.contains_key(META_SESSION_TOOL_KEY));
+        assert_eq!(ToolSessionMark::read(Some(&meta)).unwrap().tool, None);
+    }
+
+    #[test]
+    fn an_unknown_or_hostile_tool_id_is_dropped_rather_than_carried() {
+        // Unlike `pane.kind`, this key is not a round-trip contract — it exists only to be
+        // resolved to a program name. An id that resolves to nothing is dead weight, and a
+        // hostile one must never reach the command line the mark is spent on.
+        let mut meta = BTreeMap::new();
+        meta.insert(META_SESSION_KEY.to_string(), "aaaa-bbbb".to_string());
+        meta.insert(META_SESSION_CWD_KEY.to_string(), "/tmp/proj".to_string());
+        meta.insert(
+            META_SESSION_TOOL_KEY.to_string(),
+            "claude; rm -rf /".to_string(),
+        );
+        let back = ToolSessionMark::read(Some(&meta)).unwrap();
+        assert_eq!(back.tool, None);
+        assert_eq!(back.tool_bin(), None);
     }
 
     #[test]

@@ -65,9 +65,13 @@ install -m 644 "$SHELL_INT/hp-init.ps1" "$APPDIR/usr/bin/resources/shell-integra
 mkdir -p "$APPDIR/usr/bin/resources/shell-integration/zdotdir"
 install -m 644 "$SHELL_INT/zdotdir/.zshenv" "$APPDIR/usr/bin/resources/shell-integration/zdotdir/.zshenv"
 install -m 644 "$SHELL_INT/zdotdir/.zshrc"  "$APPDIR/usr/bin/resources/shell-integration/zdotdir/.zshrc"
-# Claude Code session hook (claude-resume feature) — same exe_dir/resources layout.
-mkdir -p "$APPDIR/usr/bin/resources/claude"
-install -m 755 "$ROOT/resources/claude/hp-claude-session-hook.sh" "$APPDIR/usr/bin/resources/claude/hp-claude-session-hook.sh"
+# CLI-agent session hooks (tool-resume feature) — same exe_dir/resources layout. All three
+# must ship: registration degrades to a silent no-op when a script is missing, so a dropped
+# one costs the hand-started panes of that tool their conversation id with no error anywhere.
+for h in claude/hp-claude-session-hook.sh cursor/hp-cursor-session-hook.sh copilot/hp-copilot-session-hook.sh; do
+  mkdir -p "$APPDIR/usr/bin/resources/$(dirname "$h")"
+  install -m 755 "$ROOT/resources/$h" "$APPDIR/usr/bin/resources/$h"
+done
 
 # Goal-orchestrator personas (goals system) — resolved as exe_dir/resources/claude/goal-orchestrator.
 mkdir -p "$APPDIR/usr/bin/resources/claude/goal-orchestrator"

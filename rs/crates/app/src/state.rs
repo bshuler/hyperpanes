@@ -828,7 +828,12 @@ pub struct PaneState {
     /// opened from the left panel's session list, and persisted through `PaneSpec`'s
     /// `meta["tool.session"]` / `meta["tool.cwd"]` so a relaunch re-resumes the same chat.
     ///
-    /// `kind` already says *which tool*, so the mark deliberately does not repeat it.
+    /// `kind` usually already says *which tool*, so the mark does not normally repeat it.
+    /// The exception is a pane the user turned into a tool pane **by hand**: the runtime
+    /// sniff re-brands such a pane for display but never writes its persisted kind, so the
+    /// kind stays `Terminal` and answers nothing. A mark adopted for one of those carries
+    /// the tool id itself (`meta["tool.id"]`) so the restore path can still name the
+    /// binary to resume.
     pub tool_session: Option<ToolSessionMark>,
 }
 
@@ -2249,6 +2254,67 @@ impl State {
         if self.agent_live.remove(uid).is_some() | self.sniffed_tool.remove(uid).is_some() {
             self.dirty = true;
         }
+    }
+
+    /// Record `mark` as the conversation running in pane `uid` — **only if the pane has
+    /// no conversation recorded yet**.
+    ///
+    /// # Why this fills an empty slot instead of taking the best answer
+    ///
+    /// Three things can name a pane's conversation, and they do not deserve equal trust:
+    ///
+    /// 1. the **spawn** out of the left panel's session list, which handed the pane one
+    ///    exact conversation and therefore cannot be wrong;
+    /// 2. a **hook** the tool itself fired, which reports the id the tool is actually in;
+    /// 3. an **inference** from watching new conversations appear in the tool's history
+    ///    store (`tools::session_infer`), which is a deduction, not a report.
+    ///
+    /// Ranking them at the moment of adoption would need a stored provenance per pane. It
+    /// is not needed, because the three cannot tie: (1) is set when the pane is born, and
+    /// (2) lands within a second of the tool starting, whereas (3) cannot adopt before its
+    /// second look — a full scan interval later — and only after a baseline taken at the
+    /// first. So "first writer wins" *is* "the most authoritative writer wins", and it has
+    /// the property that matters more than either: an id already on a pane is never
+    /// silently swapped for a different one, which is the failure that would resume the
+    /// user into somebody else's conversation.
+    ///
+    /// Returns whether the mark was taken, so a caller can stop looking.
+    pub fn adopt_tool_session(&mut self, uid: &str, mark: ToolSessionMark) -> bool {
+        let Some((ti, pi)) = self.find_pane(uid) else {
+            return false;
+        };
+        let p = &mut self.tabs[ti].panes[pi];
+        if p.tool_session.is_some() {
+            return false;
+        }
+        p.tool_session = Some(mark);
+        self.dirty = true;
+        true
+    }
+
+    /// Whether pane `uid` still needs a conversation found for it, and — once the pane has
+    /// said where it is — the directory to look in. `None` means "do not look": the pane is
+    /// gone, is not a tool pane, or already knows its conversation.
+    ///
+    /// Reads `effective_kind`, not `kind`, on purpose — the hand-started pane this exists
+    /// for is precisely the one whose persisted kind is still `Terminal`.
+    ///
+    /// The directory is optional because a pty pane is born without one and learns its live
+    /// cwd from the shell's OSC 7 (see the `cwd` seed in `add_pane_opts`). That is not a
+    /// reason to stop looking: a hook marker names its own directory, so it can be read the
+    /// moment the tool starts. Only the scan-and-diff fallback needs a directory to scope
+    /// by, and it would rather wait for a real one than search every project on the disk.
+    pub fn tool_session_wanted(&self, uid: &str) -> Option<(String, Option<String>)> {
+        let p = self
+            .tabs
+            .iter()
+            .flat_map(|t| t.panes.iter())
+            .find(|p| p.uid == uid)?;
+        if p.tool_session.is_some() {
+            return None;
+        }
+        let tool = self.effective_kind(p).tool_id()?.to_string();
+        Some((tool, p.cwd.clone()))
     }
 
     /// Drop every runtime-only fact keyed by `uid`. Called wherever a pane leaves this
@@ -6185,7 +6251,17 @@ impl State {
                 PaneKind::Tool(tool) => {
                     hyperpanes_core::tools::resume_args(tool, &mark.id).map(|a| (tool.clone(), a))
                 }
-                _ => None,
+                // ...unless the pane's kind cannot say. A pane the user turned into a tool
+                // pane by TYPING the tool's name persists as `Terminal` — the foreground
+                // sniff re-brands the chrome but deliberately never writes the persisted
+                // kind — so the arm above answers `None` for exactly the panes this whole
+                // feature exists to rescue. A mark adopted for such a pane names its own
+                // tool; that name is validated against the registry on the way in, so it
+                // can only ever be a real id.
+                _ => mark.tool.as_deref().and_then(|tool| {
+                    hyperpanes_core::tools::resume_args(tool, &mark.id)
+                        .map(|a| (tool.to_string(), a))
+                }),
             };
             // A pane opened from the session list already persists `<tool> --resume <id>` as
             // its command; appending a second `--resume` is a usage error, not a no-op.
@@ -7842,6 +7918,162 @@ mod tool_session_tests {
             want.iter()
                 .map(|(k, t)| (k.clone(), (*t).to_string()))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    // Restoring a tool pane re-spawns its pty, so this one needs a runtime.
+    #[tokio::test]
+    async fn a_hand_started_pane_resumes_from_the_tool_its_own_mark_names() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        // No `pane.kind` at all — this is the shape a pane the human turned into a tool
+        // pane BY TYPING the tool's name snapshots as, because the runtime sniff that
+        // re-brands its chrome deliberately never writes the persisted kind. Before the
+        // mark carried `tool.id` there was nothing here to name a binary, so the pane came
+        // back as a bare shell and the conversation was gone.
+        st.attach_panes_from_specs(
+            &m,
+            &[spec_with(&[
+                (hyperpanes_core::tools::META_SESSION_KEY, "aaaa-bbbb-cccc"),
+                (hyperpanes_core::tools::META_SESSION_CWD_KEY, "/tmp"),
+                (hyperpanes_core::tools::META_SESSION_TOOL_KEY, "copilot"),
+            ])],
+        );
+        let p = st.active_tab().panes.last().unwrap();
+        assert_eq!(
+            p.startup.as_deref(),
+            Some("cd '/tmp' && copilot --resume aaaa-bbbb-cccc\r")
+        );
+        // And the pane is directed at the conversation's own directory, like every other
+        // resumed tool pane: the id only resolves inside the project it was recorded in.
+        assert_eq!(p.cwd.as_deref(), Some("/tmp"));
+    }
+
+    // Restoring a tool pane re-spawns its pty, so this one needs a runtime.
+    #[tokio::test]
+    async fn a_mark_that_names_no_tool_and_a_kind_that_names_none_either_resume_nothing() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        // The pair alone cannot say which binary takes the id. Guessing one is how a pane
+        // ends up running the wrong program against somebody else's conversation id, so
+        // the pane comes back as the plain shell it was recorded as.
+        st.attach_panes_from_specs(
+            &m,
+            &[spec_with(&[
+                (hyperpanes_core::tools::META_SESSION_KEY, "aaaa-bbbb-cccc"),
+                (hyperpanes_core::tools::META_SESSION_CWD_KEY, "/tmp"),
+            ])],
+        );
+        let p = st.active_tab().panes.last().unwrap();
+        assert_eq!(p.startup, None);
+        // The mark is still kept, though: a later build that learns the tool, or a hook
+        // that fills the gap, must not find the fact already thrown away.
+        assert_eq!(
+            p.tool_session.as_ref().map(|m| m.id.as_str()),
+            Some("aaaa-bbbb-cccc")
+        );
+    }
+
+    // Spawns a real pty.
+    #[tokio::test]
+    async fn a_pane_that_already_knows_its_conversation_is_never_told_a_different_one() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        let uid = st
+            .add_pane_opts(
+                &m,
+                NewPaneOpts {
+                    kind: Some(PaneKind::Tool("copilot".into())),
+                    cwd: Some("/tmp".to_string()),
+                    command: Some("/bin/cat".to_string()),
+                    session: Some("aaaa-bbbb-cccc".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("the pane spawns");
+        // The spawn out of the session list handed this pane one exact conversation. A
+        // hook report or an inference arriving afterwards must not overwrite it — a
+        // silently swapped id resumes the human into the wrong chat, which is worse than
+        // not resuming at all.
+        let other = ToolSessionMark::new("dddd-eeee-ffff", "/tmp").unwrap();
+        assert!(!st.adopt_tool_session(&uid, other));
+        assert_eq!(
+            st.active_tab()
+                .panes
+                .last()
+                .unwrap()
+                .tool_session
+                .as_ref()
+                .map(|m| m.id.as_str()),
+            Some("aaaa-bbbb-cccc")
+        );
+        // ...and it is not looked for either, so nothing keeps scanning on its behalf.
+        assert_eq!(st.tool_session_wanted(&uid), None);
+    }
+
+    // Spawns a real pty.
+    #[tokio::test]
+    async fn a_shell_pane_seen_running_a_tool_is_looked_for_under_that_tool() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        let uid = st
+            .add_pane_opts(
+                &m,
+                NewPaneOpts {
+                    cwd: Some("/tmp".to_string()),
+                    command: Some("/bin/cat".to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("the pane spawns");
+        // A plain shell has no conversation to find and no tool to find one under.
+        assert_eq!(st.tool_session_wanted(&uid), None);
+
+        // The human types `claude`. The persisted kind stays `Terminal` — only the sniff
+        // moves — so the search has to read the EFFECTIVE kind or it would never look for
+        // the one pane this whole path exists to rescue.
+        st.note_pane_foreground(&uid, Some("claude"));
+        // The shell has not reported a cwd yet, so there is a tool to look under but no
+        // directory to scope a scan by. The hook path can still run; the scan waits.
+        assert_eq!(
+            st.tool_session_wanted(&uid),
+            Some(("claude".to_string(), None))
+        );
+
+        // OSC 7 lands (see the cwd arm of the pane-event pump) and now both halves are known.
+        let (ti, pi) = st.find_pane(&uid).expect("the pane is laid out");
+        st.tabs[ti].panes[pi].cwd = Some("/tmp".to_string());
+        assert_eq!(
+            st.tool_session_wanted(&uid),
+            Some(("claude".to_string(), Some("/tmp".to_string())))
+        );
+        assert!(matches!(
+            st.active_tab().panes.last().unwrap().kind,
+            PaneKind::Terminal
+        ));
+
+        // Once a conversation is adopted the pane stops being looked for.
+        let mark = ToolSessionMark::new("aaaa-bbbb-cccc", "/tmp")
+            .unwrap()
+            .with_tool("claude");
+        assert!(st.adopt_tool_session(&uid, mark));
+        assert_eq!(st.tool_session_wanted(&uid), None);
+        // And the adopted mark rides out through the real serializer, tool id and all —
+        // without it the restore above has no binary to name.
+        let meta = snapshot_panes(&st)
+            .pop()
+            .expect("the pane is in the snapshot")
+            .meta
+            .expect("an adopted pane carries meta");
+        assert_eq!(
+            meta.get(hyperpanes_core::tools::META_SESSION_KEY)
+                .map(String::as_str),
+            Some("aaaa-bbbb-cccc")
+        );
+        assert_eq!(
+            meta.get(hyperpanes_core::tools::META_SESSION_TOOL_KEY)
+                .map(String::as_str),
+            Some("claude")
         );
     }
 }

@@ -29,6 +29,17 @@ fn main() {
     // `State::submit_new_goal`'s `exe_dir/resources/claude/goal-orchestrator` candidate
     // resolves at dev runtime, matching what packaging ships. Best-effort.
     let personas = manifest.join("../../../resources/claude/goal-orchestrator");
+    // The three CLI-agent session hooks. `claude_hook::bundled_hook_path` and
+    // `tools::session_hook::bundled_script` both look beside the exe FIRST, so without
+    // this a dev build registers no hook at all and every hand-started tool pane silently
+    // falls back to the scan-and-diff heuristic — the one path we cannot test by running
+    // it. Packaging ships the same three; keep the two lists in step.
+    let hooks: [(&str, &str); 3] = [
+        ("claude", "hp-claude-session-hook.sh"),
+        ("cursor", "hp-cursor-session-hook.sh"),
+        ("copilot", "hp-copilot-session-hook.sh"),
+    ];
+    let res = manifest.join("../../../resources");
     if let Ok(out_dir) = std::env::var("OUT_DIR") {
         // OUT_DIR = <target>/<profile>/build/<pkg>-<hash>/out → profile dir is 3 up.
         if let Some(profile) = Path::new(&out_dir).ancestors().nth(3) {
@@ -41,6 +52,23 @@ fn main() {
                     .join("claude")
                     .join("goal-orchestrator"),
             );
+            for (dir, script) in hooks {
+                let dst_dir = profile.join("resources").join(dir);
+                let _ = std::fs::create_dir_all(&dst_dir);
+                let dst = dst_dir.join(script);
+                if std::fs::copy(res.join(dir).join(script), &dst).is_ok() {
+                    // A hook is invoked as a command; a copy that lost its mode bit is a
+                    // hook that never runs.
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            &dst,
+                            std::fs::Permissions::from_mode(0o755),
+                        );
+                    }
+                }
+            }
             if target_windows {
                 for f in ["conpty.dll", "OpenConsole.exe"] {
                     let _ = std::fs::copy(conpty.join(f), profile.join(f));
@@ -50,6 +78,12 @@ fn main() {
     }
     for f in ["SKILL.md", "SPEC.md", "IMPL.md"] {
         println!("cargo:rerun-if-changed={}", personas.join(f).display());
+    }
+    for (dir, script) in hooks {
+        println!(
+            "cargo:rerun-if-changed={}",
+            res.join(dir).join(script).display()
+        );
     }
     for f in [
         "hp-init.ps1",
