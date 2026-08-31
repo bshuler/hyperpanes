@@ -898,6 +898,8 @@ impl ControlHost {
             // Likewise no conversation mark: the control model records none, and inventing
             // one would resume a chat this pane was never in.
             tool_session: None,
+            // The control model carries no cwd either; the pane learns its own from OSC 7.
+            cwd: None,
         };
 
         // Resolve the GUI tab index this pane belongs in (None ⇒ it needs a brand-new tab).

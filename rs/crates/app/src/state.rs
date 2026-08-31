@@ -124,6 +124,12 @@ pub struct DetachedPane {
     /// The conversation this pane was resumed into, carried across a re-host for the same
     /// reason as `kind`: a pane moved to another window has to relaunch into the same chat.
     pub tool_session: Option<ToolSessionMark>,
+    /// The pane's working directory — and, for the non-pty views, its *target*: the file the
+    /// viewer/markdown pane renders, the directory the browser lists (see [`crate::viewpane`]).
+    /// That makes it content, not decoration: a re-host that dropped it turned a README
+    /// preview into "No path set for this pane". For a terminal it is what the left panel's
+    /// file tree follows, so dropping it there un-anchored the tree instead.
+    pub cwd: Option<String>,
 }
 
 /// A whole tab detached for re-hosting (the tab menu's "Move to New Window") or parked on the
@@ -1931,6 +1937,7 @@ impl State {
                 spawn_shell: ps.spawn_shell,
                 kind: ps.kind,
                 tool_session: ps.tool_session,
+                cwd: ps.cwd,
             },
             alive,
         ))
@@ -1995,7 +2002,9 @@ impl State {
             font_px: det.font_px,
             font,
             font_dirty: false,
-            cwd: None,
+            // Carried, not reset: for a view pane this IS the file/directory it renders, and
+            // for a terminal it is what the file tree follows.
+            cwd: det.cwd,
             env: None,
             // A re-hosted session: its original spawn shell isn't tracked across the detach,
             // so the badge stays hidden ("") rather than guessing.
@@ -2056,6 +2065,7 @@ impl State {
                 spawn_shell: ps.spawn_shell,
                 kind: ps.kind,
                 tool_session: ps.tool_session,
+                cwd: ps.cwd,
             },
             alive,
         ))
@@ -5162,6 +5172,7 @@ impl State {
             spawn_shell: ps.spawn_shell,
             kind: ps.kind,
             tool_session: ps.tool_session,
+            cwd: ps.cwd,
         })
     }
 
@@ -5221,7 +5232,9 @@ impl State {
             font_px: det.font_px,
             font,
             font_dirty: false,
-            cwd: None,
+            // Carried, not reset: for a view pane this IS the file/directory it renders, and
+            // for a terminal it is what the file tree follows.
+            cwd: det.cwd,
             env: None,
             // A re-hosted session: its original spawn shell isn't tracked across the detach,
             // so the badge stays hidden ("") rather than guessing.
@@ -5480,6 +5493,7 @@ impl State {
                 spawn_shell: p.spawn_shell,
                 kind: p.kind,
                 tool_session: p.tool_session,
+                cwd: p.cwd,
             })
             .collect();
         Some((
@@ -6890,6 +6904,7 @@ mod spawn_cells_tests {
             spawn_shell: None,
             kind: PaneKind::default(),
             tool_session: None,
+            cwd: None,
         }
     }
 
@@ -6977,6 +6992,7 @@ mod session_file_tests {
             spawn_shell: None,
             kind: PaneKind::default(),
             tool_session: None,
+            cwd: None,
         }
     }
 
@@ -7317,6 +7333,7 @@ mod reminder_tests {
             spawn_shell: None,
             kind: PaneKind::default(),
             tool_session: None,
+            cwd: None,
         }
     }
 
@@ -7515,6 +7532,42 @@ mod view_pane_tests {
         let a = st.add_pane_opts(&m, view_opts(PaneKind::Markdown)).unwrap();
         let b = st.add_pane_opts(&m, view_opts(PaneKind::Markdown)).unwrap();
         assert_ne!(a, b);
+    }
+
+    /// D3's other half: a view pane's `cwd` is not bookkeeping, it is the CONTENT — the file
+    /// `viewpane::rows_for` renders. Dropping it on a re-host is what turned a README preview
+    /// dragged onto a new tab into "No path set for this pane".
+    #[test]
+    fn a_view_pane_dropped_on_a_new_tab_still_renders_its_file() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        let uid = st
+            .add_pane_opts(
+                &m,
+                NewPaneOpts {
+                    kind: Some(PaneKind::Markdown),
+                    cwd: Some("/repo/README.md".into()),
+                    ..Default::default()
+                },
+            )
+            .expect("markdown pane added");
+
+        // Exactly the drop-on-the-empty-tab-strip path: detach the dragged uid, re-host as a tab.
+        let (det, _alive) = st.detach_uid(&uid).expect("the dragged pane detaches");
+        assert_eq!(det.cwd.as_deref(), Some("/repo/README.md"));
+        st.adopt_pane_as_tab(&m, det);
+
+        let p = st
+            .active_tab()
+            .panes
+            .iter()
+            .find(|p| p.uid == uid)
+            .expect("re-hosted into the new tab");
+        assert_eq!(p.cwd.as_deref(), Some("/repo/README.md"));
+        assert!(
+            !crate::viewpane::rows_for(&p.kind, p.cwd.as_deref()).is_empty(),
+            "a target-less view pane projects only the 'No path set' notice"
+        );
     }
 
     #[test]
@@ -8118,6 +8171,7 @@ mod tool_identity_tests {
                 spawn_shell: None,
                 kind: PaneKind::default(),
                 tool_session: None,
+                cwd: None,
             },
         );
         st
@@ -8453,6 +8507,7 @@ mod left_panel_tests {
             spawn_shell: None,
             kind: PaneKind::default(),
             tool_session: None,
+            cwd: None,
         }
     }
 
@@ -8678,6 +8733,7 @@ mod set_tests {
             spawn_shell: None,
             kind: PaneKind::default(),
             tool_session: None,
+            cwd: None,
         }
     }
 
@@ -9218,6 +9274,7 @@ mod keyboard_focus_tests {
             spawn_shell: None,
             kind: PaneKind::default(),
             tool_session: None,
+            cwd: None,
         }
     }
 

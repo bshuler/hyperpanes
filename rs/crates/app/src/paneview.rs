@@ -1966,6 +1966,7 @@ mod pty_resize_tests {
             spawn_shell: None,
             kind: PaneKind::default(),
             tool_session: None,
+            cwd: None,
         }
     }
 
