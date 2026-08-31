@@ -407,14 +407,27 @@ const LAYOUT_CYCLE: [Layout; 5] = [
 pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect {
     // Any action other than renaming itself cancels an in-progress tab rename,
     // so the inline edit box never lingers when you interact elsewhere.
-    if state.editing_tab != -1 && !matches!(cmd, Command::BeginRename(_) | Command::RenameTab(..)) {
+    //
+    // `CloseContext` is exempt: picking "Rename…" out of a context menu dispatches the
+    // picked command and then closes the menu, in that order and in the same click. If
+    // dismissing the menu counted as "interacting elsewhere" it would cancel the very
+    // edit the pick just started, and the inline box would never appear.
+    if state.editing_tab != -1
+        && !matches!(
+            cmd,
+            Command::BeginRename(_) | Command::RenameTab(..) | Command::CloseContext
+        )
+    {
         state.editing_tab = -1;
         state.dirty = true;
     }
     // Likewise, any action other than a pane rename cancels an in-progress pane-label edit
     // (so the inline box never lingers when you interact elsewhere).
     if state.editing_pane != -1
-        && !matches!(cmd, Command::BeginRenamePane(_) | Command::RenamePane(..))
+        && !matches!(
+            cmd,
+            Command::BeginRenamePane(_) | Command::RenamePane(..) | Command::CloseContext
+        )
     {
         state.editing_pane = -1;
         state.dirty = true;
@@ -853,5 +866,67 @@ mod quote_tests {
     fn an_apostrophe_closes_and_reopens_the_quoting() {
         // The classic: 'it'\''s' — four tokens the shell concatenates back into `it's`.
         assert_eq!(quote_arg("it's"), r"'it'\''s'");
+    }
+}
+
+#[cfg(test)]
+mod rename_from_menu_tests {
+    //! Regression: "Rename…" in the tab / pane-label context menu did nothing.
+    //!
+    //! A menu pick runs the picked command and then dismisses the menu, both in the same
+    //! click (`App::on_ctx_pick`). `dispatch`'s cancel guards treat every command other
+    //! than the rename pair as "the user interacted elsewhere" and clear the editor — so
+    //! the `CloseContext` that closed the menu also cancelled the rename the pick had
+    //! just started, one command later. The inline edit box never appeared.
+    use super::*;
+    use hyperpanes_core::session_manager::SessionManager;
+
+    fn mgr() -> SessionManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionManager::new(tx)
+    }
+
+    fn fresh() -> State {
+        State::new(theme::load_font(1.0))
+    }
+
+    /// Replay the menu pick exactly as `on_ctx_pick` does: run the row's command, then
+    /// close the menu. The editor must still be open afterwards.
+    #[test]
+    fn picking_rename_from_the_tab_menu_leaves_the_editor_open() {
+        let mgr = mgr();
+        let mut st = fresh();
+        st.open_tab_context(0, 0.0, 0.0);
+
+        dispatch(&mut st, Command::BeginRename(0), &mgr);
+        assert_eq!(st.editing_tab, 0, "the pick itself opens the editor");
+        dispatch(&mut st, Command::CloseContext, &mgr);
+        assert_eq!(st.editing_tab, 0, "dismissing the menu must not cancel it");
+    }
+
+    // Needs a reactor: `add_pane` spawns the pty read loop.
+    #[tokio::test]
+    async fn picking_rename_from_the_pane_menu_leaves_the_editor_open() {
+        let mgr = mgr();
+        let mut st = fresh();
+        st.add_pane(&mgr);
+        st.open_pane_context(0, 0.0, 0.0);
+
+        dispatch(&mut st, Command::BeginRenamePane(0), &mgr);
+        assert_eq!(st.editing_pane, 0, "the pick itself opens the editor");
+        dispatch(&mut st, Command::CloseContext, &mgr);
+        assert_eq!(st.editing_pane, 0, "dismissing the menu must not cancel it");
+    }
+
+    /// The guards still do their job: anything that isn't the rename pair (or the menu
+    /// dismissal that rides along with the pick) closes a lingering editor.
+    #[test]
+    fn an_unrelated_command_still_cancels_an_open_editor() {
+        let mgr = mgr();
+        let mut st = fresh();
+        dispatch(&mut st, Command::BeginRename(0), &mgr);
+        assert_eq!(st.editing_tab, 0);
+        dispatch(&mut st, Command::OpenTabContext(0, 0.0, 0.0), &mgr);
+        assert_eq!(st.editing_tab, -1);
     }
 }

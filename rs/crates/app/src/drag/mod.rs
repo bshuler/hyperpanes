@@ -107,17 +107,28 @@ pub struct Hover {
 }
 
 /// Edge bands of a tile of size `size` along its layout axis. Returns the slot offset
-/// (`0` insert-before, `1` insert-after) and which edge the marker sits on. The central
-/// band resolves to insert-after (so an in-window reorder always lands), matching the
-/// forgiving "drop anywhere on the tile" reorder while still biasing to the near edge.
+/// (`0` insert-before, `1` insert-after) and which edge the marker sits on.
+///
+/// The whole tile is a drop target — the edge bands are only the *unambiguous* ends; the
+/// middle resolves to whichever half the pointer is in. It used to resolve to insert-after
+/// unconditionally, which made the commonest gesture in the app a silent no-op: dragging a
+/// pane leftward onto the centre of its immediate left neighbour asks for slot `j + 1`,
+/// which is the slot the pane already occupies, so `reorder_pane_in` returned without
+/// moving anything. Splitting at the midpoint means a drop only no-ops when the caret is
+/// genuinely already where the pane sits.
 pub fn edge_band(pos: f32, size: f32, vertical: bool) -> (usize, u8) {
     let band = (size * EDGE_BAND_FRAC).min(EDGE_BAND_MAX_PX);
-    if pos <= band {
-        (0, if vertical { 2 } else { 0 }) // before → top/left
+    let before = if pos <= band {
+        true // near edge → insert before
     } else if pos >= size - band {
-        (1, if vertical { 3 } else { 1 }) // after → bottom/right
+        false // far edge → insert after
     } else {
-        (1, if vertical { 3 } else { 1 }) // centre → after (still a valid reorder)
+        pos < size / 2.0 // centre → the nearer half
+    };
+    if before {
+        (0, if vertical { 2 } else { 0 }) // before → top/left
+    } else {
+        (1, if vertical { 3 } else { 1 }) // after → bottom/right
     }
 }
 
@@ -159,3 +170,47 @@ mod platform;
 mod platform;
 
 pub use platform::{window_rect, Ghost};
+
+#[cfg(test)]
+mod edge_band_tests {
+    //! The centre of a tile used to resolve to insert-*after* unconditionally, which made
+    //! the most natural reorder gesture a silent no-op: dragging a pane onto the middle of
+    //! its immediate left neighbour asks for the slot the pane already occupies.
+    use super::edge_band;
+
+    const W: f32 = 400.0; // band = 0.3 * 400 = 120px at each end
+
+    #[test]
+    fn the_near_edge_inserts_before_and_the_far_edge_after() {
+        assert_eq!(edge_band(4.0, W, false), (0, 0)); // left edge
+        assert_eq!(edge_band(W - 4.0, W, false), (1, 1)); // right edge
+        assert_eq!(edge_band(4.0, W, true), (0, 2)); // top edge
+        assert_eq!(edge_band(W - 4.0, W, true), (1, 3)); // bottom edge
+    }
+
+    #[test]
+    fn the_centre_resolves_to_the_half_the_pointer_is_in() {
+        // Just inside the near half → before; just past the midpoint → after.
+        assert_eq!(edge_band(W / 2.0 - 1.0, W, false), (0, 0));
+        assert_eq!(edge_band(W / 2.0 + 1.0, W, false), (1, 1));
+        assert_eq!(edge_band(W / 2.0 - 1.0, W, true), (0, 2));
+        assert_eq!(edge_band(W / 2.0 + 1.0, W, true), (1, 3));
+    }
+
+    #[test]
+    fn dropping_on_a_left_neighbours_near_half_is_a_real_move() {
+        // Panes [0,1,2]; drag pane 2 onto the near half of pane 1 → slot 1, which
+        // `reorder_pane_in` turns into a genuine move (before: slot 2 = a no-op).
+        let (off, _) = edge_band(W * 0.4, W, false);
+        assert_eq!(1 + off, 1);
+    }
+
+    #[test]
+    fn a_capped_band_on_a_huge_tile_still_splits_at_the_midpoint() {
+        // 1000px tile: 0.3 * 1000 = 300 > EDGE_BAND_MAX_PX, so the bands cap at 140px and
+        // the (large) middle must still fall to the nearer half.
+        let w = 1000.0;
+        assert_eq!(edge_band(400.0, w, false), (0, 0));
+        assert_eq!(edge_band(600.0, w, false), (1, 1));
+    }
+}
