@@ -2777,16 +2777,12 @@ impl App {
             });
         }
 
-        // clickable paths: track each pane's surface size + drive hover/click hit-testing.
-        {
-            let app = app.clone();
-            let id = win.id;
-            win.app.on_pane_geometry(move |i, w, h| {
-                if let Some(win) = app.window_by_id(id) {
-                    win.state.borrow_mut().set_pane_surf(i as usize, w, h);
-                }
-            });
-        }
+        // clickable paths: drive hover/click hit-testing. The hit-test surface itself is NOT
+        // taken from `pane-geometry` — the widget reports the size of the BODY it occupies,
+        // while the terminal image inside it is floored to whole cells and is a hair smaller.
+        // `relayout_active` owns `surf` and derives it from the rendered cols/rows; letting
+        // this callback write the body size back over it is what put the pointer's cell up to
+        // a full cell off near a pane's right edge.
         {
             let app = app.clone();
             let id = win.id;

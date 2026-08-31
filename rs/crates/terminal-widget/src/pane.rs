@@ -263,8 +263,16 @@ impl TerminalPane {
         }
     }
 
-    /// The logical-px cell size for a surface of `surf_w`×`surf_h` (the terminal image is
-    /// stretched `image-fit: fill` over the pane body), or `None` for a degenerate pane.
+    /// The logical-px cell size for a surface of `surf_w`×`surf_h`, or `None` for a degenerate
+    /// pane.
+    ///
+    /// `surf_w`/`surf_h` must be the size of the RENDERED IMAGE (`cols*cell_w × rows*cell_h`,
+    /// converted to logical px), not of the widget body it sits in. The widget once stretched
+    /// the image over the body with `image-fit: fill`, when the two were interchangeable; it
+    /// now pins the image 1:1 at its source resolution for crisp glyphs, so the body is up to
+    /// a cell wider and a row taller. Passing the body divides that slack back into every cell,
+    /// and because the error is multiplied by the column index it reaches a whole cell by the
+    /// right-hand edge — the pointer selects one glyph left of the one under it.
     fn cell_logical(&self, surf_w: f32, surf_h: f32) -> Option<(f32, f32, usize, usize)> {
         let (cols, rows) = self.grid_size();
         if cols == 0 || rows == 0 || surf_w <= 0.0 || surf_h <= 0.0 {

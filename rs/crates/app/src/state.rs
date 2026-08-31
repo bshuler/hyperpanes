@@ -744,8 +744,11 @@ pub struct PaneState {
     pub startup: Option<String>,
     /// A fixed accent (e.g. a project color) that survives relabel; `None` = by-index.
     pub pinned_accent: Option<Color>,
-    /// The terminal surface's on-screen logical size (from the widget's `geometry-changed`),
-    /// used to hit-test clickable-path hover/click coordinates. `(0,0)` until first laid out.
+    /// The terminal image's on-screen logical size — `cols x rows` cells, NOT the widget body
+    /// it is centred in (the body's sub-cell remainder shows through as empty terminal space).
+    /// Every hit-test divides by cols/rows to recover the cell size, so this has to be the
+    /// image or the pointer drifts off the glyph. Owned by `relayout_active`; `(0,0)` until the
+    /// first layout.
     pub surf: (f32, f32),
     /// The current clickable-path hover hit (drives the link overlay), plus the cursor
     /// position (logical px within the surface) for tooltip placement. `None` = no link.
@@ -3616,14 +3619,6 @@ impl State {
     }
 
     // ---- clickable paths (terminal link hover / activation) ----
-
-    /// Record a pane's on-screen terminal-surface size (logical px) from the widget's
-    /// `geometry-changed`, used to hit-test link coordinates. `idx` is an active-tab pane.
-    pub fn set_pane_surf(&mut self, idx: usize, w: f32, h: f32) {
-        if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
-            p.surf = (w, h);
-        }
-    }
 
     /// Hover hit-test for a clickable path under the cursor (logical px within the pane
     /// surface). Updates the pane's link-overlay state. No-op (and clears any link) when

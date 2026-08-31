@@ -451,20 +451,31 @@ fn relayout_active(state: &mut State, area: (f32, f32), scale: f32) {
         let gh = (h - 2.0 * PANE_GAP).max(1.0);
         p.rect = (gx, gy, gw, gh);
         p.visible = true;
-        // The selection / link / search-highlight hit-test surface, set authoritatively here
-        // every tick. Slint's `geometry-changed` is unreliable: it doesn't fire for a pane
-        // created already at its final size (a freshly *launched* pane stays at surf (0,0), which
-        // breaks hit-testing), and when adding a pane reflows its neighbours their surf can go
-        // stale (highlights then drift against the old size). The pump always knows the exact
-        // size, so we own it here. The widget's surface = the frame minus its insets: a 4px
-        // x-inset and 30px vertically (26px header + 2px top + 2px bottom) — see paneview.slint
-        // `tp` (matches the size `geometry-changed` reports, so this never fights it).
-        p.surf = ((gw - 4.0).max(1.0), (gh - 30.0).max(1.0));
         // size the grid to the terminal body (frame chrome removed) so cells match. Each pane
         // uses its OWN font cell metrics (per-pane zoom), so panes can differ in cols/rows.
         let tw = (gw - PANE_CHROME_W).max(1.0);
         let th = (gh - PANE_CHROME_H).max(1.0);
         let (cols, rows) = cells_for_px(tw * scale, th * scale, p.font.cell_w, p.font.cell_h);
+        // The selection / link / search-highlight hit-test surface, set authoritatively here
+        // every tick. Slint's `geometry-changed` is unreliable: it doesn't fire for a pane
+        // created already at its final size (a freshly *launched* pane stays at surf (0,0), which
+        // breaks hit-testing), and when adding a pane reflows its neighbours their surf can go
+        // stale (highlights then drift against the old size). The pump always knows the exact
+        // size, so we own it here.
+        //
+        // This is the size of the RENDERED IMAGE, not of the widget it sits in, and the two are
+        // not the same: `cols`/`rows` are FLOORED from the body, and widget.slint pins the
+        // surface at `source.width x source.height` physical px (1:1, no `image-fit: fill`), so
+        // the drawn image is up to a cell narrower and a row shorter than the body it sits in.
+        // Every consumer divides this by cols/rows to recover the cell size, so handing over the
+        // body instead made every cell fractionally too big — an error that accumulates with the
+        // column index, putting the pointer's idea of the cell under it up to a full cell to the
+        // left of the glyph the human is aiming at by the right-hand edge of a pane. Deriving it
+        // from the same cols/rows the renderer used cannot drift by construction.
+        p.surf = (
+            (cols as f32 * p.font.cell_w as f32 / scale).max(1.0),
+            (rows as f32 * p.font.cell_h as f32 / scale).max(1.0),
+        );
         if (cols, rows) != p.applied {
             p.pane.resize(cols, rows);
             p.applied = (cols, rows);
