@@ -1046,6 +1046,13 @@ pub struct Tab {
     pub focused: usize,
     /// Index of the zoomed (maximised-in-tab) pane, if any.
     pub zoomed: Option<usize>,
+    /// Whether this is a SYSTEM tab — the app owns it, the human does not get to close it.
+    /// Exactly one exists today (the always-on "Hyperpane" tab, see [`State::ensure_hyperpane_tab`]),
+    /// but nothing here assumes that. A system tab is ordinary in every other respect: it can be
+    /// renamed, reordered, split, and its panes closed like any other. Only the close is refused,
+    /// and it is refused at the state layer rather than only in the UI, because the control plane
+    /// and the keyboard both reach `close_tab` without going through a × button.
+    pub system: bool,
 }
 
 impl Tab {
@@ -1058,6 +1065,7 @@ impl Tab {
             main_fraction: 0.6,
             focused: 0,
             zoomed: None,
+            system: false,
         }
     }
 
@@ -2675,18 +2683,151 @@ impl State {
     // ---- tabs ----
 
     pub fn new_tab(&mut self, mgr: &SessionManager) {
-        let tab = self.fresh_tab();
+        self.new_tab_with(mgr, None, false, NewPaneOpts::default());
+    }
+
+    /// Append a tab and seed it with one pane, with everything about it spelled out: an
+    /// explicit `title` (`None` ⇒ the "term N" default), whether the app owns it
+    /// ([`Tab::system`]), and the full [`NewPaneOpts`] for its first pane. Activates it and
+    /// returns its index.
+    ///
+    /// This is the one place a tab is born, so the control plane's `newTab` (which carries a
+    /// title and a cwd) and [`Self::ensure_hyperpane_tab`] (which carries a command) don't
+    /// each have to re-do the push/activate/seed dance — and can't get it subtly different.
+    pub fn new_tab_with(
+        &mut self,
+        mgr: &SessionManager,
+        title: Option<&str>,
+        system: bool,
+        opts: NewPaneOpts,
+    ) -> usize {
+        let mut tab = self.fresh_tab();
+        if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
+            tab.title = t.into();
+        }
+        tab.system = system;
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
-        self.add_pane(mgr); // seed one shell so the tab is usable
+        self.add_pane_opts(mgr, opts); // seed one pane so the tab is usable
         self.editing_tab = -1;
         self.dirty = true;
+        self.active
+    }
+
+    /// Create the always-on **Hyperpane** tab, unless this window already has one.
+    ///
+    /// The tab runs the user's coding CLI in [`hyperpane_dir`], the app-managed directory
+    /// holding the skills that teach it to drive this workspace over the control API. Returns
+    /// `true` only when a tab was actually created — the caller uses that to enable the
+    /// control API exactly once, at creation, and never again.
+    ///
+    /// The CLI is picked the way the rest of the app picks one: the first favourite that
+    /// resolves, then Claude, then the first resolving agent in the registry. Editors are
+    /// excluded — `vim` is a tool pane like any other, but it cannot read a skill. No agent
+    /// installed ⇒ a plain shell in the same directory, so the tab and its files still exist
+    /// and the user can start one by hand.
+    ///
+    /// [`hyperpane_dir`]: hyperpanes_core::persistence::paths::hyperpane_dir
+    pub fn ensure_hyperpane_tab(&mut self, mgr: &SessionManager) -> bool {
+        if self.tabs.iter().any(|t| t.system) {
+            return false;
+        }
+        // Refresh the shipped skills from the bundle. Failing that (a read-only or missing
+        // data dir) there is nowhere to put the tab, so leave it uncreated rather than open
+        // an agent into some arbitrary cwd where its skill would be absent.
+        let Ok(dir) = hyperpanes_core::hyperpane::materialize() else {
+            eprintln!("[hyperpane] could not prepare the Hyperpane directory; tab not created");
+            return false;
+        };
+
+        use hyperpanes_core::tools::{detect, registry};
+        let picked = self
+            .settings
+            .tool_favorites
+            .iter()
+            .filter_map(|id| registry::by_id(id))
+            .chain(registry::by_id("claude"))
+            .chain(registry::TOOLS.iter())
+            .filter(|t| !registry::EDITOR_IDS.contains(&t.id))
+            .find_map(|t| detect::resolve(t, &self.settings.tool_paths).map(|r| (t, r)));
+
+        let (kind, command) = match &picked {
+            // The resolved absolute path, not the bare name: the pane's shell may not carry
+            // the same PATH the app was launched with, and a tab that opens on
+            // "command not found" is worse than no tab.
+            Some((def, res)) => (
+                Some(PaneKind::Tool(def.id.to_string())),
+                Some(res.path.to_string_lossy().into_owned()),
+            ),
+            None => (None, None),
+        };
+
+        let mut env: hyperpanes_core::session::spawn::EnvMap = std::collections::HashMap::new();
+        // Where the control API's token and port are published. The agent reads it through
+        // `hyperpanes ctl`, which does the same lookup — set explicitly so a pane that
+        // inherited an empty value from somewhere else still points at the right file.
+        env.insert(
+            "HYPERPANES_CONTROL_FILE".to_string(),
+            hyperpanes_core::persistence::paths::control_json()
+                .to_string_lossy()
+                .into_owned(),
+        );
+        env.insert(
+            "HP_HYPERPANE_DIR".to_string(),
+            dir.to_string_lossy().into_owned(),
+        );
+        // Same Claude Code >= 2.1.x tool-search deferral `submit_new_goal` pins off: with the
+        // default mode every MCP tool needs a ToolSearch round-trip before it can be called.
+        env.insert("ENABLE_TOOL_SEARCH".to_string(), "false".to_string());
+        if let Ok(exe) = std::env::current_exe() {
+            env.insert(
+                "HP_CTL".to_string(),
+                exe.to_string_lossy().into_owned(),
+            );
+            // Put the app's own directory on PATH so the skills' `hyperpanes ctl …` resolves
+            // verbatim — which is what lets the shipped `.claude/settings.json` pre-approve
+            // exactly that command and nothing else. An absolute path could not be written
+            // into a permission rule, and a permission prompt per read would make the tab
+            // useless.
+            if let Some(exe_dir) = exe.parent() {
+                let base = std::env::var("PATH").unwrap_or_default();
+                let sep = if cfg!(windows) { ";" } else { ":" };
+                env.insert(
+                    "PATH".to_string(),
+                    format!("{}{sep}{base}", exe_dir.to_string_lossy()),
+                );
+            }
+        }
+
+        self.new_tab_with(
+            mgr,
+            Some("Hyperpane"),
+            true,
+            NewPaneOpts {
+                label: Some("hyperpane".to_string()),
+                cwd: Some(dir.to_string_lossy().into_owned()),
+                command,
+                kind,
+                env: Some(env),
+                ..Default::default()
+            },
+        );
+        true
     }
 
     /// Close tab `idx`, killing its sessions. Returns `false` if nothing remains
     /// (caller quits the window).
+    ///
+    /// A system tab (the always-on "Hyperpane") is never closed — every close path funnels
+    /// through here or [`Self::close_tab_menu`], so guarding both covers the × button, the
+    /// keybinding, the context menu, "close others"/"close to the right", and the control API
+    /// alike. The return is `true` ("something remains"), because refusing to close is not a
+    /// reason to quit the window.
     pub fn close_tab(&mut self, idx: usize, mgr: &SessionManager) -> bool {
         if idx >= self.tabs.len() {
+            return true;
+        }
+        if self.tabs[idx].system {
             return true;
         }
         if self.tabs.len() <= 1 {
@@ -3723,6 +3864,90 @@ impl State {
         }
         prefs::save(&self.settings);
         self.dirty = true;
+    }
+
+    /// The live preferences as the camelCase JSON object the control plane serves from
+    /// `GET /settings`. Serializing [`Settings`] rather than re-listing its fields means the
+    /// published shape follows the struct: a field added there shows up here — and in the key
+    /// validation `PATCH /settings` runs against this same blob — with no second edit.
+    pub fn settings_json(&self) -> serde_json::Value {
+        serde_json::to_value(&self.settings).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
+    /// Apply a settings patch from the control plane: a shallow merge of camelCase keys onto
+    /// the live [`Settings`], persisted and with the same live side effects the Preferences
+    /// panel triggers.
+    ///
+    /// This deliberately does NOT go through [`Setting`]: two of that enum's variants
+    /// (`FontDelta`, `IdleSeconds`) are ±1 steps for a dial, and a caller saying
+    /// `{"fontPx": 15}` means fifteen, not fifteen steps up. Merging through serde also keeps
+    /// the accepted keys in step with the struct instead of a hand-written match that would
+    /// silently miss each new field.
+    ///
+    /// Returns the keys actually applied, or `Err` if the patch is not an object, names a key
+    /// [`Settings`] does not have, or gives one a value of the wrong type — all-or-nothing, so
+    /// a typo in one key cannot leave the other half applied.
+    pub fn patch_settings(&mut self, patch: &serde_json::Value) -> Result<Vec<String>, String> {
+        let obj = patch
+            .as_object()
+            .ok_or_else(|| "settings patch must be a JSON object".to_string())?;
+        let mut merged = self.settings_json();
+        let dst = merged
+            .as_object_mut()
+            .ok_or_else(|| "settings are not an object".to_string())?;
+        let mut keys: Vec<String> = Vec::with_capacity(obj.len());
+        for (k, v) in obj {
+            if !dst.contains_key(k) {
+                return Err(format!("unknown setting: {k}"));
+            }
+            dst.insert(k.clone(), v.clone());
+            keys.push(k.clone());
+        }
+        let mut next: Settings =
+            serde_json::from_value(merged).map_err(|e| format!("bad settings patch: {e}"))?;
+
+        // The panel's widgets can only produce in-range values; a JSON caller can ask for a
+        // 400px font or a 3-second idle alert, so clamp on the way in rather than storing
+        // something the UI would then have to defend against.
+        next.font_px = Settings::clamp_font(next.font_px);
+        next.idle_alert_seconds = prefs::idle_seconds_on_grid(next.idle_alert_seconds);
+        next.frame_palette = next.frame_palette.min(theme::FRAME_PALETTES.len() - 1);
+        next.terminal_theme = next.terminal_theme.min(theme::TERMINAL_THEMES.len() - 1);
+
+        // Then the same live effects `apply_setting` runs, driven off what actually changed —
+        // each is expensive enough (a font reload, a repaint of every open pane) to be worth
+        // skipping when the patch didn't touch it.
+        if next.font_family != self.settings.font_family {
+            self.font_reload = true;
+        }
+        if next.font_px != self.settings.font_px {
+            // The Appearance font size is the base for everything: re-base every pane to it,
+            // resetting any per-pane zoom, exactly as the ± buttons do.
+            for t in &mut self.tabs {
+                for p in &mut t.panes {
+                    p.font_px = next.font_px;
+                }
+            }
+            self.font_reload = true;
+        }
+        if next.frame_palette != self.settings.frame_palette {
+            for t in &mut self.tabs {
+                t.relabel(next.frame_palette);
+            }
+        }
+        if next.terminal_theme != self.settings.terminal_theme {
+            let palette = theme::terminal_theme(next.terminal_theme);
+            for t in &mut self.tabs {
+                for p in &mut t.panes {
+                    p.pane.set_palette(palette);
+                }
+            }
+        }
+
+        self.settings = next;
+        prefs::save(&self.settings);
+        self.dirty = true;
+        Ok(keys)
     }
 
     // ---- keybindings editor (Preferences → Keybindings) ----
@@ -5740,6 +5965,9 @@ impl State {
     /// Close tab `idx` reopenably: with ≥2 tabs it's parked (sessions alive) on the closed stack;
     /// the last tab is killed for real (returns `false` → the window quits).
     pub fn close_tab_menu(&mut self, idx: usize, mgr: &SessionManager) -> bool {
+        if self.tabs.get(idx).is_some_and(|t| t.system) {
+            return true;
+        }
         if self.tabs.len() >= 2 {
             if let Some((det, _)) = self.detach_tab(idx) {
                 self.push_closed(ClosedWhat::Tab(Box::new(det)), mgr);
@@ -5995,6 +6223,9 @@ impl State {
                     main_fraction: Some(t.main_fraction),
                     focused: Some(t.focused as u32),
                     zoomed: t.zoomed.map(|z| z as u32),
+                    // Only written when set, so an ordinary tab's group is byte-identical to
+                    // what earlier versions wrote.
+                    system: t.system.then_some(true),
                 }
             })
             .collect();
@@ -6317,6 +6548,10 @@ impl State {
         }
         tab.focused = g.focused.map(|f| (f as usize).min(n - 1)).unwrap_or(0);
         tab.zoomed = g.zoomed.map(|z| (z as usize).min(n - 1));
+        // Restoring the flag matters as much as writing it: without it the restored
+        // "Hyperpane" would be an ordinary tab, and `ensure_hyperpane_tab` would then find
+        // no system tab and append a second one.
+        tab.system = g.system.unwrap_or(false);
         tab.relabel(palette);
         self.tabs.push(tab);
     }
@@ -7041,7 +7276,7 @@ fn color_hex(c: Color) -> String {
 /// Parse a workspace-file layout token (`"single"`/`"columns"`/… / `"main-stack"`, or a
 /// `"grid-2x3"` shape) back to a [`Layout`], defaulting to `Auto` for an unknown/absent
 /// token — a file written by a newer build must still open here, minus the layout it names.
-fn layout_from_name(name: &str) -> Layout {
+pub fn layout_from_name(name: &str) -> Layout {
     Layout::from_token(name).unwrap_or(Layout::Auto)
 }
 

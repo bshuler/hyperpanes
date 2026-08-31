@@ -36,6 +36,7 @@ use tokio::task::JoinHandle;
 
 use hyperpanes_core::control::readmodel::{PaneInfo, PaneStatus, ReadModel, TabInfo, WindowInfo};
 use hyperpanes_core::control::server::{self, notify_state, Shared};
+use hyperpanes_core::control::uiops::UiOp;
 use hyperpanes_core::persistence::{control_settings, paths};
 use hyperpanes_core::session_manager::{SessionEvent, SessionManager};
 use hyperpanes_core::tools::PaneKind;
@@ -413,6 +414,12 @@ impl ControlHost {
         // notices again.
         self.talk_notice_shown.borrow_mut().clear();
 
+        // Tab + preferences edits queued by `/command` and `PATCH /settings`. Applied before
+        // the model lock: they touch only GUI state, and doing them first means this tick's
+        // publish already carries the result.
+        let ui_op_changed = self.apply_ui_ops(&shared, windows, mgr);
+        self.publish_settings(&shared, windows);
+
         // ONE model lock across snapshot → reconcile → republish. `/command` dispatch holds
         // this lock for its whole execution (routes.rs), so a mutation lands either before
         // the snapshot (reconciled this tick) or after the republish (seen next tick) —
@@ -433,7 +440,7 @@ impl ControlHost {
 
             // 3. Republish the (now-updated) live GUI tree into the read-model.
             let republished = self.publish(&mut model, windows);
-            (reconciled || healed, republished)
+            (reconciled || healed || ui_op_changed, republished)
         };
 
         // 4. Nudge WS clients if the published structure changed (GUI- or control-driven).
@@ -760,6 +767,116 @@ impl ControlHost {
                 ids.insert(new_uid.to_string(), c.pane_id.clone());
                 return;
             }
+        }
+    }
+
+
+    /// Drain and apply the tab / preferences edits the control routes queued for this thread.
+    ///
+    /// These verbs can't be served the way pane verbs are. A pane mutation is written straight
+    /// into the read-model off-thread and adopted back here by [`Self::reconcile`]; but the GUI
+    /// owns the tab tree and [`Self::publish`] rebuilds it wholesale every tick, so a tab edit
+    /// written into the model would be erased a frame later. Preferences are worse still — their
+    /// effects (a font reload, repainting every open pane) are UI-thread-only by construction.
+    /// So the routes validate, queue, and answer `202 Accepted`; the work happens here.
+    ///
+    /// Runs *before* the snapshot/publish block, so an edit applied this tick is already visible
+    /// in the `/state` the same tick publishes. Returns whether anything changed.
+    fn apply_ui_ops(
+        &self,
+        shared: &Arc<Shared>,
+        windows: &[Rc<Window>],
+        mgr: &Arc<SessionManager>,
+    ) -> bool {
+        let ops = shared.ui_ops.lock().unwrap().drain();
+        if ops.is_empty() {
+            return false;
+        }
+        let mut changed = false;
+        for op in ops {
+            match op {
+                UiOp::NewTab {
+                    window_id,
+                    title,
+                    cwd,
+                } => {
+                    if let Some(w) = window_by_id(windows, window_id) {
+                        w.state.borrow_mut().new_tab_with(
+                            mgr,
+                            title.as_deref(),
+                            false,
+                            crate::state::NewPaneOpts {
+                                cwd,
+                                ..Default::default()
+                            },
+                        );
+                        changed = true;
+                    }
+                }
+                UiOp::CloseTab { tab_id } => {
+                    if let Some((w, idx)) = resolve_tab(windows, &tab_id) {
+                        // The menu variant, not `close_tab`: it parks the tab (sessions alive)
+                        // on the recently-closed history, so an API caller's mistake is one
+                        // "Reopen closed tab" away. The confirm-first path is deliberately
+                        // skipped — nobody is at the keyboard to answer its dialog.
+                        w.state.borrow_mut().close_tab_menu(idx, mgr);
+                        changed = true;
+                    }
+                }
+                UiOp::RenameTab { tab_id, title } => {
+                    if let Some((w, idx)) = resolve_tab(windows, &tab_id) {
+                        w.state.borrow_mut().rename_tab(idx as i32, &title);
+                        changed = true;
+                    }
+                }
+                UiOp::FocusTab { tab_id } => {
+                    if let Some((w, idx)) = resolve_tab(windows, &tab_id) {
+                        w.state.borrow_mut().switch_tab(idx);
+                        changed = true;
+                    }
+                }
+                UiOp::MoveTab { tab_id, to } => {
+                    if let Some((w, idx)) = resolve_tab(windows, &tab_id) {
+                        let mut st = w.state.borrow_mut();
+                        // `reorder_tab` speaks the drag gesture's "insert before slot `to`"
+                        // coordinates, where `to == len` means "past the end" — so clamp there
+                        // rather than at `len - 1`.
+                        let to = to.min(st.tabs.len());
+                        st.reorder_tab(idx, to);
+                        changed = true;
+                    }
+                }
+                UiOp::SetTabLayout { tab_id, layout } => {
+                    if let Some((w, idx)) = resolve_tab(windows, &tab_id) {
+                        // An unknown token resolves to `Auto` rather than failing: the command
+                        // already answered 200 from the dispatch, so there is nobody left to
+                        // tell, and `Auto` is what the app falls back to whenever it reads a
+                        // layout token it doesn't know out of a workspace file.
+                        let l = crate::state::layout_from_name(&layout);
+                        w.state.borrow_mut().set_tab_layout(idx, l);
+                        changed = true;
+                    }
+                }
+                UiOp::PatchSettings { patch } => {
+                    // Settings are app-wide but held per-window; patch every window so a second
+                    // window doesn't keep painting itself with the old theme.
+                    for w in windows {
+                        let _ = w.state.borrow_mut().patch_settings(&patch);
+                    }
+                    changed = !windows.is_empty();
+                }
+            }
+        }
+        changed
+    }
+
+    /// Publish the live preferences into [`Shared::settings`], the read side of `GET /settings`.
+    /// Cheap and unconditional: serializing the struct is a few dozen fields, and the
+    /// alternative (a change signal from every settings write path) is one more thing to forget.
+    fn publish_settings(&self, shared: &Arc<Shared>, windows: &[Rc<Window>]) {
+        // Any window will do — the blob is app-wide.
+        if let Some(w) = windows.first() {
+            *shared.settings.lock().unwrap() = Some(w.state.borrow().settings_json());
         }
     }
 
@@ -1090,6 +1207,24 @@ fn remove_from_gui(windows: &[Rc<Window>], uid: &str) {
 /// Parse the tab index out of a `"{window_id}:{tab_index}"` id.
 fn parse_tab_index(tab_id: &str) -> Option<usize> {
     tab_id.rsplit(':').next()?.parse().ok()
+}
+
+/// The window with this id, if it is still open.
+fn window_by_id(windows: &[Rc<Window>], window_id: i64) -> Option<&Rc<Window>> {
+    windows.iter().find(|w| w.id as i64 == window_id)
+}
+
+/// Resolve a `"{window_id}:{tab_index}"` id to its live window and tab index.
+///
+/// The index is bounds-checked here rather than left to each caller: tab ids are POSITIONAL,
+/// so an id that was valid when the client read `/state` can name a different tab — or no tab
+/// at all — once tabs have closed. Refusing an out-of-range index is the difference between a
+/// stale `closeTab` doing nothing and it closing whatever now sits at that slot.
+fn resolve_tab<'a>(windows: &'a [Rc<Window>], tab_id: &str) -> Option<(&'a Rc<Window>, usize)> {
+    let (wid, idx) = tab_id.split_once(':')?;
+    let w = window_by_id(windows, wid.parse().ok()?)?;
+    let idx: usize = idx.parse().ok()?;
+    (idx < w.state.borrow().tabs.len()).then_some((w, idx))
 }
 
 /// Format a Slint color as `#rrggbb` (the read-model's `color` shape).

@@ -623,6 +623,7 @@ pub fn resync(
         .map(|(i, t)| TabItem {
             title: t.title.clone(),
             active: i == active,
+            system: t.system,
         })
         .collect();
     sync_model(&ui.tabs, tabs);

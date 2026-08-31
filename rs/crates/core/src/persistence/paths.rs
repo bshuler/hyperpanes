@@ -237,6 +237,17 @@ pub fn workspaces_dir() -> PathBuf {
     data_dir().join("workspaces")
 }
 
+/// The always-on **Hyperpane** tab's working directory: the app-managed home of the skills and
+/// notes its agent works from.
+///
+/// Durable user data ([`data_dir`]) rather than [`state_dir`], because it is a directory a person
+/// works in — the agent keeps notes there and the user can drop files in — not a runtime scratch
+/// file the app may delete. The app refreshes only the files it ships (see
+/// `crate::hyperpane::materialize`) and never removes anything else.
+pub fn hyperpane_dir() -> PathBuf {
+    data_dir().join("hyperpane")
+}
+
 /// Saved **workspace sets** (`sets/*.json`): a name plus references to member workspaces —
 /// see [`crate::workspace::sets`]. Durable user data → [`data_dir`], beside
 /// [`workspaces_dir`].

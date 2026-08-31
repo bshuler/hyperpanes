@@ -28,6 +28,7 @@ mod control_cli;
 mod control_host;
 mod control_mode_cli;
 mod crash;
+mod ctl_cli;
 mod devices;
 mod drag;
 mod filetree;
@@ -454,6 +455,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // a pure daemon client — no GUI, no single-instance gate.
     if control_mode_cli::wants_control_mode(&argv0) {
         return control_mode_cli::run(&argv0).map_err(Into::into);
+    }
+
+    // `ctl <verb>`: the workspace's own command line over the running control API — the tool
+    // surface the always-on Hyperpane tab hands its agent, and a plain shell command anywhere
+    // else. A client of the HTTP server, so like `attach` it launches no GUI.
+    if ctl_cli::wants_ctl(&argv0) {
+        return ctl_cli::run(&argv0).map_err(Into::into);
     }
 
     // Extract the baked-in OFL fonts (Fira Code / JetBrains Mono) so they always resolve.

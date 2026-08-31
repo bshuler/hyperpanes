@@ -48,6 +48,7 @@ fn kitchen_sink() -> WorkspaceFile {
         main_fraction: Some(0.6),
         focused: Some(1),
         zoomed: Some(0),
+        system: Some(true),
     };
     WorkspaceFile {
         name: Some("sink".into()),
@@ -154,6 +155,7 @@ fn group_split_state_survives_disk_round_trip() {
             main_fraction: Some(0.55),
             focused: Some(1),
             zoomed: Some(1),
+            system: None,
         }]),
         active: Some(0),
         ..Default::default()

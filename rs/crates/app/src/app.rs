@@ -169,6 +169,11 @@ pub struct App {
     first_seed: Cell<bool>,
     /// Guards the one-shot `HYPERPANES_MULTIWIN` screenshot scaffold.
     scaffold_done: Cell<bool>,
+    /// True once the always-on **Hyperpane** tab has been accounted for — either found on a
+    /// restored window or created. App-wide rather than per-window: it is one console for the
+    /// whole workspace, and a second copy would only be a second agent contending for the
+    /// same control API.
+    hyperpane_done: Cell<bool>,
     /// Monotonic tick counter (only used to delay the screenshot scaffold).
     ticks: Cell<u64>,
     /// The in-flight drag/tear-off gesture, if any (driven by [`App::pump_drag`]).
@@ -260,6 +265,7 @@ impl App {
             next_id: Cell::new(0),
             first_seed: Cell::new(true),
             scaffold_done: Cell::new(false),
+            hyperpane_done: Cell::new(false),
             ticks: Cell::new(0),
             drag: RefCell::new(None),
             ghost: RefCell::new(None),
@@ -1760,6 +1766,43 @@ impl App {
         {
             dispatch(st, Command::ToggleLeftPanel, &self.mgr);
         }
+
+        self.ensure_hyperpane_tab(st);
+    }
+
+    /// Make sure the always-on **Hyperpane** tab exists somewhere, creating it on this window
+    /// if it doesn't.
+    ///
+    /// Runs at the tail of every seed, because the window that ends up owning the tab depends
+    /// on what was restored: a workspace that already carries it (the tab persists, see
+    /// `Tab::system`) needs nothing, and only a session that has none anywhere gets a fresh
+    /// one. `hyperpane_done` then latches, so later windows never grow a second copy.
+    fn ensure_hyperpane_tab(self: &Rc<Self>, st: &mut State) {
+        if self.hyperpane_done.get() {
+            return;
+        }
+        // `st` is one of `self.windows`' states and is already mutably borrowed here, so its
+        // own `try_borrow` fails — checked separately rather than being missed.
+        let existing = st.tabs.iter().any(|t| t.system)
+            || self.windows.borrow().iter().any(|w| {
+                w.state
+                    .try_borrow()
+                    .map(|s| s.tabs.iter().any(|t| t.system))
+                    .unwrap_or(false)
+            });
+        if existing {
+            self.hyperpane_done.set(true);
+            return;
+        }
+        if !st.ensure_hyperpane_tab(&self.mgr) {
+            return; // couldn't prepare its directory — try again on the next window
+        }
+        self.hyperpane_done.set(true);
+        // The tab exists to drive the control API, so turn it on — once, here, at the moment
+        // of creation. A user who switches it back off in Preferences keeps it off: the tab
+        // is restored with the workspace from then on, so this branch never runs again.
+        self.control.set_enabled(true, &self.mgr);
+        self.control.set_allow_input(true);
     }
 
     /// Render one window. Returns its [`paneview::PumpResult`] (panes repainted + whether the

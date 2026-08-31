@@ -20,6 +20,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::runtime::Handle;
 
 use serde::Serialize;
+use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::control::events::{ControlEvent, EventHub};
@@ -31,6 +32,7 @@ use crate::control::routes;
 use crate::control::speech_service::SpeechService;
 use crate::control::supervisor::{Decision, Supervisor};
 use crate::control::tokens::{random_token, TokenStore};
+use crate::control::uiops::UiOpQueue;
 use crate::control::work::WorkQueue;
 use crate::session_manager::{SessionEvent, SessionManager};
 
@@ -101,6 +103,15 @@ pub struct Shared {
     /// Per-pane "talk" (local TTS): persisted settings + lazily-spawned engine + transcript
     /// tails. Default-off; costs nothing until a pane's talk is switched on.
     pub speech: SpeechService,
+    /// Tab + preferences edits waiting for the UI thread (`control::uiops`). Written by the
+    /// routes off-thread, drained by the GUI host each sync tick. Never drained in a headless
+    /// embedder, which is why the queue is capped.
+    pub ui_ops: Mutex<UiOpQueue>,
+    /// The app's live preferences, as the camelCase JSON blob the GUI publishes each sync
+    /// tick — the read side of settings CRUD. `None` until the first publish (and forever in
+    /// a headless embedder), which `GET /settings` reports as 503 rather than inventing
+    /// defaults: a caller about to PATCH must not be handed a blob the app isn't running.
+    pub settings: Mutex<Option<Value>>,
 }
 
 impl Shared {
@@ -138,6 +149,8 @@ impl Shared {
             bind: Mutex::new(("127.0.0.1".to_string(), 0)),
             runtime: OnceLock::new(),
             speech: SpeechService::new(speech_settings_path),
+            ui_ops: Mutex::new(UiOpQueue::new()),
+            settings: Mutex::new(None),
         })
     }
 

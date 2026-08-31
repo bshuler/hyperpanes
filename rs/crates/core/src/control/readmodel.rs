@@ -284,6 +284,27 @@ impl ReadModel {
         self.windows.iter().any(|w| w.window_id == window_id)
     }
 
+    /// How many tabs a window currently holds. Tab ids are positional
+    /// (`"{window_id}:{index}"`), so this is also the index an appended tab will take —
+    /// which is how a queued `newTab` can name its id before the UI thread has run it.
+    pub fn tab_count(&self, window_id: i64) -> Option<usize> {
+        self.windows
+            .iter()
+            .find(|w| w.window_id == window_id)
+            .map(|w| w.tabs.len())
+    }
+
+    /// The tab with this id, if the model knows it.
+    pub fn tab(&self, tab_id: &str) -> Option<&TabInfo> {
+        let wid = self.tab_window(tab_id)?;
+        self.windows
+            .iter()
+            .find(|w| w.window_id == wid)?
+            .tabs
+            .iter()
+            .find(|t| t.id == tab_id)
+    }
+
     pub fn uid_to_pane(&self, uid: &str) -> Option<String> {
         self.uid_to_pane.get(uid).cloned()
     }

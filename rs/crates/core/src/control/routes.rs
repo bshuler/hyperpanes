@@ -42,6 +42,7 @@ use crate::control::readmodel::{Activity, PaneStatus, WindowOut};
 use crate::control::scope::{check_mintable, coerce_scope, pane_in_scope, queue_in_scope, Scope};
 use crate::control::server::{events_url, notify_state, now_ms, Shared};
 use crate::control::tokens::TokenInfo;
+use crate::control::uiops::UiOp;
 use crate::control::work::{
     Counts, EnqueueOpts, LeaseOutcome, ListFilter, NackOpts, QueueSummary, Task, TaskState,
 };
@@ -79,6 +80,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
         .route("/tasks/{id}/ack", post(task_ack))
         .route("/tasks/{id}/nack", post(task_nack))
         .route("/tasks/{id}/extend", post(task_extend))
+        .route("/settings", get(settings_get).patch(settings_patch))
         .route("/fs/read", get(fs_read))
         .route("/events", get(events_ws))
         .method_not_allowed_fallback(method_not_allowed)
@@ -1535,6 +1537,15 @@ async fn command(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: By
             serde_json::json!({"ok": true, "scope": if scope == 1 {"gui"} else {"full"}}),
         );
     }
+    // Tab verbs are handled here too, and for the same reason as `restartApp`: the GUI owns
+    // the tab tree and republishes it wholesale every sync tick, so a tab edit written into
+    // the read model would be overwritten a frame later. They are validated now and QUEUED for
+    // the UI thread (`control::uiops`).
+    if let Some(ty) = cmd.get("type").and_then(Value::as_str) {
+        if TAB_VERBS.contains(&ty) {
+            return tab_command(&shared, &info, ty, &cmd);
+        }
+    }
     let control_file = shared.control_file.to_str().map(str::to_string);
     let result = {
         let mut m = shared.model.lock().unwrap();
@@ -1547,6 +1558,22 @@ async fn command(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: By
             &shared.speech,
         )
     };
+    // `setLayout` is dispatched above like any other model command, but a layout only exists
+    // for real in the GUI: `publish` rebuilds each tab from the GUI's own state every tick and
+    // would snap the read-model change straight back. Mirror the successful ones into the UI
+    // queue. Best-effort — a full queue here is not worth failing a command that already
+    // succeeded, and the caller's next `setLayout` will land.
+    if cmd.get("type").and_then(Value::as_str) == Some("setLayout") && result.status < 300 {
+        if let (Some(tab_id), Some(layout)) = (
+            cmd.get("tabId").and_then(Value::as_str),
+            cmd.get("layout").and_then(Value::as_str),
+        ) {
+            let _ = shared.ui_ops.lock().unwrap().push(UiOp::SetTabLayout {
+                tab_id: tab_id.to_string(),
+                layout: layout.to_string(),
+            });
+        }
+    }
     // Phase-5: keep supervisor policies in lockstep with pane meta (setMeta flips
     // hp.supervise; newPane carries meta; closePane removes a pane). Cheap + idempotent.
     shared.reconcile_policies();
@@ -1558,6 +1585,220 @@ async fn command(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: By
         shared.mark_projects_dirty();
     }
     jstatus(result.status, result.body)
+}
+
+// ---- tabs + settings (queued for the UI thread) --------------------------------------------
+// Both surfaces edit state the GUI owns rather than the read model, so both take the
+// `control::uiops` path: validate here, apply on the next sync tick. See that module for why.
+
+/// `/command` verbs that edit the tab tree.
+const TAB_VERBS: &[&str] = &["newTab", "closeTab", "renameTab", "focusTab", "moveTab"];
+
+/// Queue a UI op, turning a full queue into a 503 rather than a silent drop.
+fn queue_ui_op(shared: &Arc<Shared>, op: UiOp, body: Value) -> Response {
+    if shared.ui_ops.lock().unwrap().push(op) {
+        jstatus(202, body)
+    } else {
+        jstatus(
+            503,
+            json!({ "error": "the UI op queue is full — is the app running?" }),
+        )
+    }
+}
+
+/// Resolve a tab id against the read model, 404ing an id the model has never seen. Tab ids are
+/// positional, so a stale one would otherwise silently address whatever tab now sits at that
+/// index — the worst possible failure mode for `closeTab`.
+// pre-existing convention; deferred per repo lint policy (test.yml)
+#[allow(clippy::result_large_err)]
+fn find_tab(shared: &Arc<Shared>, cmd: &Value) -> Result<(String, i64), Response> {
+    let tab_id = match cmd.get("tabId").and_then(Value::as_str) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => {
+            return Err(jstatus(
+                400,
+                json!({ "error": "missing string field: tabId" }),
+            ))
+        }
+    };
+    match shared.model.lock().unwrap().tab_window(&tab_id) {
+        Some(wid) => Ok((tab_id, wid)),
+        None => Err(jstatus(
+            404,
+            json!({ "error": "no such tab", "tabId": tab_id }),
+        )),
+    }
+}
+
+/// Handle one tab verb. Tab edits are structural and window-wide, so — like `restartApp` —
+/// they need a root token; a scoped token is a grant over named panes, not over the workspace
+/// those panes happen to sit in.
+fn tab_command(shared: &Arc<Shared>, info: &TokenInfo, ty: &str, cmd: &Value) -> Response {
+    if info.scope.is_some() {
+        return jstatus(403, json!({ "error": format!("{ty} needs a root token") }));
+    }
+    match ty {
+        "newTab" => {
+            let window_id = match cmd.get("windowId").and_then(Value::as_i64) {
+                Some(w) => w,
+                None => match shared.model.lock().unwrap().first_window_id() {
+                    Some(w) => w,
+                    None => return jstatus(503, json!({ "error": "no window" })),
+                },
+            };
+            // The id the tab WILL have: ids are positional and only the UI thread appends.
+            let index = match shared.model.lock().unwrap().tab_count(window_id) {
+                Some(n) => n,
+                None => {
+                    return jstatus(
+                        404,
+                        json!({ "error": "no such window", "windowId": window_id }),
+                    )
+                }
+            };
+            let title = cmd
+                .get("title")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|t| !t.is_empty());
+            let cwd = cmd
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|c| !c.is_empty());
+            queue_ui_op(
+                shared,
+                UiOp::NewTab {
+                    window_id,
+                    title,
+                    cwd,
+                },
+                json!({ "ok": true, "queued": true, "tabId": format!("{window_id}:{index}") }),
+            )
+        }
+        "closeTab" => match find_tab(shared, cmd) {
+            Err(e) => e,
+            Ok((tab_id, _)) => queue_ui_op(
+                shared,
+                UiOp::CloseTab {
+                    tab_id: tab_id.clone(),
+                },
+                json!({ "ok": true, "queued": true, "tabId": tab_id }),
+            ),
+        },
+        "renameTab" => {
+            let title = match cmd.get("title").and_then(Value::as_str) {
+                Some(t) => t.to_string(),
+                None => return jstatus(400, json!({ "error": "missing string field: title" })),
+            };
+            match find_tab(shared, cmd) {
+                Err(e) => e,
+                Ok((tab_id, _)) => queue_ui_op(
+                    shared,
+                    UiOp::RenameTab {
+                        tab_id: tab_id.clone(),
+                        title,
+                    },
+                    json!({ "ok": true, "queued": true, "tabId": tab_id }),
+                ),
+            }
+        }
+        "focusTab" => match find_tab(shared, cmd) {
+            Err(e) => e,
+            Ok((tab_id, _)) => queue_ui_op(
+                shared,
+                UiOp::FocusTab {
+                    tab_id: tab_id.clone(),
+                },
+                json!({ "ok": true, "queued": true, "tabId": tab_id }),
+            ),
+        },
+        "moveTab" => {
+            let to = match cmd.get("to").and_then(Value::as_i64).filter(|&t| t >= 0) {
+                Some(t) => t as usize,
+                None => {
+                    return jstatus(
+                        400,
+                        json!({ "error": "missing non-negative integer field: to" }),
+                    )
+                }
+            };
+            match find_tab(shared, cmd) {
+                Err(e) => e,
+                Ok((tab_id, _)) => queue_ui_op(
+                    shared,
+                    UiOp::MoveTab {
+                        tab_id: tab_id.clone(),
+                        to,
+                    },
+                    json!({ "ok": true, "queued": true, "tabId": tab_id, "to": to }),
+                ),
+            }
+        }
+        _ => jstatus(400, json!({ "error": format!("unknown command: {ty}") })),
+    }
+}
+
+/// The app's live preferences. Published by the GUI each sync tick — absent (503) when no GUI
+/// is attached, rather than a defaults blob that would not describe anything real.
+async fn settings_get(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    if let Err(e) = authorize(&shared, &headers) {
+        return e;
+    }
+    match shared.settings.lock().unwrap().clone() {
+        Some(v) => ok_json(json!({ "settings": v })),
+        None => jstatus(
+            503,
+            json!({ "error": "settings unavailable (no GUI attached)" }),
+        ),
+    }
+}
+
+/// Merge a camelCase patch into the app preferences. Root token only: preferences are global,
+/// and some of them (`keepAlive`, `browserMode`) change what happens to every pane in the app.
+/// Unknown keys are rejected up front — a typo that silently does nothing is worse than a 400.
+async fn settings_patch(
+    State(shared): State<Arc<Shared>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let info = match authorize(&shared, &headers) {
+        Ok(i) => i,
+        Err(e) => return e,
+    };
+    if info.scope.is_some() {
+        return jstatus(403, json!({ "error": "settings needs a root token" }));
+    }
+    let patch: Value = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(_) => return jstatus(400, json!({ "error": "expected a JSON object" })),
+    };
+    let Some(obj) = patch.as_object() else {
+        return jstatus(400, json!({ "error": "expected a JSON object" }));
+    };
+    if obj.is_empty() {
+        return jstatus(400, json!({ "error": "expected at least one setting" }));
+    }
+    // Validate keys against the blob the GUI published — that is the live shape of `Settings`,
+    // so this stays correct as fields are added without core having to know them.
+    let published = shared.settings.lock().unwrap().clone();
+    let Some(known) = published.as_ref().and_then(Value::as_object) else {
+        return jstatus(
+            503,
+            json!({ "error": "settings unavailable (no GUI attached)" }),
+        );
+    };
+    let unknown: Vec<&str> = obj
+        .keys()
+        .filter(|k| !known.contains_key(*k))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        return jstatus(400, json!({ "error": "unknown settings", "keys": unknown }));
+    }
+    let keys: Vec<&String> = obj.keys().collect();
+    let body = json!({ "ok": true, "queued": true, "keys": keys });
+    queue_ui_op(&shared, UiOp::PatchSettings { patch: patch.clone() }, body)
 }
 
 // ---- /projects ----------------------------------------------------------------------------

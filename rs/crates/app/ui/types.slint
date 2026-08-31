@@ -195,6 +195,10 @@ export struct PaneItem {
 export struct TabItem {
     title: string,
     active: bool,
+    // App-owned tab (the always-on "Hyperpane"). It cannot be closed, so it shows no ×
+    // and ignores the middle-click close — an affordance that does nothing is worse than
+    // no affordance.
+    system: bool,
 }
 
 // A draggable resize seam (vertical column / horizontal row / main-stack main).

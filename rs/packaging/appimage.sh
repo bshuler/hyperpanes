@@ -79,6 +79,12 @@ for f in SKILL.md SPEC.md IMPL.md; do
   install -m 644 "$ROOT/resources/claude/goal-orchestrator/$f" "$APPDIR/usr/bin/resources/claude/goal-orchestrator/$f"
 done
 
+# The always-on Hyperpane tab's working directory (README + the hidden .claude/skills tree its
+# agent loads) — resolved as exe_dir/resources/claude/hyperpane. `cp -R` of the directory itself,
+# so the dot-directory rides along; a glob would silently drop it.
+rm -rf "$APPDIR/usr/bin/resources/claude/hyperpane"
+cp -R "$ROOT/resources/claude/hyperpane" "$APPDIR/usr/bin/resources/claude/hyperpane"
+
 # Desktop entry + MIME info (registered by appimaged/AppImageLauncher or a
 # package manager hook via update-mime-database on integration).
 install -m 644 "$LINUX_DIR/hyperpanes.desktop" "$APPDIR/usr/share/applications/hyperpanes.desktop"

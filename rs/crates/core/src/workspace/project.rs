@@ -370,6 +370,7 @@ const GROUP_KEYS: &[&str] = &[
     "mainFraction",
     "focused",
     "zoomed",
+    "system",
 ];
 const PANE_KEYS: &[&str] = &[
     "label", "color", "command", "args", "cwd", "shell", "fontSize", "meta", "uid", "talk", "note",
@@ -924,6 +925,7 @@ mod tests {
             main_fraction: Some(0.5),
             focused: Some(0),
             zoomed: Some(0),
+            system: Some(true),
         };
         let window = WindowSpec {
             title: Some("w".into()),

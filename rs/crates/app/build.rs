@@ -29,6 +29,11 @@ fn main() {
     // `State::submit_new_goal`'s `exe_dir/resources/claude/goal-orchestrator` candidate
     // resolves at dev runtime, matching what packaging ships. Best-effort.
     let personas = manifest.join("../../../resources/claude/goal-orchestrator");
+    // The always-on Hyperpane tab's working directory: its README plus the hidden
+    // `.claude/skills/` tree its agent loads. `hyperpane::source_dir()` looks beside the exe
+    // first, so without this a dev build opens the tab into an empty directory and the agent
+    // has no idea the app can be driven at all. Packaging ships the same tree.
+    let hyperpane = manifest.join("../../../resources/claude/hyperpane");
     // The three CLI-agent session hooks. `claude_hook::bundled_hook_path` and
     // `tools::session_hook::bundled_script` both look beside the exe FIRST, so without
     // this a dev build registers no hook at all and every hand-started tool pane silently
@@ -51,6 +56,10 @@ fn main() {
                     .join("resources")
                     .join("claude")
                     .join("goal-orchestrator"),
+            );
+            let _ = copy_dir(
+                &hyperpane,
+                &profile.join("resources").join("claude").join("hyperpane"),
             );
             for (dir, script) in hooks {
                 let dst_dir = profile.join("resources").join(dir);
@@ -76,6 +85,15 @@ fn main() {
     }
     for f in ["SKILL.md", "SPEC.md", "IMPL.md"] {
         println!("cargo:rerun-if-changed={}", personas.join(f).display());
+    }
+    for f in [
+        "README.md",
+        ".claude/settings.json",
+        ".claude/skills/hyperpanes/SKILL.md",
+        ".claude/skills/hyperpanes/REFERENCE.md",
+        ".claude/skills/hyperpanes/RECIPES.md",
+    ] {
+        println!("cargo:rerun-if-changed={}", hyperpane.join(f).display());
     }
     for (dir, script) in hooks {
         println!(

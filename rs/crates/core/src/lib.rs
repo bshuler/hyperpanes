@@ -15,6 +15,7 @@ pub mod claude_panes;
 pub mod claude_recovery;
 pub mod cli;
 pub mod control;
+pub mod hyperpane;
 pub mod layout;
 pub mod open;
 pub mod paths;

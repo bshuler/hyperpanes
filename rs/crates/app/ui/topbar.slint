@@ -115,6 +115,7 @@ component TabChip inherits Rectangle {
     in property <bool> active;
     in property <bool> editing;
     in property <bool> spring-hover: false;   // a dragged pane is hovering this tab
+    in property <bool> system: false;         // app-owned tab — no close affordance
     callback select();
     callback close();
     callback begin-rename();
@@ -153,7 +154,8 @@ component TabChip inherits Rectangle {
         clicked => { root.select(); }
         double-clicked => { root.begin-rename(); }
         pointer-event(e) => {
-            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.middle) {
+            if (e.kind == PointerEventKind.down && e.button == PointerEventButton.middle
+                && !root.system) {
                 root.close();
             }
             if (e.kind == PointerEventKind.down && e.button == PointerEventButton.left) {
@@ -191,7 +193,7 @@ component TabChip inherits Rectangle {
             // include xa.has-hover: hovering the × itself steals hover from the
             // chip's TouchArea, which would otherwise hide the × mid-hover.
             opacity: (root.active || ta.has-hover || xa.has-hover) ? 1.0 : 0.0;
-            visible: !root.editing;
+            visible: !root.editing && !root.system;
             animate opacity { duration: 90ms; }
             CloseIcon {
                 x: (parent.width - self.width) / 2;
@@ -365,6 +367,7 @@ export component TopBar inherits Rectangle {
                     active: tab.active;
                     editing: root.editing-tab == idx;
                     spring-hover: root.drop-tab-idx == idx;
+                    system: tab.system;
                     select => { root.select-tab(idx); }
                     close => { root.close-tab(idx); }
                     begin-rename => { root.begin-rename(idx); }

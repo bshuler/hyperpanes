@@ -18,3 +18,4 @@ pub mod server;
 pub mod speech_service;
 pub mod supervisor;
 pub mod tokens;
+pub mod uiops;

@@ -127,6 +127,16 @@ pub const DEFAULT_IDLE_SECONDS: u32 = 30;
 /// The ± step (seconds) the "Idle after" dial moves by.
 pub const IDLE_STEP_SECONDS: u32 = 30;
 
+/// Snap an idle-alert threshold onto the dial's grid and into its bounds. The ± buttons can
+/// only ever produce a value that already satisfies this; a JSON caller (control API) and an
+/// old persisted blob can both hand over anything, and the dial has to be able to show the
+/// result.
+pub fn idle_seconds_on_grid(secs: u32) -> u32 {
+    let step = IDLE_STEP_SECONDS;
+    let snapped = (secs / step) * step;
+    snapped.clamp(MIN_IDLE_SECONDS, MAX_IDLE_SECONDS)
+}
+
 /// Persisted app-wide preferences (native MVP subset of the renderer `Settings`).
 /// Every field has a sensible default so an older/partial blob never breaks load.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

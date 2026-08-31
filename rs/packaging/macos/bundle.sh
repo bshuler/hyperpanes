@@ -99,6 +99,13 @@ cp "$ROOT/resources/claude/goal-orchestrator/SKILL.md" "$APP/Contents/Resources/
 cp "$ROOT/resources/claude/goal-orchestrator/SPEC.md" "$APP/Contents/Resources/claude/goal-orchestrator/"
 cp "$ROOT/resources/claude/goal-orchestrator/IMPL.md" "$APP/Contents/Resources/claude/goal-orchestrator/"
 
+# The always-on Hyperpane tab's working directory (README + the hidden .claude/skills tree its
+# agent loads). `cp -R` of the directory itself, so the dot-directory rides along — a glob would
+# silently drop it and ship the tab an agent that can't drive anything.
+mkdir -p "$APP/Contents/Resources/claude"
+rm -rf "$APP/Contents/Resources/claude/hyperpane"
+cp -R "$ROOT/resources/claude/hyperpane" "$APP/Contents/Resources/claude/hyperpane"
+
 # CLI-agent session hooks (tool-resume feature). These had never been bundled at all, so a
 # shipped .app registered no hook and every hand-started tool pane fell back to the
 # scan-and-diff heuristic. They go in Contents/Resources for the same signing reason as the

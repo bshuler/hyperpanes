@@ -137,6 +137,12 @@ pub struct GroupSpec {
     /// index of the maximized pane (default: none)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub zoomed: Option<u32>,
+    /// Whether the app owns this tab and refuses to close it — today only the always-on
+    /// "Hyperpane" tab. Absent (rather than `false`) in every workspace written before the
+    /// flag existed, and in every ordinary tab since, so a restore of an older file simply
+    /// yields no system tab and the app recreates its own at startup.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system: Option<bool>,
 }
 
 /// Saved OS-window geometry.
