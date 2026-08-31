@@ -62,14 +62,31 @@ component ViewRowView inherits Rectangle {
     in property <PaneViewRow> item;
     in property <color> accent;
     callback activate();
+    // A link inside rendered markdown. Reported as the href, not the row: the
+    // controller opens it through the same browser-choice path an OSC 8 link in a
+    // terminal pane takes, so one preference governs both.
+    callback link-clicked(string);
 
-    // A rule is a divider, not a line of text; everything else gets a full row.
-    // A diagram is the one role that sizes itself: its height was decided by the
-    // layout in `src/mermaid.rs`, and nothing here may second-guess it.
+    // Prose, list items and quotes are a run of inline markdown that wraps, so
+    // their height is whatever the renderer needs *at this width* — the one
+    // measurement this side can't make, since the UI font is proportional.
+    property <bool> flows: root.item.role == 16 || root.item.role == 8 || root.item.role == 9;
+    property <bool> heads: root.item.role >= 4 && root.item.role <= 6;
+    // Where the text column starts. A list item steps in by its nesting; the
+    // gutter to its left holds the dot, the ordinal or the task box.
+    property <length> lead: root.item.role == 8 ? 24px + root.item.indent * 14px
+        : root.item.role == 9 ? 16px
+        : 8px;
+
+    // A rule is a divider, not a line of text; a blank line is air. A diagram
+    // sizes itself: its height was decided by the layout in `src/mermaid.rs`, and
+    // nothing here may second-guess it.
     height: root.item.role == 12 ? root.item.diagram.h + 12px
         : root.item.role == 10 ? 15px
-        : root.item.role == 4 ? 26px
-        : root.item.role == 5 ? 22px
+        : root.item.role == 15 ? 7px
+        : root.item.role == 13 || root.item.role == 14 ? 24px
+        : root.flows ? max(19px, flow.preferred-height + 5px)
+        : root.heads ? max(22px, head.preferred-height + 8px)
         : 19px;
     background: ta.has-hover && root.item.activatable ? #ffffff12 : transparent;
 
@@ -78,6 +95,37 @@ component ViewRowView inherits Rectangle {
         clicked => {
             if (root.item.activatable) { root.activate(); }
         }
+    }
+
+    // Declared here, not inside their `if` branches: a name scoped to a branch is
+    // invisible to the row's own height binding. `ListView` only builds the rows
+    // on screen, so the pair costs ~40 idle elements, not 5,000.
+    flow := StyledText {
+        x: root.lead;
+        y: 3px;
+        width: root.width - root.lead - 8px;
+        visible: root.flows;
+        // Empty on every non-flowing role, which is what keeps a 2,000-character
+        // source line out of the text shaper.
+        text: root.item.md;
+        default-color: root.item.role == 9 ? Theme.subtext : Theme.text;
+        default-font-size: 12px;
+        link-color: Theme.link;
+        link-clicked(l) => { root.link-clicked(l); }
+    }
+    head := Text {
+        x: 8px;
+        y: 4px;
+        width: root.width - 16px;
+        visible: root.heads;
+        // A heading is a plain Text because it needs a font weight, and
+        // `StyledText` has no property for one — so its markers were stripped
+        // Rust-side instead.
+        text: root.heads ? root.item.text : "";
+        wrap: word-wrap;
+        color: root.item.role == 4 ? root.accent : Theme.text;
+        font-size: root.item.role == 4 ? 17px : root.item.role == 5 ? 14px : 12px;
+        font-weight: 700;
     }
 
     // --- 10: horizontal rule ---
@@ -89,24 +137,11 @@ component ViewRowView inherits Rectangle {
         background: Theme.border;
     }
 
-    // --- 9: block quote — a leading bar, then dim italic text ---
+    // --- 9: block quote — the bar; the text is `flow`, dimmed ---
     if root.item.role == 9 : Rectangle {
-        Rectangle {
-            x: 6px; y: 2px;
-            width: 2px; height: parent.height - 4px;
-            background: Theme.surface2;
-        }
-        Text {
-            x: 14px;
-            width: parent.width - 20px;
-            height: 100%;
-            vertical-alignment: center;
-            text: root.item.text;
-            color: Theme.subtext;
-            font-italic: true;
-            font-size: 12px;
-            overflow: elide;
-        }
+        x: 6px; y: 2px;
+        width: 2px; height: parent.height - 4px;
+        background: Theme.surface2;
     }
 
     // --- 7: code — the row gets its own darker ground so a block reads as one ---
@@ -124,38 +159,45 @@ component ViewRowView inherits Rectangle {
         }
     }
 
-    // --- 8: list item — a drawn bullet, since "•" is a font glyph ---
-    if root.item.role == 8 : Rectangle {
-        Rectangle {
-            x: 12px;
-            y: (parent.height - 3px) / 2;
-            width: 3px; height: 3px;
-            border-radius: 1.5px;
-            background: Theme.subtext;
-        }
-        Text {
-            x: 22px;
-            width: parent.width - 28px;
-            height: 100%;
-            vertical-alignment: center;
-            text: root.item.text;
-            color: Theme.text;
-            font-size: 12px;
-            overflow: elide;
-        }
+    // --- 8: list item — the gutter only; the text is `flow`.
+    // A dot, an ordinal or a task box, all drawn: "•" and "☑" are font glyphs,
+    // and a missing codepoint renders as a hollow box on Windows.
+    if root.item.role == 8 && root.item.check < 0 && root.item.marker == "" : Rectangle {
+        x: root.lead - 12px;
+        y: 8px;
+        width: 3px; height: 3px;
+        border-radius: 1.5px;
+        background: Theme.subtext;
     }
-
-    // --- 4/5/6: headings — size and weight carry the level, the accent carries H1 ---
-    if root.item.role == 4 || root.item.role == 5 || root.item.role == 6 : Text {
-        x: 8px;
-        width: parent.width - 14px;
-        height: 100%;
-        vertical-alignment: center;
-        text: root.item.text;
-        color: root.item.role == 4 ? root.accent : Theme.text;
-        font-size: root.item.role == 4 ? 17px : root.item.role == 5 ? 14px : 12px;
-        font-weight: 700;
-        overflow: elide;
+    if root.item.role == 8 && root.item.check < 0 && root.item.marker != "" : Text {
+        // Right-aligned so "9." and "10." share an edge instead of ragging.
+        x: 0;
+        width: root.lead - 6px;
+        y: 3px;
+        horizontal-alignment: right;
+        text: root.item.marker;
+        color: Theme.subtext;
+        font-size: 12px;
+    }
+    if root.item.role == 8 && root.item.check >= 0 : Rectangle {
+        x: root.lead - 15px;
+        y: 4px;
+        width: 11px; height: 11px;
+        border-radius: 2px;
+        border-width: 1px;
+        border-color: root.item.check == 1 ? Theme.ok : Theme.faint;
+        background: root.item.check == 1 ? Theme.ok.with-alpha(0.18) : transparent;
+        // The tick, stroked rather than glyphed, for the same reason as the dot.
+        if root.item.check == 1 : Path {
+            x: 2px; y: 2px;
+            width: 7px; height: 7px;
+            viewbox-width: 7;
+            viewbox-height: 7;
+            commands: "M 0.4 3.5 L 2.6 5.8 L 6.6 1.1";
+            stroke: Theme.ok;
+            stroke-width: 1.5px;
+            fill: transparent;
+        }
     }
 
     // --- 11: notice — the app talking, not the file ---
@@ -327,15 +369,41 @@ component ViewRowView inherits Rectangle {
         }
     }
 
-    // --- 3 (and anything unknown): a plain line, with the viewer's line number ---
-    if root.item.role == 3 || root.item.role > 12 : HorizontalLayout {
-        // Markdown prose lands on this role too, and it carries no line number.
-        // Reserving the gutter for it indents every paragraph ~40px past the
-        // headings and bullets around it, which reads as accidental centring.
-        padding-left: root.item.detail == "" ? 8px : 6px;
+    // --- 13/14: table — even columns, a rule under the header ---
+    if root.item.role == 13 || root.item.role == 14 : Rectangle {
+        background: root.item.role == 13 ? #ffffff08 : transparent;
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            spacing: 10px;
+            for c in root.item.cells : StyledText {
+                horizontal-stretch: 1;
+                vertical-alignment: center;
+                horizontal-alignment: c.align == 1 ? center : c.align == 2 ? right : left;
+                text: c.md;
+                default-color: root.item.role == 13 ? root.accent : Theme.text;
+                default-font-size: 12px;
+                link-color: Theme.link;
+                link-clicked(l) => { root.link-clicked(l); }
+            }
+        }
+        if root.item.role == 13 : Rectangle {
+            x: 8px;
+            y: parent.height - 1px;
+            width: parent.width - 16px;
+            height: 1px;
+            background: Theme.border;
+        }
+    }
+
+    // --- 3 (and anything unknown): a verbatim line, with the viewer's line
+    // number. Verbatim is the point: row N has to stay line N, so this one
+    // elides where prose wraps, and its `*`s are asterisks, not emphasis.
+    if root.item.role == 3 || root.item.role > 16 : HorizontalLayout {
+        padding-left: 6px;
         padding-right: 8px;
         spacing: 8px;
-        if root.item.detail != "" : Text {
+        Text {
             // A fixed gutter so the numbers form a column instead of ragging with
             // their digit count.
             width: 34px;
@@ -367,6 +435,10 @@ export component ViewPane inherits Rectangle {
     // Reports the row INDEX; the controller resolves it against the same cached
     // projection it handed to this view.
     callback activate(int);
+    // Reports a clicked markdown link by href. Not a row index: the row is a
+    // paragraph and the link is one span inside it, so the index would not say
+    // which.
+    callback link-clicked(string);
 
     background: Theme.bg;
 
@@ -400,6 +472,7 @@ export component ViewPane inherits Rectangle {
                 item: it;
                 accent: root.accent;
                 activate => { root.activate(i); }
+                link-clicked(l) => { root.link-clicked(l); }
             }
         }
     }

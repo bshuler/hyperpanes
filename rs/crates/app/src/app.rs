@@ -2923,6 +2923,28 @@ impl App {
             });
         }
 
+        // A link inside a rendered markdown preview was clicked. It goes through the
+        // very same `open_link` an OSC 8 hyperlink from a terminal pane takes, so the
+        // Preferences browser choice — default, one named browser, or ask — governs a
+        // README's links exactly as it governs a shell's. The URL scheme is re-checked
+        // in there: `open_link` refuses anything that is not http/https/mailto, which
+        // is what keeps a `file:` or `javascript:` href in a downloaded document from
+        // becoming a launch.
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app.on_pane_view_link(move |_pane, url| {
+                let Some(w) = app.window_by_id(id) else {
+                    return;
+                };
+                // The one entry point for "something in a pane wants a link opened",
+                // shared with an OSC 8 hyperlink clicked in a terminal pane, so the
+                // Preferences browser choice governs both. Nothing is borrowed here:
+                // the command may mount the chooser overlay (borrow rule #18).
+                app.run_command(&w, Command::OpenLink(url.to_string()));
+            });
+        }
+
         // tabs
         cb0!(on_new_tab, Command::NewTab);
         cb_usize!(on_select_tab, Command::SwitchTab);

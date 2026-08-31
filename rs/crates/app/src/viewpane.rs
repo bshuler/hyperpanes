@@ -29,7 +29,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hyperpanes_core::tools::PaneKind;
 use slint::{ModelRc, VecModel};
 
-use crate::{DiagLabel, DiagNode, PaneDiagram, PaneViewRow};
+use crate::{DiagLabel, DiagNode, PaneCell, PaneDiagram, PaneViewRow};
 
 /// How a row is drawn. The `.slint` side switches on this and nothing else — it
 /// never re-parses `text`. Keep these in lock-step with `ViewPane` in
@@ -61,9 +61,30 @@ pub mod role {
     /// error. Never activatable.
     pub const NOTICE: i32 = 11;
     /// A rendered mermaid diagram. The row's `text` is empty and its geometry
-    /// rides along in [`super::ViewRow::diagram`]; it is the one role whose
-    /// height is decided by its content rather than by the role itself.
+    /// rides along in [`super::ViewRow::diagram`].
     pub const DIAGRAM: i32 = 12;
+    /// A table's header line. `text` is empty; the content is in
+    /// [`super::ViewRow::cells`].
+    pub const TABLE_HEAD: i32 = 13;
+    /// A table's body line.
+    pub const TABLE_ROW: i32 = 14;
+    /// The gap a blank line leaves between two blocks. Draws nothing; it exists
+    /// so paragraphs are separated by air rather than by a full empty row.
+    pub const SPACE: i32 = 15;
+    /// A markdown paragraph. Distinct from [`LINE`] because the two want
+    /// opposite things: prose wraps and carries inline markup, a viewer line is
+    /// verbatim and elides so that row N stays line N.
+    pub const PROSE: i32 = 16;
+}
+
+/// One cell of a markdown table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableCell {
+    /// Inline markdown with its markers intact — the same contract as
+    /// [`ViewRow::text`] on the flowing roles.
+    pub text: String,
+    /// What the `|:--:|` delimiter row asked for: 0 left, 1 centre, 2 right.
+    pub align: i32,
 }
 
 /// One projected row. `path` is empty for everything that is not activatable, so
@@ -82,6 +103,24 @@ pub struct ViewRow {
     /// Set only on [`role::DIAGRAM`]. Boxed because it is large and every other
     /// row in a 5,000-row file would otherwise carry the empty space for it.
     pub diagram: Option<Box<crate::mermaid::Diagram>>,
+    /// List nesting depth, 0 at the top level. [`role::BULLET`] only. Decided
+    /// here rather than in the view because the leading whitespace that implied
+    /// it never reaches Slint.
+    pub indent: i32,
+    /// An ordered item's own number, `"2."` — empty for an unordered one, which
+    /// the view draws as a dot. Kept verbatim: a list that renumbers itself
+    /// 1, 2, 3 when the author wrote 3, 4, 5 misquotes the document.
+    pub marker: String,
+    /// A task box: -1 none, 0 unchecked, 1 checked.
+    pub check: i32,
+    /// [`role::TABLE_HEAD`] and [`role::TABLE_ROW`] only, one entry per column.
+    pub cells: Vec<TableCell>,
+}
+
+impl Default for ViewRow {
+    fn default() -> Self {
+        Self::inert(role::LINE, "")
+    }
 }
 
 impl ViewRow {
@@ -93,6 +132,10 @@ impl ViewRow {
             detail: String::new(),
             path: PathBuf::new(),
             diagram: None,
+            indent: 0,
+            marker: String::new(),
+            check: -1,
+            cells: Vec::new(),
         }
     }
 
@@ -209,6 +252,7 @@ pub fn list_dir(dir: &Path) -> Vec<ViewRow> {
                     detail: "—".into(),
                     path: ent.path(),
                     diagram: None,
+                    ..ViewRow::default()
                 });
                 continue;
             }
@@ -229,6 +273,7 @@ pub fn list_dir(dir: &Path) -> Vec<ViewRow> {
                 detail: age,
                 path: ent.path(),
                 diagram: None,
+                ..ViewRow::default()
             });
         } else {
             let detail = if age.is_empty() {
@@ -242,6 +287,7 @@ pub fn list_dir(dir: &Path) -> Vec<ViewRow> {
                 detail,
                 path: ent.path(),
                 diagram: None,
+                ..ViewRow::default()
             });
         }
     }
@@ -257,6 +303,7 @@ pub fn list_dir(dir: &Path) -> Vec<ViewRow> {
             detail: String::new(),
             path: parent.to_path_buf(),
             diagram: None,
+            ..ViewRow::default()
         });
     }
     let empty = dirs.is_empty() && files.is_empty();
@@ -293,6 +340,7 @@ pub fn read_lines(file: &Path) -> Vec<ViewRow> {
             detail: (i + 1).to_string(),
             path: PathBuf::new(),
             diagram: None,
+            ..ViewRow::default()
         });
     }
     if rows.is_empty() {
@@ -306,65 +354,188 @@ pub fn read_lines(file: &Path) -> Vec<ViewRow> {
     rows
 }
 
-/// A markdown file as styled blocks. Line-based on purpose: a real markdown parser
-/// would pull in a dependency and an inline-span model the row projection cannot
-/// express anyway, and a preview only needs the block level to read like a
-/// document. Fences win over every other rule while open, so a `# comment` inside
-/// a shell snippet stays code.
+/// A markdown file as styled blocks. The block level is parsed here — headings,
+/// lists, quotes, tables, fences, rules — and only the block level: each row's
+/// *inline* markup is handed to Slint's `StyledText` with its markers intact.
+///
+/// That split is the whole design. Inline markup is the half that has to wrap
+/// mid-sentence, and only the renderer that measures the glyphs can decide where
+/// a line breaks; nothing on this side can, because the UI font is proportional
+/// and the only metrics Rust has here are the terminal's monospace cell. So Rust
+/// keeps every decision a parser makes and the framework keeps the one decision a
+/// typesetter makes.
+///
+/// Fences win over every other rule while open, so a `# comment` inside a shell
+/// snippet stays code.
 pub fn markdown_blocks(file: &Path) -> Vec<ViewRow> {
     let text = match read_text(file) {
         Ok(t) => t,
         Err(row) => return vec![row],
     };
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    let cap = total.min(MAX_LINES);
     let mut rows: Vec<ViewRow> = Vec::new();
-    let mut fenced = false;
-    // The lines of an open ```mermaid fence, held back until the fence closes: a
-    // diagram cannot be laid out one line at a time.
-    let mut pending: Option<Vec<String>> = None;
-    let mut total = 0usize;
-    for (i, raw) in text.lines().enumerate() {
-        total = i + 1;
-        if i >= MAX_LINES {
-            continue;
-        }
-        let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
-            // The fence line itself is chrome, not content: toggle and drop it —
-            // but its info string decides what the body becomes.
-            fenced = !fenced;
-            match pending.take() {
-                Some(src) => rows.append(&mut diagram_rows(&src)),
-                None if fenced && is_mermaid(&trimmed[3..]) => pending = Some(Vec::new()),
-                None => {}
+    // The leading column of every open list level, innermost last. Self-correcting
+    // — a shallower item pops back to its own level — so it never needs clearing
+    // at a block boundary.
+    let mut stack: Vec<usize> = Vec::new();
+    // The row a following line may flow into: an open paragraph, list item or
+    // quote. `None` after anything that closed one.
+    let mut open: Option<usize> = None;
+    let mut i = 0usize;
+
+    while i < cap {
+        let raw = lines[i].strip_suffix('\r').unwrap_or(lines[i]);
+        // Trailing space is never content — it is markdown's hard break, which
+        // `hard_break` reads off `raw` instead.
+        let trimmed = raw.trim();
+
+        // A fence is checked first and consumed whole, which is what keeps every
+        // rule below it from firing on a line of code.
+        if let Some((mark, info)) = fence_open(trimmed) {
+            let mut j = i + 1;
+            while j < cap && !fence_closes(lines[j], mark) {
+                j += 1;
             }
+            let body: Vec<String> = lines[i + 1..j.min(cap)]
+                .iter()
+                .map(|l| l.strip_suffix('\r').unwrap_or(l).to_string())
+                .collect();
+            if is_mermaid(info) {
+                rows.append(&mut diagram_rows(&body));
+            } else {
+                rows.extend(body.iter().map(|l| ViewRow::inert(role::CODE, clip(l))));
+            }
+            open = None;
+            i = j + 1;
             continue;
         }
-        if let Some(src) = pending.as_mut() {
-            src.push(raw.to_string());
+
+        // A blank line closes whatever was open and leaves air. Runs of them
+        // collapse to one: five blank lines are a typing habit, not five gaps.
+        if trimmed.is_empty() {
+            open = None;
+            if !rows.is_empty() && rows.last().map(|r| r.role) != Some(role::SPACE) {
+                rows.push(ViewRow::inert(role::SPACE, ""));
+            }
+            i += 1;
             continue;
         }
-        if fenced {
-            rows.push(ViewRow::inert(role::CODE, clip(raw)));
+
+        // A table, header and delimiter together. Checked before the paragraph
+        // rules so the header line is never swallowed as prose.
+        if i + 1 < cap {
+            if let Some(aligns) = table_at(raw, lines[i + 1]) {
+                rows.push(table_row(role::TABLE_HEAD, &split_cells(raw), &aligns));
+                let mut j = i + 2;
+                while j < cap {
+                    let body = lines[j].strip_suffix('\r').unwrap_or(lines[j]);
+                    if !body.contains('|') || body.trim().is_empty() {
+                        break;
+                    }
+                    rows.push(table_row(role::TABLE_ROW, &split_cells(body), &aligns));
+                    j += 1;
+                }
+                open = None;
+                i = j;
+                continue;
+            }
+        }
+
+        if let Some(row) = heading(trimmed) {
+            rows.push(row);
+            open = None;
+            i += 1;
             continue;
         }
-        let row = if let Some(rest) = heading(trimmed) {
-            rest
-        } else if is_rule(trimmed) {
-            ViewRow::inert(role::RULE, "")
-        } else if let Some(rest) = bullet(trimmed) {
-            ViewRow::inert(role::BULLET, clip(rest))
-        } else if let Some(rest) = trimmed.strip_prefix('>') {
-            ViewRow::inert(role::QUOTE, clip(rest.trim_start()))
-        } else if raw.starts_with("    ") || raw.starts_with('\t') {
-            ViewRow::inert(role::CODE, clip(raw.trim_end()))
+
+        // A setext underline retitles the paragraph above it, and beats the rule
+        // below because `---` under prose is a heading in every dialect.
+        if let Some(k) = open.filter(|k| rows[*k].role == role::PROSE) {
+            if let Some(level) = setext(trimmed) {
+                rows[k].role = level;
+                rows[k].text = strip_inline(&rows[k].text);
+                open = None;
+                i += 1;
+                continue;
+            }
+        }
+
+        if is_rule(trimmed) {
+            rows.push(ViewRow::inert(role::RULE, ""));
+            open = None;
+            i += 1;
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix('>') {
+            let body = rest.strip_prefix(' ').unwrap_or(rest);
+            match open.filter(|k| rows[*k].role == role::QUOTE) {
+                Some(k) => flow_into(&mut rows[k], body),
+                None => {
+                    rows.push(ViewRow::inert(role::QUOTE, clip(body)));
+                    open = Some(rows.len() - 1);
+                }
+            }
+            if hard_break(raw) {
+                open = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if let Some(item) = list_item(trimmed) {
+            let mut row = ViewRow::inert(role::BULLET, clip(item.body));
+            row.indent = nest(column_of(raw), &mut stack);
+            row.marker = item.marker;
+            row.check = item.check;
+            rows.push(row);
+            open = if hard_break(raw) {
+                None
+            } else {
+                Some(rows.len() - 1)
+            };
+            i += 1;
+            continue;
+        }
+
+        // An indented block is only code where there is nothing for it to be a
+        // continuation of; under an open list item the same indent means "still
+        // the same item".
+        if open.is_none() && stack.is_empty() && (raw.starts_with("    ") || raw.starts_with('\t'))
+        {
+            rows.push(ViewRow::inert(role::CODE, clip(raw.trim_end())));
+            i += 1;
+            continue;
+        }
+
+        if let Some(k) = open {
+            flow_into(&mut rows[k], trimmed);
+            if hard_break(raw) {
+                open = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        // Prose back at column 0 ends every open list: the indent that held the
+        // items nested is gone.
+        if column_of(raw) == 0 {
+            stack.clear();
+        }
+        rows.push(ViewRow::inert(role::PROSE, clip(trimmed)));
+        open = if hard_break(raw) {
+            None
         } else {
-            ViewRow::inert(role::LINE, clip(trimmed))
+            Some(rows.len() - 1)
         };
-        rows.push(row);
+        i += 1;
     }
-    // A fence that never closed still has a diagram in it worth drawing.
-    if let Some(src) = pending.take() {
-        rows.append(&mut diagram_rows(&src));
+
+    // Trailing air is the file's final newlines, not a block.
+    while rows.last().map(|r| r.role) == Some(role::SPACE) {
+        rows.pop();
     }
     if rows.is_empty() {
         rows.push(ViewRow::inert(role::NOTICE, "Empty file"));
@@ -377,8 +548,6 @@ pub fn markdown_blocks(file: &Path) -> Vec<ViewRow> {
     rows
 }
 
-/// `#`/`##`/`###+` → the matching heading row. `None` when the line is not a
-/// heading — including `#hashtag`, which needs the space ATX requires.
 /// Whether a fence's info string opens a mermaid block. Mermaid is only ever the
 /// first word — ```` ```mermaid {init: …} ```` is legal and still a diagram.
 fn is_mermaid(info: &str) -> bool {
@@ -388,12 +557,36 @@ fn is_mermaid(info: &str) -> bool {
         .is_some_and(|w| w.eq_ignore_ascii_case("mermaid"))
 }
 
+/// The opening line of a fenced block → its marker character and info string.
+/// A backtick fence's info string may not itself contain a backtick, which is
+/// what stops ``` `` `code` `` ``` from opening a block.
+fn fence_open(trimmed: &str) -> Option<(char, &str)> {
+    for mark in ['`', '~'] {
+        let run = trimmed.chars().take_while(|c| *c == mark).count();
+        if run >= 3 {
+            let info = &trimmed[run..];
+            if mark == '`' && info.contains('`') {
+                continue;
+            }
+            return Some((mark, info));
+        }
+    }
+    None
+}
+
+/// Whether `line` closes a fence opened with `mark`: the same character, three or
+/// more, and nothing else.
+fn fence_closes(line: &str, mark: char) -> bool {
+    let t = line.trim();
+    t.chars().take_while(|c| *c == mark).count() >= 3 && t.trim_start_matches(mark).trim().is_empty()
+}
+
 /// A mermaid fence body, as either one diagram row or the code block it was.
 ///
 /// Falling back to code is the whole point of the `Result`: mermaid has a dozen
-/// dialects and this renders two, so the unsupported case is the common case, not
-/// an error path. The reader gets the source plus a line saying why — which is
-/// strictly more than the preview showed before diagrams existed.
+/// dialects and this renders some of them, so the unsupported case is a normal
+/// outcome, not an error path. The reader gets the source plus a line saying why —
+/// which is strictly more than the preview showed before diagrams existed.
 fn diagram_rows(src: &[String]) -> Vec<ViewRow> {
     match crate::mermaid::render(&src.join("\n")) {
         Ok(d) => vec![ViewRow {
@@ -402,6 +595,7 @@ fn diagram_rows(src: &[String]) -> Vec<ViewRow> {
             detail: String::new(),
             path: PathBuf::new(),
             diagram: Some(Box::new(d)),
+            ..ViewRow::default()
         }],
         Err(why) => {
             let mut rows: Vec<ViewRow> = src
@@ -414,40 +608,273 @@ fn diagram_rows(src: &[String]) -> Vec<ViewRow> {
     }
 }
 
+/// `#`/`##`/`###+` → the matching heading row. `None` when the line is not a
+/// heading — including `#hashtag`, which needs the space ATX requires.
+///
+/// A heading's inline markers are stripped rather than kept, because a heading is
+/// drawn with a plain `Text`: it needs a font weight, and `StyledText` has no
+/// property for one.
 fn heading(trimmed: &str) -> Option<ViewRow> {
     let hashes = trimmed.chars().take_while(|c| *c == '#').count();
     if hashes == 0 || hashes > 6 {
         return None;
     }
     let rest = &trimmed[hashes..];
-    let body = rest.strip_prefix(' ')?;
+    let body = rest.strip_prefix(' ')?.trim();
+    // A closing run of `#` is chrome, but only when a space separates it — `# C#`
+    // is a heading about C#.
+    let body = {
+        let bare = body.trim_end_matches('#');
+        if bare.len() < body.len() && (bare.is_empty() || bare.ends_with(' ')) {
+            bare.trim_end()
+        } else {
+            body
+        }
+    };
     let r = match hashes {
         1 => role::H1,
         2 => role::H2,
         // `####` and deeper share H3's styling rather than disappearing.
         _ => role::H3,
     };
-    Some(ViewRow::inert(r, clip(body.trim())))
+    Some(ViewRow::inert(r, clip(&strip_inline(body))))
 }
 
-/// `- x` / `* x` / `+ x` / `1. x` → the item text.
-fn bullet(trimmed: &str) -> Option<&str> {
-    for m in ["- ", "* ", "+ "] {
-        if let Some(rest) = trimmed.strip_prefix(m) {
-            return Some(rest);
+/// A setext underline → the level it makes the paragraph above it. `=` is H1 and
+/// `-` is H2; two dashes are required so a lone `-` stays a list item.
+fn setext(trimmed: &str) -> Option<i32> {
+    let t = trimmed.trim_end();
+    if t.len() >= 1 && t.chars().all(|c| c == '=') {
+        return Some(role::H1);
+    }
+    if t.len() >= 2 && t.chars().all(|c| c == '-') {
+        return Some(role::H2);
+    }
+    None
+}
+
+/// One list item, taken apart.
+struct Item<'a> {
+    /// `"2."` for an ordered item, empty for an unordered one.
+    marker: String,
+    /// -1 none, 0 unchecked, 1 checked.
+    check: i32,
+    /// What is left after the marker and the task box.
+    body: &'a str,
+}
+
+/// `- x` / `* x` / `+ x` / `1. x` / `- [x] x` → the item, or `None`.
+fn list_item(trimmed: &str) -> Option<Item<'_>> {
+    let mut marker = String::new();
+    let rest = match ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|m| trimmed.strip_prefix(m))
+    {
+        Some(r) => r,
+        None => {
+            // An ordered item: digits, then `.` or `)`, then a space.
+            let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+            if digits == 0 || digits > 9 {
+                return None;
+            }
+            let after = &trimmed[digits..];
+            let r = [". ", ") "].iter().find_map(|m| after.strip_prefix(m))?;
+            marker = format!("{}.", &trimmed[..digits]);
+            r
+        }
+    };
+    let rest = rest.trim_start();
+    // The task box is the one inline construct that survives as data rather than
+    // as markup: it is drawn as a box, not typeset.
+    let (check, body) = if let Some(b) = rest.strip_prefix("[ ]") {
+        (0, b.strip_prefix(' ').unwrap_or(b))
+    } else if let Some(b) = rest
+        .strip_prefix("[x]")
+        .or_else(|| rest.strip_prefix("[X]"))
+    {
+        (1, b.strip_prefix(' ').unwrap_or(b))
+    } else {
+        (-1, rest)
+    };
+    Some(Item {
+        marker,
+        check,
+        body,
+    })
+}
+
+/// The nesting depth an item at column `lead` sits at, updating the open stack.
+/// Capped, because past six levels the text column is narrower than the indent
+/// leading to it.
+fn nest(lead: usize, stack: &mut Vec<usize>) -> i32 {
+    while stack.last().is_some_and(|&top| lead < top) {
+        stack.pop();
+    }
+    match stack.last() {
+        Some(&top) if lead > top => stack.push(lead),
+        None => stack.push(lead),
+        _ => {}
+    }
+    (stack.len() as i32 - 1).min(5)
+}
+
+/// The column a line's text starts at, tabs expanded to the next multiple of four.
+fn column_of(raw: &str) -> usize {
+    let mut n = 0;
+    for c in raw.chars() {
+        match c {
+            ' ' => n += 1,
+            '\t' => n += 4 - n % 4,
+            _ => break,
         }
     }
-    // An ordered item: digits, then `.` or `)`, then a space.
-    let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
-    if digits > 0 {
-        let rest = &trimmed[digits..];
-        for m in [". ", ") "] {
-            if let Some(r) = rest.strip_prefix(m) {
-                return Some(r);
+    n
+}
+
+/// Whether the line asked for a break rather than for the next line to flow into
+/// it: markdown's two trailing spaces, or a trailing backslash.
+fn hard_break(raw: &str) -> bool {
+    raw.ends_with("  ") || raw.ends_with('\\')
+}
+
+/// Append a continuation line to an open block. Joined with a space, not a
+/// newline, because the row is one wrapped paragraph and the renderer decides
+/// where it breaks.
+fn flow_into(row: &mut ViewRow, more: &str) {
+    if row.text.chars().count() >= MAX_LINE_CHARS {
+        return;
+    }
+    if !row.text.is_empty() {
+        row.text.push(' ');
+    }
+    row.text.push_str(more.trim_end());
+    if row.text.chars().count() > MAX_LINE_CHARS {
+        row.text = clip(&row.text);
+    }
+}
+
+/// `| a | b |` over `|---|:--:|` → one alignment per column, or `None`.
+///
+/// Both lines have to agree on the column count. That is what stops a paragraph
+/// that happens to contain a pipe from eating the line under it.
+fn table_at(head: &str, delim: &str) -> Option<Vec<i32>> {
+    let delim = delim.strip_suffix('\r').unwrap_or(delim);
+    if !head.contains('|') || !delim.contains('|') {
+        return None;
+    }
+    let cols: Vec<i32> = split_cells(delim)
+        .iter()
+        .map(|c| {
+            let (left, right) = (c.starts_with(':'), c.ends_with(':'));
+            let dashes = c.trim_matches(':');
+            if dashes.is_empty() || !dashes.chars().all(|ch| ch == '-') {
+                return -1;
+            }
+            match (left, right) {
+                (true, true) => 1,
+                (false, true) => 2,
+                _ => 0,
+            }
+        })
+        .collect();
+    if cols.is_empty() || cols.iter().any(|&a| a < 0) || split_cells(head).len() != cols.len() {
+        return None;
+    }
+    Some(cols)
+}
+
+/// The cells of one table line: split on `|`, with the optional leading and
+/// trailing fence dropped. An escaped `\|` stays inside its cell.
+fn split_cells(line: &str) -> Vec<String> {
+    let mut cells = vec![String::new()];
+    let mut esc = false;
+    for c in line.trim().chars() {
+        let cur = cells.last_mut().expect("never emptied");
+        if esc {
+            if c != '|' {
+                cur.push('\\');
+            }
+            cur.push(c);
+            esc = false;
+        } else if c == '\\' {
+            esc = true;
+        } else if c == '|' {
+            cells.push(String::new());
+        } else {
+            cur.push(c);
+        }
+    }
+    if cells.first().is_some_and(|c| c.is_empty()) {
+        cells.remove(0);
+    }
+    if cells.len() > 1 && cells.last().is_some_and(|c| c.trim().is_empty()) {
+        cells.pop();
+    }
+    cells.iter().map(|c| c.trim().to_string()).collect()
+}
+
+/// One table line as a row. Short lines are padded and long ones truncated to the
+/// header's column count, so every row in a table has the same shape.
+fn table_row(role: i32, cells: &[String], aligns: &[i32]) -> ViewRow {
+    let mut row = ViewRow::inert(role, "");
+    row.cells = aligns
+        .iter()
+        .enumerate()
+        .map(|(i, &align)| TableCell {
+            text: clip(cells.get(i).map(String::as_str).unwrap_or("")),
+            align,
+        })
+        .collect();
+    row
+}
+
+/// Inline markdown reduced to the words it was wrapping. Used only where the row
+/// is drawn with a plain `Text` instead of Slint's `StyledText` — headings, which
+/// need the font weight `StyledText` has no property for.
+fn strip_inline(src: &str) -> String {
+    let ch: Vec<char> = src.chars().collect();
+    let mut out = String::with_capacity(src.len());
+    let mut i = 0;
+    while i < ch.len() {
+        match ch[i] {
+            '\\' if ch.get(i + 1).is_some_and(|c| c.is_ascii_punctuation()) => {
+                out.push(ch[i + 1]);
+                i += 2;
+            }
+            '`' | '*' => i += 1,
+            '~' if ch.get(i + 1) == Some(&'~') => i += 2,
+            // `_` only at a word edge: snake_case is a word, not emphasis.
+            '_' if !(i > 0
+                && ch[i - 1].is_alphanumeric()
+                && ch.get(i + 1).is_some_and(|c| c.is_alphanumeric())) =>
+            {
+                i += 1
+            }
+            // `[text](url)` and `[text][ref]` keep the text and drop the target.
+            '[' => i += 1,
+            '!' if ch.get(i + 1) == Some(&'[') => i += 1,
+            ']' => {
+                i += 1;
+                let close = match ch.get(i) {
+                    Some('(') => Some(')'),
+                    Some('[') => Some(']'),
+                    _ => None,
+                };
+                if let Some(close) = close {
+                    i += 1;
+                    while i < ch.len() && ch[i] != close {
+                        i += 1;
+                    }
+                    i += usize::from(i < ch.len());
+                }
+            }
+            c => {
+                out.push(c);
+                i += 1;
             }
         }
     }
-    None
+    out.trim().to_string()
 }
 
 /// `---`, `***`, `___` (three or more, nothing else on the line).
@@ -662,6 +1089,19 @@ fn diagram_model(d: &crate::mermaid::Diagram) -> PaneDiagram {
     }
 }
 
+/// Whether a role's text is a wrapping run of inline markdown. These are the
+/// rows the view hands to `StyledText`; every other role is either verbatim
+/// (a viewer line, a code line) or drawn (a rule, a diagram, air).
+fn flows(role: i32) -> bool {
+    matches!(role, role::PROSE | role::BULLET | role::QUOTE)
+}
+
+/// Inline markdown for the view. A source that will not parse still has to be
+/// readable, so it falls back to itself as plain text rather than vanishing.
+fn markdown_text(src: &str) -> slint::StyledText {
+    slint::StyledText::from_markdown(src).unwrap_or_else(|_| slint::StyledText::from_plain_text(src))
+}
+
 pub fn model_for(uid: &str, kind: &PaneKind, target: Option<&str>) -> ModelRc<PaneViewRow> {
     let fp = fingerprint(kind, target);
     VIEW_CACHE.with(|c| {
@@ -676,6 +1116,11 @@ pub fn model_for(uid: &str, kind: &PaneKind, target: Option<&str>) -> ModelRc<Pa
         // a fresh empty pair for each of 5,000 plain rows is 10,000 allocations to
         // say "no diagram here".
         let blank = blank_diagram();
+        // Same economy for the two fields only markdown uses: parsing 5,000 lines
+        // of a source file as inline markdown would mangle its `*`s and cost a
+        // full parse per row to do it.
+        let no_md = slint::StyledText::default();
+        let no_cells: ModelRc<PaneCell> = ModelRc::from(Rc::new(VecModel::from(Vec::<PaneCell>::new())));
         let model: ModelRc<PaneViewRow> = ModelRc::from(Rc::new(VecModel::from(
             rows.iter()
                 .map(|r| PaneViewRow {
@@ -686,6 +1131,27 @@ pub fn model_for(uid: &str, kind: &PaneKind, target: Option<&str>) -> ModelRc<Pa
                     diagram: match &r.diagram {
                         Some(d) => diagram_model(d),
                         None => blank.clone(),
+                    },
+                    md: if flows(r.role) {
+                        markdown_text(&r.text)
+                    } else {
+                        no_md.clone()
+                    },
+                    indent: r.indent,
+                    marker: r.marker.as_str().into(),
+                    check: r.check,
+                    cells: if r.cells.is_empty() {
+                        no_cells.clone()
+                    } else {
+                        ModelRc::from(Rc::new(VecModel::from(
+                            r.cells
+                                .iter()
+                                .map(|c| PaneCell {
+                                    md: markdown_text(&c.text),
+                                    align: c.align,
+                                })
+                                .collect::<Vec<_>>(),
+                        )))
                     },
                 })
                 .collect::<Vec<_>>(),
@@ -850,6 +1316,7 @@ mod tests {
              ## Sub\n\
              #### Deep\n\
              #nothashtag\n\
+             \n\
              plain text\n\
              - first\n\
              2. second\n\
@@ -867,14 +1334,19 @@ mod tests {
                 // `####` shares H3 rather than vanishing.
                 (role::H3, "Deep"),
                 // ATX needs the space, so this is prose.
-                (role::LINE, "#nothashtag"),
-                (role::LINE, "plain text"),
+                (role::PROSE, "#nothashtag"),
+                (role::SPACE, ""),
+                (role::PROSE, "plain text"),
                 (role::BULLET, "first"),
                 (role::BULLET, "second"),
                 (role::QUOTE, "quoted"),
                 (role::RULE, ""),
             ]
         );
+        // The ordinal is the author's, kept verbatim: a list that renumbers itself
+        // 1, 2, 3 when the author wrote 2, 3, 4 misquotes the document.
+        assert_eq!(blocks[6].marker, "");
+        assert_eq!(blocks[7].marker, "2.");
     }
 
     #[test]
@@ -891,11 +1363,193 @@ mod tests {
         assert_eq!(
             got,
             vec![
-                (role::LINE, "before".into()),
+                (role::PROSE, "before".into()),
                 // the fence lines themselves are dropped, their contents stay verbatim
                 (role::CODE, "# not a heading".into()),
                 (role::CODE, "- not a bullet".into()),
-                (role::LINE, "after".into()),
+                (role::PROSE, "after".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_paragraph_is_one_row_however_many_lines_it_was_typed_on() {
+        let d = scratch("flow");
+        let f = write(
+            &d,
+            "doc.md",
+            "one\ntwo\nthree\n\nnext para\n",
+        );
+
+        let rows = markdown_blocks(&f);
+        let got: Vec<(i32, &str)> = rows.iter().map(|r| (r.role, r.text.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                // Joined with a space, not a newline: the row is one wrapping unit
+                // and the renderer decides where it breaks.
+                (role::PROSE, "one two three"),
+                (role::SPACE, ""),
+                (role::PROSE, "next para"),
+            ]
+        );
+    }
+
+    #[test]
+    fn two_trailing_spaces_break_the_line_instead_of_flowing_into_it() {
+        let d = scratch("hardbreak");
+        let f = write(&d, "doc.md", "first  \nsecond\n");
+
+        let rows = markdown_blocks(&f);
+        let got: Vec<&str> = rows.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(got, vec!["first", "second"]);
+        assert!(rows.iter().all(|r| r.role == role::PROSE));
+    }
+
+    #[test]
+    fn a_run_of_blank_lines_is_one_gap_not_five() {
+        let d = scratch("air");
+        let f = write(&d, "doc.md", "a\n\n\n\n\nb\n\n\n");
+
+        let rows = markdown_blocks(&f);
+        let got: Vec<i32> = rows.iter().map(|r| r.role).collect();
+        // And the trailing newlines leave nothing: they are the file ending, not
+        // a block.
+        assert_eq!(got, vec![role::PROSE, role::SPACE, role::PROSE]);
+    }
+
+    #[test]
+    fn a_setext_underline_retitles_the_paragraph_above_it() {
+        let d = scratch("setext");
+        let f = write(&d, "doc.md", "Big\n===\n\nSmall\n---\n\nalone\n\n---\n");
+
+        let rows = markdown_blocks(&f);
+        let got: Vec<(i32, &str)> = rows.iter().map(|r| (r.role, r.text.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (role::H1, "Big"),
+                (role::SPACE, ""),
+                (role::H2, "Small"),
+                (role::SPACE, ""),
+                (role::PROSE, "alone"),
+                (role::SPACE, ""),
+                // With a blank line between, the dashes are a rule again.
+                (role::RULE, ""),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_nested_list_keeps_its_depth_and_its_task_boxes() {
+        let d = scratch("nested");
+        let f = write(
+            &d,
+            "doc.md",
+            "- top\n  - under\n    - deeper\n  - back\n- [ ] todo\n- [x] done\n",
+        );
+
+        let rows = markdown_blocks(&f);
+        assert!(rows.iter().all(|r| r.role == role::BULLET));
+        let got: Vec<(i32, i32, &str)> = rows
+            .iter()
+            .map(|r| (r.indent, r.check, r.text.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (0, -1, "top"),
+                (1, -1, "under"),
+                (2, -1, "deeper"),
+                // The stack pops back rather than counting a fourth level.
+                (1, -1, "back"),
+                (0, 0, "todo"),
+                (0, 1, "done"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_table_becomes_rows_of_aligned_cells() {
+        let d = scratch("table");
+        let f = write(
+            &d,
+            "doc.md",
+            "| name | qty | cost |\n|:--|:--:|--:|\n| bolt | 4 | 1.20 |\n| nut | 12 |\n\nafter\n",
+        );
+
+        let rows = markdown_blocks(&f);
+        let got: Vec<i32> = rows.iter().map(|r| r.role).collect();
+        assert_eq!(
+            got,
+            vec![
+                role::TABLE_HEAD,
+                role::TABLE_ROW,
+                role::TABLE_ROW,
+                role::SPACE,
+                role::PROSE,
+            ]
+        );
+        let aligns: Vec<i32> = rows[0].cells.iter().map(|c| c.align).collect();
+        assert_eq!(aligns, vec![0, 1, 2]);
+        let head: Vec<&str> = rows[0].cells.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(head, vec!["name", "qty", "cost"]);
+        // A short row is padded to the header's shape, so the columns still line up.
+        let short: Vec<&str> = rows[2].cells.iter().map(|c| c.text.as_str()).collect();
+        assert_eq!(short, vec!["nut", "12", ""]);
+    }
+
+    #[test]
+    fn a_paragraph_with_a_pipe_in_it_is_not_a_table() {
+        let d = scratch("pipe");
+        let f = write(&d, "doc.md", "a | b\nnot a delimiter\n");
+
+        let rows = markdown_blocks(&f);
+        assert!(rows.iter().all(|r| r.role == role::PROSE));
+    }
+
+    #[test]
+    fn a_heading_keeps_its_words_and_loses_its_markers() {
+        let d = scratch("inline");
+        let f = write(
+            &d,
+            "doc.md",
+            "# A **bold** `word` ##\n\nkeep **these** markers\n",
+        );
+
+        let rows = markdown_blocks(&f);
+        // Stripped, because a heading is drawn with a plain Text: it needs a font
+        // weight, and StyledText has no property for one.
+        assert_eq!(rows[0].role, role::H1);
+        assert_eq!(rows[0].text, "A bold word");
+        // Prose keeps them: they are the renderer's input, not ours.
+        assert_eq!(rows[2].text, "keep **these** markers");
+    }
+
+    #[test]
+    fn inline_markers_come_off_without_taking_the_words_with_them() {
+        // snake_case is a word, not emphasis; a link keeps its text and drops its
+        // target; an escape yields the character it was hiding.
+        assert_eq!(strip_inline("a *b* _c_ `d`"), "a b c d");
+        assert_eq!(strip_inline("call some_long_name now"), "call some_long_name now");
+        assert_eq!(strip_inline("see [the docs](http://x/y) here"), "see the docs here");
+        assert_eq!(strip_inline("see [the docs][ref]"), "see the docs");
+        assert_eq!(strip_inline("~~gone~~ and \\*kept\\*"), "gone and *kept*");
+    }
+
+    #[test]
+    fn a_tilde_fence_closes_on_tildes_and_ignores_backticks() {
+        let d = scratch("tilde");
+        let f = write(&d, "doc.md", "~~~\n```\nstill code\n~~~\nout\n");
+
+        let rows = markdown_blocks(&f);
+        let got: Vec<(i32, &str)> = rows.iter().map(|r| (r.role, r.text.as_str())).collect();
+        assert_eq!(
+            got,
+            vec![
+                (role::CODE, "```"),
+                (role::CODE, "still code"),
+                (role::PROSE, "out"),
             ]
         );
     }
@@ -911,7 +1565,7 @@ mod tests {
 
         let rows = markdown_blocks(&f);
         let got: Vec<i32> = rows.iter().map(|r| r.role).collect();
-        assert_eq!(got, vec![role::LINE, role::DIAGRAM, role::LINE]);
+        assert_eq!(got, vec![role::PROSE, role::DIAGRAM, role::PROSE]);
         let dg = rows[1].diagram.as_ref().expect("the row carries its geometry");
         assert_eq!(dg.nodes.len(), 2);
         assert!(dg.w > 0.0 && dg.h > 0.0);
@@ -926,16 +1580,16 @@ mod tests {
         let f = write(
             &d,
             "doc.md",
-            "```mermaid\nclassDiagram\n  Animal <|-- Duck\n```\n",
+            "```mermaid\ngantt\n  title Roadmap\n```\n",
         );
 
         let rows = markdown_blocks(&f);
         assert!(!rows.iter().any(|r| r.role == role::DIAGRAM));
         assert_eq!(rows[0].role, role::CODE);
-        assert_eq!(rows[0].text, "classDiagram");
+        assert_eq!(rows[0].text, "gantt");
         let last = rows.last().unwrap();
         assert_eq!(last.role, role::NOTICE);
-        assert!(last.text.starts_with("mermaid: class"), "{}", last.text);
+        assert!(last.text.starts_with("mermaid: gantt"), "{}", last.text);
     }
 
     #[test]

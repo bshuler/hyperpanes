@@ -18,6 +18,9 @@ export global Theme {
     out property <color> danger: #e5484d;     // window close hover
     out property <color> ok: #a6e3a1;         // a finished/healthy state (agent liveness)
     out property <color> warn: #f9e2af;       // a state wanting attention (agent awaiting input)
+    // A link inside rendered markdown. Distinct from `accent`, which headings
+    // already use — a heading that looks clickable is a lie.
+    out property <color> link: #94e2d5;
     out property <color> scrim: #0000008c;
 
     // ---- aliases kept for the rest of the UI (paneview/app) ----

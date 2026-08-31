@@ -297,6 +297,8 @@ export component PaneView inherits Rectangle {
     // the same one it handed to the view — a stale index can only miss, never open the
     // wrong path.
     callback pane-view-activate(int, int);
+    // A markdown link clicked inside a view pane: the pane index and the href.
+    callback pane-view-link(int, string);
     // Wave-2 overlay callbacks (each maps to a Command in the controller).
     callback palette-query(string);
     callback palette-nav(int);
@@ -671,6 +673,10 @@ export component PaneView inherits Rectangle {
                         activate(i) => {
                             root.focus-pane(idx);
                             root.pane-view-activate(idx, i);
+                        }
+                        link-clicked(l) => {
+                            root.focus-pane(idx);
+                            root.pane-view-link(idx, l);
                         }
                     }
                     }

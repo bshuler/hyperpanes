@@ -51,6 +51,13 @@ export struct PaneDiagram {
     diamonds: string,
 }
 
+// One cell of a markdown table. `align` is what the `|:--:|` row asked for:
+// 0 left, 1 centre, 2 right.
+export struct PaneCell {
+    md: styled-text,
+    align: int,
+}
+
 export struct PaneViewRow {
     role: int,
     text: string,
@@ -62,6 +69,19 @@ export struct PaneViewRow {
     activatable: bool,
     // Only meaningful when role == 12; empty (w == 0) on every other row.
     diagram: PaneDiagram,
+    // `text` again, with its inline markup parsed — bold, code, links. Built in
+    // Rust, because a `string` bound to a styled-text property is *escaped*, not
+    // parsed. Empty on every role that is verbatim rather than prose.
+    md: styled-text,
+    // List nesting depth, 0 at the top level. role == 8 only.
+    indent: int,
+    // An ordered item's own number, "2." — empty for an unordered one, which the
+    // view draws as a dot.
+    marker: string,
+    // A task box: -1 none, 0 unchecked, 1 checked.
+    check: int,
+    // role == 13 (header) and role == 14 (body) only; empty elsewhere.
+    cells: [PaneCell],
 }
 
 // One tiled pane: the rendered terminal surface + its placement + chrome state.
