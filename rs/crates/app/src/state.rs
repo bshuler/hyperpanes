@@ -6419,10 +6419,7 @@ impl State {
             font_dirty: false,
             // Restored view panes get their target back the same way (2); a restored pty pane
             // re-learns its cwd from the shell it just respawned.
-            cwd: is_view
-                .then(|| spec.cwd.clone())
-                .flatten()
-                .or(resume_cwd),
+            cwd: is_view.then(|| spec.cwd.clone()).flatten().or(resume_cwd),
             env: None,
             // The resolved shell program → its short header badge (computed once here);
             // suppressed for a view pane for the same reason as in `make_pane`.
@@ -9103,7 +9100,10 @@ mod git_mode {
         set_cwd(&mut st, &a);
         st.sync_left_root(LEFT_MODE_FILES);
         let root_a = st.files_root.clone().expect("rooted on the selected pane");
-        assert!(root_a.ends_with("a"), "rooted at {root_a:?}, wanted the a repo");
+        assert!(
+            root_a.ends_with("a"),
+            "rooted at {root_a:?}, wanted the a repo"
+        );
 
         // A cd deeper into the SAME repository derives the same root: expansions survive.
         st.files_expanded.insert(a.join("sub"));

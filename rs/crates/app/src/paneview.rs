@@ -24,9 +24,9 @@ use crate::theme;
 use crate::{
     AppWindow, ClaudeSessionItem, CtxTab, DividerItem, FramePaletteOption, HiRect, KeybindingItem,
     LayoutOption, LeftFileRow, LeftGitRow, LeftModeRow, LeftPaneRow, LeftPanelAdapter,
-    LeftSessionItem,
-    LeftSessionRow, LeftSetRow, LeftTabRow, LeftWorkspaceRow, MenuEntry, PaletteItem, PaneItem,
-    PaneViewRow, PrefBrowserRow, PrefOption, PrefToolRow, ProjectItem, TabItem, WorktreeRow,
+    LeftSessionItem, LeftSessionRow, LeftSetRow, LeftTabRow, LeftWorkspaceRow, MenuEntry,
+    PaletteItem, PaneItem, PaneViewRow, PrefBrowserRow, PrefOption, PrefToolRow, ProjectItem,
+    TabItem, WorktreeRow,
 };
 
 /// Thickness (logical px) of the draggable divider hit-area.
@@ -1329,12 +1329,20 @@ pub fn resync(
                 // The counts are formatted here, not concatenated in Slint: the panel draws
                 // strings, exactly as it does for `head_summary`.
                 lp.set_git_staged_title(
-                    format!("{} · {}", crate::gitpanel::Section::Staged.title(), staged.len())
-                        .into(),
+                    format!(
+                        "{} · {}",
+                        crate::gitpanel::Section::Staged.title(),
+                        staged.len()
+                    )
+                    .into(),
                 );
                 lp.set_git_changed_title(
-                    format!("{} · {}", crate::gitpanel::Section::Changed.title(), changed.len())
-                        .into(),
+                    format!(
+                        "{} · {}",
+                        crate::gitpanel::Section::Changed.title(),
+                        changed.len()
+                    )
+                    .into(),
                 );
                 lp.set_git_untracked_title(
                     format!(
@@ -1965,7 +1973,11 @@ mod pty_resize_tests {
         }
 
         // Still inside the settle window: nothing goes out, however many ticks run.
-        flush_pty_resizes(&mut st, &m, start + PTY_RESIZE_SETTLE - Duration::from_millis(1));
+        flush_pty_resizes(
+            &mut st,
+            &m,
+            start + PTY_RESIZE_SETTLE - Duration::from_millis(1),
+        );
         assert_eq!(
             st.active_tab().panes[0].pty,
             (47, 18),
