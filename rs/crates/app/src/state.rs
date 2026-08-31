@@ -497,6 +497,159 @@ pub struct NewPaneOpts {
     pub session: Option<String>,
 }
 
+/// Where the process was launched from, pinned once at startup by [`pin_launch_dir`].
+///
+/// `std::env::current_dir()` is not a stable answer later in the run: anything in-process may
+/// `set_current_dir`, and on macOS a bundle launched from Finder/launchd reports `/`. Pinning
+/// it at `main` entry keeps "the directory the app was started in" meaning exactly that.
+static LAUNCH_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+
+/// Record the process's launch directory. Called once from `main` before anything can `cd`.
+///
+/// The filesystem ROOT is deliberately rejected rather than stored: a double-clicked macOS
+/// bundle (and a launchd-started process on Linux) reports `/`, which *is* a directory and so
+/// would silently win over `$HOME` in [`State::resolve_new_pane_cwd`] — every new pane would
+/// open on the whole disk. A `None` here simply moves the decision on to the next candidate.
+pub fn pin_launch_dir() {
+    let _ = LAUNCH_DIR.get_or_init(|| {
+        std::env::current_dir()
+            .ok()
+            .filter(|d| d.parent().is_some())
+            .filter(|d| d.is_dir())
+    });
+}
+
+/// The pinned launch directory, or `None` when it was the filesystem root / unreadable / the
+/// pin never ran (tests, headless tools — the caller then falls through to `$HOME`).
+fn launch_dir() -> Option<String> {
+    LAUNCH_DIR
+        .get()
+        .and_then(|d| d.as_ref())
+        .map(|d| d.to_string_lossy().into_owned())
+}
+
+/// The first candidate that names a directory that actually exists.
+///
+/// Ordering alone is not enough: a pane's remembered cwd, a workspace anchor and a launch
+/// directory all outlive the directory they point at (a deleted worktree, an unmounted
+/// volume, a project moved on disk). Handing such a path to a pty does not fail loudly — the
+/// shell dies during `chdir` with no output, and the pane just sits there empty. So each
+/// candidate is stat'd and a dead one is SKIPPED, not used and not fatal.
+///
+/// Empty strings are treated as "not set" because that is how they arrive: Slint string
+/// properties and the workspace JSON both default to `""` rather than to null.
+fn first_existing_dir<I, S>(candidates: I) -> Option<String>
+where
+    I: IntoIterator<Item = Option<S>>,
+    S: AsRef<str>,
+{
+    candidates.into_iter().flatten().find_map(|c| {
+        let c = c.as_ref();
+        (!c.is_empty() && Path::new(c).is_dir()).then(|| c.to_string())
+    })
+}
+
+#[cfg(test)]
+mod new_pane_cwd_tests {
+    use super::{first_existing_dir, PaneKind, State};
+
+    /// A scratch tree of real directories — the resolver stats every candidate, so the test
+    /// has to hand it paths that exist (and one that provably does not).
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("hp-pane-cwd-{}-{tag}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[test]
+    fn explicit_cwd_wins_over_every_fallback() {
+        let a = scratch("explicit-a");
+        let b = scratch("explicit-b");
+        let got = first_existing_dir(vec![
+            Some(a.to_string_lossy().into_owned()),
+            Some(b.to_string_lossy().into_owned()),
+        ]);
+        assert_eq!(got.as_deref(), Some(a.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn empty_and_none_candidates_are_not_set() {
+        let a = scratch("empty-skip");
+        let got = first_existing_dir(vec![
+            None,
+            Some(String::new()),
+            Some(a.to_string_lossy().into_owned()),
+        ]);
+        assert_eq!(got.as_deref(), Some(a.to_string_lossy().as_ref()));
+    }
+
+    /// The whole point of stat'ing: a stale anchor must fall THROUGH to the next candidate
+    /// instead of being handed to the pty, where it would kill the shell silently.
+    #[test]
+    fn a_candidate_that_does_not_exist_is_skipped() {
+        let gone = scratch("gone").join("no-such-subdir");
+        let a = scratch("skip-to");
+        let got = first_existing_dir(vec![
+            Some(gone.to_string_lossy().into_owned()),
+            Some(a.to_string_lossy().into_owned()),
+        ]);
+        assert_eq!(got.as_deref(), Some(a.to_string_lossy().as_ref()));
+    }
+
+    /// A file is not a directory — `chdir` fails on it exactly like a missing path.
+    #[test]
+    fn a_file_is_not_a_usable_cwd() {
+        let dir = scratch("file-candidate");
+        let file = dir.join("not-a-dir");
+        std::fs::write(&file, b"x").expect("scratch file");
+        let got = first_existing_dir(vec![
+            Some(file.to_string_lossy().into_owned()),
+            Some(dir.to_string_lossy().into_owned()),
+        ]);
+        assert_eq!(got.as_deref(), Some(dir.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn no_usable_candidate_yields_none() {
+        let gone = scratch("all-dead").join("nope");
+        let got = first_existing_dir(vec![Some(gone.to_string_lossy().into_owned()), None]);
+        assert_eq!(got, None);
+    }
+
+    /// Why [`State::resolve_new_pane_cwd`] takes a kind at all. A view pane's `cwd` is the
+    /// FILE it is pointed at, not a directory to start a shell in, and it is what the
+    /// workspace snapshot round-trips as that pane's target. Stat'ing it as a directory
+    /// fails, and the pane silently falls through to the focused terminal's directory — a
+    /// restored workspace comes back showing the wrong file (or the containing folder).
+    #[test]
+    fn a_view_panes_file_target_is_not_treated_as_a_directory() {
+        let dir = scratch("view-target");
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, b"x").expect("scratch file");
+        let target = file.to_string_lossy().into_owned();
+        let st = State::new(crate::theme::load_font(1.0));
+        for kind in [
+            PaneKind::FileViewer,
+            PaneKind::Markdown,
+            PaneKind::FileBrowser,
+        ] {
+            assert_eq!(
+                st.resolve_new_pane_cwd(&kind, Some(target.clone()))
+                    .as_deref(),
+                Some(target.as_str()),
+                "{kind:?} lost its target"
+            );
+        }
+        // The pty side is unchanged by the gate: nothing can `chdir` into a file, so a
+        // terminal handed the same path still falls through rather than spawning into it.
+        assert_ne!(
+            st.resolve_new_pane_cwd(&PaneKind::Terminal, Some(target.clone()))
+                .as_deref(),
+            Some(target.as_str())
+        );
+    }
+}
+
 /// The in-dialog draft of the **appearance** settings. While Preferences is open these edit
 /// the draft only — the live panes don't change until Done (mirrors the renderer's
 /// `AppearanceDraft`). General/Terminal settings (shell, clickable paths, editor) are not
@@ -1389,6 +1542,55 @@ impl State {
         }
     }
 
+    /// Decide where a pane's shell starts, in one place, in a fixed order.
+    ///
+    /// A terminal that opens in `$HOME` when the app was started in a project is the single
+    /// most-reported papercut here, and it happened because nobody DECIDED: `SpawnOptions.cwd`
+    /// was left `None` and [`hyperpanes_core::session_manager`]'s pty-layer safety net picked
+    /// `$HOME` — which is the right last resort but the wrong first answer. The order below is
+    /// the intent, most-specific first:
+    ///
+    /// 1. `explicit` — a cwd the caller already knows (the New-pane dialog, a workspace spec, a
+    ///    restored pane). It is never second-guessed: a restored pane must come back where it
+    ///    was, not where the window happens to be pointed now.
+    /// 2. the focused pane's live cwd in this tab — "open another pane HERE" is what splitting
+    ///    a terminal means, and the focused pane is the one the human is looking at.
+    /// 3. the project the left panel is anchored to ([`State::files_root`] — the same anchor
+    ///    FILES and GIT draw, deliberately reused so there is ONE notion of "this window's
+    ///    project" rather than a second one that can disagree with what is on screen).
+    /// 4. the directory the process was launched from ([`launch_dir`]), so `cd project &&
+    ///    hyperpanes` opens in `project`.
+    /// 5. `$HOME`, and finally `None` — at which point the pty layer's own fallback runs.
+    ///
+    /// Every candidate is stat'd by [`first_existing_dir`]; a stale one is skipped rather than
+    /// handed to the pty, where a failed `chdir` kills the shell with no visible error.
+    ///
+    /// `kind` is not decoration. A NON-pty pane's `cwd` is not a working directory at all — it
+    /// is the FILE the viewer or the markdown renderer is pointed at (`/tmp/notes.txt`), and it
+    /// is what the snapshot round-trips as that pane's target. Running it through the directory
+    /// stat below would reject it and silently retarget the pane at whatever directory the
+    /// focused terminal happens to be sitting in, so a restored workspace came back showing the
+    /// wrong file. Nothing chdirs for a view pane, so there is no pty to protect: its target is
+    /// taken exactly as given.
+    fn resolve_new_pane_cwd(&self, kind: &PaneKind, explicit: Option<String>) -> Option<String> {
+        let explicit = explicit.filter(|c| !c.is_empty());
+        if !kind.is_pty() {
+            return explicit;
+        }
+        let home = std::env::var("HOME")
+            .ok()
+            .or_else(|| std::env::var("USERPROFILE").ok());
+        first_existing_dir(vec![
+            explicit,
+            self.focused_cwd(),
+            self.files_root
+                .as_ref()
+                .map(|r| r.to_string_lossy().into_owned()),
+            launch_dir(),
+            home,
+        ])
+    }
+
     fn make_pane(
         &mut self,
         mgr: &SessionManager,
@@ -1396,8 +1598,22 @@ impl State {
         opts: NewPaneOpts,
     ) -> Option<PaneState> {
         let palette = self.settings.frame_palette;
-        let cwd = opts.cwd.filter(|c| !c.is_empty());
         let accent = opts.accent;
+        // A command to run instead of an interactive shell ("" → interactive).
+        let command = opts.command.filter(|c| !c.is_empty());
+        // What this pane IS is decided before anything else, because it decides three
+        // questions below: which uid scheme, whether a pty is spawned at all (D3), and
+        // whether `cwd` is a directory to start a shell in or a file to point a viewer at.
+        // An explicit kind wins; otherwise the program we were asked to run names it.
+        let kind = opts.kind.clone().unwrap_or_else(|| {
+            command
+                .as_deref()
+                .map(PaneKind::for_command)
+                .unwrap_or_default()
+        });
+        // Resolved once, here, so the pane's own record and the pty spawn below agree on
+        // where it started (the relaunch snapshot reads it back off the pane).
+        let cwd = self.resolve_new_pane_cwd(&kind, opts.cwd);
         // The conversation this pane is being opened into, when the caller knew one. Built
         // here, before `cwd` is moved into the pane, because the mark is the id AND the
         // directory it belongs to — every provider-backed tool keys resume off both.
@@ -1406,17 +1622,6 @@ impl State {
             .as_deref()
             .zip(cwd.as_deref())
             .and_then(|(id, dir)| ToolSessionMark::new(id, dir));
-        // A command to run instead of an interactive shell ("" → interactive).
-        let command = opts.command.filter(|c| !c.is_empty());
-        // What this pane IS is decided before anything else, because it decides the two
-        // questions below: which uid scheme, and whether a pty is spawned at all (D3).
-        // An explicit kind wins; otherwise the program we were asked to run names it.
-        let kind = opts.kind.clone().unwrap_or_else(|| {
-            command
-                .as_deref()
-                .map(PaneKind::for_command)
-                .unwrap_or_default()
-        });
         // Mint via the backend so a daemon-backed pane gets a cross-run-unique uid (it may
         // outlive this GUI run and be re-attached by uid next launch); in-process keeps the
         // `pane-N` form. See `SessionManager::fresh_uid` / the plan's "uid stability".
@@ -6026,6 +6231,13 @@ impl State {
                 }
             }
         }
+
+        // Same resolution order as a hand-made pane, with one difference that matters: a
+        // RESTORED pane already carries its own cwd (from the snapshot, or forced above by a
+        // tool resume), and that always wins — a workspace that comes back in the wrong
+        // directory loses the `--resume` project along with it. Only a spec that never had one
+        // falls through to the focused pane / project anchor / launch dir.
+        let spawn_cwd = self.resolve_new_pane_cwd(&kind, spawn_cwd);
 
         // A survivor's grid is born at the size the DAEMON says its pty has, not at
         // `spawn_cells()`'s 80x24 guess. The replay we are about to feed it is the raw pty

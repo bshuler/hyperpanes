@@ -310,6 +310,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     perf::init();
     perf::mark("main: enter");
 
+    // Pin the launch directory before ANY mode below can `set_current_dir` (the workspace
+    // resolver, a tool spawn, the crash reporter). `state::resolve_new_pane_cwd` uses it as
+    // the fallback that makes `cd project && hyperpanes` open its terminals in `project`
+    // instead of `$HOME`, and that only means anything if it is read at process entry.
+    state::pin_launch_dir();
+
     // `--help`/`--version`: handled before ANY other mode, including the single-instance gate
     // (~line 358 pre-fix), which would otherwise silently forward these to a running primary
     // and exit 0 without printing anything (the original defect).
