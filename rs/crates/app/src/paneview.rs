@@ -1117,6 +1117,11 @@ pub fn resync(
                         .enumerate()
                         .map(|(pi, p)| {
                             let last = mgr.last_output_at(&p.uid);
+                            // The tree's mark comes off the EFFECTIVE kind, the same merged
+                            // identity the header's mark is drawn from (the pane's own kind,
+                            // or the OSC-title sniff when it is a plain terminal), so the two
+                            // views of one pane can never disagree about what it is running.
+                            let kind = state.effective_kind(p);
                             LeftPaneRow {
                                 uid: p.uid.as_str().into(),
                                 title: p.title.clone(),
@@ -1130,6 +1135,8 @@ pub fn resync(
                                     idle_on,
                                     idle_threshold_ms,
                                 ),
+                                mark: crate::leftpanel::pane_mark_kind(&kind),
+                                brand: crate::leftpanel::pane_mark_ink(&kind, p.accent),
                             }
                         })
                         .collect();

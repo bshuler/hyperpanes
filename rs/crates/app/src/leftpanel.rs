@@ -29,6 +29,7 @@ use std::path::{Path, PathBuf};
 
 use hyperpanes_core::persistence::paths::{self as paths, data_dir};
 use hyperpanes_core::session_manager::SessionManager;
+use hyperpanes_core::tools::PaneKind;
 use hyperpanes_core::workspace::sets;
 
 /// How long after a session's last output its liveness dot stays fully lit before fading
@@ -69,6 +70,65 @@ pub fn is_idle(
             Some(ms) => now_ms.saturating_sub(ms) >= threshold_ms,
             None => false,
         }
+}
+
+/// The mark kinds the workspace tree draws for a pane that is **not** a tool this build
+/// knows. The pane header is free to leave those blank — it is chrome sitting on a pane you
+/// are already looking at — but a tree is a column, and a column of marks with holes
+/// punched in it reads as ragged, so every row here gets one.
+///
+/// Negative on purpose: the positive half of this namespace belongs to the tool registry
+/// (`ToolDef.icon`, allocated from [`crate::theme::menu_icon::TOOL_BASE`]) and is drawn by
+/// the shared `ToolIcon`. Keeping the two halves on opposite sides of zero means a tool
+/// added to the registry tomorrow can never collide with a view added here today.
+pub mod pane_mark {
+    /// A plain shell — a `>_` prompt. Also what a tool id this build has no mark for falls
+    /// back to: such a pane really is a terminal running something, and an honest prompt
+    /// beats a borrowed brand (the same call the header makes when it draws nothing).
+    pub const TERMINAL: i32 = -1;
+    /// The file-browser view — a folder.
+    pub const FILE_BROWSER: i32 = -2;
+    /// The file-viewer view — a page.
+    pub const FILE_VIEWER: i32 = -3;
+    /// The markdown preview — the markdown badge.
+    pub const MARKDOWN: i32 = -4;
+    /// The internal browser view — a globe.
+    pub const BROWSER: i32 = -5;
+}
+
+/// The mark one pane row carries, in the namespace `PaneMark` in `ui/leftpanel.slint`
+/// switches on: the registry's own icon kind for a tool we know (>= `TOOL_BASE`, drawn by
+/// the shared `ToolIcon` — the very component the pane header uses, which is the whole
+/// point: a pane must be identifiable in the panel the same way it is on its chrome), and
+/// one of the [`pane_mark`] negatives for everything else.
+///
+/// Takes the pane's EFFECTIVE kind (`State::effective_kind`), not `PaneState::kind`, so a
+/// plain terminal that the title sniff caught running an agent is branded in the tree for
+/// the same reason — and at the same moment — as it is in its header.
+pub fn pane_mark_kind(kind: &PaneKind) -> i32 {
+    match kind {
+        PaneKind::FileBrowser => pane_mark::FILE_BROWSER,
+        PaneKind::FileViewer => pane_mark::FILE_VIEWER,
+        PaneKind::Markdown => pane_mark::MARKDOWN,
+        PaneKind::Browser => pane_mark::BROWSER,
+        // `ui_icon` answers 0 for a plain shell AND for a tool id with no mark in this
+        // build; both are PTY panes, so both get the prompt rather than a gap.
+        PaneKind::Terminal | PaneKind::Tool(_) => match kind.ui_icon() {
+            0 => pane_mark::TERMINAL,
+            icon => icon,
+        },
+    }
+}
+
+/// The ink a pane row's mark is drawn in: the tool's own brand when the registry knows it —
+/// the identical colour the header tints its mark with, so the two readings of the same
+/// pane never disagree — and the pane's accent otherwise, which is the header's own
+/// fallback and is never invisible against the panel.
+pub fn pane_mark_ink(kind: &PaneKind, accent: slint::Color) -> slint::Color {
+    match kind.tool() {
+        Some(t) => slint::Color::from_rgb_u8(t.brand.0, t.brand.1, t.brand.2),
+        None => accent,
+    }
 }
 
 /// How often the projection re-runs purely to age the liveness dots while the panel is
@@ -700,6 +760,84 @@ mod tests {
         assert_eq!(liveness(Some(now - LIVE_WINDOW_MS * 10), now), 0.0);
         // a timestamp in the future (clock skew) must not exceed 1.0
         assert_eq!(liveness(Some(now + 5_000), now), 1.0);
+    }
+
+    #[test]
+    fn a_pane_row_carries_the_mark_of_the_tool_it_runs() {
+        // A tool the registry knows resolves to ITS icon kind — the registry's own number,
+        // not one this module invents — so the tree hands `ToolIcon` exactly what the pane
+        // header hands it and the two draw the same mark.
+        for t in hyperpanes_core::tools::registry::TOOLS {
+            let kind = PaneKind::Tool(t.id.to_string());
+            assert_eq!(
+                pane_mark_kind(&kind),
+                t.icon as i32,
+                "{} must carry the registry's own mark",
+                t.id
+            );
+        }
+    }
+
+    #[test]
+    fn every_pane_row_gets_a_mark_even_when_it_runs_no_tool() {
+        // The whole point of the negatives: a column with a hole in it reads as ragged, so
+        // no kind may ever come back as "draw nothing" (0, which is what the header's
+        // `ui_icon` answers for all of these).
+        let views = [
+            (PaneKind::Terminal, pane_mark::TERMINAL),
+            (PaneKind::FileBrowser, pane_mark::FILE_BROWSER),
+            (PaneKind::FileViewer, pane_mark::FILE_VIEWER),
+            (PaneKind::Markdown, pane_mark::MARKDOWN),
+            (PaneKind::Browser, pane_mark::BROWSER),
+            // A tool id from a build newer than this one: still a terminal running
+            // something, so it gets the prompt rather than a gap or a borrowed brand.
+            (PaneKind::Tool("tool-from-the-future".into()), pane_mark::TERMINAL),
+        ];
+        for (kind, want) in views {
+            let got = pane_mark_kind(&kind);
+            assert_eq!(got, want, "{kind:?}");
+            assert_ne!(got, 0, "{kind:?} must never draw nothing");
+        }
+    }
+
+    #[test]
+    fn pane_marks_never_collide_with_the_registrys_icon_kinds() {
+        // The two halves of the namespace are split at zero. If a view mark ever went
+        // positive it would draw whichever tool happened to own that number.
+        for m in [
+            pane_mark::TERMINAL,
+            pane_mark::FILE_BROWSER,
+            pane_mark::FILE_VIEWER,
+            pane_mark::MARKDOWN,
+            pane_mark::BROWSER,
+        ] {
+            assert!(m < 0, "view mark {m} is inside the registry's half");
+        }
+        // …and every registry kind stays in the other half, which is what lets
+        // `PaneMark` dispatch on the sign alone.
+        for t in hyperpanes_core::tools::registry::TOOLS {
+            assert!(t.icon as i32 > 0);
+        }
+    }
+
+    #[test]
+    fn a_marks_ink_is_the_tools_brand_and_the_panes_accent_otherwise() {
+        let accent = slint::Color::from_rgb_u8(1, 2, 3);
+        let claude = hyperpanes_core::tools::registry::by_id("claude").unwrap();
+        assert_eq!(
+            pane_mark_ink(&PaneKind::Tool("claude".into()), accent),
+            slint::Color::from_rgb_u8(claude.brand.0, claude.brand.1, claude.brand.2)
+        );
+        // No registry entry, so no brand: the pane's own accent, which is what the header
+        // falls back to and is never invisible against the panel.
+        for kind in [
+            PaneKind::Terminal,
+            PaneKind::FileBrowser,
+            PaneKind::Markdown,
+            PaneKind::Tool("tool-from-the-future".into()),
+        ] {
+            assert_eq!(pane_mark_ink(&kind, accent), accent, "{kind:?}");
+        }
     }
 
     #[test]

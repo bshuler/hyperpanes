@@ -416,6 +416,16 @@ export struct LeftPaneRow {
     focused: bool,
     live: float,
     idle: bool,
+    // What the pane is RUNNING, as the mark kind `leftpanel.slint`'s `PaneMark` switches
+    // on (built by `leftpanel::pane_mark_kind`). A positive value is the tool registry's
+    // own icon kind and is handed straight to the shared `ToolIcon` — the same component
+    // the pane header draws — so a pane is identified in the tree by exactly the mark it
+    // wears on its own chrome; a negative value is one of the panel's built-in view marks,
+    // which the header can leave blank and a tree column cannot. `brand` is the ink that
+    // mark is drawn in: the tool's registry colour, falling back to the pane's accent for
+    // an unbranded pane, exactly as the header's `tool-brand` does.
+    mark: int,
+    brand: color,
 }
 
 // One tab (workspace group) in the panel's tree: its title plus its panes.

@@ -130,6 +130,96 @@ component FileGlyph inherits Path {
     commands: "M 3 1.5 L 8.5 1.5 L 11 4 L 11 12.5 L 3 12.5 Z M 8.5 1.5 L 8.5 4 L 11 4";
 }
 
+// A shell prompt — the chevron and the input rule under it. The workspace tree's mark for
+// a plain terminal pane, and for a tool id this build has no registry mark for. Drawn here
+// for the same reason FolderGlyph is: a shell is not a tool, so it has no registry icon
+// and no brand, and the pane header (which can afford a blank slot) draws nothing at all.
+component PromptGlyph inherits Path {
+    in property <color> ink;
+    width: 14px;
+    height: 14px;
+    viewbox-width: 14;
+    viewbox-height: 14;
+    stroke: ink;
+    stroke-width: 1.5px;
+    fill: transparent;
+    commands: "M 3 3.6 L 6.6 7 L 3 10.4 M 7.6 10.8 L 11.4 10.8";
+}
+
+// The markdown preview's mark: the markdown badge — the frame with the M and the ↓ inside
+// it. Stroked thin because at 14px the frame and the letter compete for the same eight
+// pixels; a heavier stroke closes the M's counters and the whole thing reads as a blob.
+// Drawn here for the same reason PromptGlyph is — a view has no registry icon.
+component MarkdownGlyph inherits Path {
+    in property <color> ink;
+    width: 14px;
+    height: 14px;
+    viewbox-width: 16;
+    viewbox-height: 16;
+    stroke: ink;
+    stroke-width: 1.2px;
+    fill: transparent;
+    // the badge, then the M, then the ↓ that follows it in the logo
+    commands: "M 1.2 3.6 L 14.8 3.6 L 14.8 12.4 L 1.2 12.4 Z"
+            + "M 3.8 10.2 L 3.8 5.8 L 5.9 8.2 L 8 5.8 L 8 10.2"
+            + "M 11.2 5.8 L 11.2 9.6 M 9.7 8.1 L 11.2 9.8 L 12.7 8.1";
+}
+
+// The internal browser's mark: a globe — the sphere, its equator and one meridian. The
+// circle is one arc that comes back a hundredth of a unit short of its start, the same
+// trick SearchGlyph's lens uses: a path that closed exactly on its origin would have no
+// sweep to draw.
+component GlobeGlyph inherits Path {
+    in property <color> ink;
+    width: 14px;
+    height: 14px;
+    viewbox-width: 14;
+    viewbox-height: 14;
+    stroke: ink;
+    stroke-width: 1.3px;
+    fill: transparent;
+    commands: "M 7 1.2 A 5.8 5.8 0 1 1 6.99 1.2"
+            + "M 1.2 7 L 12.8 7"
+            + "M 7 1.2 A 3.4 5.8 0 0 1 7 12.8 A 3.4 5.8 0 0 1 7 1.2";
+}
+
+// The leading identity mark on a pane row: WHAT the pane is running, sitting next to the
+// LiveDot's HOW it is doing — the two answer different questions and the row needs both.
+//
+// A positive `kind` is the tool registry's own icon kind and goes straight to the shared
+// `ToolIcon`, the exact component the pane header draws: reusing it rather than redrawing
+// it is what makes a Claude pane in the tree and a Claude pane in the main area the same
+// mark, forever, including for tools added after this code was written. The negatives are
+// `leftpanel::pane_mark`'s built-in views, which the header is allowed to leave blank and
+// a column of tree rows is not.
+//
+// Fixed 14x14 whatever it draws, so the title column starts at the same x on every row and
+// so the row's height can never come back through a child (the panel's layout has been
+// broken twice by exactly that — b0c6637, 5c2eef5). 14 rather than something daintier
+// because the shared marks size THEMSELVES: every one of them is a hard 14x14, so a smaller
+// slot would crop the tool marks instead of shrinking them, and only the mode strip's own
+// glyphs would obey. In a 26px row a 14px mark is still the smaller half.
+component PaneMark inherits Rectangle {
+    in property <int> kind;
+    in property <color> ink;
+    width: 14px;
+    height: 14px;
+    // Each negative is tested EXACTLY, never as `< 0`, for the reason the mode strip is: a
+    // catch-all negative arm would draw the prompt for every view added after this one.
+    if root.kind == -1 : PromptGlyph { ink: root.ink; }
+    if root.kind == -2 : FolderGlyph { ink: root.ink; }
+    // FileGlyph is the explorer's 12px page; centre it so the smaller mark still sits on
+    // the same optical axis as the 14px ones.
+    if root.kind == -3 : FileGlyph {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        ink: root.ink;
+    }
+    if root.kind == -4 : MarkdownGlyph { ink: root.ink; }
+    if root.kind == -5 : GlobeGlyph { ink: root.ink; }
+    if root.kind > 0 : ToolIcon { kind: root.kind; ink: root.ink; }
+}
+
 // A magnifier — the finder box's leading mark.
 component SearchGlyph inherits Rectangle {
     in property <color> ink;
@@ -309,6 +399,21 @@ component PaneRowView inherits Rectangle {
                 live: root.pane.live;
                 idle: root.pane.idle;
                 tint: root.pane.tint;
+            }
+        }
+
+        // ---- tool mark ----
+        // The same branded mark this pane wears in its own header, at the same size, in the
+        // same ink (the tool's registry brand, or the pane's accent when it has none) — so
+        // recognising a pane in the tree is the same act as recognising it in the grid, not
+        // a second thing to learn. Unlike the header this slot is never empty: a shell, a
+        // file browser, a viewer and a markdown preview each have their own mark, because a
+        // hole in a column is far more visible than a hole in one pane's chrome.
+        VerticalLayout {
+            alignment: center;
+            PaneMark {
+                kind: root.pane.mark;
+                ink: root.pane.brand;
             }
         }
 
