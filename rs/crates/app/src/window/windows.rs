@@ -354,3 +354,34 @@ pub fn exit_fullscreen(raw: isize, saved: SavedPlacement) {
         );
     }
 }
+
+/// The desktop area a window may legitimately occupy, for the startup frame clamp in
+/// `window/geometry.rs`. One rectangle: the VIRTUAL SCREEN — the bounding box of every
+/// attached monitor, which is exactly what shrinks when a monitor is unplugged and is
+/// therefore the thing a stale remembered frame has to be checked against.
+///
+/// Per-monitor enumeration is deliberately not used. winit makes this process
+/// per-monitor-DPI-aware, so there is no single logical coordinate space on Windows at all
+/// — each monitor has its own scale — and a "logical" per-monitor list would be a fiction
+/// as soon as two displays disagree. The virtual screen in PHYSICAL pixels is a strict
+/// SUPERSET of the logical box the clamp compares against (scaling only ever shrinks it
+/// toward the origin), which makes this conservative in the right direction: a frame that
+/// is genuinely off every display is still pulled back, and a frame that merely hangs a
+/// little past an edge on a scaled display is left where the human put it.
+pub fn displays() -> Vec<(i32, i32, i32, i32)> {
+    // SAFETY: pure reads of process-wide system metrics; no handles, no state.
+    let (x, y, w, h) = unsafe {
+        (
+            GetSystemMetrics(SM_XVIRTUALSCREEN),
+            GetSystemMetrics(SM_YVIRTUALSCREEN),
+            GetSystemMetrics(SM_CXVIRTUALSCREEN),
+            GetSystemMetrics(SM_CYVIRTUALSCREEN),
+        )
+    };
+    if w <= 0 || h <= 0 {
+        // The metrics are unavailable (a session with no display attached). An empty list
+        // means "do not clamp", which is the only honest answer here.
+        return Vec::new();
+    }
+    vec![(x, y, w, h)]
+}

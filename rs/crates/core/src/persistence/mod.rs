@@ -6,3 +6,4 @@ pub mod control_settings;
 pub mod device_tokens;
 pub mod paths;
 pub mod projects;
+pub mod window_geometry;

@@ -791,8 +791,20 @@ impl App {
                 .window()
                 .set_position(LogicalPosition::new(140.0 + off, 90.0 + off));
         }
+        // The remembered frame must be applied BEFORE the first show: no native window
+        // exists yet, so this writes the attributes winit will create the window WITH —
+        // one size, one position, no 1280x800 flash and no startup pty-resize churn from
+        // it. Restoring after `show()` is too late (see `window/geometry.rs`).
+        // Register BEFORE showing. `restore_geometry` pins an explicit size, and that is
+        // exactly what makes the first layout run synchronously inside `show()` — which is
+        // where the pane area emits its first `area-resized`. Every callback resolves its
+        // window through `window_by_id`, so a window that is not in the registry yet drops
+        // that report; and for a window nobody ever resizes by hand, the first report is
+        // the ONLY one. Losing it leaves `win.area` at (0, 0), `pump_window` short-circuits
+        // forever, and no model — tabs, panes, left panel — is ever projected.
+        self.windows.borrow_mut().push(win.clone());
+        window::restore_geometry(win.id, &win.app);
         let _ = win.app.show();
-        self.windows.borrow_mut().push(win);
     }
 
     /// Look a window up by id (clones the `Rc`, releasing the registry borrow so the

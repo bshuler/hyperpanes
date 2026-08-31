@@ -20,11 +20,24 @@
 //! pub fn close(raw: isize);
 //! pub fn enter_fullscreen(raw: isize) -> Option<SavedPlacement>;
 //! pub fn exit_fullscreen(raw: isize, saved: SavedPlacement);
+//! pub fn displays() -> Vec<(i32, i32, i32, i32)>; // usable desktop rects, top-left x/y/w/h
 //! ```
+//!
+//! `displays()` is the one entry that is not about chrome: it feeds the startup frame
+//! restore in [`geometry`], which has to know where the monitors are BEFORE any window
+//! exists — so it cannot ask winit, and each platform answers for itself. The contract is
+//! deliberately loose in one direction only: a rect must never be SMALLER than the logical
+//! area it describes, because the caller uses it to decide whether a remembered frame is
+//! stranded, and an under-estimate would move a window the human placed on purpose. macOS
+//! answers exactly (AppKit points are logical px); Windows and X11 answer with the physical
+//! virtual-screen box, a superset under any scaling. An EMPTY vec means "cannot tell"
+//! (Wayland, headless) and the caller reads it as "do not clamp".
 //!
 //! `windows.rs` is the original Win32 implementation (moved verbatim from the old
 //! `window.rs`); `linux.rs` / `macos.rs` are compiling no-op stubs owned by the Wave-1
 //! platform tracks.
+
+mod geometry;
 
 #[cfg(windows)]
 #[path = "windows.rs"]
@@ -39,4 +52,5 @@ mod platform;
 #[path = "linux.rs"]
 mod platform;
 
+pub use geometry::{flush_geometry, restore_geometry};
 pub use platform::*;

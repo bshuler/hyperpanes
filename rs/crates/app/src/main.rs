@@ -617,6 +617,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     slint::run_event_loop()?;
 
+    // The frame watcher debounces its writes, so a quit inside that window would drop the
+    // very last move or resize — the one the human just made. Commit it now, while the
+    // loop is down but the process is still alive.
+    window::flush_geometry();
+
     // Quit-vs-keep-alive (session-daemon-plan M3). Read the persisted preference fresh (it
     // may have been toggled this session) — default ON: "keep terminals running in the
     // background when Hyperpanes closes".

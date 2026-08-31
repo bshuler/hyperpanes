@@ -26,6 +26,8 @@ use std::task::{Context, Poll, Waker};
 use slint::winit_030::winit::event::{ElementState, MouseButton, WindowEvent};
 use slint::winit_030::winit::window::{CursorIcon, Fullscreen, Window as WinitWindow};
 use slint::winit_030::{EventResult, WinitWindowAccessor};
+// `setup()` lives on the Connection trait — needed by `displays()` at the bottom.
+use x11rb::connection::Connection;
 
 /// One registered window: `raw` → the winit window it encodes, plus the desired
 /// frameless state (shared with that window's event hook, which re-asserts it — see
@@ -325,4 +327,37 @@ pub fn exit_fullscreen(raw: isize, saved: SavedPlacement) {
             w.set_maximized(true);
         }
     });
+}
+
+/// The desktop area a window may legitimately occupy, for the startup frame clamp in
+/// `window/geometry.rs`. One rectangle: the X11 root window, i.e. the bounding box of the
+/// whole (Xinerama-merged) screen layout — which is exactly what shrinks when a monitor is
+/// unplugged, and so is the thing a stale remembered frame has to be checked against.
+///
+/// Deliberately coarse, in the safe direction. Per-output RandR geometry would let the
+/// clamp reason about an L-shaped arrangement's dead corners, but it also lets a wrong
+/// answer MOVE a window the human placed on purpose; the root rect can only ever fail to
+/// move one, which is the failure worth having. Fractional scaling makes it a slight
+/// over-estimate (root dimensions are physical px) — again permissive, never aggressive.
+///
+/// **Wayland returns an empty list**, and must: there is no protocol for a client to learn
+/// the output layout, and none for it to position itself either — the compositor places the
+/// window, so a remembered position is not applied there in the first place. An empty list
+/// tells the caller not to clamp rather than to clamp against a guess. A Wayland session
+/// running XWayland may still answer here; the rect is then whatever XWayland reports,
+/// which is harmless because the position it would guard is being ignored anyway.
+pub fn displays() -> Vec<(i32, i32, i32, i32)> {
+    // A fresh short-lived connection: this runs exactly once, at startup, before any
+    // window exists — there is nothing yet to borrow a connection from.
+    let Ok((conn, screen_num)) = x11rb::connect(None) else {
+        return Vec::new();
+    };
+    let Some(screen) = conn.setup().roots.get(screen_num) else {
+        return Vec::new();
+    };
+    let (w, h) = (screen.width_in_pixels as i32, screen.height_in_pixels as i32);
+    if w <= 0 || h <= 0 {
+        return Vec::new();
+    }
+    vec![(0, 0, w, h)]
 }

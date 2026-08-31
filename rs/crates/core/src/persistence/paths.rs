@@ -161,6 +161,12 @@ pub fn last_workspace_json() -> PathBuf {
     state_dir().join("last-workspace.json")
 }
 
+/// The main window's remembered frame (position, size, maximized). Restored before the
+/// window is first shown, so it is session state, not durable user data → [`state_dir`].
+pub fn window_geometry_json() -> PathBuf {
+    state_dir().join("window-geometry.json")
+}
+
 /// Remembered git-project history. Durable user data → [`data_dir`].
 pub fn projects_json() -> PathBuf {
     data_dir().join("projects.json")
@@ -323,6 +329,7 @@ mod tests {
             control_json(),
             control_settings_json(),
             last_workspace_json(),
+            window_geometry_json(),
             projects_json(),
             ai_settings_json(),
             ai_memory_json(),
@@ -337,6 +344,10 @@ mod tests {
         assert_eq!(
             last_workspace_json().file_name().unwrap(),
             "last-workspace.json"
+        );
+        assert_eq!(
+            window_geometry_json().file_name().unwrap(),
+            "window-geometry.json"
         );
         assert_eq!(projects_json().file_name().unwrap(), "projects.json");
         assert_eq!(ai_settings_json().file_name().unwrap(), "ai-settings.json");

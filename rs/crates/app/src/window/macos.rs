@@ -20,8 +20,8 @@
 use objc2::rc::Retained;
 use objc2::MainThreadMarker;
 use objc2_app_kit::{
-    NSCursor, NSEvent, NSEventModifierFlags, NSEventType, NSView, NSWindow, NSWindowStyleMask,
-    NSWindowTitleVisibility,
+    NSCursor, NSEvent, NSEventModifierFlags, NSEventType, NSScreen, NSView, NSWindow,
+    NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSPoint, NSProcessInfo};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -213,4 +213,41 @@ pub fn exit_fullscreen(raw: isize, _saved: SavedPlacement) {
     if w.styleMask().contains(NSWindowStyleMask::FullScreen) {
         w.toggleFullScreen(None);
     }
+}
+
+/// The attached screens as logical, top-left-origin rectangles of their *usable* area
+/// (menu bar and Dock excluded — `visibleFrame`), for the startup frame clamp in
+/// `window/geometry.rs`.
+///
+/// Two conversions are unavoidable here. AppKit points ARE Slint's logical pixels, so no
+/// scaling is needed; but AppKit's origin is the BOTTOM-left of the primary screen with Y
+/// growing upward, while winit (and therefore every coordinate this app persists) uses the
+/// TOP-left with Y growing downward. Flipping against the primary screen's FULL frame
+/// height — not its visible frame — is what makes a second monitor above or below the
+/// laptop land at the right offset; using the visible frame here would shift every rect by
+/// the menu-bar height.
+///
+/// Off the main thread, or before AppKit is up, the answer is an empty vec: the caller
+/// reads that as "do not clamp", which is strictly better than clamping against a guess.
+pub fn displays() -> Vec<(i32, i32, i32, i32)> {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return Vec::new();
+    };
+    let screens = NSScreen::screens(mtm);
+    let Some(primary) = screens.iter().next() else {
+        return Vec::new();
+    };
+    let flip = primary.frame().size.height;
+    screens
+        .iter()
+        .map(|s| {
+            let f = s.visibleFrame();
+            (
+                f.origin.x as i32,
+                (flip - (f.origin.y + f.size.height)) as i32,
+                f.size.width as i32,
+                f.size.height as i32,
+            )
+        })
+        .collect()
 }
