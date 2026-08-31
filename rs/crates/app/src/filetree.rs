@@ -31,6 +31,38 @@ pub const KIND_FILE: i32 = 1;
 /// notice, "no matches". Inert: it has no path and cannot be activated.
 pub const KIND_NOTE: i32 = 2;
 
+/// Height of one explorer row, in logical pixels — the same 20px `FileRowView` lays itself
+/// out at in `leftpanel.slint`. Duplicated here rather than queried because the scroll
+/// offset for a reveal has to be computed in Rust, before the row exists in the UI: a
+/// `ListView` cannot be asked where a row it has not yet been given would land.
+pub const ROW_H: f32 = 20.0;
+
+/// Extra height a row takes on when it carries a `detail` line (30px total). See [`ROW_H`]
+/// — the two must be changed together with `FileRowView`.
+pub const ROW_DETAIL_EXTRA: f32 = 10.0;
+
+/// Distance from the top of the row list to the top of the row for `sel`, in logical px, or
+/// `None` when `sel` is not among `rows`.
+///
+/// Selecting a row is only half of showing it: in a tree of any size the selected row is
+/// below the fold, and a panel that opened scrolled to row 0 with the highlight off screen
+/// answered "where is this file" with a blank list. Measured here, over the same flattened
+/// rows the view is about to be given, because a `ListView` cannot be asked where a row it
+/// has not yet received would land.
+pub fn scroll_offset_for(rows: &[FileRow], sel: &Path) -> Option<f32> {
+    let mut y = 0.0f32;
+    for r in rows {
+        if r.path == sel {
+            return Some(y);
+        }
+        y += ROW_H;
+        if !r.detail.is_empty() {
+            y += ROW_DETAIL_EXTRA;
+        }
+    }
+    None
+}
+
 /// Most rows the flattened tree will hand to the model. A human who expands the whole of a
 /// large monorepo gets a truncation note rather than a 200k-row `ListView`.
 pub const MAX_ROWS: usize = 5_000;
@@ -346,6 +378,50 @@ pub fn find(root: &Path, query: &str) -> Vec<FileRow> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row(name: &str, detail: &str) -> FileRow {
+        FileRow {
+            depth: 0,
+            kind: KIND_FILE,
+            expanded: false,
+            label: name.into(),
+            detail: detail.into(),
+            path: PathBuf::from("/r").join(name),
+        }
+    }
+
+    #[test]
+    fn scroll_offset_sums_the_rows_above_the_selection() {
+        let rows = vec![row("a", ""), row("b", ""), row("c", "")];
+        assert_eq!(
+            scroll_offset_for(&rows, Path::new("/r/c")),
+            Some(2.0 * ROW_H)
+        );
+        // The first row needs no scroll at all — an offset it did not ask for would pull the
+        // list down past a selection that was already in view.
+        assert_eq!(scroll_offset_for(&rows, Path::new("/r/a")), Some(0.0));
+    }
+
+    #[test]
+    fn scroll_offset_counts_the_taller_finder_rows() {
+        // Finder results carry a `detail` line and are 10px taller. Measuring them as plain
+        // rows put the viewport progressively short of the match — the deeper the result, the
+        // further above the fold it landed.
+        let rows = vec![row("a", "src"), row("b", "src/deep"), row("c", "")];
+        assert_eq!(
+            scroll_offset_for(&rows, Path::new("/r/c")),
+            Some(2.0 * (ROW_H + ROW_DETAIL_EXTRA))
+        );
+    }
+
+    #[test]
+    fn scroll_offset_declines_a_row_that_is_not_there() {
+        // A reveal whose target the flatten truncated must leave the viewport where it is,
+        // not scroll to a guessed offset — the human's place in the list is worth more than
+        // a wrong jump.
+        let rows = vec![row("a", "")];
+        assert_eq!(scroll_offset_for(&rows, Path::new("/r/zz")), None);
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("hp-filetree-{}-{}", std::process::id(), name));

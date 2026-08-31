@@ -3133,15 +3133,18 @@ impl App {
         {
             let app = app.clone();
             let id = win.id;
-            win.app.on_pane_view_link(move |_pane, url| {
+            win.app.on_pane_view_link(move |pane, url| {
                 let Some(w) = app.window_by_id(id) else {
                     return;
                 };
-                // The one entry point for "something in a pane wants a link opened",
-                // shared with an OSC 8 hyperlink clicked in a terminal pane, so the
-                // Preferences browser choice governs both. Nothing is borrowed here:
-                // the command may mount the chooser overlay (borrow rule #18).
-                app.run_command(&w, Command::OpenLink(url.to_string()));
+                // Decide first, act second. A link to a neighbouring FILE reveals it in the
+                // explorer; everything else is a URL and takes the one entry point for
+                // "something in a pane wants a link opened", shared with an OSC 8 hyperlink
+                // clicked in a terminal pane, so the Preferences browser choice governs both.
+                // The borrow is scoped and dropped before dispatch: the command may mount the
+                // chooser overlay (borrow rule #18).
+                let cmd = w.state.borrow().view_link_command(pane as usize, &url);
+                app.run_command(&w, cmd);
             });
         }
 

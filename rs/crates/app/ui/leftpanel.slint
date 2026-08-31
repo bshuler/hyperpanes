@@ -960,6 +960,12 @@ component FileRowView inherits Rectangle {
     background: root.item.kind == 2
         ? transparent
         : (root.item.selected ? Theme.surface2 : (ta.has-hover ? Theme.surface : transparent));
+    // The selected row also gets an accent edge. A reveal's whole job is to answer "where is
+    // this file" at a glance, and a fill one step off the panel background did not survive
+    // being one row among forty — especially when the panel had just opened and the eye had
+    // no idea where to land.
+    border-width: root.item.selected && root.item.kind != 2 ? 1px : 0px;
+    border-color: Theme.accent;
 
     // Two indent steps per level, clamped so a deep path still leaves room for its name.
     property <length> indent: 4px + min(root.item.depth, 8) * 11px;
@@ -1462,7 +1468,19 @@ export component LeftPanel inherits Rectangle {
         if LeftPanelAdapter.mode == 1 : Rectangle {
             vertical-stretch: 1;
             clip: true;
-            ListView {
+            // Watched, not bound. A reveal bumps `files-scroll-seq`, and only that change
+            // moves the viewport — binding `viewport-y` to the target directly would drag
+            // the list back to the revealed row every time the human scrolled away from it.
+            property <int> scroll-seq: LeftPanelAdapter.files-scroll-seq;
+            changed scroll-seq => {
+                // Put the row a little below the top edge rather than flush against it, so
+                // the rows above it stay visible and the highlight reads as "here, in this
+                // folder" instead of "here, at the top of a list of unknown depth".
+                lv.viewport-y = -max(0px, min(
+                    LeftPanelAdapter.files-scroll-y - 40px,
+                    max(0px, lv.viewport-height - lv.visible-height)));
+            }
+            lv := ListView {
                 width: 100%;
                 height: 100%;
                 for f in LeftPanelAdapter.files : FileRowView {

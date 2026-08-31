@@ -183,6 +183,27 @@ pub fn rows_for(kind: &PaneKind, target: Option<&str>) -> Vec<ViewRow> {
     }
 }
 
+/// Resolve a link clicked in a rendered markdown preview to a file on disk, or `None` when
+/// it is not one.
+///
+/// `target` is the previewed document's own path (a directory for a listing pane); a
+/// relative href is relative to the document's *directory*, which is what a markdown link
+/// means everywhere else. Fragments and queries are dropped — `design.md#rationale` names a
+/// file we can show. Nothing that does not exist resolves, which is what keeps a
+/// `javascript:` or a link into a directory that is not there from becoming an action.
+pub fn resolve_local_href(target: &Path, href: &str) -> Option<PathBuf> {
+    let bare = href.split(['#', '?']).next().unwrap_or(href);
+    if bare.is_empty() {
+        return None;
+    }
+    let base = if target.is_dir() {
+        target
+    } else {
+        target.parent()?
+    };
+    base.join(bare).canonicalize().ok()
+}
+
 /// The header line for a view pane: the target's own name, which is all the
 /// header has room for. "" when there is no target.
 pub fn view_title(kind: &PaneKind, target: Option<&str>) -> String {
@@ -1228,6 +1249,39 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).expect("scratch dir");
         d
+    }
+
+    #[test]
+    fn a_relative_href_resolves_beside_the_document() {
+        let d = scratch("href-rel");
+        fs::create_dir_all(d.join("docs")).unwrap();
+        fs::write(d.join("README.md"), b"x").unwrap();
+        fs::write(d.join("docs/design.md"), b"x").unwrap();
+        let doc = d.join("README.md");
+        // Relative to the FILE's directory, not to the process cwd.
+        let got = resolve_local_href(&doc, "docs/design.md").expect("resolves");
+        assert_eq!(got, d.join("docs/design.md").canonicalize().unwrap());
+        // A fragment names the same file: a link to a heading is still a link to a document.
+        let got = resolve_local_href(&doc, "docs/design.md#rationale").expect("resolves");
+        assert_eq!(got, d.join("docs/design.md").canonicalize().unwrap());
+        // `..` walks out of the document's directory the way the author meant it to.
+        let nested = d.join("docs/design.md");
+        let got = resolve_local_href(&nested, "../README.md").expect("resolves");
+        assert_eq!(got, doc.canonicalize().unwrap());
+    }
+
+    #[test]
+    fn an_href_with_nothing_behind_it_resolves_to_nothing() {
+        let d = scratch("href-none");
+        fs::write(d.join("README.md"), b"x").unwrap();
+        let doc = d.join("README.md");
+        // Nothing on disk → the caller falls back to `open_link`, which refuses anything that
+        // is not http/https/mailto. That refusal is the whole guard against a downloaded
+        // document turning a `javascript:` or a missing path into an action.
+        assert!(resolve_local_href(&doc, "javascript:alert(1)").is_none());
+        assert!(resolve_local_href(&doc, "does/not/exist.md").is_none());
+        assert!(resolve_local_href(&doc, "").is_none());
+        assert!(resolve_local_href(&doc, "#only-a-fragment").is_none());
     }
 
     fn write(dir: &Path, name: &str, body: &str) -> PathBuf {

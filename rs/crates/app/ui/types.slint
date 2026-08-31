@@ -669,6 +669,12 @@ export global LeftPanelAdapter {
     callback files-up();
     // Re-read the tree from disk (nothing watches the filesystem).
     callback files-refresh();
+    // Where a reveal wants the explorer scrolled, measured from the top of the row list.
+    in property <length> files-scroll-y;
+    // Bumped by a reveal and by nothing else. The view jumps when this CHANGES rather than
+    // binding to `files-scroll-y`, so an ordinary frame — and every scroll the human makes
+    // with the wheel — leaves the viewport exactly where they left it.
+    in property <int> files-scroll-seq;
 
     // ---- mode 2: the working tree ----
     // Read-only by design: staging, committing and discarding are one-click destructive and

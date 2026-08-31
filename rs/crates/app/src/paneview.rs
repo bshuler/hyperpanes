@@ -1316,6 +1316,10 @@ pub fn resync(
                     })
                     .collect();
                 sync_model(&ui.lp_files, file_rows);
+                // Ship the reveal's scroll target. The sequence number is what the view
+                // watches, so writing both every tick is inert until a reveal bumps it.
+                lp.set_files_scroll_y(state.files_scroll_y);
+                lp.set_files_scroll_seq(state.files_scroll_seq);
             }
 
             // ---- mode 2: the working tree ----

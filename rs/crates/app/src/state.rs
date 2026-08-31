@@ -1237,6 +1237,15 @@ pub struct State {
     /// stale line number can never ride along to an unrelated open.
     pub files_target_line: Option<u32>,
     pub files_target_col: Option<u32>,
+    /// How far down the row list a reveal wants the explorer scrolled, in logical pixels from
+    /// the top of the list. Selecting a row is only half of showing it: in a tree of any size
+    /// the selected row is usually below the fold, and a panel that opened at row 0 with the
+    /// highlight off screen answered "where is this file" with a blank list.
+    pub files_scroll_y: f32,
+    /// Bumped by every reveal, and by nothing else. The view scrolls when this CHANGES rather
+    /// than tracking `files_scroll_y` as a binding, so an ordinary frame — and every scroll the
+    /// human does with the wheel — leaves the viewport exactly where they left it.
+    pub files_scroll_seq: i32,
     // ---- left panel: Git mode (J) ----
     /// The working tree the panel last read, rooted at the same project the explorer is
     /// rooted at. A stored projection for the same reason `files_rows` is one: reading it
@@ -1463,6 +1472,8 @@ impl State {
             files_rows: Vec::new(),
             files_target_line: None,
             files_target_col: None,
+            files_scroll_y: 0.0,
+            files_scroll_seq: 0,
             git: crate::gitpanel::GitStatus::none(),
             git_sel: None,
             left_mode_request: None,
@@ -3016,6 +3027,41 @@ impl State {
     /// A refused URL reports `Err` here rather than silently doing nothing, so the caller
     /// can say why. Validation happens before the overlay mounts, so the chooser is never
     /// holding a URL it would then refuse to open.
+    /// Decide what a link clicked inside a rendered markdown preview should do.
+    ///
+    /// A README's links are mostly `http(s)`, and those keep going through [`open_link`] so
+    /// the Preferences browser choice governs a preview exactly as it governs a shell. But a
+    /// README also links its *neighbours* — `see [the design](docs/design.md)`, `../README.md`
+    /// — and those are the majority of the links a human actually clicks while reading one.
+    /// They are not URLs, so `open_link` refused them and the click did nothing at all: no
+    /// error, no motion, just a dead link in the middle of a document.
+    ///
+    /// Resolved against the previewed file's own directory and revealed in the explorer, the
+    /// same place a path clicked in a terminal lands. Only paths that EXIST resolve; anything
+    /// else falls through to `open_link` and gets its refusal, which is what keeps a
+    /// `javascript:` or `file:///etc/…` href in a downloaded document inert.
+    pub fn view_link_command(&self, idx: usize, href: &str) -> crate::command::Command {
+        use crate::command::Command;
+        let open = Command::OpenLink(href.to_string());
+        if hyperpanes_core::open::is_openable_url(href) {
+            return open;
+        }
+        let Some(p) = self.active_tab().panes.get(idx) else {
+            return open;
+        };
+        let Some(target) = p.cwd.as_deref().filter(|t| !t.is_empty()) else {
+            return open;
+        };
+        match crate::viewpane::resolve_local_href(Path::new(target), href) {
+            Some(abs) => Command::RevealInFiles {
+                path: abs.display().to_string(),
+                line: None,
+                col: None,
+            },
+            None => open,
+        }
+    }
+
     pub fn open_link(&mut self, url: &str) -> Result<(), String> {
         if !hyperpanes_core::open::is_openable_url(url) {
             return Err(format!(
@@ -4023,7 +4069,33 @@ impl State {
         self.files_target_col = col;
         self.left_mode_request = Some(crate::paneview::LEFT_MODE_FILES);
         self.left_panel_open = true;
+        // Claim the follow-the-focused-pane anchor for the root we just chose. A reveal
+        // normally OPENS the panel, and while it was closed `sync_left_root` never ran — so
+        // the anchor still holds whatever cwd was current the last time it was open (or
+        // nothing at all). Left stale, the very next tick would compare it against the
+        // focused pane's cwd, decide the panel had fallen behind, and re-root onto that
+        // pane's project — which clears `files_expanded` and `files_sel` and undoes the
+        // reveal before the human's eye reaches the panel. Clicking a path that lives
+        // outside the pane's own project is exactly when a reveal is most useful, and was
+        // exactly the case that lost it.
+        self.files_root_from = self.focused_cwd();
         self.rebuild_files();
+        self.scroll_files_to_selection();
+    }
+
+    /// Point the explorer's viewport at the selected row (see [`State::files_scroll_y`]).
+    /// Called after a reveal has rebuilt the rows, so it measures the list the panel is
+    /// about to draw. A selection that is not in the rows — a file under a directory the
+    /// flatten truncated — leaves the viewport alone rather than guessing at an offset.
+    fn scroll_files_to_selection(&mut self) {
+        let Some(sel) = self.files_sel.clone() else {
+            return;
+        };
+        if let Some(y) = crate::filetree::scroll_offset_for(&self.files_rows, &sel) {
+            self.files_scroll_y = y;
+            self.files_scroll_seq = self.files_scroll_seq.wrapping_add(1);
+            self.dirty = true;
+        }
     }
 
     /// Open the row menu for `path`, anchored at window-logical `(x, y)`. Selecting the row
