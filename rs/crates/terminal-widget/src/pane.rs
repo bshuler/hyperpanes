@@ -810,6 +810,73 @@ impl TerminalPane {
         Some(bytes)
     }
 
+    /// A plain click on the shell's input line → the arrow keys that walk the caret to the
+    /// clicked cell, or `None` when the click cannot safely be read as "put the caret here".
+    ///
+    /// Every other terminal-embedded line editor (readline, PSReadLine, Claude Code's prompt)
+    /// already lets you move the caret with the arrow keys; the only thing missing was a way to
+    /// say where you want it without counting the characters yourself. A terminal cannot ask the
+    /// application to move its caret — there is no such escape sequence — so it does the only
+    /// thing it can: it presses the arrow key for you, the right number of times.
+    ///
+    /// Safety model, deliberately the same one [`type_over_selection`](Self::type_over_selection)
+    /// already relies on:
+    ///
+    ///  * **Left/right arrows only**, and every line editor **clamps them at the input-region
+    ///    boundaries**. So a click on the prompt decoration, on a box border, or past the end of
+    ///    what you typed lands the caret at the nearest end of the editable text rather than
+    ///    doing something destructive. Nothing outside the input can be touched, and no vertical
+    ///    motion is emitted — up/down is history recall in most editors, which would be exactly
+    ///    the surprise this is trying to avoid.
+    ///  * **Alternate screen excluded**: there these bytes are application commands (vim
+    ///    motions), not caret movement.
+    ///  * **Mouse-grabbing apps excluded**: they asked for the click themselves and get it
+    ///    verbatim, as before.
+    ///  * **The click must land on the cursor's own wrapped logical line.** A click on
+    ///    scrollback, on command output, or on a different row of a drawn box is not an edit
+    ///    position, and declining is free — the click keeps its old meaning.
+    ///
+    /// Cell↔char caveat: counts are in grid cells, exact for ASCII (same wide-glyph caveat as
+    /// [`selection_text`](Self::selection_text)).
+    pub fn click_move_cursor(&self) -> Option<Vec<u8>> {
+        if self.grid.alt_screen() || self.grid.mouse_mode() {
+            return None;
+        }
+        // The press anchor IS the clicked cell; a dragged selection is a selection, not a click.
+        let target = match &self.selection {
+            Some(s) if !s.dragged => s.anchor,
+            _ => return None,
+        };
+        let crow = self.grid.cursor_row()?;
+        let cline = crow as i32 - self.grid.display_offset() as i32;
+        let (cols, _) = self.grid_size();
+        if cols == 0 {
+            return None;
+        }
+        // Same wrapped-line test as `type_over_selection`: every grid line from the upper of the
+        // two to (exclusive) the lower must carry the WRAPLINE continuation flag, so a soft-wrapped
+        // input is one editable line while genuinely separate rows are not.
+        let (lo, hi) = (target.line.min(cline), target.line.max(cline));
+        if (lo..hi).any(|r| !self.grid.line_wraps(r)) {
+            return None;
+        }
+        // Linear cell offsets within the wrapped line — a wrapped row is always `cols` wide and the
+        // editor's arrows walk straight through the wrap, so this arithmetic holds across rows.
+        let lin = |line: i32, col: usize| line * cols as i32 + col as i32;
+        let steps = lin(target.line, target.col) - lin(cline, self.grid.cursor_col());
+        if steps == 0 {
+            return None; // clicked the caret's own cell: nothing to send
+        }
+        const LEFT: &[u8] = b"\x1b[D";
+        const RIGHT: &[u8] = b"\x1b[C";
+        let seq = if steps > 0 { RIGHT } else { LEFT };
+        let mut bytes = Vec::with_capacity(steps.unsigned_abs() as usize * seq.len());
+        for _ in 0..steps.abs() {
+            bytes.extend_from_slice(seq);
+        }
+        Some(bytes)
+    }
+
     /// Highlight rectangles (logical px) for the active *dragged* selection over a surface of
     /// `surf_w`×`surf_h`. Empty for no selection or a non-dragged click — so a plain click never
     /// leaves a stray one-cell highlight.
@@ -1919,6 +1986,75 @@ mod tests {
         p.selection_begin(c1 as f32 * 10.0 + 5.0, y, w, h);
         p.selection_update(c2 as f32 * 10.0 + 5.0, y, w, h);
         assert!(p.selection_is_drag());
+    }
+
+    /// A plain click: press and release on one cell, never crossing the drag threshold.
+    fn click(p: &mut TerminalPane, col: usize, row: usize, w: f32, h: f32) {
+        p.selection_begin(col as f32 * 10.0 + 5.0, row as f32 * 10.0 + 5.0, w, h);
+        assert!(
+            !p.selection_is_drag(),
+            "a press with no motion is not a drag"
+        );
+    }
+
+    #[test]
+    fn a_click_left_of_the_caret_walks_it_back_with_left_arrows() {
+        // "prompt" with the caret at col 6; click col 2 → 4 lefts.
+        let (mut p, w, h) = prompt_pane();
+        click(&mut p, 2, 2, w, h);
+        assert_eq!(p.click_move_cursor(), Some(b"\x1b[D".repeat(4)));
+    }
+
+    #[test]
+    fn a_click_right_of_the_caret_walks_it_forward_with_right_arrows() {
+        // Past the end of the typed text: the editor clamps, so this is safe and still useful
+        // (it lands the caret at the end of the input rather than in the blank cells).
+        let (mut p, w, h) = prompt_pane();
+        click(&mut p, 9, 2, w, h);
+        assert_eq!(p.click_move_cursor(), Some(b"\x1b[C".repeat(3)));
+    }
+
+    #[test]
+    fn a_click_on_the_caret_sends_nothing() {
+        let (mut p, w, h) = prompt_pane();
+        click(&mut p, 6, 2, w, h);
+        assert_eq!(p.click_move_cursor(), None);
+    }
+
+    #[test]
+    fn a_click_on_another_line_is_not_an_edit_position() {
+        // Row 0 holds "a" — output, not the input line. Moving the caret there would be
+        // fabricating an edit the human never asked for.
+        let (mut p, w, h) = prompt_pane();
+        click(&mut p, 0, 0, w, h);
+        assert_eq!(p.click_move_cursor(), None);
+    }
+
+    #[test]
+    fn a_click_walks_through_a_soft_wrap() {
+        // One input longer than the 20-col grid: row 0 wraps into row 1, so the whole thing is
+        // a single editable line and the arrows walk straight across the wrap.
+        let mut p = unit_pane(20, 5);
+        p.feed(&"x".repeat(25)); // caret lands on row 1, col 5
+        click(&mut p, 3, 0, 200.0, 50.0);
+        // 20 - 3 cells to the end of row 0, plus 5 more back across row 1 = 22 lefts.
+        assert_eq!(p.click_move_cursor(), Some(b"\x1b[D".repeat(22)));
+    }
+
+    #[test]
+    fn a_click_in_the_alternate_screen_moves_nothing() {
+        // There the arrows are vim motions, not caret movement.
+        let (mut p, w, h) = prompt_pane();
+        p.feed("\x1b[?1049h");
+        click(&mut p, 2, 2, w, h);
+        assert_eq!(p.click_move_cursor(), None);
+    }
+
+    #[test]
+    fn a_dragged_selection_is_not_a_click() {
+        let (mut p, w, h) = prompt_pane();
+        drag(&mut p, 1, 3, 2, w, h);
+        assert_eq!(p.click_move_cursor(), None);
     }
 
     #[test]

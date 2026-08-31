@@ -4982,10 +4982,12 @@ impl State {
     }
 
     /// Finish a selection in pane `idx`: a real drag copies to the clipboard (raising the
-    /// "Copied …" toast) and keeps its highlight; a stationary click clears the zero-size
-    /// selection so it doesn't linger or block the next click.
-    pub fn pane_selection_end(&mut self, idx: usize) {
+    /// "Copied …" toast) and keeps its highlight; a stationary click on the shell's input line
+    /// moves the caret there, and any other stationary click just clears the zero-size selection
+    /// so it doesn't linger or block the next click.
+    pub fn pane_selection_end(&mut self, idx: usize, mgr: &SessionManager) {
         let copy_on_select = self.settings.copy_on_select;
+        let mut caret = None;
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             // Button released → stop edge-autoscroll (the selection itself is kept/copied below).
             p.pane.end_selection_drag();
@@ -4998,9 +5000,19 @@ impl State {
                     p.pane.copy_selection();
                 }
             } else {
+                // Click-to-place-caret. Read BEFORE the clear — the anchor cell is the click.
+                // `click_move_cursor` declines for everything that isn't unambiguously an edit
+                // position (see its safety model), so this is a no-op on output, scrollback, a
+                // mouse-grabbing app or the alternate screen.
+                if p.kind.is_pty() {
+                    caret = p.pane.click_move_cursor().map(|b| (p.uid.clone(), b));
+                }
                 p.pane.selection_clear();
             }
             self.dirty = true;
+        }
+        if let Some((uid, bytes)) = caret {
+            mgr.write(&uid, &String::from_utf8_lossy(&bytes));
         }
     }
 

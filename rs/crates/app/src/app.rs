@@ -2933,7 +2933,9 @@ impl App {
             let id = win.id;
             win.app.on_pane_selection_end(move |i| {
                 if let Some(w) = app.window_by_id(id) {
-                    w.state.borrow_mut().pane_selection_end(i as usize);
+                    w.state
+                        .borrow_mut()
+                        .pane_selection_end(i as usize, &app.mgr);
                 }
             });
         }
