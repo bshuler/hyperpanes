@@ -823,6 +823,17 @@ pub struct State {
     /// Index (within the active tab) of the pane whose label is being edited inline
     /// (-1 = none). Double-clicking a pane header sets this; it drives the inline editor.
     pub editing_pane: i32,
+    /// Which pane last had the keyboard handed to it, as `(tab index, pane uid)`. The
+    /// per-tick [`Self::sync_pane_keyboard_focus`] compares the current selection against
+    /// this and only then bumps a `refocus_seq`.
+    pub kbd_focus_on: Option<(usize, String)>,
+    /// Monotonic source for every `refocus_seq` bump. A per-pane counter is not enough:
+    /// the pane model is rebuilt per active tab, so the value Slint compares against is
+    /// whatever the OTHER tab's pane at that repeater slot last showed. Two independent
+    /// per-pane counters collide (both sit at 0 on a fresh workspace, and drift back into
+    /// step later), and a collision reads as "unchanged" — no `changed` handler, no focus.
+    /// One clock for the whole app can never repeat a value.
+    pub refocus_clock: i32,
     pub last_blink: Instant,
     pub cursor_on: bool,
     pub frames: u32,
@@ -1098,6 +1109,8 @@ impl State {
             fullscreen: false,
             editing_tab: -1,
             editing_pane: -1,
+            kbd_focus_on: None,
+            refocus_clock: 0,
             last_blink: Instant::now(),
             cursor_on: true,
             frames: 0,
@@ -2610,9 +2623,54 @@ impl State {
     /// `refocus_seq`). Called when the New-goal box closes so the shell regains the keyboard.
     fn refocus_active_pane_scope(&mut self) {
         let f = self.active_tab().focused;
+        let seq = self.next_refocus();
         if let Some(p) = self.active_tab_mut().panes.get_mut(f) {
-            p.refocus_seq = p.refocus_seq.wrapping_add(1);
+            p.refocus_seq = seq;
         }
+    }
+
+    /// The next value for a `refocus_seq`, from the app-wide [`Self::refocus_clock`].
+    fn next_refocus(&mut self) -> i32 {
+        self.refocus_clock = self.refocus_clock.wrapping_add(1);
+        self.refocus_clock
+    }
+
+    /// Hand the keyboard to the selected pane whenever the selection has moved (L).
+    ///
+    /// A pane is selected from a dozen places — clicking its header, clicking a tab,
+    /// Ctrl+Tab, closing a pane or a tab, a drag that rearranges the grid, restoring a
+    /// workspace — but only the two header `TouchArea`s call `tp.focus()`. Everywhere
+    /// else the pane drew its focus ring while the keystrokes still went to whatever
+    /// held focus before, so the user had to click the pane to type into it.
+    ///
+    /// One guarded check per tick, for the same reason `sync_left_root` is one: the list
+    /// of ways focus moves goes stale, a compare against the last-handed-to pane does not.
+    /// The quiet tick costs a string compare.
+    pub fn sync_pane_keyboard_focus(&mut self) {
+        // Something else legitimately owns the keyboard: an overlay's own scope, a tab
+        // title editor, a pane label editor. Each focuses its own field, and a double
+        // click on an UNFOCUSED pane header moves the selection and opens the label
+        // editor in the same gesture — so stealing focus back here would cancel the
+        // rename the user just started.
+        if self.overlay_open() || self.editing_tab != -1 || self.editing_pane != -1 {
+            return;
+        }
+        let t = self.active_tab();
+        let Some(p) = t.panes.get(t.focused) else {
+            // No pane to hand it to (an empty tab). Forget the last one, so returning to
+            // a populated tab counts as a move again.
+            self.kbd_focus_on = None;
+            return;
+        };
+        let now = (self.active, p.uid.clone());
+        if self.kbd_focus_on.as_ref() == Some(&now) {
+            return;
+        }
+        self.kbd_focus_on = Some(now);
+        let seq = self.next_refocus();
+        let f = self.active_tab().focused;
+        self.active_tab_mut().panes[f].refocus_seq = seq;
+        self.dirty = true;
     }
 
     /// New-goal box: set the goal text (the key router's controller-owned mirror). Typing
@@ -8679,5 +8737,142 @@ mod git_mode {
         assert_eq!(st.git_sel.as_deref(), Some("loose.txt"));
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod keyboard_focus_tests {
+    use super::*;
+
+    fn fresh() -> State {
+        State::new(crate::theme::load_font(1.0))
+    }
+
+    fn mgr() -> SessionManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionManager::new(tx)
+    }
+
+    fn det(uid: &str) -> DetachedPane {
+        DetachedPane {
+            uid: uid.into(),
+            title: uid.into(),
+            subtitle: None,
+            pinned_accent: None,
+            show_frame: None,
+            show_dot: None,
+            font_px: 14.0,
+            spawn_command: None,
+            spawn_args: None,
+            spawn_shell: None,
+            kind: PaneKind::default(),
+            tool_session: None,
+        }
+    }
+
+    /// The `refocus_seq` of whatever pane is selected right now.
+    fn seq(st: &State) -> i32 {
+        let t = st.active_tab();
+        t.panes[t.focused].refocus_seq
+    }
+
+    /// Clicking a tab must make its pane typeable, without a second click on the pane.
+    #[test]
+    fn selecting_a_tab_hands_the_keyboard_to_its_pane() {
+        let mut st = fresh();
+        let m = mgr();
+        st.adopt_pane_as_tab(&m, det("a"));
+        st.adopt_pane_as_tab(&m, det("b"));
+        let (ta, tb) = (st.tabs.len() - 2, st.tabs.len() - 1);
+
+        st.switch_tab(ta);
+        st.sync_pane_keyboard_focus();
+        let on_a = seq(&st);
+
+        st.switch_tab(tb);
+        st.sync_pane_keyboard_focus();
+        let on_b = seq(&st);
+
+        // Slint only re-focuses on a CHANGED tick, and the two tabs render through the same
+        // repeater slot — so b's value must differ from the one a left showing there.
+        assert_ne!(
+            on_b, on_a,
+            "the newly selected tab's pane must present a value Slint sees as changed"
+        );
+
+        // Going back is a move again, and must not reuse a: the clock never repeats.
+        st.switch_tab(ta);
+        st.sync_pane_keyboard_focus();
+        let back_on_a = seq(&st);
+        assert_ne!(back_on_a, on_a);
+        assert_ne!(back_on_a, on_b);
+    }
+
+    /// A tick where nothing moved must not touch focus — otherwise every frame would yank
+    /// the keyboard back off whatever the user had clicked into.
+    #[test]
+    fn a_quiet_tick_does_not_touch_focus() {
+        let mut st = fresh();
+        let m = mgr();
+        st.adopt_pane_as_tab(&m, det("a"));
+        st.sync_pane_keyboard_focus();
+        let settled = seq(&st);
+        for _ in 0..10 {
+            st.sync_pane_keyboard_focus();
+        }
+        assert_eq!(seq(&st), settled, "a still selection must cost nothing");
+    }
+
+    /// Selecting a pane inside the SAME tab is a move too — Ctrl+arrow, a drag, a close.
+    #[test]
+    fn selecting_another_pane_in_the_same_tab_moves_the_keyboard() {
+        let mut st = fresh();
+        let m = mgr();
+        st.adopt_pane_as_tab(&m, det("a"));
+        st.adopt_pane(&m, det("b"));
+        st.sync_pane_keyboard_focus();
+        let on_b = seq(&st);
+
+        let a = st
+            .active_tab()
+            .panes
+            .iter()
+            .position(|p| p.uid == "a")
+            .expect("a is in this tab");
+        st.focus_pane(a);
+        st.sync_pane_keyboard_focus();
+        assert_ne!(seq(&st), on_b);
+    }
+
+    /// A double click on an UNFOCUSED pane header selects it and opens its label editor in
+    /// one gesture. Grabbing the keyboard back for the terminal would cancel the rename.
+    #[test]
+    fn an_open_editor_keeps_the_keyboard() {
+        let mut st = fresh();
+        let m = mgr();
+        st.adopt_pane_as_tab(&m, det("a"));
+        st.adopt_pane(&m, det("b"));
+        st.sync_pane_keyboard_focus();
+
+        let a = st
+            .active_tab()
+            .panes
+            .iter()
+            .position(|p| p.uid == "a")
+            .expect("a is in this tab");
+        let before = st.active_tab().panes[a].refocus_seq;
+        st.focus_pane(a);
+        st.editing_pane = a as i32;
+        st.sync_pane_keyboard_focus();
+        assert_eq!(
+            seq(&st),
+            before,
+            "the pane label editor must keep the keys it was opened to receive"
+        );
+
+        // Once the editor closes, the pending move lands.
+        st.editing_pane = -1;
+        st.sync_pane_keyboard_focus();
+        assert_ne!(seq(&st), before);
     }
 }

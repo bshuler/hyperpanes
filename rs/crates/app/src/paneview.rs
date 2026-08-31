@@ -1628,6 +1628,13 @@ pub fn pump(
         state.sync_left_root(mode);
     }
 
+    // ---- keep the KEYBOARD on the selected pane (L) ----
+    // Only the pane header's own TouchAreas call `tp.focus()`. Selecting a pane any other
+    // way — clicking its tab, Ctrl+Tab, closing its neighbour — left the focus ring on the
+    // new pane and the keystrokes on the old one. Same shape as the left-panel anchor
+    // above: one compare per tick, and it does nothing at all until the selection moves.
+    state.sync_pane_keyboard_focus();
+
     // ---- expire a held-Esc once auto-repeat stops (no key-release event) ----
     state.tick_esc();
 
