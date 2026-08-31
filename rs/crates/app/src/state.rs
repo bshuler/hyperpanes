@@ -6653,7 +6653,8 @@ impl State {
         // file that describes one while we already have one must not append a second. This is
         // checked BEFORE any pane is spawned: a duplicate that re-attached the live session
         // would show the same terminal in two tabs, which is how the duplicates got here.
-        if group_is_hyperpane(&g) && self.tabs.iter().any(|t| t.system) {
+        let hyperpane = group_is_hyperpane(&g);
+        if hyperpane && self.tabs.iter().any(|t| t.system) {
             return;
         }
         let palette = self.settings.frame_palette;
@@ -6691,8 +6692,10 @@ impl State {
         tab.zoomed = g.zoomed.map(|z| (z as usize).min(n - 1));
         // Restoring the flag matters as much as writing it: without it the restored
         // "Hyperpane" would be an ordinary tab, and `ensure_hyperpane_tab` would then find
-        // no system tab and append a second one.
-        tab.system = g.system.unwrap_or(false);
+        // no system tab and append a second one. A legacy file carries no flag, so the
+        // recognizer above supplies it — that is what stops the files already on disk from
+        // producing a duplicate on their very next relaunch.
+        tab.system = hyperpane;
         tab.relabel(palette);
         self.tabs.push(tab);
     }
@@ -10768,6 +10771,33 @@ mod hyperpane_uniqueness_tests {
             s.tabs.iter().filter(|t| t.system).count(),
             1,
             "the saved Hyperpane restores, and restores as the system tab"
+        );
+    }
+
+    /// A file written before the flag existed must come back FLAGGED, not as an ordinary tab.
+    /// Otherwise `ensure_hyperpane_tab` finds no system tab on the next launch and appends a
+    /// second Hyperpane — which is exactly how the duplicates on disk were made.
+    #[test]
+    fn a_legacy_hyperpane_restores_as_the_system_tab() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _guard = rt.enter();
+        // The real directory, so the pane can actually spawn there.
+        let dir = paths::hyperpane_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let mut s = fresh();
+        s.load_workspace(
+            WorkspaceFile {
+                groups: Some(vec![legacy_group()]),
+                ..Default::default()
+            },
+            &mgr(),
+        );
+        assert_eq!(
+            s.tabs.iter().filter(|t| t.system).count(),
+            1,
+            "a flagless Hyperpane is recognized and re-flagged on the way in"
         );
     }
 }
