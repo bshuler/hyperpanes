@@ -132,6 +132,32 @@ pub fn edge_band(pos: f32, size: f32, vertical: bool) -> (usize, u8) {
     }
 }
 
+/// Translate "put the dragged pane **on** tile `dest`" into the insertion index
+/// [`crate::state::State::reorder_pane`] wants.
+///
+/// An insertion caret and a tile index are not the same thing, and conflating them is why a
+/// pane could never be dropped into the first tile. The caret model asks "before or after
+/// tile `j`?", which is a sound question only for a *linear* strip. The pane area is not
+/// linear: four panes lay out as a 2×2 grid (row-major — 0 top-left, 1 top-right, 2
+/// bottom-left, 3 bottom-right) and [`edge_band`] then consults the **x** offset alone, so
+/// the grid's whole vertical axis is invisible to the hit test. Pointing at the middle of the
+/// top-left tile — the natural aim — lands in its right half and resolves to caret 1, i.e.
+/// **top-right**; and if the pane being dragged already sits at index 1, that same caret is
+/// the slot it occupies, so the move is a silent no-op and the pane *stays* top-right. Either
+/// way the top-left tile is unreachable from anywhere but its left 50%.
+///
+/// Treating the hovered tile as the destination makes every tile — the first included — a
+/// full-tile target, in a grid and in a strip alike. The caret model is kept where it is
+/// still the right question: stitching a pane in from another window or another tab, where
+/// there is no "current index" to move away from.
+pub fn insertion_for(from: usize, dest: usize) -> usize {
+    if dest >= from {
+        dest + 1
+    } else {
+        dest
+    }
+}
+
 // ---- the per-platform pointer pump + ghost (the GlobalPointer seam) ----
 
 /// The global-pointer seam the drag pump runs on. The whole tear-off gesture is driven
@@ -212,5 +238,52 @@ mod edge_band_tests {
         let w = 1000.0;
         assert_eq!(edge_band(400.0, w, false), (0, 0));
         assert_eq!(edge_band(600.0, w, false), (1, 1));
+    }
+}
+
+#[cfg(test)]
+mod insertion_for_tests {
+    //! A tile is a *destination*, not a caret. `reorder_pane_in` removes the pane first and
+    //! then inserts, so landing on index `dest` needs the caret one past it when moving
+    //! rightward — the arithmetic that makes tile 0 reachable at all.
+    use super::insertion_for;
+
+    /// The round trip through `reorder_pane_in`'s own translation (`to > from → to - 1`).
+    fn lands_at(from: usize, dest: usize) -> usize {
+        let to = insertion_for(from, dest);
+        if to > from {
+            to - 1
+        } else {
+            to
+        }
+    }
+
+    #[test]
+    fn every_tile_is_reachable_from_every_other() {
+        for n in 2..=6 {
+            for from in 0..n {
+                for dest in 0..n {
+                    assert_eq!(lands_at(from, dest), dest, "{from} → {dest} of {n}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_top_left_tile_is_reachable_from_the_top_right_one() {
+        // The reported bug, as a 2×2 grid: pane 1 (top-right) dropped on tile 0 (top-left)
+        // must actually land at 0. Under the old caret model the natural aim — the middle of
+        // the top-left tile — resolved to caret 1, which is where the pane already was.
+        assert_eq!(lands_at(1, 0), 0);
+        assert_eq!(lands_at(2, 0), 0);
+        assert_eq!(lands_at(3, 0), 0);
+    }
+
+    #[test]
+    fn dropping_a_pane_back_on_its_own_tile_is_a_no_op() {
+        // dest == from asks for caret from + 1, which `reorder_pane_in` folds back to `from`
+        // and returns early on — no relabel, no layout churn.
+        assert_eq!(insertion_for(2, 2), 3);
+        assert_eq!(lands_at(2, 2), 2);
     }
 }

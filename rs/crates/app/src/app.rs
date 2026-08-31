@@ -1960,6 +1960,38 @@ impl App {
             }
         }
 
+        // Live pane reflow: the same Chrome-style rearrangement for panes — the dragged pane
+        // takes the tile under the cursor as you sweep across the layout, so you *see* where
+        // it is going instead of guessing from a caret. Stable by construction: once the move
+        // lands the pane occupies the hovered tile, so the next tick resolves to itself and
+        // does nothing until the cursor crosses into a different tile. The drop on release is
+        // then already applied.
+        if is_pane && hover.win == Some(source_id) && !hover.over_strip && !hover.over_left_panel
+        {
+            if let (Some(src), Some(dest)) = (self.window_by_id(source_id), hover.pane_idx) {
+                let uid = match &self.drag.borrow().as_ref().map(|d| d.kind.clone()) {
+                    Some(DragKind::Pane { uid }) => Some(uid.clone()),
+                    _ => None,
+                };
+                if let Some(uid) = uid {
+                    // Only the source window's *active* tab reflows: a spring-load onto
+                    // another tab is a cross-tab move, resolved on release.
+                    let from = {
+                        let st = src.state.borrow();
+                        st.active_has_uid(&uid)
+                            .then(|| st.active_tab().panes.iter().position(|p| p.uid == uid))
+                            .flatten()
+                    };
+                    if let Some(from) = from {
+                        if from != dest {
+                            let to = drag::insertion_for(from, dest);
+                            src.state.borrow_mut().reorder_pane(from, to);
+                        }
+                    }
+                }
+            }
+        }
+
         // Engage the grabbing cursor + mouse capture once, for the whole drag.
         if !self.drag_capture.get() {
             if let Some(src) = self.window_by_id(source_id) {
@@ -1991,19 +2023,17 @@ impl App {
             }
         }
 
-        // Ghost chases the cursor once a *pane* drag has left its source window. A tab drag
-        // is in-window only, so it never spawns a ghost.
+        // Ghost chases the cursor for the whole gesture, not just once the drag has left its
+        // source window. It is what makes the drag read as a tear-off: something visibly
+        // leaves the layout and comes along with the pointer, while the panes behind it
+        // reflow to show where it will land. Suppressing it in-window left the commonest
+        // gesture — a reorder inside one window — with no cursor-attached feedback at all.
         {
             let mut gb = self.ghost.borrow_mut();
             if gb.is_none() {
                 *gb = Some(drag::Ghost::new());
             }
-            let g = gb.as_ref().unwrap();
-            if is_pane && hover.win != Some(source_id) {
-                g.follow(cursor);
-            } else {
-                g.hide();
-            }
+            gb.as_ref().unwrap().follow(cursor);
         }
 
         self.set_previews(windows, is_pane, &hover, source_id);
@@ -2149,12 +2179,20 @@ impl App {
                 return over.map(|i| Command::OpenTabContext(i, lx, ly));
             }
 
-            // Otherwise the pane area (area-relative: subtract the top bar). Bind the pane hit
-            // out of a scoped borrow, then drop it before we build the command.
-            let ax = lx;
+            // Otherwise the pane area (area-relative: subtract the top bar *and* the left
+            // panel — `p.rect` is measured from the pane area's origin, so an open panel
+            // shifts every tile by its width; without this the chained menu targets the pane
+            // 300px to the right of the one under the cursor). Bind the pane hit out of a
+            // scoped borrow, then drop it before we build the command.
             let ay = ly - if fullscreen { 0.0 } else { TOPBAR_H };
             let pane_hit = {
                 let st = win.state.borrow();
+                let panel_w = if st.left_panel_open && !fullscreen {
+                    LEFT_PANEL_W
+                } else {
+                    0.0
+                };
+                let ax = lx - panel_w;
                 let mut hit = None;
                 for (j, p) in st.active_tab().panes.iter().enumerate() {
                     if !p.visible {
@@ -2273,11 +2311,17 @@ impl App {
                                     }
                                 }
                             }
-                        } else if hover.pane_idx.is_some() {
+                        } else if let Some(dest) = hover.pane_idx {
                             // Pane area: reorder within the active tab, or — if a spring-load
                             // moved us to a different tab — move the pane across tabs to the
                             // hovered slot.
                             if src.state.borrow().active_has_uid(uid) {
+                                // In-window, the hovered tile is the *destination*: the pane
+                                // takes the tile you point at and the rest shift. The
+                                // edge-band caret is a strip question and gets a 2×2 grid
+                                // wrong — see `drag::insertion_for`. The live reflow in
+                                // `pump_drag` has usually already done this, leaving the
+                                // release a no-op.
                                 let from = src
                                     .state
                                     .borrow()
@@ -2286,7 +2330,8 @@ impl App {
                                     .iter()
                                     .position(|p| p.uid == *uid);
                                 if let Some(from) = from {
-                                    src.state.borrow_mut().reorder_pane(from, hover.slot_index);
+                                    let to = drag::insertion_for(from, dest);
+                                    src.state.borrow_mut().reorder_pane(from, to);
                                 }
                             } else {
                                 let det = src.state.borrow_mut().detach_uid(uid);
