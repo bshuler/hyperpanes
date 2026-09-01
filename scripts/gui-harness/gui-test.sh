@@ -123,6 +123,17 @@ keysym_of() {
     case "$1" in
         " ") echo space ;;    "-") echo minus ;;      "_") echo underscore ;;
         ".") echo period ;;   "/") echo slash ;;      "=") echo equal ;;
+        # Shell punctuation. Without these the harness could not type a command
+        # with a semicolon or a quote in it, which quietly ruled out every test
+        # that needs to set the pane up before looking at it.
+        ";") echo semicolon ;;   ":") echo colon ;;        ",") echo comma ;;
+        \') echo apostrophe ;;   \") echo quotedbl ;;      "!") echo exclam ;;
+        "@") echo at ;;          "#") echo numbersign ;;   "%") echo percent ;;
+        "^") echo asciicircum ;; "&") echo ampersand ;;    "*") echo asterisk ;;
+        "(") echo parenleft ;;   ")") echo parenright ;;   "+") echo plus ;;
+        "?") echo question ;;    "[") echo bracketleft ;;  "]") echo bracketright ;;
+        "{") echo braceleft ;;   "}") echo braceright ;;   "|") echo bar ;;
+        "<") echo less ;;        ">") echo greater ;;      "~") echo asciitilde ;;
         *)   echo "$1" ;;
     esac
 }
@@ -242,6 +253,91 @@ if [[ -n "$WIN" && -n "$PANE" && "$PANE" != null ]]; then
     else
         bad "Ctrl+Shift+C emptied the clipboard"
     fi
+
+    # --- the round trip: select output, copy it, paste it into the input line ----
+    #
+    # The two halves above each prove themselves in isolation — a clipboard we
+    # planted goes in, a selection we dragged comes out — and neither proves the
+    # gesture a person actually performs: select some text the tool printed, then
+    # paste it into the box you type in. Only the round trip does, and it is the
+    # one that can fail while both halves pass.
+    #
+    # The screen is cleared first so the copied row is a value this test chose. An
+    # arbitrary row is not safe to assert on: the first attempt dragged a row that
+    # already read "command not found", pasted it faithfully, and then convicted
+    # the paste of executing. That is the third time this suite has accused the app
+    # of a bug that turned out to be the assertion's.
+    #
+    # `clear; echo RT-x` leaves the token alone on the top row with the prompt
+    # below it, so the selection is one short line holding no shell syntax and no
+    # prompt string. One row, not the body: a multi-line paste would be testing
+    # bracketed-paste mode in whatever shell the pane runs, not the copy path.
+    # The token is printed on a band of rows, not one, because the drag below aims
+    # in pixels and the pane's first text row is not at a height this script knows.
+    # The first attempt echoed it once and dragged through the prompt line sitting
+    # underneath it, copying the prompt instead. Identical rows make the aim's
+    # remaining error harmless while keeping the selection one row tall — a
+    # multi-row selection would be exercising the shell's bracketed-paste handling
+    # rather than the copy path this stage is about.
+    # Only the digits are matched on. The drag starts a few pixels inside the pane
+    # and so can begin mid-character, which clipped the leading "R" off the first
+    # working version and read as a copy failure; a marker that survives losing a
+    # character or two off its front cannot be broken that way again.
+    RT_DIGITS="$$$RANDOM$RANDOM"
+    RT="RTX$RT_DIGITS"
+    send_key ctrl+u
+    send_type "clear; for i in 1 2 3 4 5 6 7 8 9 10 11 12; do echo $RT; done"
+    send_key Return
+    await_pane "$PANE" "$RT" >/dev/null
+    sleep 0.4
+
+    count_rt() { ctl read "$PANE" --tail 60 2>/dev/null | grep -oF -- "$RT_DIGITS" | grep -c . ; }
+    before="$(count_rt)"
+    act
+    # Several heights are tried so a pane whose text starts lower than expected
+    # reports a copy failure only when the copy genuinely failed.
+    copied=""
+    for dy in 90 120 150 60 180; do
+        printf 'harness-nothing-was-copied-%s' "$$" | xclip -selection clipboard
+        RY=$(( ${Y:-0} + dy ))
+        xdotool mousemove $(( ${X:-0} + 20 )) "$RY" mousedown 1 \
+                mousemove $(( ${X:-0} + 240 )) "$RY" sleep 0.2 mouseup 1
+        sleep 0.3
+        send_key ctrl+shift+c
+        sleep 0.5
+        copied="$(xclip -selection clipboard -o 2>/dev/null)"
+        [[ "$copied" == *"$RT_DIGITS"* ]] && break
+    done
+
+    if [[ "$copied" != *"$RT_DIGITS"* ]]; then
+        bad "the pane's own output did not copy out ($RT absent; clipboard holds '${copied:0:60}')"
+    else
+        ok "output printed by the pane copied out to the OS clipboard"
+        send_key ctrl+v
+        after="$before"
+        for _ in $(seq 1 40); do
+            after="$(count_rt)"
+            [[ "$after" -gt "$before" ]] && break
+            sleep 0.25
+        done
+        if [[ "$after" -gt "$before" ]]; then
+            ok "copied output pasted back into the input line (round trip)"
+        else
+            bad "the round trip failed: $RT copied out but never came back (${before} -> ${after})"
+        fi
+        # Execution is what makes the difference observable: the pasted token is
+        # not a command, so a shell that ran it would answer "$RT: command not
+        # found" — a string the copied text cannot itself contain, which is the
+        # property the previous version of this check lacked.
+        sleep 0.5
+        tail_now="$(ctl read "$PANE" --tail 6 2>/dev/null)"
+        if [[ "$tail_now" == *"$RT_DIGITS: command not found"* || "$tail_now" == *"$RT_DIGITS: not found"* ]]; then
+            bad "the round-tripped paste was EXECUTED — a paste must not submit the line"
+        else
+            ok "the round-tripped paste was not executed"
+        fi
+        send_key ctrl+u
+    fi
 else
     skip "no window or no pane id — clipboard stage not attempted"
 fi
@@ -284,6 +380,58 @@ if [[ -n "$WIN" && -n "$PANE" && "$PANE" != null ]]; then
     fi
 else
     skip "no window or no pane id — drop stage not attempted"
+fi
+
+echo "== shift+enter sends a newline, not a submit =="
+# The gesture TUIs bind for "another line, don't send yet" — Claude Code among
+# them. There is no code point for it, so terminals settled on a meta-prefixed
+# CR, which is exactly what Claude Code's own /terminal-setup programs iTerm2
+# and VS Code to emit.
+#
+# `stty -icanon -echo; cat -v` is the witness. `cat -v` renders the bytes it is
+# given, so ESC CR shows up on screen as ^[^M — but only with the line
+# discipline out of the way. In cooked mode the tty swallows the CR as the line
+# terminator and hands cat just the ESC, which is what the first version of this
+# check saw and misread as a missing CR. Raw-ish mode keeps every byte, so this
+# tests the encoder's output rather than some downstream program's tolerance of
+# a bare CR. `-icrnl` matters as much as `-icanon`: with CR-to-NL translation
+# left on, the tty rewrites the CR into a newline and cat prints a line break
+# where the ^M should be — which is what the second version of this check saw,
+# and it too was the tty's doing rather than the encoder's. `-icanon` alone
+# leaves isig on, so Ctrl+C still gets us out.
+if [[ -n "$WIN" && -n "$PANE" && "$PANE" != null ]]; then
+    act
+    send_key ctrl+u
+    send_type "stty -icanon -echo -icrnl; cat -v"
+    send_key Return
+    sleep 1
+    send_type "before"
+    send_key shift+Return
+    sleep 0.8
+    seen="$(ctl read "$PANE" --tail 12 2>/dev/null)"
+    send_key ctrl+c
+    sleep 0.4
+    send_type "stty sane"
+    send_key Return
+    sleep 0.5
+    if [[ "$seen" == *'^[^M'* ]]; then
+        ok "Shift+Enter reaches the pty as ESC CR (newline, not submit)"
+    else
+        bad "Shift+Enter did not reach the pty as ESC CR (tail: ${seen: -160})"
+    fi
+
+    # A plain Enter must still submit, or the fix has broken the common case.
+    send_key ctrl+u
+    ET="ENTER-$$-$RANDOM"
+    send_type "echo $ET"
+    send_key Return
+    if await_pane "$PANE" "$ET" >/dev/null; then
+        ok "plain Enter still submits the line"
+    else
+        bad "plain Enter no longer submits the line"
+    fi
+else
+    skip "no window or no pane id — shift+enter stage not attempted"
 fi
 
 echo

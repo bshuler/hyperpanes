@@ -85,7 +85,17 @@ pub fn encode_key(text: &str, ctrl: bool, alt: bool, shift: bool) -> Option<Vec<
         return Some(csi_tilde(3));
     }
     if is(Key::Return) {
-        return Some(b"\r".to_vec());
+        // Shift+Enter means "newline, don't submit" — the gesture TUIs bind for a multi-line
+        // prompt, Claude Code among them. No distinct code point exists for it, so terminals
+        // settled on a meta-prefixed CR; that is exactly what Claude Code's own
+        // `/terminal-setup` programs iTerm2 and VS Code to send. Alt+Enter takes the same
+        // route, because ESC-prefixing is the rule the `alt` branch below applies to every
+        // other key and this early return would otherwise swallow it.
+        return Some(if shift || alt {
+            b"\x1b\r".to_vec()
+        } else {
+            b"\r".to_vec()
+        });
     }
     if is(Key::Backspace) {
         // Terminals conventionally map Backspace to DEL (0x7f).
@@ -269,6 +279,26 @@ mod tests {
         assert_eq!(
             encode_key(&special(Key::Tab), false, false, true),
             Some(b"\x1b[Z".to_vec())
+        );
+    }
+
+    #[test]
+    fn shift_enter_is_a_meta_prefixed_cr() {
+        // "Newline, don't submit". Plain Enter must keep submitting — that is the whole
+        // distinction, so both halves are asserted together.
+        assert_eq!(
+            encode_key(&special(Key::Return), false, false, true),
+            Some(b"\x1b\r".to_vec())
+        );
+        assert_eq!(
+            encode_key(&special(Key::Return), false, false, false),
+            Some(b"\r".to_vec())
+        );
+        // Alt+Enter is the same gesture by the other convention, and used to be swallowed
+        // into a bare CR.
+        assert_eq!(
+            encode_key(&special(Key::Return), false, true, false),
+            Some(b"\x1b\r".to_vec())
         );
     }
 

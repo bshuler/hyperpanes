@@ -1967,11 +1967,15 @@ impl App {
         // `run_command` (which also wakes); this covers raw typing routed straight to the pty.
         self.wake();
         crate::dbg_log(&format!(
-            "key raw text={:x?} ctrl={} alt={} shift={}",
+            "key raw text={:x?} ctrl={} alt={} shift={} meta={}",
             msg.text.chars().map(|c| c as u32).collect::<Vec<_>>(),
             msg.control,
             msg.alt,
-            msg.shift
+            msg.shift,
+            // `meta` is the physical Control key on macOS (see `crate::pty_ctrl`), so without
+            // it this line cannot tell a Ctrl+C apart from a plain "c" on the one platform
+            // where the two modifiers are swapped.
+            msg.meta
         ));
         // Ctrl+Shift is fully app-reserved: run the mapped command and ALWAYS swallow.
         if msg.control && msg.shift {
