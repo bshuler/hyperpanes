@@ -116,3 +116,19 @@ jobs:
 
       - name: Test
         run: flutter test
+
+  # The guardrails that keep an install from ending the live session daemon
+  # (docs/live-session-safety.md). macOS-only: the installer's whole subject is
+  # the app bundle directory and the BSD `uchg` flag. Blocking — the failure
+  # mode they cover is the silent loss of every program running in every pane.
+  guardrails:
+    name: guardrails (install + hook)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Hook rules (allow/deny table)
+        run: bash scripts/guard-live-sessions.test.sh
+
+      - name: Safe installer (a live process must survive the swap)
+        run: bash scripts/install-macos.test.sh

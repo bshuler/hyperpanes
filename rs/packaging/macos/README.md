@@ -64,6 +64,22 @@ identity, so a Screen Recording or Full Disk Access grant made against an
 ad-hoc signature is dropped the next time the app is rebuilt. A Developer ID
 build keeps them.
 
+## Installing
+
+Use `scripts/install-macos.sh`, not a hand-rolled copy:
+
+```sh
+bash rs/packaging/macos/bundle.sh 0.0.28
+bash scripts/install-macos.sh
+```
+
+Replacing `/Applications/Hyperpanes.app` by deleting it first kills the session
+daemon — it is executing out of that bundle, and macOS kills a process whose
+executable is unlinked underneath it — which ends every program running in every
+pane. The installer renames the old bundle aside instead, verifies the daemon
+survived, and locks the result with `chflags uchg` so the shortcut stops being
+possible. See [docs/live-session-safety.md](../../../docs/live-session-safety.md).
+
 ### Installing an ad-hoc build (Gatekeeper)
 
 An ad-hoc-signed, un-notarized dmg is quarantined on download, and a plain
