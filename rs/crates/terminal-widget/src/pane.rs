@@ -63,6 +63,13 @@ pub struct TerminalPane {
     /// misses ARE cached: history is append-only, so a word that is not an object now will not
     /// become one, and every uncached lookup is a `git rev-parse` subprocess per hover.
     commits: HashMap<String, Option<String>>,
+    /// Names this pane looked for across the whole repository, after the pane's own cwd could
+    /// not place them, keyed by `cwd\x1ftoken`. Both answers are cached, misses included: the
+    /// lookup is a `git ls-files` subprocess, and a hover that crosses a paragraph of prose
+    /// would otherwise fire one per word that happens to end in `.py`. The price is a file
+    /// created *after* it was first mentioned staying dark until the pane's cwd changes —
+    /// paid only by this fallback, never by a path the cwd can resolve on its own.
+    found: HashMap<String, Option<ResolveResult>>,
     /// The live drag-selection, if any (our own cell-range model — see [`crate::selection`]).
     /// `None` until a press starts one; a non-dragged selection (a plain click) is held but
     /// renders nothing, so the same press can still resolve to a link click.
@@ -178,6 +185,7 @@ impl TerminalPane {
             cwd: None,
             verified: HashMap::new(),
             commits: HashMap::new(),
+            found: HashMap::new(),
             selection: None,
             select_origin: None,
             clipboard: Clipboard::new(),
@@ -282,6 +290,7 @@ impl TerminalPane {
             self.cwd = cwd;
             self.verified.clear();
             self.commits.clear();
+            self.found.clear();
         }
     }
 
@@ -414,18 +423,26 @@ impl TerminalPane {
             .find(|c| idx >= c.start && idx < c.end)?;
 
         let key = self.cache_key(&cand.path);
-        let resolved = if let Some(hit) = self.verified.get(&key) {
-            hit.clone()
-        } else {
-            let r = paths::resolve_path(self.cwd.as_deref(), &cand.path);
-            if r.exists {
-                self.verified.insert(key, r.clone());
-            } else if require_exists {
-                return None;
+        let resolved = match self.verified.get(&key) {
+            Some(hit) => hit.clone(),
+            None => {
+                let r = paths::resolve_path(self.cwd.as_deref(), &cand.path);
+                if r.exists {
+                    self.verified.insert(key, r.clone());
+                    r
+                } else if let Some(found) = self.elsewhere(&cand.path) {
+                    // Not where this pane is standing, but somewhere in its repository — and
+                    // only one such file, or `elsewhere` would have declined to guess.
+                    self.verified.insert(key, found.clone());
+                    found
+                } else if require_exists {
+                    return None;
+                } else {
+                    // A miss is never cached: a file that appears a second later has to
+                    // linkify on the next hover rather than stay dark for the life of the pane.
+                    r
+                }
             }
-            // A miss is never cached: a file that appears a second later has to linkify on the
-            // next hover rather than stay dark for the life of the pane.
-            r
         };
         // The candidate's line/col rides out with it: re-extracting to recover them would have
         // to rebuild the same joined line, and the span it matched on is a logical index now.
@@ -433,6 +450,34 @@ impl TerminalPane {
         Some((
             resolved, cand.line, cand.col, start, end, row, cell_w, cell_h,
         ))
+    }
+
+    /// The repository-wide fallback for a name the pane's own cwd could not place.
+    ///
+    /// A coding session says `b99_price.py` and means a file it is not standing next to. The
+    /// repository is the only corpus that makes that name an answer rather than a guess, and
+    /// [`git::find_in_repo`] declines outright when more than one file could be meant.
+    fn elsewhere(&mut self, token: &str) -> Option<ResolveResult> {
+        let cwd = self.cwd.clone()?;
+        let key = self.cache_key(token);
+        if let Some(hit) = self.found.get(&key) {
+            return hit.clone();
+        }
+        let r = git::find_in_repo(std::path::Path::new(&cwd), token).and_then(|abs| {
+            let abs_path = abs.to_string_lossy().into_owned();
+            // Listed by git is not the same as present on disk — an index entry outlives a
+            // `rm`. The link means "open this", so it has to be there.
+            let md = std::fs::metadata(&abs).ok()?;
+            Some(ResolveResult {
+                token: token.to_string(),
+                is_exe: paths::is_executable_ext(&abs_path),
+                is_dir: md.is_dir(),
+                exists: true,
+                abs_path,
+            })
+        });
+        self.found.insert(key, r.clone());
+        r
     }
 
     /// Find an http/https URL under the (logical-px) point, returning the candidate, its row,
@@ -1778,6 +1823,48 @@ mod tests {
         assert!(p.link_at(6.5, 0.5, 60.0, 3.0).is_none());
         // Ctrl/Cmd-click has nothing to copy either: an unresolvable hash is not a target.
         assert!(p.link_target_at(6.5, 0.5, 60.0, 3.0).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bare_name_from_elsewhere_in_the_repository_still_linkifies() {
+        let Some((dir, _)) = commit_fixture() else {
+            return;
+        };
+        // The file the agent is talking about is nowhere near the pane's cwd — which is the
+        // ordinary case when a session narrates its own work.
+        std::fs::create_dir_all(dir.join("deep/er")).unwrap();
+        std::fs::write(dir.join("deep/er/b99_price.py"), "x = 1\n").unwrap();
+        // And two files that share a name, which is a question with no answer.
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        std::fs::write(dir.join("a/dup.rs"), "").unwrap();
+        std::fs::write(dir.join("b/dup.rs"), "").unwrap();
+
+        let mut p = unit_pane(60, 3);
+        p.set_cwd(Some(dir.to_string_lossy().into_owned()));
+        p.feed("in the b99_price.py shape, and dup.rs");
+        let (w, h) = (60.0, 3.0); // 1px per cell
+
+        let at = "in the ".len() as f32 + 0.5;
+        let hit = p.link_at(at, 0.5, w, h).expect("the name should light up");
+        assert!(hit.exists);
+        assert!(!hit.is_commit);
+        assert!(
+            hit.abs_path.ends_with("deep/er/b99_price.py"),
+            "{}",
+            hit.abs_path
+        );
+        // Underline spans the name and nothing else.
+        assert_eq!(hit.x, "in the ".len() as f32);
+        assert_eq!(hit.w, "b99_price.py".len() as f32);
+
+        let dup = "in the b99_price.py shape, and ".len() as f32 + 0.5;
+        assert!(
+            p.link_at(dup, 0.5, w, h).is_none(),
+            "two files of that name: opening one of them would be a guess"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

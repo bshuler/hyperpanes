@@ -85,6 +85,56 @@ pub fn is_hex_rev(rev: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
 }
 
+/// Find the one file `name` refers to, when it is not where the pane is standing.
+///
+/// A coding session says `b99_price.py` and means a file three directories away; the pane's
+/// cwd resolves it to nothing, and the name stays dark. The repository is the right place to
+/// look for it, and `git ls-files` is the cheap way: one subprocess over the index (plus
+/// untracked-but-not-ignored files, which a just-written file is), instead of a walk of a
+/// tree whose `node_modules` alone would dwarf the answer.
+///
+/// **Ambiguity is a miss, deliberately.** Four files named `mod.rs` and a guess would open
+/// the wrong one, and a link that opens the wrong file is worse than a name that stays dark.
+///
+/// `name` may carry directories (`src/b99_price.py`); it matches on a whole-segment suffix,
+/// so `price.py` never answers for `b99_price.py`.
+pub fn find_in_repo(dir: &Path, name: &str) -> Option<PathBuf> {
+    if name.is_empty() || name.starts_with('/') || name.contains('\\') || name.contains("..") {
+        return None;
+    }
+    let root = repo_root(dir)?;
+    // Two pathspecs: the name at the root, and the name anywhere under it. `*` in a git
+    // pathspec crosses `/`, so `*b99_price.py` is the whole-tree search — done by git, so
+    // the output that crosses the pipe is the handful of matches rather than the index.
+    let anywhere = format!("*{name}");
+    let out = git(
+        &root,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "--",
+            name,
+            &anywhere,
+        ],
+    )?;
+    let tail = format!("/{name}");
+    let mut hit: Option<&str> = None;
+    for p in out.split('\0').filter(|p| !p.is_empty()) {
+        // The pathspec glob matched on characters; this is the segment boundary it ignored.
+        if p != name && !p.ends_with(&tail) {
+            continue;
+        }
+        match hit {
+            Some(prev) if prev != p => return None,
+            _ => hit = Some(p),
+        }
+    }
+    Some(root.join(hit?))
+}
+
 /// Resolve `rev` to the full hash of a **commit** in the repository containing `dir`, or
 /// `None`. The `^{commit}` peel is what makes this an answer rather than a guess: a tree or
 /// blob whose abbreviation happens to match is not something a commit link can show.
@@ -339,6 +389,48 @@ mod tests {
         assert_eq!(
             (deep.label.as_str(), deep.detail.as_str()),
             ("a b.txt", "sub")
+        );
+    }
+
+    #[test]
+    fn a_bare_name_finds_its_one_file_anywhere_in_the_repository() {
+        let Some((dir, _)) = fixture() else { return };
+        let root = dir.path();
+        // What comes back is rooted at git's own `--show-toplevel`, which on macOS has
+        // already walked the `/var` → `/private/var` symlink the temp dir sits behind.
+        let real = repo_root(root).expect("the fixture is a repository");
+
+        // The name is three directories from where we are standing, and still resolves.
+        assert_eq!(
+            find_in_repo(root, "a b.txt").as_deref(),
+            Some(real.join("sub/a b.txt").as_path()),
+            "a nested file answers to its bare name"
+        );
+        assert_eq!(
+            find_in_repo(&root.join("sub"), "top.txt").as_deref(),
+            Some(real.join("top.txt").as_path()),
+            "the search is the repository, not the directory we asked from"
+        );
+        assert_eq!(
+            find_in_repo(root, "sub/a b.txt").as_deref(),
+            Some(real.join("sub/a b.txt").as_path()),
+            "a partial path is a name too"
+        );
+
+        assert_eq!(
+            find_in_repo(root, "op.txt"),
+            None,
+            "the match is by whole segment: `op.txt` is not `top.txt`"
+        );
+        assert_eq!(find_in_repo(root, "nothing-like-this.txt"), None);
+
+        // A second `top.txt` — untracked, but not ignored, so the search sees it and now
+        // cannot say which one was meant. Silence beats opening the wrong file.
+        std::fs::write(root.join("sub/top.txt"), "three\n").unwrap();
+        assert_eq!(
+            find_in_repo(root, "top.txt"),
+            None,
+            "two files of that name is an ambiguity, not a pick"
         );
     }
 
