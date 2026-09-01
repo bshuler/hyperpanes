@@ -27,6 +27,12 @@
 //! client compares its own [`PROTO_VER`] against the daemon's `Hello.proto_ver` reply and,
 //! on a mismatch, sends [`ClientMsg::Shutdown`] (tearing the stale daemon down) then
 //! respawns a fresh one — see [`daemon_client`](crate::session::daemon_client).
+//!
+//! The protocol version is deliberately coarse: it moves only when the message shapes do.
+//! `Hello.build_id` is the fine-grained companion — it names the exact build on both ends,
+//! so a client can move the sessions onto a rebuilt or freshly installed binary (by live
+//! takeover, keeping every pty) without waiting for a protocol change to notice. See
+//! [`build_id`](crate::session::build_id).
 
 use std::io::{self, Read, Write};
 
@@ -290,11 +296,22 @@ pub enum DaemonMsg {
     /// the client asserts, so no pid is trusted and none has to be peer-credentialed.
     /// `#[serde(default)]` (→ `0`, the "unknown" sentinel) keeps a pre-M7 daemon's reply
     /// parseable.
+    ///
+    /// `build_id` names the daemon's exact build (see
+    /// [`build_id`](crate::session::build_id)). [`PROTO_VER`] alone cannot distinguish a
+    /// rebuild, a new install, or the dev binary from the installed one — they all speak
+    /// the same protocol — so before this field the only way onto a new build was to kill
+    /// the daemon, which closes every pty. A client that sees a build it is not asks for
+    /// the same live takeover the proto-mismatch path uses, and every session survives.
+    /// Also `#[serde(default)]` (→ `""`, "unknown"), which never forces anything: no
+    /// `PROTO_VER` bump, and an older daemon's shorter reply still parses.
     Hello {
         proto_ver: u32,
         daemon_pid: u32,
         #[serde(default)]
         conn_id: crate::session::claims::ConnId,
+        #[serde(default)]
+        build_id: String,
     },
     /// Reply to [`ClientMsg::ListSessions`].
     Sessions(Vec<SessionMeta>),
@@ -540,6 +557,7 @@ mod tests {
                 proto_ver: PROTO_VER,
                 daemon_pid: 4242,
                 conn_id: 7,
+                build_id: "9.9.9+0123456789abcdef".into(),
             },
             DaemonMsg::Sessions(vec![SessionMeta {
                 uid: "s1".into(),
@@ -636,15 +654,18 @@ mod tests {
 
     #[test]
     fn the_hello_handshake_carries_the_version_field() {
-        // The version must survive the wire so a client can detect a stale daemon.
+        // The version must survive the wire so a client can detect a stale daemon - and so
+        // must the build id, which is what detects a stale daemon of the SAME version.
         let DaemonMsg::Hello {
             proto_ver,
             daemon_pid,
             conn_id,
+            build_id,
         } = roundtrip_daemon(&DaemonMsg::Hello {
             proto_ver: PROTO_VER,
             daemon_pid: 77,
             conn_id: 5,
+            build_id: "1.2.3+abcdef0123456789".into(),
         })
         else {
             panic!("expected Hello");
@@ -652,6 +673,7 @@ mod tests {
         assert_eq!(proto_ver, PROTO_VER);
         assert_eq!(daemon_pid, 77);
         assert_eq!(conn_id, 5);
+        assert_eq!(build_id, "1.2.3+abcdef0123456789");
     }
 
     /// `Hello.conn_id` is `#[serde(default)]` so a pre-M7 daemon's two-field reply still
@@ -661,13 +683,31 @@ mod tests {
         let body = br#"{"Hello":{"proto_ver":2,"daemon_pid":9}}"#;
         let msg: DaemonMsg = serde_json::from_slice(body).expect("legacy Hello parses");
         assert!(matches!(
-            msg,
+            &msg,
             DaemonMsg::Hello {
                 proto_ver: 2,
                 daemon_pid: 9,
-                conn_id: 0
-            }
+                conn_id: 0,
+                build_id,
+            } if build_id.is_empty()
         ));
+    }
+
+    /// `Hello.build_id` is `#[serde(default)]` for the same reason `conn_id` is: a daemon
+    /// built before the field existed answers without it, and that reply must still parse -
+    /// landing on `""`, the "unknown build" sentinel that never triggers an upgrade.
+    #[test]
+    fn a_hello_without_a_build_id_still_parses() {
+        let body = br#"{"Hello":{"proto_ver":3,"daemon_pid":9,"conn_id":4}}"#;
+        let msg: DaemonMsg = serde_json::from_slice(body).expect("build-id-less Hello parses");
+        let DaemonMsg::Hello { build_id, .. } = msg else {
+            panic!("expected Hello");
+        };
+        assert!(build_id.is_empty(), "an absent build id reads as unknown");
+        assert!(
+            !crate::session::build_id::differs(&build_id),
+            "and unknown must never look like a build worth upgrading to"
+        );
     }
 
     /// The claim messages must survive the wire in both directions - the whole

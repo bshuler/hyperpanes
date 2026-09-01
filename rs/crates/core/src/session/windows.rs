@@ -524,6 +524,7 @@ impl Daemon {
                         proto_ver: PROTO_VER,
                         daemon_pid: std::process::id(),
                         conn_id,
+                        build_id: crate::session::build_id::build_id().to_string(),
                     })
                     .await;
                 // M7: open the push gate, then seed by broadcasting — same ordering argument

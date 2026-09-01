@@ -1044,10 +1044,14 @@ impl Daemon {
                 // `daemon_client`). The daemon need not reject the client here: a stale client
                 // that ignores the reply simply talks to a daemon it can't fully understand,
                 // which is exactly what the client-side mismatch check prevents.
+                // …and with the exact build we are running, so a client of a DIFFERENT
+                // build can ask for a live takeover instead of having to kill us (which
+                // would close every pty). See `session::build_id`.
                 let _ = out.send(DaemonMsg::Hello {
                     proto_ver: PROTO_VER,
                     daemon_pid: std::process::id(),
                     conn_id,
+                    build_id: crate::session::build_id::build_id().to_string(),
                 });
                 // M7: `Hello` marks this peer as a full protocol client, so unsolicited
                 // snapshots may now flow to it. Open the gate BEFORE seeding, and seed by

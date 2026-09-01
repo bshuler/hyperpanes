@@ -9,6 +9,9 @@ pub mod adopt;
 /// tty or stdio in it — the app crate supplies those, and M3's SSH channel will supply its own.
 pub mod attach;
 pub mod batcher;
+/// This binary's build identity, carried in the daemon handshake so either side can be
+/// upgraded (or rolled back) without dropping the sessions.
+pub mod build_id;
 /// The cross-process session claim registry (M7): who is hosting which uid right now.
 pub mod claims;
 /// The tmux **control-mode** (`-CC`) server surface (M4): a pure protocol encoder and state

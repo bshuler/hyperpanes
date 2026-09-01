@@ -56,6 +56,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::session::build_id;
 use crate::session::claims::ConnId;
 use crate::session::proto::{read_frame, write_frame, ClientMsg, DaemonMsg, SpawnSpec, PROTO_VER};
 use crate::session::replay::Replay;
@@ -193,6 +194,14 @@ impl DaemonSessionManager {
     /// user-data dir, exactly as the GUI's single-instance gate and the daemon's own
     /// discovery use it.
     ///
+    /// **Build handshake:** the same round-trip also compares the daemon's `build_id`
+    /// against ours. A daemon of a different build speaks our protocol perfectly well, so
+    /// nothing is broken — but the user launched *this* binary and means its backend to
+    /// serve, so we ask for the same live takeover and every session moves across intact.
+    /// That is what makes upgrading (or rolling back) either side free of friction: no
+    /// `--kill-daemon`, no lost terminals. Attempted at most ONCE per process, so two GUIs
+    /// of different builds concede to each other instead of trading the salt forever.
+    ///
     /// **Proto-version handshake (M3):** before building the manager, this does a bare
     /// `Hello` round-trip on the raw socket and compares the daemon's `proto_ver` against the
     /// client's [`PROTO_VER`]. On a MISMATCH the running daemon is a stale build of OUR binary
@@ -220,10 +229,64 @@ impl DaemonSessionManager {
         // Up to a couple of respawn rounds: a single mismatch should resolve in one
         // tear-down + respawn; more than that means something is wrong (e.g. two GUIs of
         // different versions fighting), and we just proceed with whatever answers last.
+        // A build-driven takeover is attempted AT MOST ONCE per process. It always succeeds
+        // against a cooperating incumbent, so a SECOND mismatch means someone else is
+        // pulling the salt the other way — two GUIs of different builds, each correctly
+        // wanting its own backend. Fighting that produces a takeover loop; conceding
+        // produces a daemon of the wrong build, which still speaks our protocol and still
+        // holds the user's terminals. We concede, and say so.
+        let mut forced_build_upgrade = false;
         for attempt in 0..3 {
             let stream = connect_or_spawn(&endpoint, salt)?;
-            match probe_proto_version(&stream)? {
+            match probe_daemon_identity(&stream)? {
                 ProtoCheck::Match => return Self::from_stream(stream, events),
+                ProtoCheck::BuildMismatch { daemon_build } if policy == VersionPolicy::Tolerant => {
+                    // The pty-host being an older build is the whole point of `Tolerant`:
+                    // it holds live ConPTYs that Windows gives us no way to move. A build
+                    // difference there is expected, not stale.
+                    dbg(&format!(
+                        "pty-host build skew (client {}, host {daemon_build}); proceeding — \
+                         the host surface is version-stable by contract",
+                        build_id::build_id()
+                    ));
+                    return Self::from_stream(stream, events);
+                }
+                ProtoCheck::BuildMismatch { daemon_build } if forced_build_upgrade => {
+                    dbg(&format!(
+                        "daemon is build {daemon_build}, not ours ({}), after we already \
+                         handed it over once; another client wants it that way — driving \
+                         it rather than starting a takeover fight",
+                        build_id::build_id()
+                    ));
+                    return Self::from_stream(stream, events);
+                }
+                ProtoCheck::BuildMismatch { daemon_build } => {
+                    // Same protocol, different binary: a rebuild, a new install, or the
+                    // other half of the dev/installed pair. The user launched THIS build and
+                    // means its backend to serve. Take the sessions over rather than kill
+                    // anything — the descriptors move, the shells never notice, and that is
+                    // what makes upgrading (or rolling back) either side free.
+                    dbg(&format!(
+                        "daemon build mismatch (client {}, daemon {daemon_build}); \
+                         attempting live takeover (attempt {attempt})",
+                        build_id::build_id()
+                    ));
+                    forced_build_upgrade = true;
+                    drop(stream);
+                    if !hand_over_stale_daemon(salt, &endpoint) {
+                        // Nothing to fall back to and nothing to fall back FROM: the
+                        // protocol matches, so the incumbent is fully drivable. It keeps the
+                        // salt and its terminals; we just work with the build that is there.
+                        // (Unlike a proto mismatch, there is never a reason to tear this
+                        // one down — an upgrade we merely prefer is not worth a session.)
+                        dbg(&format!(
+                            "build takeover failed against daemon {daemon_build}; driving it \
+                             as-is — the terminals matter more than the upgrade"
+                        ));
+                        let stream = connect_or_spawn(&endpoint, salt)?;
+                        return Self::from_stream(stream, events);
+                    }
+                }
                 ProtoCheck::Mismatch { daemon_ver } if policy == VersionPolicy::Tolerant => {
                     // Deliberate: the peer is a pty-host from an older build, still holding
                     // live ConPTYs. Replacing it is exactly what we must NOT do — every
@@ -929,26 +992,41 @@ pub enum VersionPolicy {
     Tolerant,
 }
 
-/// Result of the proto-version handshake probe ([`probe_proto_version`]).
+/// Result of the handshake probe ([`probe_daemon_identity`]).
 enum ProtoCheck {
-    /// The daemon's `proto_ver` equals the client's [`PROTO_VER`] — proceed.
+    /// The daemon is one we can simply use: its `proto_ver` equals the client's
+    /// [`PROTO_VER`] *and* it reports our own build (or no build at all — an older daemon
+    /// that predates the field, which never forces anything). Proceed.
     Match,
-    /// The daemon speaks a different version — tear it down + respawn.
+    /// Same protocol, different build: a rebuild, a fresh install, or the other of the
+    /// dev/installed pair. Nothing is broken — we could talk to it — but the user launched
+    /// *this* binary and expects its backend, so ask for a live takeover. Every session
+    /// survives it, which is why this is worth doing on a merely-different build at all.
+    BuildMismatch { daemon_build: String },
+    /// The daemon speaks a different version — hand its sessions over + respawn (or, when
+    /// that fails and it holds live terminals, drive it as it is).
     Mismatch { daemon_ver: u32 },
 }
 
 /// How long the version probe waits for the daemon's `Hello` before giving up.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Do a bare `Hello` round-trip on a freshly-connected (NOT yet manager-owned) connection
-/// and compare the daemon's reported `proto_ver` to the client's [`PROTO_VER`]. Used by `new`
-/// BEFORE the manager + reader thread are built, so a mismatch can be resolved by handing the
-/// stale daemon's sessions over (or, failing that, tearing it down) and respawning — the
-/// lock-step-upgrade contract, since the daemon is our own binary. A handshake that doesn't
-/// answer in time is treated as a `Match` (proceed): the version gate must never hard-block
-/// launch over a slow/odd handshake — the worst case is talking to a same-version daemon we
-/// couldn't confirm, which is harmless.
-fn probe_proto_version(stream: &Conn) -> io::Result<ProtoCheck> {
+/// Do a bare `Hello` round-trip on a freshly-connected (NOT yet manager-owned) connection and
+/// compare the daemon's identity to ours: first its `proto_ver` against [`PROTO_VER`], then —
+/// when those agree — its `build_id` against [`build_id`](crate::session::build_id). Used by
+/// `new` BEFORE the manager + reader thread are built, so a mismatch can be resolved by
+/// handing the stale daemon's sessions over and respawning — the lock-step-upgrade contract,
+/// since the daemon is our own binary.
+///
+/// The two checks answer different questions. The protocol version asks *can* we talk to it;
+/// the build id asks *is it the binary the user launched*. The second is the one that moves
+/// on an ordinary rebuild or install, and it is safe to act on precisely because the answer
+/// is a live takeover rather than a kill.
+///
+/// A handshake that doesn't answer in time is treated as a `Match` (proceed): the gate must
+/// never hard-block launch over a slow or odd handshake — the worst case is talking to a
+/// daemon we couldn't confirm, which is harmless.
+fn probe_daemon_identity(stream: &Conn) -> io::Result<ProtoCheck> {
     let mut w = transport::try_clone(stream)?;
     let send = write_frame(
         &mut w,
@@ -968,13 +1046,24 @@ fn probe_proto_version(stream: &Conn) -> io::Result<ProtoCheck> {
     const PROBE_FRAMES: usize = 8;
     for _ in 0..PROBE_FRAMES {
         match transport::read_frame_deadline::<DaemonMsg>(stream, PROBE_TIMEOUT) {
-            Ok(Some(DaemonMsg::Hello { proto_ver, .. })) => {
-                return Ok(if proto_ver == PROTO_VER {
-                    ProtoCheck::Match
-                } else {
-                    ProtoCheck::Mismatch {
+            Ok(Some(DaemonMsg::Hello {
+                proto_ver,
+                build_id: daemon_build,
+                ..
+            })) => {
+                if proto_ver != PROTO_VER {
+                    return Ok(ProtoCheck::Mismatch {
                         daemon_ver: proto_ver,
-                    }
+                    });
+                }
+                // Same protocol. The build id is the finer question: is this daemon the
+                // binary the user just launched, or a different build of it? An empty id is
+                // a daemon from before the field existed — unknown, and unknown is never a
+                // reason to move anything.
+                return Ok(if build_id::differs(&daemon_build) {
+                    ProtoCheck::BuildMismatch { daemon_build }
+                } else {
+                    ProtoCheck::Match
                 });
             }
             // Unsolicited push traffic (M7) or an unrelated reply — keep looking.
@@ -997,8 +1086,10 @@ const TAKEOVER_BUDGET: Duration = Duration::from_secs(8);
 /// Upgrade the daemon at `endpoint` **without killing its sessions**: spawn a daemon from the
 /// current (new) binary, which finds the salt's endpoint already held, asks the incumbent to
 /// hand every session over, and takes the endpoint once the incumbent exits (see
-/// `daemon::take_over` / `daemon::windows::take_over`). Returns whether a daemon speaking our
-/// [`PROTO_VER`] is serving by the end of it.
+/// `daemon::take_over` / `daemon::windows::take_over`). Returns whether a daemon that is
+/// *ours* — same [`PROTO_VER`] and same build id — is serving by the end of it. Both
+/// triggers (proto skew and build skew) poll the same predicate, because both want the same
+/// end state: the daemon is this binary.
 ///
 /// `false` is the expected answer against an incumbent that predates the takeover protocol
 /// (proto 1): it cannot parse the request and drops the connection, and the successor
@@ -1014,7 +1105,7 @@ fn hand_over_stale_daemon(salt: &str, endpoint: &Endpoint) -> bool {
         // Only a version MATCH proves the successor won: while the incumbent still holds the
         // endpoint, connecting succeeds and reports the stale version.
         if let Ok(stream) = transport::connect(endpoint) {
-            if matches!(probe_proto_version(&stream), Ok(ProtoCheck::Match)) {
+            if matches!(probe_daemon_identity(&stream), Ok(ProtoCheck::Match)) {
                 return true;
             }
         }
@@ -2241,7 +2332,7 @@ mod tests {
 
     // ====================== M3 proto-version handshake + shutdown ======================
 
-    // probe_proto_version against a REAL daemon (same PROTO_VER) returns Match, AND the
+    // probe_daemon_identity against a REAL daemon (same PROTO_VER) returns Match, AND the
     // manager built on that same socket afterwards still works — i.e. the probe's Hello
     // round-trip did NOT desync the stream nor leave a read timeout on the shared fd (a
     // regression guard for the SO_RCVTIMEO-is-shared subtlety).
@@ -2253,7 +2344,7 @@ mod tests {
         let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
         assert!(
             matches!(
-                probe_proto_version(&stream).expect("probe"),
+                probe_daemon_identity(&stream).expect("probe"),
                 ProtoCheck::Match
             ),
             "a same-version daemon must match"
@@ -2300,6 +2391,7 @@ mod tests {
                         proto_ver: PROTO_VER + 1,
                         daemon_pid: 4242,
                         conn_id: 1,
+                        build_id: build_id::build_id().to_string(),
                     },
                 );
                 // Keep the connection open briefly so the client reads the reply.
@@ -2308,10 +2400,85 @@ mod tests {
         });
 
         let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect fake");
-        let check = probe_proto_version(&stream).expect("probe");
+        let check = probe_daemon_identity(&stream).expect("probe");
         assert!(
             matches!(check, ProtoCheck::Mismatch { daemon_ver } if daemon_ver == PROTO_VER + 1),
             "a different-version daemon must be a Mismatch carrying the daemon's version"
+        );
+        drop(stream);
+        let _ = server.join();
+    }
+
+    // Same protocol, DIFFERENT build: the case `PROTO_VER` alone can never see. The probe must
+    // report it separately from a proto mismatch, because the two get different treatment —
+    // a build mismatch is only ever worth a live takeover, never a teardown.
+    #[test]
+    fn version_probe_detects_a_daemon_of_another_build() {
+        let socket = temp_socket("build-mismatch");
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("fake bind");
+
+        // Fake daemon: our protocol exactly, but a build id that is plainly not ours.
+        let server = std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let _ = read_frame::<_, ClientMsg>(&mut conn); // the client's Hello
+                let _ = write_frame(
+                    &mut conn,
+                    &DaemonMsg::Hello {
+                        proto_ver: PROTO_VER,
+                        daemon_pid: 4243,
+                        conn_id: 1,
+                        build_id: "0.0.0+deadbeefdeadbeef".into(),
+                    },
+                );
+                std::thread::sleep(Dur::from_millis(200));
+            }
+        });
+
+        let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect fake");
+        let check = probe_daemon_identity(&stream).expect("probe");
+        assert!(
+            matches!(&check, ProtoCheck::BuildMismatch { daemon_build } if daemon_build == "0.0.0+deadbeefdeadbeef"),
+            "a same-proto, other-build daemon must be a BuildMismatch carrying its build id"
+        );
+        drop(stream);
+        let _ = server.join();
+    }
+
+    // The other half of the additive-field promise: a daemon built BEFORE `build_id` existed
+    // answers without it, and must still read as a plain `Match`. Anything else would take
+    // over every older daemon on sight — the exact "killed my terminals" failure this whole
+    // mechanism exists to avoid.
+    #[test]
+    fn a_daemon_that_reports_no_build_is_still_a_match() {
+        let socket = temp_socket("build-unknown");
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("fake bind");
+
+        let server = std::thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                let _ = read_frame::<_, ClientMsg>(&mut conn);
+                let _ = write_frame(
+                    &mut conn,
+                    &DaemonMsg::Hello {
+                        proto_ver: PROTO_VER,
+                        daemon_pid: 4244,
+                        conn_id: 1,
+                        // What `#[serde(default)]` yields for a pre-build-id daemon's reply.
+                        build_id: String::new(),
+                    },
+                );
+                std::thread::sleep(Dur::from_millis(200));
+            }
+        });
+
+        let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect fake");
+        assert!(
+            matches!(
+                probe_daemon_identity(&stream).expect("probe"),
+                ProtoCheck::Match
+            ),
+            "an unknown build must never look like a build worth upgrading to"
         );
         drop(stream);
         let _ = server.join();
@@ -2428,6 +2595,7 @@ mod tests {
                                 proto_ver: MIN_CLAIM_DAEMON_VER - 1,
                                 daemon_pid: 4242,
                                 conn_id: 0,
+                                build_id: build_id::build_id().to_string(),
                             },
                         );
                     }
