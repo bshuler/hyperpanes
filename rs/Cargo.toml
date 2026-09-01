@@ -5,3 +5,6 @@ members = ["crates/core"]
 # their own fan-out track. Each declares its own `[workspace]` so it never drags
 # the lean core build, and is excluded here for clarity.
 exclude = ["spikes/terminal-render", "spikes/tearoff"]
+
+[profile.dev]
+debug = "line-tables-only"

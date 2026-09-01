@@ -19,3 +19,6 @@ portable-pty = { path = "vendor/portable-pty" }
 [[bin]]
 name = "conpty-probe"
 path = "src/main.rs"
+
+[profile.dev]
+debug = "line-tables-only"

@@ -37,4 +37,5 @@ slint-build = "1.16"
 opt-level = 3
 
 [profile.dev]
+debug = "line-tables-only"
 opt-level = 1
