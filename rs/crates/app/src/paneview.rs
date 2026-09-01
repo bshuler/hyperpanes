@@ -381,6 +381,7 @@ fn pane_item(
         show_dot: ps.dot_on(show_dot),
         editing,
         accent: ps.accent,
+        uid: ps.uid.as_str().into(),
         x,
         y,
         w,

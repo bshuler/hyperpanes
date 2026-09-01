@@ -3376,16 +3376,16 @@ impl State {
         self.dirty = true;
     }
 
-    /// The widget reported that pane `idx` of the active tab gained (`on`) or lost the
-    /// keyboard. Confirms — or invalidates — the hand-off `sync_pane_keyboard_focus` asked for.
-    pub fn note_pane_focus(&mut self, idx: usize, on: bool) {
-        let Some(p) = self.active_tab().panes.get(idx) else {
-            return;
-        };
-        let uid = p.uid.clone();
+    /// The widget for pane `uid` reported that it gained (`on`) or lost the keyboard.
+    /// Confirms — or invalidates — the hand-off `sync_pane_keyboard_focus` asked for.
+    ///
+    /// Keyed by uid rather than row index because the report is queued by the window and
+    /// applied on the next pump (see `Window::focus_acks`): by then the row order may have
+    /// moved under it, and a stale index would confirm the hand-off against the wrong pane.
+    pub fn note_pane_focus(&mut self, uid: &str, on: bool) {
         if on {
-            self.kbd_focus_live = Some(uid);
-        } else if self.kbd_focus_live.as_deref() == Some(uid.as_str()) {
+            self.kbd_focus_live = Some(uid.to_string());
+        } else if self.kbd_focus_live.as_deref() == Some(uid) {
             // Only the pane that currently holds it can give it up: on a move Slint may
             // report the gain before the loss, and clearing unconditionally would erase the
             // confirmation we just recorded for the new pane.
@@ -10107,7 +10107,8 @@ mod keyboard_focus_tests {
         st.sync_pane_keyboard_focus();
         // The widget answers: it really does hold the keyboard now.
         let f = st.active_tab().focused;
-        st.note_pane_focus(f, true);
+        let uid = st.active_tab().panes[f].uid.clone();
+        st.note_pane_focus(&uid, true);
         st.sync_pane_keyboard_focus();
         let settled = seq(&st);
         for _ in 0..10 {
@@ -10187,6 +10188,41 @@ mod keyboard_focus_tests {
         st.editing_pane = -1;
         st.sync_pane_keyboard_focus();
         assert_ne!(seq(&st), before);
+    }
+
+    /// The acknowledgement is queued by the window and applied on the NEXT pump, so it can
+    /// arrive after the rows it was reported against have moved. Keying it by uid is what
+    /// makes that safe: an ack for the pane that really holds the keyboard must confirm THAT
+    /// pane, whatever slot it now sits in.
+    #[test]
+    fn a_late_acknowledgement_confirms_the_pane_it_names_not_a_slot() {
+        let mut st = fresh();
+        let m = mgr();
+        st.adopt_pane_as_tab(&m, det("a"));
+        st.adopt_pane(&m, det("b"));
+        st.sync_pane_keyboard_focus();
+
+        // The widget reports for "a" while "b" is the selected pane — the shape of a stale
+        // report. It must land on "a" and leave the hand-off to "b" unconfirmed.
+        st.note_pane_focus("a", true);
+        assert_eq!(st.kbd_focus_live.as_deref(), Some("a"));
+        let before = seq(&st);
+        st.sync_pane_keyboard_focus();
+        assert_ne!(seq(&st), before, "an ack for another pane confirms nothing");
+
+        // And the real one settles it.
+        let sel = st.active_tab().focused;
+        let uid = st.active_tab().panes[sel].uid.clone();
+        st.note_pane_focus(&uid, true);
+        let settled = seq(&st);
+        st.sync_pane_keyboard_focus();
+        assert_eq!(seq(&st), settled);
+
+        // A pane that does NOT hold it cannot give it up on another's behalf.
+        st.note_pane_focus("a", false);
+        assert_eq!(st.kbd_focus_live.as_deref(), Some(uid.as_str()));
+        st.note_pane_focus(&uid, false);
+        assert_eq!(st.kbd_focus_live, None);
     }
 }
 

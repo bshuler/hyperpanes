@@ -101,6 +101,9 @@ export struct PaneItem {
     // glyph in the header, shown only while on.
     talk: bool,
     accent: color,
+    // The pane's session uid — the stable identity behind the row. Used to report keyboard
+    // focus back to the controller, where a row index would go stale (see `focus-changed`).
+    uid: string,
     // resolved per-pane chrome (the per-pane override already folded over the global pref
     // by the controller): a clean new pane is frame/dot OFF; a git-project pane is ON.
     show-frame: bool,

@@ -261,7 +261,7 @@ export component PaneView inherits Rectangle {
     callback focus-pane(int);
     // A pane's terminal FocusScope gained/lost the keyboard — the confirmation half of
     // the `refocus-seq` hand-off (see the widget's `focus-changed`).
-    callback pane-focus-changed(int, bool);
+    callback pane-focus-changed(string, bool);
     callback area-resized(length, length);
     callback divider-drag(int, bool, bool, length, length);
     callback pane-zoom(int);
@@ -656,7 +656,7 @@ export component PaneView inherits Rectangle {
                         // unfocused) pane (#32). `link-activated` keeps its own focus call:
                         // it fires on left-up, harmlessly re-focusing.
                         focus-requested => { root.focus-pane(idx); }
-                        focus-changed(on) => { root.pane-focus-changed(idx, on); }
+                        focus-changed(on) => { root.pane-focus-changed(pane.uid, on); }
                         link-activated(x, y, ctrl) => {
                             root.focus-pane(idx);
                             root.pane-link-activated(idx, x, y, ctrl);

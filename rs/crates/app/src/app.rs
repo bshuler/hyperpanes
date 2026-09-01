@@ -156,6 +156,17 @@ pub struct Window {
     pub last_reminders: Cell<Option<u64>>,
     /// Same guard for the `ClosedAdapter` global's recently-closed rows.
     pub last_closed: Cell<Option<u64>>,
+    /// Focus acknowledgements from the terminal widgets (`(pane uid, gained)`), waiting for
+    /// the next pump to fold them into the state.
+    ///
+    /// They cannot be applied where they arrive. The widget's `changed has-focus` fires
+    /// SYNCHRONOUSLY out of `fs.focus()`, and that call is made by `changed refocus-tick` —
+    /// i.e. from inside the model write that `paneview::resync` performs while `pump_window`
+    /// holds `state` borrowed. Taking the borrow there always failed, so *every*
+    /// controller-driven hand-off went unconfirmed and only a real mouse click was ever
+    /// recorded. Queueing costs one tick of latency and cannot be dropped. Keyed by uid, not
+    /// row index, because a deferred ack outlives the row order it was reported against.
+    pub focus_acks: RefCell<Vec<(String, bool)>>,
 }
 
 /// The app: the window registry + the shared session engine + the shared event stream.
@@ -904,6 +915,7 @@ impl App {
             last_update: RefCell::new(None),
             last_reminders: Cell::new(None),
             last_closed: Cell::new(None),
+            focus_acks: RefCell::new(Vec::new()),
         });
 
         self.wire(&win);
@@ -1831,6 +1843,12 @@ impl App {
             };
         }
         let mut st = win.state.borrow_mut();
+        // Fold in the focus acknowledgements the widgets queued since the last pump, BEFORE
+        // `sync_pane_keyboard_focus` runs inside the pump — that is what lets a hand-off be
+        // confirmed and stop retrying.
+        for (uid, on) in win.focus_acks.borrow_mut().drain(..) {
+            st.note_pane_focus(&uid, on);
+        }
         paneview::pump(&win.app, &mut st, &win.ui, (aw, ah), scale, &self.mgr)
     }
 
@@ -2901,17 +2919,15 @@ impl App {
             });
         }
         {
-            // The terminal FocusScope reporting that it gained/lost the keyboard. This is the
-            // acknowledgement for `State::sync_pane_keyboard_focus`'s hand-off; `try_borrow_mut`
-            // because Slint may deliver it while the pump still holds the state (a missed ack
-            // just costs one more retry, and the retry is what makes the hand-off reliable).
+            // The terminal FocusScope reporting that it gained/lost the keyboard: the
+            // acknowledgement for `State::sync_pane_keyboard_focus`'s hand-off. It is only
+            // QUEUED here — `Window::focus_acks` explains why touching `state` on this path
+            // never worked.
             let app = app.clone();
             let id = win.id;
-            win.app.on_pane_focus_changed(move |i, on| {
+            win.app.on_pane_focus_changed(move |uid, on| {
                 if let Some(win) = app.window_by_id(id) {
-                    if let Ok(mut st) = win.state.try_borrow_mut() {
-                        st.note_pane_focus(i as usize, on);
-                    }
+                    win.focus_acks.borrow_mut().push((uid.to_string(), on));
                 }
             });
         }
