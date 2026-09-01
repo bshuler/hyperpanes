@@ -211,7 +211,7 @@ pub enum Command {
     SetPaneDot(usize, bool),
     /// Toggle whether pane `0`'s ambient-AI summary line is muted.
     ToggleMuteAi(usize),
-    /// Toggle whether pane `0`'s "talk" (speak new Claude assistant replies aloud) is on.
+    /// Toggle whether pane `0`'s "talk" (speak new assistant replies aloud) is on.
     ToggleTalk(usize),
     // ---- speech (global; routed to the ControlHost's SpeechService) ----
     /// Kill any in-flight/queued speech immediately (command palette "Speech: Stop Now").

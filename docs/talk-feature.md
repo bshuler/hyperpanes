@@ -1,26 +1,54 @@
 # Per-pane talk (spoken assistant replies)
 
-A per-pane **Talk** toggle: while it is on, that pane speaks every NEW Claude assistant reply
-aloud through a local TTS backend. Off by default, per pane, persisted in the workspace
-snapshot. The text comes from the conversation's own transcript (the pane→session marker
-JSONL), never from scraping the terminal — so what is spoken is the assistant's actual reply,
-normalized from markdown to listenable prose. All panes share ONE serialized speech queue with
-pane-label prefixes, a global mute/stop, and an optional focused-pane-only mode.
+A per-pane **Talk** toggle: while it is on, that pane speaks every NEW assistant reply aloud
+through a local TTS backend. Off by default, per pane, persisted in the workspace snapshot. The
+text comes from the conversation's own transcript (the pane→session marker JSONL), never from
+scraping the terminal — so what is spoken is the assistant's actual reply, normalized from
+markdown to listenable prose. All panes share ONE serialized speech queue with pane-label
+prefixes, a global mute/stop, and an optional focused-pane-only mode.
 
-**Status (2026-07-30): BUILT** — core pipeline + control API + GUI + MCP tools; verified
-end-to-end against the headless binary (see "Verifying" below).
+**Status: BUILT** — core pipeline + control API + GUI + MCP tools; verified end-to-end against
+the headless binary (see "Verifying" below). Generalized past Claude-only and Unix-only on
+2026-09-01: three transcript formats, four TTS backends across three platforms.
+
+## Which tools can talk, and why not all of them
+
+Talk needs the tool's own record of what it said. Three tools keep one Hyperpanes can bind to a
+pane and tail:
+
+| Tool | Pane→session binding | Transcript | Record shape |
+| --- | --- | --- | --- |
+| claude | `claude-sessions/<paneId>.json` (SessionStart hook) | `<configDir>/projects/<encoded-cwd>/<sid>.jsonl` | `{"type":"assistant","message":{"content":[…]}}` |
+| cursor-agent | `tool-sessions/cursor-agent/<paneId>.json` (`~/.cursor/hooks.json`) | `~/.cursor/projects/<Encoded-Cwd>/agent-transcripts/<sid>/<sid>.jsonl` | `{"role":"assistant","message":{"content":[…]}}` — no `type` on message records; `type` marks control records like `turn_ended` |
+| copilot | `tool-sessions/copilot/<paneId>.json` (`~/.copilot/settings.json`) | `~/.copilot/session-state/<sid>/events.jsonl` | `{"type":"assistant.message","data":{"content":"…"}}` — flat event log |
+
+Every shape above was read off a real install, not off documentation.
+
+A pane running anything else — aider, gemini, goose, codex, a plain shell — resolves to no
+transcript and **stays silent**. That is deliberate, not a gap waiting to be filled by reading
+the terminal: a terminal carries spinners, progress bars, box drawing and the human's own
+echoed keystrokes with no way to tell them from prose, so a scraped tier would make Talk worse,
+not better. Adding a tool means adding a hook that writes a pane marker plus a
+`TranscriptFormat` arm — nothing else.
 
 ## Pipeline
 
 ```
 pane (talk on)                       core, every 750ms (speech_service::run_ticker)
-  └─ claude-sessions/<paneId>.json   session marker (session id + cwd + configDir)
-       └─ <configDir>/projects/<encoded-cwd>/<sessionId>.jsonl
+  └─ resolve_transcript(paneId)      claude marker first, then any hooked tool's marker
+       └─ TranscriptRef {path, format}  path + which of the three record shapes to read
             └─ TranscriptTail        byte-cursor tail, starts at EOF (history is never spoken)
-                 └─ extract_assistant_text   text blocks only; tool_use/tool_result dropped
+                 └─ extract_assistant_text   per-format; tool_use/tool_result dropped
                       └─ normalize_for_speech  markdown → prose (see below)
                            └─ SpeechEngine     ONE global queue, one utterance at a time
-                                └─ backend      custom argv template | spd-say | espeak-ng | say
+                                └─ backend      custom | spd-say | espeak-ng | say | SAPI
+```
+
+A pane whose agent exits and restarts points at a different file (or a different tool's
+format); the tail notices and re-starts at THAT file's end, so the new conversation's backlog is
+not spoken from the top.
+
+```
 ```
 
 Every stage is core-owned (`rs/crates/core/src/speech/` + `control/speech_service.rs`), spawned
@@ -65,12 +93,24 @@ A user setting (beside `ai-settings.json`), all fields optional:
 }
 ```
 
-`commandTemplate` overrides backend auto-detection (spd-say → espeak-ng on Linux, `say` on
-macOS): an argv array run per utterance WITHOUT a shell; `{text}` in any element is replaced
-with the spoken text, and a template with no `{text}` receives it on stdin. This is also the
-testing seam — point it at a script that appends to a file and the whole pipeline is
-observable headless. **No backend at all** degrades to a one-time GUI notice + no-op; nothing
-crashes and the toggle still round-trips.
+`commandTemplate` overrides backend auto-detection: an argv array run per utterance WITHOUT a
+shell; `{text}` in any element is replaced with the spoken text, and a template with no
+`{text}` receives it on stdin. This is also the testing seam — point it at a script that
+appends to a file and the whole pipeline is observable headless. **No backend at all** degrades
+to a one-time GUI notice + no-op; nothing crashes and the toggle still round-trips.
+
+### Backends (`speech/engine.rs`)
+
+| Platform | Detected backend | Notes |
+| --- | --- | --- |
+| Linux | `spd-say`, else `espeak-ng` | first one on `PATH` wins |
+| macOS | `say` | always present |
+| Windows | PowerShell `System.Speech` | `Speak` is synchronous, so the process exits when the utterance ends — which is what the queue's one-at-a-time contract needs |
+
+The Windows backend passes the utterance in the environment (`HYPERPANES_SPEECH_TEXT`), never
+on the command line: a `-Command` string would have to survive both PowerShell's parser and
+Windows' single-string argv, and an assistant reply is arbitrary text. The `PATH` probe is
+`PATHEXT`-aware there — `powershell` on disk is `powershell.EXE`.
 
 ## GUI
 

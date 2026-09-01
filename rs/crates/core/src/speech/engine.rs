@@ -16,6 +16,12 @@ const QUEUE_CAP: usize = 64;
 /// [`SpeechHandle::stop_all`] can interrupt it promptly without holding the child
 /// lock across a blocking wait.
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
+/// Environment variable [`Backend::Sapi`] passes the utterance through.
+const SAPI_TEXT_VAR: &str = "HYPERPANES_SPEECH_TEXT";
+/// `Speak` is synchronous, so the process exits when the utterance finishes — which
+/// is what the queue's "one at a time" contract needs.
+const SAPI_SCRIPT: &str = "Add-Type -AssemblyName System.Speech; \
+(New-Object System.Speech.Synthesis.SpeechSynthesizer).Speak($env:HYPERPANES_SPEECH_TEXT)";
 
 /// The TTS backend a pane's speech is rendered through.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +31,8 @@ pub enum Backend {
     SpdSay,
     EspeakNg,
     Say,
+    /// Windows SAPI, driven through PowerShell's `System.Speech` assembly.
+    Sapi,
     /// No usable backend was found (or none configured) — utterances are dropped.
     None,
 }
@@ -36,16 +44,41 @@ impl Backend {
             Backend::SpdSay => "spd-say",
             Backend::EspeakNg => "espeak-ng",
             Backend::Say => "say",
+            Backend::Sapi => "sapi",
             Backend::None => "none",
         }
     }
 }
 
-#[cfg(unix)]
+/// Is `cmd` an executable somewhere on `PATH`?
+///
+/// On Windows a bare name is not enough: the shell appends each suffix in `PATHEXT`
+/// (`powershell` is really `powershell.EXE`), so try the bare name first and then
+/// every configured extension.
 fn on_path(cmd: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|path| std::env::split_paths(&path).any(|dir| dir.join(cmd).is_file()))
-        .unwrap_or(false)
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    let candidates = path_candidates(cmd);
+    std::env::split_paths(&path).any(|dir| candidates.iter().any(|name| dir.join(name).is_file()))
+}
+
+#[cfg(unix)]
+fn path_candidates(cmd: &str) -> Vec<String> {
+    vec![cmd.to_string()]
+}
+
+#[cfg(not(unix))]
+fn path_candidates(cmd: &str) -> Vec<String> {
+    let mut out = vec![cmd.to_string()];
+    let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
+    for ext in pathext.split(';') {
+        let ext = ext.trim();
+        if !ext.is_empty() {
+            out.push(format!("{cmd}{ext}"));
+        }
+    }
+    out
 }
 
 /// Pick a backend: the configured custom command if present, else the first backend
@@ -71,6 +104,12 @@ pub fn detect(settings: &SpeechSettings) -> Backend {
             return Backend::EspeakNg;
         }
     }
+    #[cfg(windows)]
+    {
+        if on_path("powershell") {
+            return Backend::Sapi;
+        }
+    }
     Backend::None
 }
 
@@ -90,6 +129,18 @@ fn build_command(backend: &Backend, text: &str) -> Option<Command> {
         Backend::Say => {
             let mut c = Command::new("say");
             c.arg(text);
+            Some(c)
+        }
+        Backend::Sapi => {
+            // The text travels in the environment, never in the command line: a
+            // `-Command` string would have to survive both PowerShell's parser and
+            // Windows' single-string argv, and an assistant reply is arbitrary text.
+            let mut c = Command::new("powershell");
+            c.arg("-NoProfile")
+                .arg("-NonInteractive")
+                .arg("-Command")
+                .arg(SAPI_SCRIPT)
+                .env(SAPI_TEXT_VAR, text);
             Some(c)
         }
         Backend::Custom(template) => {
@@ -358,6 +409,86 @@ fn speak(shared: &Arc<Shared>, utterance: &Utterance, generation: u64) {
 mod tests {
     use super::*;
     use std::time::Instant;
+
+    #[test]
+    fn every_backend_but_none_builds_a_command() {
+        for backend in [
+            Backend::SpdSay,
+            Backend::EspeakNg,
+            Backend::Say,
+            Backend::Sapi,
+            Backend::Custom(vec!["speak".into(), "{text}".into()]),
+        ] {
+            assert!(
+                build_command(&backend, "hello").is_some(),
+                "{} built no command",
+                backend.name()
+            );
+        }
+        assert!(build_command(&Backend::None, "hello").is_none());
+    }
+
+    #[test]
+    fn the_sapi_backend_passes_text_by_environment_not_argv() {
+        let cmd = build_command(&Backend::Sapi, "rm -rf /; $(evil)").unwrap();
+        let argv: Vec<_> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !argv.iter().any(|a| a.contains("evil")),
+            "utterance text leaked into argv: {argv:?}"
+        );
+        let env: Vec<_> = cmd
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            env,
+            vec![(
+                SAPI_TEXT_VAR.to_string(),
+                Some("rm -rf /; $(evil)".to_string())
+            )]
+        );
+    }
+
+    #[test]
+    fn a_custom_template_still_wins_over_the_platform_backend() {
+        let settings = SpeechSettings {
+            command_template: Some(vec!["mine".into(), "{text}".into()]),
+            ..SpeechSettings::default()
+        };
+        assert_eq!(
+            detect(&settings),
+            Backend::Custom(vec!["mine".into(), "{text}".into()])
+        );
+    }
+
+    #[test]
+    fn the_platform_has_a_backend_to_fall_back_on() {
+        // Every platform hyperpanes ships on can speak without configuration. If this
+        // fails on a new target, that target needs a `detect` branch, not an exemption.
+        assert_ne!(
+            detect(&SpeechSettings::default()),
+            Backend::None,
+            "no built-in TTS backend on this platform"
+        );
+    }
+
+    #[test]
+    fn on_path_finds_a_command_every_platform_ships() {
+        #[cfg(unix)]
+        let known = "sh";
+        #[cfg(windows)]
+        let known = "powershell";
+        assert!(on_path(known), "{known} not found on PATH");
+        assert!(!on_path("hyperpanes-definitely-not-a-real-command"));
+    }
 
     fn scratch_dir(tag: &str) -> std::path::PathBuf {
         let dir =

@@ -891,7 +891,7 @@ pub struct PaneState {
     /// Whether the pane's ambient-AI summary line is muted (the pane menu's "Mute AI Summary"
     /// toggle; mirrors the renderer's `ui.aiMuted` set). New panes default unmuted.
     pub ai_muted: bool,
-    /// Per-pane "talk": speak NEW Claude assistant replies aloud via local TTS (the pane menu's
+    /// Per-pane "talk": speak NEW assistant replies aloud via local TTS (the pane menu's
     /// "Talk" toggle). New panes default off; mirrors the control read-model's `PaneInfo::talk`.
     pub talk: bool,
     /// Ambient-AI subtitle + typewriter reveal state (the local projection of this pane's
@@ -5450,7 +5450,7 @@ impl State {
         }
     }
 
-    /// Toggle whether pane `idx`'s "talk" (speak new Claude assistant replies aloud) is on.
+    /// Toggle whether pane `idx`'s "talk" (speak new assistant replies aloud) is on.
     pub fn toggle_talk(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             p.talk = !p.talk;

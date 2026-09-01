@@ -1,4 +1,4 @@
-//! Per-pane "talk": local TTS for new Claude assistant replies.
+//! Per-pane "talk": local TTS for new assistant replies.
 //! Owned modules: [`normalize`] (markdown) and [`engine`] (the
 //! serialized playback queue + backend detection). This file holds only the
 //! persisted settings shape + load/save.

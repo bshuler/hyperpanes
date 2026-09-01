@@ -1,8 +1,20 @@
 //! The default-off "talk" background loop: every [`POLL_INTERVAL`], scan the read-model for
-//! panes with talk enabled, tail each one's live Claude transcript for NEW assistant replies
+//! panes with talk enabled, tail each one's live agent transcript for NEW assistant replies
 //! (never history), normalize them, and enqueue onto the shared [`SpeechEngine`]. The engine
 //! itself is spawned lazily on first use — an install with no pane ever talking starts no
 //! playback thread and does no polling work beyond the (empty) read-model scan.
+//!
+//! # Which pane can talk
+//!
+//! A pane is speakable when something on disk says which conversation it is in, and that
+//! conversation is a growing file. Two mechanisms supply the first half — `claude_panes`
+//! for Claude Code and [`crate::tools::session_hook`] for every other hooked tool — and
+//! [`crate::speech::tailer::tool_transcript`] answers the second. A pane running a tool
+//! with no hook (or no transcript) resolves to nothing and stays silent rather than being
+//! spoken from a guess: the reply text always comes from the tool's own record of what it
+//! said, never from scraping the terminal, because a terminal carries spinners, progress
+//! bars, box drawing and the human's own echoed keystrokes with no way to tell them from
+//! prose.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -12,7 +24,9 @@ use std::time::Duration;
 use crate::control::server::Shared;
 use crate::speech::engine::{SpeechEngine, SpeechHandle, Utterance};
 use crate::speech::normalize::normalize_for_speech;
-use crate::speech::tailer::{transcript_path, TranscriptTail};
+use crate::speech::tailer::{
+    tool_transcript, transcript_path, TranscriptFormat, TranscriptRef, TranscriptTail,
+};
 use crate::speech::{self, SpeechSettings};
 
 /// How often the background loop scans talking panes for new transcript text.
@@ -166,12 +180,23 @@ pub async fn run_ticker(shared: Arc<Shared>) {
     }
 }
 
-/// A talking pane's live transcript path, resolved from its Claude session marker.
-/// `None` when the pane has no live marker (not a Claude pane, or the conversation
-/// already ended).
-fn resolve_transcript(pane_id: &str) -> Option<PathBuf> {
-    let marker = crate::claude_panes::read_pane_session(pane_id)?;
-    transcript_path(&marker)
+/// A talking pane's live transcript, resolved from whichever session marker its tool
+/// wrote. Claude is tried first — it has its own marker directory and its own
+/// multi-account transcript root — then the shared per-tool hook markers.
+///
+/// `None` when the pane has no live marker (no agent running, the conversation already
+/// ended, or the tool has neither a hook nor a tailable log).
+fn resolve_transcript(pane_id: &str) -> Option<TranscriptRef> {
+    if let Some(marker) = crate::claude_panes::read_pane_session(pane_id) {
+        if let Some(path) = transcript_path(&marker) {
+            return Some(TranscriptRef {
+                path,
+                format: TranscriptFormat::ClaudeJsonl,
+            });
+        }
+    }
+    let mark = crate::tools::session_hook::read_any_pane_mark(pane_id)?;
+    tool_transcript(mark.tool.as_deref()?, &mark.id, &mark.cwd)
 }
 
 /// The loop body proper, pure aside from the injected `resolve_transcript` (so tests can
@@ -186,7 +211,7 @@ fn poll_tick(
     focused_pane: Option<&str>,
     tails: &mut HashMap<String, TranscriptTail>,
     handle: &SpeechHandle,
-    resolve_transcript: impl Fn(&str) -> Option<PathBuf>,
+    resolve_transcript: impl Fn(&str) -> Option<TranscriptRef>,
 ) {
     let live: std::collections::HashSet<&str> = talking.iter().map(|(id, _)| id.as_str()).collect();
     tails.retain(|id, _| live.contains(id.as_str()));
@@ -200,15 +225,18 @@ fn poll_tick(
                 }
             }
         }
-        let Some(path) = resolve_transcript(pane_id) else {
+        let Some(source) = resolve_transcript(pane_id) else {
             tails.remove(pane_id);
             continue;
         };
         let tail = tails
             .entry(pane_id.clone())
-            .or_insert_with(|| TranscriptTail::start_at_end(path.clone()));
-        if tail.path() != path {
-            *tail = TranscriptTail::start_at_end(path);
+            .or_insert_with(|| TranscriptTail::start_at_end(source.path.clone(), source.format));
+        // A pane whose agent exited and was restarted points at a different file (or a
+        // different tool's format): start a fresh tail at THAT file's end, so the new
+        // conversation's backlog is not spoken from the top.
+        if tail.path() != source.path || tail.format() != source.format {
+            *tail = TranscriptTail::start_at_end(source.path, source.format);
         }
         for text in tail.poll() {
             let normalized = normalize_for_speech(&text);
@@ -228,6 +256,15 @@ fn poll_tick(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// Wrap a temp transcript path as a Claude-format source — the shape `poll_tick`'s
+    /// injected resolver returns.
+    fn claude_ref(path: &std::path::Path) -> TranscriptRef {
+        TranscriptRef {
+            path: path.to_path_buf(),
+            format: TranscriptFormat::ClaudeJsonl,
+        }
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn scratch_dir(tag: &str) -> PathBuf {
@@ -296,7 +333,7 @@ mod tests {
 
         let mut tails = HashMap::new();
         let talking = vec![("pane-1".to_string(), "Worker".to_string())];
-        let resolve = |_: &str| Some(transcript.clone());
+        let resolve = |_: &str| Some(claude_ref(&transcript));
         // First tick establishes the tail at EOF — pre-existing content never spoken.
         poll_tick(
             &talking,
@@ -356,8 +393,8 @@ mod tests {
         let t1c = t1.clone();
         let t2c = t2.clone();
         let resolve = move |id: &str| match id {
-            "pane-a" => Some(t1c.clone()),
-            "pane-b" => Some(t2c.clone()),
+            "pane-a" => Some(claude_ref(&t1c)),
+            "pane-b" => Some(claude_ref(&t2c)),
             _ => None,
         };
         poll_tick(
@@ -402,7 +439,10 @@ mod tests {
         let mut tails = HashMap::new();
         tails.insert(
             "stale".to_string(),
-            TranscriptTail::start_at_end(PathBuf::from("/nonexistent")),
+            TranscriptTail::start_at_end(
+                PathBuf::from("/nonexistent"),
+                TranscriptFormat::ClaudeJsonl,
+            ),
         );
         let calls = AtomicUsize::new(0);
         let handle = SpeechEngine::spawn(SpeechSettings::default());

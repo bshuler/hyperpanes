@@ -1,10 +1,22 @@
-//! Incremental tailer over a pane's Claude Code session transcript — yields the text of
-//! NEW assistant replies only, never history and never terminal output.
+//! Incremental tailer over a pane's agent session transcript — yields the text of NEW
+//! assistant replies only, never history and never terminal output.
 //!
-//! A pane's live transcript is `<config_dir, or ~/.claude>/projects/<encoded-cwd>/<session
-//! id>.jsonl`, the same per-project JSONL store [`crate::claude_history`] reads for the
-//! resume/history browser (see [`transcript_path`], which resolves it from the pane's live
-//! session marker). Unlike that reader, which parses a bounded prefix once, [`TranscriptTail`]
+//! Three tools write their conversation to a growing JSONL file as it happens, which is
+//! exactly what a tailer needs. The paths and the record shapes differ, so
+//! [`TranscriptFormat`] names which one a given file speaks; the byte-cursor machinery
+//! below is shared:
+//!
+//! * **claude** — `<config_dir, or ~/.claude>/projects/<encoded-cwd>/<session id>.jsonl`;
+//!   records are `{"type":"assistant","message":{"content":[…]}}`.
+//! * **cursor-agent** — `~/.cursor/projects/<encoded-cwd>/agent-transcripts/<id>/<id>.jsonl`;
+//!   same `message.content` block array, but keyed `"role":"assistant"` with no `type`.
+//! * **copilot** — `~/.copilot/session-state/<id>/events.jsonl`; a flat event log whose
+//!   `{"type":"assistant.message","data":{"content":"…"}}` carries the reply as a string.
+//!
+//! Every shape here was read off a real install on this machine, not inferred from docs —
+//! the same standard [`crate::tools::session_hook`] holds itself to.
+//!
+//! Unlike [`crate::claude_history`], which parses a bounded prefix once, [`TranscriptTail`]
 //! is built to be polled repeatedly (once per pane, on a timer) and only ever look at bytes
 //! appended since the last poll — a "talk" pane must never re-speak old history, so the
 //! cursor starts at end-of-file, not at the top of the transcript.
@@ -41,11 +53,66 @@ pub fn transcript_path(marker: &PaneClaudeSession) -> Option<PathBuf> {
     )
 }
 
+/// Which on-disk record shape a transcript file speaks. One variant per tool that keeps a
+/// live, append-only conversation log; tools without one are spoken from their terminal
+/// output instead (see `crate::control::speech_service`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TranscriptFormat {
+    /// `{"type":"assistant","message":{"content":[{"type":"text","text":"…"}]}}`
+    ClaudeJsonl,
+    /// `{"role":"assistant","message":{"content":[{"type":"text","text":"…"}]}}`
+    CursorJsonl,
+    /// `{"type":"assistant.message","data":{"content":"…"}}`
+    CopilotEvents,
+}
+
+/// Resolve a hooked tool's live conversation to its transcript file.
+///
+/// `tool_id` is a [`crate::tools::registry`] id and `session_id`/`cwd` come from that
+/// tool's session-hook marker. `None` for a tool with no tailable log — the caller falls
+/// back to the pane's terminal output rather than going silent.
+pub fn tool_transcript(tool_id: &str, session_id: &str, cwd: &str) -> Option<TranscriptRef> {
+    match tool_id {
+        "cursor-agent" => {
+            if cwd.is_empty() {
+                return None;
+            }
+            Some(TranscriptRef {
+                path: crate::tools::history::cursor::cursor_root()?
+                    .join("projects")
+                    .join(encode_path_str(cwd))
+                    .join("agent-transcripts")
+                    .join(session_id)
+                    .join(format!("{session_id}.jsonl")),
+                format: TranscriptFormat::CursorJsonl,
+            })
+        }
+        // Copilot's store is keyed by session id alone — its `sessions` row records `cwd`
+        // verbatim, so nothing about the path has to be re-derived from the directory.
+        "copilot" => Some(TranscriptRef {
+            path: crate::tools::history::copilot::copilot_root()?
+                .join("session-state")
+                .join(session_id)
+                .join("events.jsonl"),
+            format: TranscriptFormat::CopilotEvents,
+        }),
+        _ => None,
+    }
+}
+
+/// A transcript file plus the record shape it speaks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptRef {
+    pub path: PathBuf,
+    pub format: TranscriptFormat,
+}
+
 /// An incremental cursor over one transcript file. Starts at end-of-file (see
 /// [`TranscriptTail::start_at_end`]) so [`poll`](TranscriptTail::poll) only ever surfaces
 /// assistant replies written after the tail was created.
 pub struct TranscriptTail {
     path: PathBuf,
+    format: TranscriptFormat,
     /// Byte offset in the file already read (both emitted complete lines and any bytes
     /// folded into `partial`). The next [`poll`](Self::poll) reads from here.
     cursor: u64,
@@ -61,10 +128,11 @@ impl TranscriptTail {
     /// Start tailing `path` from its current end — pre-existing content (all prior history)
     /// is never returned by [`poll`](Self::poll). A missing file starts at offset 0, so it
     /// picks up everything once the file (and any assistant replies) appear.
-    pub fn start_at_end(path: PathBuf) -> TranscriptTail {
+    pub fn start_at_end(path: PathBuf, format: TranscriptFormat) -> TranscriptTail {
         let cursor = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         TranscriptTail {
             path,
+            format,
             cursor,
             partial: Vec::new(),
             skipping: false,
@@ -72,6 +140,11 @@ impl TranscriptTail {
     }
 
     /// The transcript path this tail is following.
+    /// The record shape this tail is parsing.
+    pub fn format(&self) -> TranscriptFormat {
+        self.format
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -122,7 +195,7 @@ impl TranscriptTail {
                 let line_bytes = &data[start..end];
                 if line_bytes.len() <= MAX_LINE_BYTES {
                     if let Ok(line) = std::str::from_utf8(line_bytes) {
-                        if let Some(text) = extract_assistant_text(line) {
+                        if let Some(text) = extract_assistant_text(line, self.format) {
                             texts.push(text);
                         }
                     }
@@ -145,16 +218,46 @@ impl TranscriptTail {
     }
 }
 
-/// Pull the speakable text out of one transcript JSONL line, or `None` if it isn't a
-/// complete `"type":"assistant"` record with text content. `message.content` is an array
-/// of blocks; only `{"type":"text"}` blocks are kept (space-joined) — `tool_use` /
-/// `tool_result` blocks are silently skipped. Malformed JSON, non-assistant records, and
-/// assistant records with no text blocks (tool-only turns) all yield `None`.
-pub fn extract_assistant_text(line: &str) -> Option<String> {
+/// Pull the speakable text out of one transcript line in `format`, or `None` if the line
+/// isn't a complete assistant record with text content.
+///
+/// Malformed JSON, non-assistant records, and assistant records carrying no text (a
+/// tool-only turn) all yield `None` — the tailer speaks nothing rather than guessing.
+pub fn extract_assistant_text(line: &str, format: TranscriptFormat) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
-    if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
-        return None;
+    match format {
+        TranscriptFormat::ClaudeJsonl => {
+            if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+                return None;
+            }
+            content_block_text(&v)
+        }
+        // Cursor marks the speaker with `role` and leaves `type` absent on message records
+        // (it uses `type` for control records such as `turn_ended`), so keying on `role`
+        // is what separates a reply from a turn marker.
+        TranscriptFormat::CursorJsonl => {
+            if v.get("role").and_then(|t| t.as_str()) != Some("assistant") {
+                return None;
+            }
+            content_block_text(&v)
+        }
+        TranscriptFormat::CopilotEvents => {
+            if v.get("type").and_then(|t| t.as_str()) != Some("assistant.message") {
+                return None;
+            }
+            let text = v.get("data")?.get("content")?.as_str()?;
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        }
     }
+}
+
+/// Space-join the `{"type":"text"}` blocks of a `message.content` array. `tool_use` /
+/// `tool_result` blocks are silently skipped — they are not speech.
+fn content_block_text(v: &serde_json::Value) -> Option<String> {
     let blocks = v.get("message")?.get("content")?.as_array()?;
     let mut out = String::new();
     for block in blocks {
@@ -248,27 +351,130 @@ mod tests {
             {\"type\":\"text\",\"text\":\"hello\"},\
             {\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"x\",\"input\":{}},\
             {\"type\":\"text\",\"text\":\"world\"}]}}";
-        assert_eq!(extract_assistant_text(line).as_deref(), Some("hello world"));
+        assert_eq!(
+            extract_assistant_text(line, TranscriptFormat::ClaudeJsonl).as_deref(),
+            Some("hello world")
+        );
     }
 
     #[test]
     fn ignores_non_assistant_records() {
         let user = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}";
-        assert!(extract_assistant_text(user).is_none());
+        assert!(extract_assistant_text(user, TranscriptFormat::ClaudeJsonl).is_none());
         let tool_result = "{\"type\":\"tool_result\",\"content\":\"x\"}";
-        assert!(extract_assistant_text(tool_result).is_none());
+        assert!(extract_assistant_text(tool_result, TranscriptFormat::ClaudeJsonl).is_none());
     }
 
     #[test]
     fn tool_only_assistant_record_has_no_text() {
         let line = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[\
             {\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"x\",\"input\":{}}]}}";
-        assert!(extract_assistant_text(line).is_none());
+        assert!(extract_assistant_text(line, TranscriptFormat::ClaudeJsonl).is_none());
     }
 
     #[test]
     fn malformed_json_is_none() {
-        assert!(extract_assistant_text("not json").is_none());
+        assert!(extract_assistant_text("not json", TranscriptFormat::ClaudeJsonl).is_none());
+    }
+
+    // ---- extract_assistant_text: cursor-agent ----
+
+    #[test]
+    fn cursor_records_are_keyed_on_role_not_type() {
+        // Cursor writes no `type` on a message record, so a format that looked for one
+        // would speak nothing at all.
+        let line = "{\"role\":\"assistant\",\"message\":{\"content\":[\
+            {\"type\":\"text\",\"text\":\"cursor\"},\
+            {\"type\":\"text\",\"text\":\"speaks\"}]}}";
+        assert_eq!(
+            extract_assistant_text(line, TranscriptFormat::CursorJsonl).as_deref(),
+            Some("cursor speaks")
+        );
+    }
+
+    #[test]
+    fn cursor_control_records_are_not_speech() {
+        // `type` on a cursor record marks a turn boundary, never a reply.
+        let turn = "{\"type\":\"turn_ended\",\"status\":\"success\"}";
+        assert!(extract_assistant_text(turn, TranscriptFormat::CursorJsonl).is_none());
+        let user =
+            "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}";
+        assert!(extract_assistant_text(user, TranscriptFormat::CursorJsonl).is_none());
+    }
+
+    // ---- extract_assistant_text: copilot ----
+
+    #[test]
+    fn copilot_reply_text_is_a_flat_string() {
+        let line = "{\"type\":\"assistant.message\",\"data\":{\"content\":\"ok\"}}";
+        assert_eq!(
+            extract_assistant_text(line, TranscriptFormat::CopilotEvents).as_deref(),
+            Some("ok")
+        );
+    }
+
+    #[test]
+    fn copilot_non_message_events_are_not_speech() {
+        for line in [
+            "{\"type\":\"session.start\",\"data\":{}}",
+            "{\"type\":\"user.message\",\"data\":{\"content\":\"hi\"}}",
+            "{\"type\":\"assistant.turn_start\",\"data\":{}}",
+            "{\"type\":\"assistant.message\",\"data\":{\"content\":\"\"}}",
+        ] {
+            assert!(
+                extract_assistant_text(line, TranscriptFormat::CopilotEvents).is_none(),
+                "{line} is not a spoken reply"
+            );
+        }
+    }
+
+    #[test]
+    fn a_format_only_reads_its_own_shape() {
+        // The same line under the wrong format yields nothing rather than garbage —
+        // which is what makes re-tailing on a format change safe.
+        let claude = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}";
+        assert!(extract_assistant_text(claude, TranscriptFormat::CopilotEvents).is_none());
+        assert!(extract_assistant_text(claude, TranscriptFormat::CursorJsonl).is_none());
+    }
+
+    // ---- tool_transcript ----
+
+    #[test]
+    fn cursor_transcript_is_nested_under_the_encoded_cwd() {
+        let Some(r) = tool_transcript("cursor-agent", "sid-1", "/tmp/proj") else {
+            return; // no cursor install on this machine
+        };
+        assert_eq!(r.format, TranscriptFormat::CursorJsonl);
+        let s = r.path.to_string_lossy().to_string();
+        assert!(s.ends_with("agent-transcripts/sid-1/sid-1.jsonl"), "{s}");
+        assert!(s.contains(&encode_path_str("/tmp/proj")), "{s}");
+    }
+
+    #[test]
+    fn cursor_needs_a_cwd_to_find_the_project_dir() {
+        assert!(tool_transcript("cursor-agent", "sid-1", "").is_none());
+    }
+
+    #[test]
+    fn copilot_transcript_is_keyed_on_the_session_id_alone() {
+        let Some(r) = tool_transcript("copilot", "sid-2", "") else {
+            return; // no copilot install on this machine
+        };
+        assert_eq!(r.format, TranscriptFormat::CopilotEvents);
+        let s = r.path.to_string_lossy().to_string();
+        assert!(s.ends_with("session-state/sid-2/events.jsonl"), "{s}");
+    }
+
+    #[test]
+    fn a_tool_with_no_transcript_store_resolves_to_nothing() {
+        // aider, gemini, goose, plain shells: no store, so Talk stays silent for them
+        // rather than being spoken from a guess.
+        for tool in ["aider", "gemini", "goose", "codex", ""] {
+            assert!(
+                tool_transcript(tool, "sid", "/tmp/proj").is_none(),
+                "{tool}"
+            );
+        }
     }
 
     // ---- TranscriptTail ----
@@ -279,7 +485,7 @@ mod tests {
         let path = dir.join("s.jsonl");
         std::fs::write(&path, assistant_line("old reply")).unwrap();
 
-        let mut tail = TranscriptTail::start_at_end(path.clone());
+        let mut tail = TranscriptTail::start_at_end(path.clone(), TranscriptFormat::ClaudeJsonl);
         assert!(
             tail.poll().is_empty(),
             "pre-existing content never returned"
@@ -301,7 +507,7 @@ mod tests {
     fn start_at_end_missing_file_starts_at_zero() {
         let dir = temp_dir("missing");
         let path = dir.join("missing.jsonl");
-        let mut tail = TranscriptTail::start_at_end(path.clone());
+        let mut tail = TranscriptTail::start_at_end(path.clone(), TranscriptFormat::ClaudeJsonl);
         assert!(tail.poll().is_empty(), "still missing, nothing to read");
 
         std::fs::write(&path, assistant_line("first reply")).unwrap();
@@ -314,7 +520,7 @@ mod tests {
         let dir = temp_dir("once");
         let path = dir.join("s.jsonl");
         std::fs::write(&path, "").unwrap();
-        let mut tail = TranscriptTail::start_at_end(path.clone());
+        let mut tail = TranscriptTail::start_at_end(path.clone(), TranscriptFormat::ClaudeJsonl);
 
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -334,7 +540,7 @@ mod tests {
         let dir = temp_dir("partial");
         let path = dir.join("s.jsonl");
         std::fs::write(&path, "").unwrap();
-        let mut tail = TranscriptTail::start_at_end(path.clone());
+        let mut tail = TranscriptTail::start_at_end(path.clone(), TranscriptFormat::ClaudeJsonl);
 
         let full = assistant_line("split reply");
         let (first_half, second_half) = full.split_at(full.len() / 2);
@@ -362,7 +568,7 @@ mod tests {
         let dir = temp_dir("ignored");
         let path = dir.join("s.jsonl");
         std::fs::write(&path, "").unwrap();
-        let mut tail = TranscriptTail::start_at_end(path.clone());
+        let mut tail = TranscriptTail::start_at_end(path.clone(), TranscriptFormat::ClaudeJsonl);
 
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -386,7 +592,7 @@ mod tests {
         let dir = temp_dir("mixed");
         let path = dir.join("s.jsonl");
         std::fs::write(&path, "").unwrap();
-        let mut tail = TranscriptTail::start_at_end(path.clone());
+        let mut tail = TranscriptTail::start_at_end(path.clone(), TranscriptFormat::ClaudeJsonl);
 
         let line = "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":[\
             {\"type\":\"text\",\"text\":\"before\"},\
@@ -409,7 +615,7 @@ mod tests {
         let dir = temp_dir("shrink");
         let path = dir.join("s.jsonl");
         std::fs::write(&path, assistant_line("first")).unwrap();
-        let mut tail = TranscriptTail::start_at_end(path.clone());
+        let mut tail = TranscriptTail::start_at_end(path.clone(), TranscriptFormat::ClaudeJsonl);
 
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -443,7 +649,7 @@ mod tests {
         let dir = temp_dir("order");
         let path = dir.join("s.jsonl");
         std::fs::write(&path, "").unwrap();
-        let mut tail = TranscriptTail::start_at_end(path.clone());
+        let mut tail = TranscriptTail::start_at_end(path.clone(), TranscriptFormat::ClaudeJsonl);
 
         let mut f = std::fs::OpenOptions::new()
             .append(true)
@@ -470,7 +676,7 @@ mod tests {
         let dir = temp_dir("path-acc");
         let path = dir.join("s.jsonl");
         std::fs::write(&path, "").unwrap();
-        let tail = TranscriptTail::start_at_end(path.clone());
+        let tail = TranscriptTail::start_at_end(path.clone(), TranscriptFormat::ClaudeJsonl);
         assert_eq!(tail.path(), path.as_path());
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -480,7 +686,7 @@ mod tests {
         let dir = temp_dir("oversize");
         let path = dir.join("s.jsonl");
         std::fs::write(&path, "").unwrap();
-        let mut tail = TranscriptTail::start_at_end(path.clone());
+        let mut tail = TranscriptTail::start_at_end(path.clone(), TranscriptFormat::ClaudeJsonl);
 
         // A single line far past MAX_LINE_BYTES, followed by a normal record.
         let huge = assistant_line(&"x".repeat(MAX_LINE_BYTES + 1024));
