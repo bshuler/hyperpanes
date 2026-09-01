@@ -33,7 +33,7 @@ use crate::command::{dispatch, set_layout_from_id, Command, Effect};
 use crate::drag::{self, DragKind, DragState, Hover};
 use crate::paneview::{self, Ui};
 use crate::state::{DetachedPane, DetachedTab, EscOutcome, NewPaneOpts, Overlay, State};
-use crate::{theme, window, AppWindow, KeyMsg};
+use crate::{filedrop, theme, window, AppWindow, KeyMsg};
 
 /// The GitHub releases page the NotifyOnly update flow (Linux/macOS) points the user at —
 /// the human URL matching `update::LATEST_RELEASE_API`'s repo.
@@ -1070,6 +1070,10 @@ impl App {
                 if raw != 0 {
                     window::make_frameless(raw);
                     w.hwnd.set(raw);
+                    // First moment this window has an identity to key a hook by — and the
+                    // drop hook needs one, since `DroppedFile` says nothing about where it
+                    // landed (see `filedrop`).
+                    filedrop::install(w.app.window(), raw);
                 }
             }
             // Only push to Slint when the maximized state actually flips — an unconditional
@@ -1220,6 +1224,11 @@ impl App {
         // 3a. Drive any in-flight drag/tear-off from the global cursor (ghost + previews;
         // resolves the drop on release). No-ops when nothing is being dragged.
         self.pump_drag(&windows);
+
+        // 3a-bis. Deliver anything dropped in from the OS file manager. Separate from the
+        // drag pump above: that one owns gestures that STARTED in this app, this one owns
+        // gestures that started in Finder/Explorer and only arrive as winit events.
+        self.pump_file_drops(&windows);
 
         // 3b. One-shot screenshot scaffold: after a short settle (so the shells have
         // printed their banner into the replay buffer), re-host window 0's focused pane
@@ -2173,6 +2182,57 @@ impl App {
         ds.armed = down;
         *self.drag.borrow_mut() = Some(ds);
         self.wake();
+    }
+
+    /// Deliver files dropped in from the OS file manager into the pane under the cursor.
+    ///
+    /// The queue is filled by a per-window winit hook (`filedrop::install`) and drained
+    /// here so the insertion happens on the pump, holding `state` exactly once, like every
+    /// other mutation. A batch is regrouped by target pane: one drag reports one event per
+    /// file, and the pane each file belongs to is only knowable here.
+    fn pump_file_drops(self: &Rc<Self>, windows: &[Rc<Window>]) {
+        let drops = filedrop::take_settled();
+        if drops.is_empty() {
+            return;
+        }
+        let mut batches: Vec<((usize, usize), Vec<String>)> = Vec::new();
+        for d in &drops {
+            let Some(target) = self.drop_target(windows, d) else {
+                continue;
+            };
+            let path = d.path.to_string_lossy().into_owned();
+            match batches.iter_mut().find(|(t, _)| *t == target) {
+                Some((_, v)) => v.push(path),
+                None => batches.push((target, vec![path])),
+            }
+        }
+        for ((win_id, pane_idx), paths) in batches {
+            let Some(w) = windows.iter().find(|w| w.id == win_id) else {
+                continue;
+            };
+            let mut st = w.state.borrow_mut();
+            // Focus first: the drop names the pane, and the user's next keystroke — editing
+            // the path they just dropped — has to land in the same one.
+            st.focus_pane(pane_idx);
+            st.drop_files(pane_idx, &paths, &self.mgr);
+        }
+        self.wake();
+    }
+
+    /// Resolve one dropped file to `(window id, pane index)`.
+    ///
+    /// The **window** comes from the event, not the cursor: the OS delivered the drop to a
+    /// specific window, and that is true even if the pointer sample raced past it. The
+    /// cursor only picks the pane inside it, and where there is no global cursor to read
+    /// (Wayland) the window's focused pane is the only honest answer.
+    fn drop_target(&self, windows: &[Rc<Window>], d: &filedrop::Dropped) -> Option<(usize, usize)> {
+        let w = windows.iter().find(|w| w.hwnd.get() == d.win)?;
+        let pane =
+            d.at.map(|c| self.compute_hover(windows, c))
+                .filter(|h| h.win == Some(w.id))
+                .and_then(|h| h.pane_idx)
+                .unwrap_or_else(|| w.state.borrow().active_tab().focused);
+        Some((w.id, pane))
     }
 
     /// Drive an in-flight drag from the global cursor: promote past the threshold, follow

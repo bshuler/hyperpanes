@@ -31,6 +31,7 @@ mod crash;
 mod ctl_cli;
 mod devices;
 mod drag;
+mod filedrop;
 mod filetree;
 mod gitpanel;
 mod glow;
@@ -51,6 +52,7 @@ mod theme;
 mod update;
 mod viewpane;
 mod window;
+mod winit_hooks;
 mod worker;
 
 use std::sync::Arc;

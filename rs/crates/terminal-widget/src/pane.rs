@@ -1144,6 +1144,17 @@ impl TerminalPane {
         Some(prepare_paste(&text, self.grid.bracketed_paste()))
     }
 
+    /// Wrap `text` for insertion exactly as a paste would — bracketed-paste markers when
+    /// the program in this pane asked for them, CR-normalized newlines otherwise.
+    ///
+    /// For text the app supplies itself rather than reading from the clipboard (the OS file
+    /// drop). Sharing `prepare_paste` is the point: a TUI that distinguishes pasted content
+    /// from typing must see a drop the same way it sees a paste, or a dropped path arrives
+    /// as if it had been hand-typed one key at a time.
+    pub fn prepare_insert(&self, text: &str) -> String {
+        prepare_paste(text, self.grid.bracketed_paste())
+    }
+
     /// Whether the OS clipboard holds an image (vs text). The controller uses this to decide
     /// whether a Ctrl+V with no clipboard text should forward a literal 0x16 to an in-pane TUI
     /// (Claude Code) that reads the clipboard image itself — see [`Clipboard::has_image`].

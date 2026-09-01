@@ -185,47 +185,53 @@ pub fn hwnd_of(win: &slint::Window) -> isize {
         //    runtime), which re-grows the title bar after `make_frameless`. Re-strip on
         //    the next event whenever that happens (`is_decorated` is a cached read).
         let hook_win = Arc::downgrade(&w);
-        win.on_winit_window_event(move |_, ev| {
-            if frameless.get() {
-                if let Some(w) = hook_win.upgrade() {
-                    if w.is_decorated() {
-                        w.set_decorations(false);
+        // Through the multiplexer, not `on_winit_window_event` directly: Slint keeps ONE
+        // filter per window and the OS file drop wants one on this same window.
+        crate::winit_hooks::add(
+            win,
+            raw,
+            Box::new(move |_, ev| {
+                if frameless.get() {
+                    if let Some(w) = hook_win.upgrade() {
+                        if w.is_decorated() {
+                            w.set_decorations(false);
+                        }
                     }
                 }
-            }
-            POINTER.with(|p| {
-                let mut t = p.get();
-                match ev {
-                    WindowEvent::CursorMoved { position, .. } => {
-                        t.raw = raw;
-                        t.pos = (position.x as i32, position.y as i32);
-                        t.inside = true;
-                        if t.left_down {
-                            crate::dbg_log(&format!("ptr-move-held pos={:?}", t.pos));
+                POINTER.with(|p| {
+                    let mut t = p.get();
+                    match ev {
+                        WindowEvent::CursorMoved { position, .. } => {
+                            t.raw = raw;
+                            t.pos = (position.x as i32, position.y as i32);
+                            t.inside = true;
+                            if t.left_down {
+                                crate::dbg_log(&format!("ptr-move-held pos={:?}", t.pos));
+                            }
                         }
-                    }
-                    WindowEvent::CursorLeft { .. } => {
-                        if t.raw == raw {
-                            t.inside = false;
+                        WindowEvent::CursorLeft { .. } => {
+                            if t.raw == raw {
+                                t.inside = false;
+                            }
                         }
-                    }
-                    WindowEvent::MouseInput {
-                        state,
-                        button: MouseButton::Left,
-                        ..
-                    } => {
-                        t.raw = raw;
-                        t.left_down = *state == ElementState::Pressed;
-                        if t.left_down {
-                            crate::dbg_log(&format!("ptr-press raw={raw} pos={:?}", t.pos));
+                        WindowEvent::MouseInput {
+                            state,
+                            button: MouseButton::Left,
+                            ..
+                        } => {
+                            t.raw = raw;
+                            t.left_down = *state == ElementState::Pressed;
+                            if t.left_down {
+                                crate::dbg_log(&format!("ptr-press raw={raw} pos={:?}", t.pos));
+                            }
                         }
+                        _ => {}
                     }
-                    _ => {}
-                }
-                p.set(t);
-            });
-            EventResult::Propagate
-        });
+                    p.set(t);
+                });
+                EventResult::Propagate
+            }),
+        );
     }
     raw
 }

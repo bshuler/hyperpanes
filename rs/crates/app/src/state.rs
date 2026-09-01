@@ -5598,6 +5598,58 @@ impl State {
         }
     }
 
+    /// Insert files dropped from the OS file manager into pane `idx` as shell-quoted words.
+    ///
+    /// Deliberately stops short of Enter — see [`crate::filedrop`]. Delivered through the
+    /// pane's own paste preparation so a TUI that reads bracketed paste treats a drop the
+    /// way it treats a paste, and a path with a control character in its name is refused
+    /// rather than typed. Returns whether anything reached the pty.
+    pub fn drop_files(&mut self, idx: usize, paths: &[String], mgr: &SessionManager) -> bool {
+        if paths.is_empty() {
+            return false;
+        }
+        let (text, refused) =
+            crate::filedrop::format_paths(paths, crate::filedrop::native_quoting());
+        let payload = match self.active_tab_mut().panes.get_mut(idx) {
+            None => return false,
+            Some(p) if !p.kind.is_pty() => {
+                // A view pane (a file, a diff, the git panel) has nothing on the other end.
+                p.pane.set_toast("Nothing here to drop files into");
+                None
+            }
+            Some(p) if text.is_empty() => {
+                // Every path in the batch was refused (or there were none) — say so, rather
+                // than leaving a drag that visibly landed with no visible effect.
+                p.pane.set_toast(format!(
+                    "Skipped {refused} dropped path{} — a control character in the name",
+                    if refused == 1 { "" } else { "s" }
+                ));
+                None
+            }
+            Some(p) => {
+                let kept = paths.len() - refused;
+                p.pane.set_toast(if refused == 0 {
+                    format!("Dropped {kept} path{}", if kept == 1 { "" } else { "s" })
+                } else {
+                    format!("Dropped {kept}, skipped {refused}")
+                });
+                // Same housekeeping a paste does: the highlight must not survive (it could
+                // be re-copied as stale text) and the caret has to be on screen to be seen.
+                p.pane.selection_clear();
+                p.pane.scroll_to_bottom();
+                Some((p.uid.clone(), p.pane.prepare_insert(&text)))
+            }
+        };
+        self.dirty = true;
+        match payload {
+            Some((uid, wire)) => {
+                mgr.write(&uid, &wire);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Forward a literal Ctrl+V (0x16) to pane `idx`'s session so an in-pane TUI that reads the
     /// OS clipboard itself (e.g. Claude Code) can paste a clipboard IMAGE — which hyperpanes'
     /// own text paste can't deliver through the pty. Bound to Alt+V, the shortcut Claude Code
