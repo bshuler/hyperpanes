@@ -24,6 +24,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # the input rig: a display to draw on, and hands to drive it
     && apt-get install -y --no-install-recommends \
         xvfb x11-utils x11-xserver-utils xdotool xclip imagemagick \
+    # A window manager, which is not optional. With a bare X server nothing maps
+    # or focuses a new window and `xdotool windowactivate` has no EWMH to talk
+    # to, so focus lands wherever it likes and synthetic keys are delivered to a
+    # window that is not listening. openbox is the smallest thing that makes
+    # focus behave the way it does on a real desktop.
+        openbox \
     # python3-xlib is the XDND source: Debian has no `dragon-drop` in bookworm,
     # and a scripted drag beats a GUI drag tool anyway — the harness needs to
     # choose the offered mime types, not accept whatever a helper app sends.

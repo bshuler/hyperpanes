@@ -29,6 +29,17 @@ Xvfb "$DISPLAY" -screen 0 1600x1000x24 -nolisten tcp >/tmp/xvfb.log 2>&1 &
 XVFB=$!
 for _ in $(seq 1 50); do xdpyinfo >/dev/null 2>&1 && break; sleep 0.2; done
 xdpyinfo >/dev/null 2>&1 || { echo "Xvfb never came up; see /tmp/xvfb.log" >&2; exit 1; }
+
+# Without a window manager nothing maps or focuses a new window, and
+# `xdotool windowactivate` has no EWMH to talk to — focus then lands wherever it
+# likes and synthetic keys reach a window that is not listening. That was a real
+# flake, not a theoretical one: two runs in five lost their keystrokes.
+openbox --sm-disable >/tmp/openbox.log 2>&1 &
+OPENBOX=$!
+for _ in $(seq 1 50); do
+    xprop -root _NET_SUPPORTING_WM_CHECK >/dev/null 2>&1 && break
+    sleep 0.2
+done
 echo "==> X server up on $DISPLAY"
 
 # --- an instance that shares nothing with anything else ------------------------
@@ -42,6 +53,7 @@ cleanup() {
     [[ $KEEP == 1 ]] && { echo "==> --keep: instance left running (DISPLAY=$DISPLAY, STATE=$STATE)"; return; }
     [[ -n "${APP:-}" ]] && kill "$APP" 2>/dev/null
     pkill -f -- "--session-daemon $HYPERPANES_USER_DATA_DIR" 2>/dev/null
+    kill "${OPENBOX:-}" 2>/dev/null
     kill "$XVFB" 2>/dev/null
     rm -rf "$STATE"
 }
@@ -63,7 +75,15 @@ echo "==> control API answering"
 
 echo "== it starts and draws =="
 want "the control API reports healthy"        'ctl health'
-want "a window exists on the X server"        'xdotool search --onlyvisible --class -- . | head -1 | grep -q .'
+# Same race as the pane check below: /health answers before the window is
+# mapped, and sampling once reported "no window" for an app that had one a
+# quarter-second later.
+for _ in $(seq 1 60); do
+    WIN="$(xdotool search --onlyvisible --class -- . 2>/dev/null | head -1)"
+    [[ -n "$WIN" ]] && break
+    sleep 0.25
+done
+want "a window exists on the X server"        '[[ -n "$WIN" ]]'
 # `ctl panes` prints TSV (id, tab, status, label) — one row per pane, not JSON.
 # /health answers before the first pane's pty is up, so this polls rather than
 # sampling once: an instant sample raced the startup and reported "no panes" for
@@ -74,7 +94,6 @@ for _ in $(seq 1 40); do
 done
 want "the app reports at least one pane"      '[[ "$(ctl panes 2>/dev/null | grep -c .)" -ge 1 ]]'
 
-WIN="$(xdotool search --onlyvisible --class -- . 2>/dev/null | head -1)"
 PANE="$(ctl panes 2>/dev/null | head -1 | cut -f1)"
 
 echo "== synthetic keyboard reaches the pty =="
@@ -83,7 +102,16 @@ echo "== synthetic keyboard reaches the pty =="
 # some event types; XTEST is indistinguishable from a real key at the server.
 # Stealing focus to do that is exactly why this runs in a container on a seatless
 # box — there is nobody here whose typing it can land in.
-act() { xdotool windowactivate --sync "$WIN" 2>/dev/null || xdotool windowfocus "$WIN" 2>/dev/null; }
+# `windowactivate --sync` returns once the server has acted, which is before the
+# app has processed FocusIn — keys sent in that gap are delivered to a window
+# that is not yet listening, and vanish. So confirm focus actually landed.
+act() {
+    xdotool windowactivate --sync "$WIN" 2>/dev/null || xdotool windowfocus "$WIN" 2>/dev/null
+    for _ in $(seq 1 20); do
+        [[ "$(xdotool getwindowfocus 2>/dev/null)" == "$WIN" ]] && return 0
+        sleep 0.1
+    done
+}
 send_key()  { act; xdotool key --clearmodifiers "$1"; }
 
 # `xdotool type` binds each character to a scratch keycode and remaps the keyboard
@@ -116,13 +144,36 @@ await_pane() { # await_pane <pane> <needle>
     printf '%s' "$got"
 }
 
+# A pane row appears in `ctl panes` before its shell has drawn a prompt, and
+# keystrokes typed at a pty nobody is reading yet are simply lost. Waiting for
+# the pane's first output is the readiness signal; without it this stage failed
+# about one run in three. A retry would have hidden that instead of fixing it.
+for _ in $(seq 1 60); do
+    [[ -n "$(ctl read "$PANE" --tail 5 2>/dev/null | tr -d '[:space:]')" ]] && break
+    sleep 0.25
+done
+
 if [[ -n "$WIN" && -n "$PANE" && "$PANE" != null ]]; then
     MARK="harness-$$-$RANDOM"
     send_type "echo $MARK"
     send_key Return
     got="$(await_pane "$PANE" "$MARK")"
     if [[ "$got" == *"$MARK"* ]]; then ok "typed text arrived in the pane"
-    else bad "typed text never arrived in the pane (marker $MARK)"; fi
+    else
+        bad "typed text never arrived in the pane (marker $MARK)"
+        # Enough to tell an app-side race from a harness one without another run:
+        # who held focus, what the pane actually shows, and whether a second
+        # attempt lands (which would say the app was simply not ready yet).
+        echo "       focus=$(xdotool getwindowfocus 2>/dev/null) win=$WIN"
+        echo "       pane tail: $(ctl read "$PANE" --tail 10 2>/dev/null | tr '\n' '|' | tail -c 200)"
+        send_type "echo retry-$MARK"
+        send_key Return
+        if [[ "$(await_pane "$PANE" "retry-$MARK")" == *"retry-$MARK"* ]]; then
+            echo "       (a second attempt DID land — the app was not ready for the first)"
+        else
+            echo "       (a second attempt also failed — input is not reaching this pane at all)"
+        fi
+    fi
 
     # The modifier question, on the branch where no Cmd/Ctrl swap applies. This
     # does NOT settle the macOS behavior — Slint swaps Control and Super only on
