@@ -9,6 +9,7 @@ pub mod output;
 pub mod scope;
 pub mod work;
 
+pub mod dictation_service;
 pub mod discovery_guard;
 pub mod dispatch;
 pub mod events;

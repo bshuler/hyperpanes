@@ -1,0 +1,118 @@
+//! Per-pane dictation: hold the mic, talk, and the transcript is typed into the pane.
+//!
+//! The mirror image of [`crate::speech`], and deliberately built the same way — two
+//! external commands, auto-detected, each overridable from a settings file:
+//!
+//! ```text
+//! click mic  → recorder command  → <state>/dictation/<pane>.wav
+//! click stop → (graceful stop)   → transcriber command → stdout → pane input
+//! ```
+//!
+//! **Why commands and not an audio crate.** Capturing audio in-process means `cpal`,
+//! which means ALSA headers at build time on Linux and a per-platform device-enumeration
+//! layer to maintain. Every desktop that can record already ships something that records
+//! (`ffmpeg`, `sox`/`rec`, `arecord`), the same way every desktop ships something that
+//! speaks. Shelling out keeps the dependency tree flat, makes the whole pipeline testable
+//! headless (point `recordTemplate` at a script that copies a fixture WAV), and degrades
+//! to a one-time notice instead of a build failure when nothing is installed.
+//!
+//! Owned modules: [`backend`] (detection + argv construction) and [`dictation`] (the
+//! per-pane record → stop → transcribe state machine). This file holds only the
+//! persisted settings shape.
+
+pub mod backend;
+pub mod dictation;
+
+use serde::{Deserialize, Serialize};
+use std::path::Path;
+
+/// Per-installation dictation settings, persisted to `stt.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SttSettings {
+    /// Custom recorder command, e.g. `["ffmpeg", "-f", "avfoundation", "-i", ":default", "{wav}"]`.
+    /// `{wav}` in any argument is replaced with the output path. `None` -> auto-detect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_template: Option<Vec<String>>,
+    /// Custom transcriber command, e.g. `["whisper-cli", "-f", "{wav}", "-nt"]`. The
+    /// transcript is read from stdout. `None` -> auto-detect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcribe_template: Option<Vec<String>>,
+    /// whisper.cpp's model file (`-m`). Only consulted when the auto-detected
+    /// transcriber is `whisper-cli`, which — unlike the Python `whisper`, which fetches
+    /// its own weights — cannot run without one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Press Enter after inserting the transcript. Off by default: dictation is not
+    /// reliable enough to send a prompt no human has read back.
+    #[serde(default)]
+    pub submit: bool,
+}
+
+/// Read settings from `path`, falling back to [`SttSettings::default`] on a missing or
+/// corrupt file.
+pub fn load(path: &Path) -> SttSettings {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return SttSettings::default();
+    };
+    serde_json::from_str(&raw).unwrap_or_default()
+}
+
+/// Persist `settings` to `path`, atomically.
+pub fn save(path: &Path, settings: &SttSettings) -> std::io::Result<()> {
+    let json = serde_json::to_string_pretty(settings)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    crate::persistence::paths::write_atomic(path, json.as_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("hp-stt-settings-{}-{tag}.json", std::process::id()))
+    }
+
+    #[test]
+    fn missing_file_yields_defaults() {
+        let p = temp_path("missing");
+        let _ = std::fs::remove_file(&p);
+        assert_eq!(load(&p), SttSettings::default());
+    }
+
+    #[test]
+    fn corrupt_file_yields_defaults() {
+        let p = temp_path("corrupt");
+        std::fs::write(&p, "{ not json").unwrap();
+        assert_eq!(load(&p), SttSettings::default());
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let p = temp_path("round");
+        let s = SttSettings {
+            record_template: Some(vec!["rec".into(), "{wav}".into()]),
+            transcribe_template: Some(vec!["whisper-cli".into(), "-f".into(), "{wav}".into()]),
+            model: Some("/models/ggml-base.en.bin".into()),
+            submit: true,
+        };
+        save(&p, &s).unwrap();
+        assert_eq!(load(&p), s);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn unset_templates_are_omitted_from_json() {
+        let json = serde_json::to_string(&SttSettings::default()).unwrap();
+        assert!(!json.contains("recordTemplate"), "{json}");
+        assert!(!json.contains("transcribeTemplate"), "{json}");
+        assert!(json.contains("submit"), "{json}");
+    }
+
+    #[test]
+    fn dictation_never_submits_unless_asked() {
+        // A misheard word in a prompt that was already sent is not recoverable.
+        assert!(!SttSettings::default().submit);
+    }
+}

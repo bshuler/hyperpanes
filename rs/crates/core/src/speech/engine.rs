@@ -55,7 +55,7 @@ impl Backend {
 /// On Windows a bare name is not enough: the shell appends each suffix in `PATHEXT`
 /// (`powershell` is really `powershell.EXE`), so try the bare name first and then
 /// every configured extension.
-fn on_path(cmd: &str) -> bool {
+pub(crate) fn on_path(cmd: &str) -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };

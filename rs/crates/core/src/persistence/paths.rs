@@ -196,6 +196,12 @@ pub fn speech_json() -> PathBuf {
     config_dir().join("speech.json")
 }
 
+/// Per-pane dictation (local STT) settings. User setting → [`config_dir`]. Kept beside
+/// `speech.json`, which is also how the control server derives it.
+pub fn stt_json() -> PathBuf {
+    config_dir().join("stt.json")
+}
+
 /// Ambient-AI per-pane memory. Durable user data → [`data_dir`].
 pub fn ai_memory_json() -> PathBuf {
     data_dir().join("ai-memory.json")

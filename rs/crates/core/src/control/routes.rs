@@ -209,10 +209,23 @@ struct SpeechOut {
     speaking_pane: Option<String>,
 }
 
+/// `/state`'s top-level, additive `dictation` field: which halves of the STT pipeline this
+/// machine actually has, and which panes have a live microphone right now. Recording state
+/// lives here rather than on the pane, because the GUI republishes every pane wholesale each
+/// sync tick and would stamp a per-pane flag straight back out.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DictationOut {
+    recorder: String,
+    transcriber: String,
+    recording_panes: Vec<String>,
+}
+
 #[derive(Serialize)]
 struct StateWithSpeechOut {
     windows: Vec<WindowOut>,
     speech: SpeechOut,
+    dictation: DictationOut,
 }
 
 async fn state(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
@@ -227,6 +240,7 @@ async fn state(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respons
         })
     };
     let status = shared.speech.status();
+    let dictation = shared.dictation.status();
     ok_json(StateWithSpeechOut {
         windows: out.windows,
         speech: SpeechOut {
@@ -234,6 +248,11 @@ async fn state(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respons
             focused_only: status.focused_only,
             backend: status.backend,
             speaking_pane: status.speaking_pane,
+        },
+        dictation: DictationOut {
+            recorder: dictation.recorder,
+            transcriber: dictation.transcriber,
+            recording_panes: dictation.recording_panes,
         },
     })
 }
@@ -1546,6 +1565,15 @@ async fn command(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: By
             return tab_command(&shared, &info, ty, &cmd);
         }
     }
+    // Dictation verbs are handled here, not in dispatch, for two reasons: they need `Shared`
+    // (the STT service AND the pty write that delivers the transcript), and `stopDictation`
+    // BLOCKS for as long as the transcriber takes — dispatch runs holding the read-model
+    // mutex, which must never be held across a whisper run.
+    if let Some(ty) = cmd.get("type").and_then(Value::as_str) {
+        if DICTATION_VERBS.contains(&ty) {
+            return dictation_command(&shared, &info, ty, &cmd).await;
+        }
+    }
     let control_file = shared.control_file.to_str().map(str::to_string);
     let result = {
         let mut m = shared.model.lock().unwrap();
@@ -1574,6 +1602,14 @@ async fn command(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: By
             });
         }
     }
+    // A closed pane must not leave a microphone running: nothing would ever stop it, and the
+    // pty its transcript was bound for is gone. Cancel discards the audio rather than
+    // transcribing it into nowhere.
+    if cmd.get("type").and_then(Value::as_str) == Some("closePane") && result.status < 300 {
+        if let Some(pane_id) = cmd.get("paneId").and_then(Value::as_str) {
+            shared.dictation.cancel(pane_id);
+        }
+    }
     // Phase-5: keep supervisor policies in lockstep with pane meta (setMeta flips
     // hp.supervise; newPane carries meta; closePane removes a pane). Cheap + idempotent.
     shared.reconcile_policies();
@@ -1590,6 +1626,91 @@ async fn command(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: By
 // ---- tabs + settings (queued for the UI thread) --------------------------------------------
 // Both surfaces edit state the GUI owns rather than the read model, so both take the
 // `control::uiops` path: validate here, apply on the next sync tick. See that module for why.
+
+/// `/command` verbs that drive a pane's microphone.
+const DICTATION_VERBS: &[&str] = &["startDictation", "stopDictation", "cancelDictation"];
+
+/// Start / stop / cancel a pane's microphone.
+///
+/// `stopDictation` is the whole feature: it stops the recorder, waits for the transcriber,
+/// and types the result into the pane. The wait happens on a blocking task — a cold whisper
+/// model is seconds, and the async executor's threads are not ours to occupy. The transcript
+/// is [sanitized](crate::control::dictation_service::sanitize_for_pane) before it reaches the
+/// pty, and Enter is a SEPARATE delayed write exactly as in `/panes/{id}/input`, so a
+/// bracketed-paste TUI reads it as a keypress rather than pasted content.
+async fn dictation_command(
+    shared: &Arc<Shared>,
+    info: &TokenInfo,
+    ty: &str,
+    cmd: &Value,
+) -> Response {
+    let pane_id = match cmd.get("paneId").and_then(Value::as_str) {
+        Some(p) => p,
+        None => return jstatus(400, json!({ "error": format!("{ty} needs a paneId") })),
+    };
+    let found = match find_pane_scoped(shared, info.scope.as_ref(), pane_id) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    // Dictation is input: it types into a pane, so it lives or dies with the same switch.
+    if !shared.allow_input() {
+        return jstatus(403, json!({ "error": "input not allowed" }));
+    }
+
+    match ty {
+        "cancelDictation" => {
+            shared.dictation.cancel(&found.pane_id);
+            jstatus(200, json!({ "ok": true, "paneId": found.pane_id }))
+        }
+        "startDictation" => match shared.dictation.start(&found.pane_id) {
+            Ok(recorder) => jstatus(
+                200,
+                json!({ "ok": true, "paneId": found.pane_id, "recorder": recorder }),
+            ),
+            Err(e) => jstatus(400, json!({ "error": e, "paneId": found.pane_id })),
+        },
+        _ => {
+            let s2 = Arc::clone(shared);
+            let pane = found.pane_id.clone();
+            let transcript =
+                match tokio::task::spawn_blocking(move || s2.dictation.stop(&pane)).await {
+                    Ok(r) => r,
+                    Err(_) => Err("dictation task failed".to_string()),
+                };
+            let transcript = match transcript {
+                Ok(t) => t,
+                Err(e) => return jstatus(400, json!({ "error": e, "paneId": found.pane_id })),
+            };
+            let text = crate::control::dictation_service::sanitize_for_pane(&transcript.text);
+            if text.is_empty() {
+                return jstatus(
+                    400,
+                    json!({ "error": "no speech in the recording", "paneId": found.pane_id }),
+                );
+            }
+            let submit = shared.dictation.submit_after_insert();
+            shared.sessions.write(&found.uid, &text);
+            if submit {
+                let sessions = Arc::clone(&shared.sessions);
+                let uid = found.uid.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(SUBMIT_DELAY_MS)).await;
+                    sessions.write(&uid, "\r");
+                });
+            }
+            jstatus(
+                200,
+                json!({
+                    "ok": true,
+                    "paneId": found.pane_id,
+                    "text": text,
+                    "backend": transcript.backend,
+                    "submitted": submit,
+                }),
+            )
+        }
+    }
+}
 
 /// `/command` verbs that edit the tab tree.
 const TAB_VERBS: &[&str] = &["newTab", "closeTab", "renameTab", "focusTab", "moveTab"];
@@ -2401,6 +2522,93 @@ mod golden {
         assert_eq!(body["speech"]["focusedOnly"], json!(false));
         assert!(body["speech"]["backend"].is_string());
         assert_eq!(body["speech"]["speakingPane"], Value::Null);
+        // `dictation` is additive too, and equally environment-dependent — a machine with no
+        // recorder still reports the block, so a client can tell "nothing installed" apart
+        // from "old server".
+        assert!(body["dictation"]["recorder"].is_string());
+        assert!(body["dictation"]["transcriber"].is_string());
+        assert_eq!(body["dictation"]["recordingPanes"], json!([]));
+    }
+
+    // ---- dictation ------------------------------------------------------------------------
+
+    async fn dictate(s: &Server, ty: &str, pane: &str) -> (u16, Value) {
+        let r = client()
+            .post(format!("{}/command", s.base))
+            .header("authorization", format!("Bearer {}", s.token))
+            .json(&json!({ "type": ty, "paneId": pane }))
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        (
+            status,
+            serde_json::from_str(&r.text().await.unwrap()).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn dictation_into_a_pane_that_does_not_exist_is_404() {
+        let s = boot(true).await;
+        let (status, body) = dictate(&s, "startDictation", "ghost").await;
+        assert_eq!(status, 404);
+        assert_eq!(body["error"], json!("no such pane"));
+    }
+
+    #[tokio::test]
+    async fn dictation_needs_a_pane_id() {
+        let s = boot(true).await;
+        let r = client()
+            .post(format!("{}/command", s.base))
+            .header("authorization", format!("Bearer {}", s.token))
+            .json(&json!({ "type": "startDictation" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 400);
+        assert!(r.text().await.unwrap().contains("needs a paneId"));
+    }
+
+    #[tokio::test]
+    async fn dictation_is_input_and_obeys_the_input_switch() {
+        // A read-only token holder must not be able to type into a pane by speaking into it.
+        let s = boot(false).await;
+        s.shared
+            .model
+            .lock()
+            .unwrap()
+            .insert_pane(1, pane("p1", "u1"));
+        let (status, body) = dictate(&s, "startDictation", "p1").await;
+        assert_eq!(status, 403);
+        assert_eq!(body["error"], json!("input not allowed"));
+    }
+
+    #[tokio::test]
+    async fn stopping_a_pane_that_never_recorded_is_an_error_not_a_hang() {
+        let s = boot(true).await;
+        s.shared
+            .model
+            .lock()
+            .unwrap()
+            .insert_pane(1, pane("p1", "u1"));
+        let (status, body) = dictate(&s, "stopDictation", "p1").await;
+        assert_eq!(status, 400);
+        assert!(body["error"].as_str().unwrap().contains("not recording"));
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_pane_that_never_recorded_is_silent() {
+        // Cancel is the teardown path — a pane closing mid-recording, a window going away.
+        // It must never fail, or teardown would have to care whether a mic was live.
+        let s = boot(true).await;
+        s.shared
+            .model
+            .lock()
+            .unwrap()
+            .insert_pane(1, pane("p1", "u1"));
+        let (status, body) = dictate(&s, "cancelDictation", "p1").await;
+        assert_eq!(status, 200);
+        assert_eq!(body["ok"], json!(true));
     }
 
     #[tokio::test]

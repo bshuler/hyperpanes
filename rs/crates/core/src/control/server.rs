@@ -23,6 +23,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
+use crate::control::dictation_service::DictationService;
 use crate::control::events::{ControlEvent, EventHub};
 use crate::control::inbox::MessageInbox;
 use crate::control::lock::PaneLocks;
@@ -103,6 +104,9 @@ pub struct Shared {
     /// Per-pane "talk" (local TTS): persisted settings + lazily-spawned engine + transcript
     /// tails. Default-off; costs nothing until a pane's talk is switched on.
     pub speech: SpeechService,
+    /// Per-pane dictation (local STT): persisted settings + whichever panes are recording
+    /// right now. Purely user-driven — no ticker, no thread, nothing until a mic is clicked.
+    pub dictation: DictationService,
     /// Tab + preferences edits waiting for the UI thread (`control::uiops`). Written by the
     /// routes off-thread, drained by the GUI host each sync tick. Never drained in a headless
     /// embedder, which is why the queue is capped.
@@ -148,6 +152,7 @@ impl Shared {
             restart_app: AtomicU8::new(0),
             bind: Mutex::new(("127.0.0.1".to_string(), 0)),
             runtime: OnceLock::new(),
+            dictation: DictationService::new(speech_settings_path.with_file_name("stt.json")),
             speech: SpeechService::new(speech_settings_path),
             ui_ops: Mutex::new(UiOpQueue::new()),
             settings: Mutex::new(None),
