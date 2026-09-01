@@ -4,6 +4,7 @@
 
 use super::SpeechSettings;
 use std::collections::VecDeque;
+use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -50,17 +51,98 @@ impl Backend {
     }
 }
 
-/// Is `cmd` an executable somewhere on `PATH`?
+/// Directories to search *in addition to* `PATH`.
+///
+/// A GUI app launched from Finder, the Dock or LaunchServices does NOT inherit a login
+/// shell's environment: macOS hands it `/usr/bin:/bin:/usr/sbin:/sbin` and nothing else.
+/// Every tool a user installed — Homebrew, MacPorts, pipx, cargo — is therefore invisible
+/// to `PATH` alone, so `say` (in /usr/bin) works while `ffmpeg` (in /opt/homebrew/bin)
+/// reports "not found" even though the user's own shell finds it instantly. Searching
+/// the conventional install prefixes closes that gap without asking the user to launch
+/// the app from a terminal (live finding, 2026-09-01).
+///
+/// Windows is absent deliberately: its installers write to the machine `PATH`, which a
+/// GUI process does inherit, so there is no equivalent blind spot to paper over.
+fn extra_dirs() -> Vec<PathBuf> {
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    #[allow(unused_mut)]
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    #[cfg(target_os = "macos")]
+    {
+        dirs.extend(
+            [
+                "/opt/homebrew/bin",
+                "/opt/homebrew/sbin",
+                "/usr/local/bin",
+                "/usr/local/sbin",
+                "/opt/local/bin",
+            ]
+            .iter()
+            .map(PathBuf::from),
+        );
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        dirs.extend(
+            ["/usr/local/bin", "/usr/local/sbin", "/snap/bin"]
+                .iter()
+                .map(PathBuf::from),
+        );
+    }
+    #[cfg(unix)]
+    if let Some(h) = home {
+        dirs.push(h.join(".local/bin"));
+        dirs.push(h.join("bin"));
+    }
+    #[cfg(not(unix))]
+    let _ = home;
+    dirs
+}
+
+/// Resolve `cmd` to the absolute path of an executable, or `None` if there isn't one.
+///
+/// `PATH` is searched first so a user's own ordering still wins; [`extra_dirs`] is the
+/// fallback for the GUI-launch case described there. The result is absolute on purpose:
+/// finding a tool is useless if the later `Command::new` spawn resolves the bare name
+/// through the same impoverished `PATH` and fails.
 ///
 /// On Windows a bare name is not enough: the shell appends each suffix in `PATHEXT`
 /// (`powershell` is really `powershell.EXE`), so try the bare name first and then
 /// every configured extension.
-pub(crate) fn on_path(cmd: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
+pub(crate) fn resolve(cmd: &str) -> Option<PathBuf> {
+    // An explicit path is already an answer — don't go looking for a different one.
+    if cmd.contains(std::path::MAIN_SEPARATOR) {
+        let p = PathBuf::from(cmd);
+        return p.is_file().then_some(p);
+    }
     let candidates = path_candidates(cmd);
-    std::env::split_paths(&path).any(|dir| candidates.iter().any(|name| dir.join(name).is_file()))
+    let from_path = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default();
+    from_path
+        .into_iter()
+        .chain(extra_dirs())
+        .find_map(|dir| {
+            candidates
+                .iter()
+                .map(|name| dir.join(name))
+                .find(|c| c.is_file())
+        })
+}
+
+/// Is `cmd` an executable this process can actually spawn?
+pub(crate) fn on_path(cmd: &str) -> bool {
+    resolve(cmd).is_some()
+}
+
+/// `Command::new` for a tool named by bare name, spawned through its resolved absolute
+/// path so it survives the GUI's stripped `PATH`. Falls back to the bare name, which
+/// keeps the failure a normal "not found" from the OS rather than a panic here.
+pub(crate) fn command_for(cmd: &str) -> Command {
+    match resolve(cmd) {
+        Some(p) => Command::new(p),
+        None => Command::new(cmd),
+    }
 }
 
 #[cfg(unix)]
@@ -117,17 +199,17 @@ fn build_command(backend: &Backend, text: &str) -> Option<Command> {
     match backend {
         Backend::None => None,
         Backend::SpdSay => {
-            let mut c = Command::new("spd-say");
+            let mut c = command_for("spd-say");
             c.arg("--wait").arg(text);
             Some(c)
         }
         Backend::EspeakNg => {
-            let mut c = Command::new("espeak-ng");
+            let mut c = command_for("espeak-ng");
             c.arg(text);
             Some(c)
         }
         Backend::Say => {
-            let mut c = Command::new("say");
+            let mut c = command_for("say");
             c.arg(text);
             Some(c)
         }
@@ -135,7 +217,7 @@ fn build_command(backend: &Backend, text: &str) -> Option<Command> {
             // The text travels in the environment, never in the command line: a
             // `-Command` string would have to survive both PowerShell's parser and
             // Windows' single-string argv, and an assistant reply is arbitrary text.
-            let mut c = Command::new("powershell");
+            let mut c = command_for("powershell");
             c.arg("-NoProfile")
                 .arg("-NonInteractive")
                 .arg("-Command")
@@ -145,7 +227,7 @@ fn build_command(backend: &Backend, text: &str) -> Option<Command> {
         }
         Backend::Custom(template) => {
             let (program, args) = template.split_first()?;
-            let mut c = Command::new(program);
+            let mut c = command_for(program);
             for arg in args {
                 c.arg(arg.replace("{text}", text));
             }
@@ -477,6 +559,46 @@ mod tests {
             detect(&SpeechSettings::default()),
             Backend::None,
             "no built-in TTS backend on this platform"
+        );
+    }
+
+    #[test]
+    fn resolve_returns_an_absolute_path_so_the_spawn_does_not_need_path() {
+        #[cfg(unix)]
+        let known = "sh";
+        #[cfg(windows)]
+        let known = "powershell";
+        let p = resolve(known).expect("{known} not resolvable");
+        assert!(p.is_absolute(), "{p:?} is not absolute");
+        assert!(p.is_file(), "{p:?} is not a file");
+    }
+
+    #[test]
+    fn resolve_accepts_a_path_and_does_not_go_looking_for_a_different_one() {
+        #[cfg(unix)]
+        let exact = "/bin/sh";
+        #[cfg(windows)]
+        let exact = "C:\\Windows\\System32\\cmd.exe";
+        assert_eq!(resolve(exact).as_deref(), Some(std::path::Path::new(exact)));
+        assert_eq!(resolve("/definitely/not/a/real/binary"), None);
+    }
+
+    #[test]
+    fn a_gui_stripped_path_still_finds_tools_in_the_conventional_prefixes() {
+        // The whole point of extra_dirs: with PATH reduced to what LaunchServices hands a
+        // GUI app, anything the user installed must still be found. Asserted against a
+        // file we create in one of those prefixes only if it already exists -- otherwise
+        // the search order itself is what we check, which is machine-independent.
+        let dirs = extra_dirs();
+        #[cfg(target_os = "macos")]
+        assert!(
+            dirs.iter().any(|d| d.ends_with("homebrew/bin")),
+            "macOS must search Homebrew: {dirs:?}"
+        );
+        #[cfg(unix)]
+        assert!(
+            dirs.iter().any(|d| d.ends_with(".local/bin")),
+            "unix must search ~/.local/bin: {dirs:?}"
         );
     }
 

@@ -83,7 +83,7 @@ impl Recorder {
         match self {
             Recorder::Custom(argv) => custom_command(argv, WAV_PLACEHOLDER, &wav_s),
             Recorder::Ffmpeg { dev, format } => {
-                let mut c = Command::new("ffmpeg");
+                let mut c = command_for("ffmpeg");
                 c.args(["-hide_banner", "-loglevel", "error", "-f", format, "-i"])
                     .arg(dev)
                     .args(["-ac", "1", "-ar", SAMPLE_RATE, "-t", MAX_RECORD_SECS, "-y"])
@@ -91,14 +91,14 @@ impl Recorder {
                 Some(c)
             }
             Recorder::Rec => {
-                let mut c = Command::new("rec");
+                let mut c = command_for("rec");
                 c.args(["-q", "-c", "1", "-r", SAMPLE_RATE])
                     .arg(&wav_s)
                     .args(["trim", "0", MAX_RECORD_SECS]);
                 Some(c)
             }
             Recorder::Arecord => {
-                let mut c = Command::new("arecord");
+                let mut c = command_for("arecord");
                 c.args([
                     "-q",
                     "-f",
@@ -156,7 +156,7 @@ fn ffmpeg_input() -> Option<(String, &'static str)> {
     }
     #[cfg(windows)]
     {
-        let out = Command::new("ffmpeg")
+        let out = command_for("ffmpeg")
             .args([
                 "-hide_banner",
                 "-list_devices",
@@ -244,7 +244,7 @@ impl Transcriber {
         match self {
             Transcriber::Custom(argv) => custom_command(argv, WAV_PLACEHOLDER, &wav_s),
             Transcriber::Whisper => {
-                let mut c = Command::new("whisper");
+                let mut c = command_for("whisper");
                 // `--output_format txt` still prints the timed transcript to stdout;
                 // `clean_transcript` strips the timestamps, so no output file is needed
                 // and nothing is left behind to clean up.
@@ -253,7 +253,7 @@ impl Transcriber {
                 Some(c)
             }
             Transcriber::WhisperCpp { model } => {
-                let mut c = Command::new("whisper-cli");
+                let mut c = command_for("whisper-cli");
                 c.args(["-m", model, "-f", &wav_s, "-nt", "-np"]);
                 Some(c)
             }
@@ -330,7 +330,7 @@ fn is_bracketed_marker(line: &str) -> bool {
 /// Build a command from a user template, substituting `placeholder` in every argument.
 fn custom_command(argv: &[String], placeholder: &str, value: &str) -> Option<Command> {
     let (prog, rest) = argv.split_first()?;
-    let mut c = Command::new(prog.replace(placeholder, value));
+    let mut c = command_for(&prog.replace(placeholder, value));
     for a in rest {
         c.arg(a.replace(placeholder, value));
     }
@@ -341,6 +341,13 @@ fn custom_command(argv: &[String], placeholder: &str, value: &str) -> Option<Com
 /// `PATHEXT`-aware probe so a Windows box resolves `ffmpeg.EXE` from a bare name.
 fn on_path(cmd: &str) -> bool {
     crate::speech::engine::on_path(cmd)
+}
+
+/// Spawn a tool through its resolved absolute path — see
+/// [`crate::speech::engine::command_for`]. A GUI launched from the Dock has no Homebrew
+/// on `PATH`, so a bare `Command::new("ffmpeg")` fails on a machine that plainly has it.
+fn command_for(cmd: &str) -> Command {
+    crate::speech::engine::command_for(cmd)
 }
 
 #[cfg(test)]

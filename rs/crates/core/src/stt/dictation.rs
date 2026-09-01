@@ -84,7 +84,16 @@ impl Dictation {
         }
         let recorder = detect_recorder(settings);
         if recorder == Recorder::None {
-            return Err("no recorder found (install ffmpeg, sox, or alsa-utils)".to_string());
+            return Err(format!(
+                "no recorder found: looked on PATH and in the usual install \
+                 prefixes for {}. Install ffmpeg (or sox/alsa-utils), or set \
+                 stt.recordTemplate to a command that captures to {{wav}}.",
+                if cfg!(target_os = "linux") {
+                    "ffmpeg, rec, arecord"
+                } else {
+                    "ffmpeg, rec"
+                }
+            ));
         }
         std::fs::create_dir_all(&self.dir).map_err(|e| format!("dictation dir: {e}"))?;
         let wav = self.dir.join(format!("{}.wav", sanitize(pane_id)));
