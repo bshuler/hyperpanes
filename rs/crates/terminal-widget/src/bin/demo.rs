@@ -323,6 +323,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(LinkAction::Reveal { path, line, col }) => {
                     eprintln!("[demo] click → reveal {path} (line {line:?}, col {col:?})");
                 }
+                // Likewise the git panel: the demo has none, so it reports the repository the
+                // hash resolved in and the hash itself.
+                Some(LinkAction::ShowCommit { cwd, hash }) => {
+                    eprintln!("[demo] click → commit {hash} in {cwd}");
+                }
                 None => {}
             }
         });
