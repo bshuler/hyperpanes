@@ -2848,10 +2848,7 @@ impl State {
         // default mode every MCP tool needs a ToolSearch round-trip before it can be called.
         env.insert("ENABLE_TOOL_SEARCH".to_string(), "false".to_string());
         if let Ok(exe) = std::env::current_exe() {
-            env.insert(
-                "HP_CTL".to_string(),
-                exe.to_string_lossy().into_owned(),
-            );
+            env.insert("HP_CTL".to_string(), exe.to_string_lossy().into_owned());
             // Put the app's own directory on PATH so the skills' `hyperpanes ctl …` resolves
             // verbatim — which is what lets the shipped `.claude/settings.json` pre-approve
             // exactly that command and nothing else. An absolute path could not be written
@@ -10134,8 +10131,7 @@ mod keyboard_focus_tests {
         }
         let bumps = seq(&st) - before;
         assert_eq!(
-            bumps,
-            KBD_FOCUS_TRIES as i32,
+            bumps, KBD_FOCUS_TRIES as i32,
             "an unanswered hand-off retries exactly KBD_FOCUS_TRIES times, then gives up"
         );
     }
@@ -10560,7 +10556,11 @@ mod system_tab_pin_tests {
     fn the_system_tab_cannot_be_dragged_out_of_slot_zero() {
         let mut s = strip(&[("hp", true), ("a", false), ("b", false)]);
         s.reorder_tab(0, 3);
-        assert_eq!(titles(&s), ["hp", "a", "b"], "the drag must simply not take");
+        assert_eq!(
+            titles(&s),
+            ["hp", "a", "b"],
+            "the drag must simply not take"
+        );
     }
 
     #[test]

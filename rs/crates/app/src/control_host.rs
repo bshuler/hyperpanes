@@ -770,7 +770,6 @@ impl ControlHost {
         }
     }
 
-
     /// Drain and apply the tab / preferences edits the control routes queued for this thread.
     ///
     /// These verbs can't be served the way pane verbs are. A pane mutation is written straight

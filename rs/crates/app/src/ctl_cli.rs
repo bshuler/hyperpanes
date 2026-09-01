@@ -92,7 +92,8 @@ pub fn run(argv: &[String]) -> std::io::Result<()> {
 
         // ---- terminals ----
         "read" => {
-            let (pane, flags) = split_flags(&args, "read <pane> [--tail N] [--raw] [--screen] [--wait]");
+            let (pane, flags) =
+                split_flags(&args, "read <pane> [--tail N] [--raw] [--screen] [--wait]");
             let mut q: Vec<String> = Vec::new();
             // Stripping ANSI is the default here and nowhere else: an agent reading a pane wants
             // the words, not the cursor choreography. `--raw` opts back into the bytes.
@@ -116,7 +117,10 @@ pub fn run(argv: &[String]) -> std::io::Result<()> {
                 pane,
                 body.get("status").and_then(Value::as_str).unwrap_or("?")
             );
-            print!("{}", body.get("output").and_then(Value::as_str).unwrap_or(""));
+            print!(
+                "{}",
+                body.get("output").and_then(Value::as_str).unwrap_or("")
+            );
         }
         "send" | "submit" => {
             let pane = need(args.first(), "send <pane> <text…>");
@@ -163,7 +167,12 @@ pub fn run(argv: &[String]) -> std::io::Result<()> {
             print_json(post(&conn, "/command", cmd)?);
         }
         "close-pane" => print_json(pane_verb(&conn, "closePane", &args, "close-pane <pane>")?),
-        "restart-pane" => print_json(pane_verb(&conn, "restartPane", &args, "restart-pane <pane>")?),
+        "restart-pane" => print_json(pane_verb(
+            &conn,
+            "restartPane",
+            &args,
+            "restart-pane <pane>",
+        )?),
         "focus-pane" => print_json(pane_verb(&conn, "focusPane", &args, "focus-pane <pane>")?),
         "rename-pane" => {
             let pane = need(args.first(), "rename-pane <pane> <title>");
@@ -296,7 +305,9 @@ fn post(conn: &Conn, path: &str, body: Value) -> std::io::Result<Value> {
 
 fn patch(conn: &Conn, path: &str, body: Value) -> std::io::Result<Value> {
     send(
-        conn.client.patch(format!("{}{path}", conn.base)).json(&body),
+        conn.client
+            .patch(format!("{}{path}", conn.base))
+            .json(&body),
         conn,
         path,
     )
@@ -331,11 +342,19 @@ fn print_json(v: Value) {
 /// `/state` as an outline. The point is that one screenful answers "what is open, and what is
 /// each thing's id" — the two questions every other verb needs answered first.
 fn print_outline(state: &Value) {
-    for w in state.get("windows").and_then(Value::as_array).map_or(&[][..], |a| a) {
+    for w in state
+        .get("windows")
+        .and_then(Value::as_array)
+        .map_or(&[][..], |a| a)
+    {
         let wid = w.get("windowId").and_then(Value::as_i64).unwrap_or(-1);
         let active = w.get("activeTabId").and_then(Value::as_str).unwrap_or("");
         println!("window {wid}");
-        for t in w.get("tabs").and_then(Value::as_array).map_or(&[][..], |a| a) {
+        for t in w
+            .get("tabs")
+            .and_then(Value::as_array)
+            .map_or(&[][..], |a| a)
+        {
             let id = t.get("id").and_then(Value::as_str).unwrap_or("?");
             let mark = if id == active { "*" } else { " " };
             println!(
@@ -343,7 +362,11 @@ fn print_outline(state: &Value) {
                 t.get("title").and_then(Value::as_str).unwrap_or(""),
                 t.get("layout").and_then(Value::as_str).unwrap_or("")
             );
-            for p in t.get("panes").and_then(Value::as_array).map_or(&[][..], |a| a) {
+            for p in t
+                .get("panes")
+                .and_then(Value::as_array)
+                .map_or(&[][..], |a| a)
+            {
                 println!(
                     "      {}  {}  ({})",
                     p.get("id").and_then(Value::as_str).unwrap_or("?"),
@@ -358,10 +381,22 @@ fn print_outline(state: &Value) {
 /// Every pane, flat, with the tab it sits in — the listing to grep when you know a pane by its
 /// title and need its id.
 fn print_panes(state: &Value) {
-    for w in state.get("windows").and_then(Value::as_array).map_or(&[][..], |a| a) {
-        for t in w.get("tabs").and_then(Value::as_array).map_or(&[][..], |a| a) {
+    for w in state
+        .get("windows")
+        .and_then(Value::as_array)
+        .map_or(&[][..], |a| a)
+    {
+        for t in w
+            .get("tabs")
+            .and_then(Value::as_array)
+            .map_or(&[][..], |a| a)
+        {
             let tab = t.get("id").and_then(Value::as_str).unwrap_or("?");
-            for p in t.get("panes").and_then(Value::as_array).map_or(&[][..], |a| a) {
+            for p in t
+                .get("panes")
+                .and_then(Value::as_array)
+                .map_or(&[][..], |a| a)
+            {
                 println!(
                     "{}\t{}\t{}\t{}",
                     p.get("id").and_then(Value::as_str).unwrap_or("?"),

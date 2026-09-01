@@ -18,7 +18,8 @@
 //! [`MainThreadMarker`] and no-ops off-thread rather than UB.
 
 use objc2::rc::Retained;
-use objc2::MainThreadMarker;
+use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
+use objc2::{sel, MainThreadMarker};
 use objc2_app_kit::{
     NSCursor, NSEvent, NSEventModifierFlags, NSEventType, NSScreen, NSView, NSWindow,
     NSWindowStyleMask, NSWindowTitleVisibility,
@@ -81,6 +82,42 @@ pub fn make_frameless(raw: isize) {
         w.setStyleMask(mask);
         w.setTitlebarAppearsTransparent(true);
         w.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+    }
+    refuse_implicit_window_drag(w);
+}
+
+/// Teach the content view to refuse AppKit's implicit window move-drag.
+///
+/// A press in the native titlebar band (the top 28pt) drags the whole window whenever the
+/// view under the cursor allows it — and with `fullSizeContentView` that band is *our tab
+/// strip*. Every tab drag therefore moved the window instead of reordering: the window
+/// travelled with the cursor, so the pointer never left the chip it grabbed and the drop
+/// resolved to the slot the tab already occupied. AppKit asks the hit view via
+/// `-mouseDownCanMoveWindow`, and winit's view inherits NSView's permissive default, so
+/// answer NO on that class (one class shared by every window — replacing twice is
+/// harmless). Dragging the bar still works: the empty trailing area asks for it explicitly
+/// with `performWindowDragWithEvent:` (see [`start_drag`]), which never consults this.
+fn refuse_implicit_window_drag(w: &NSWindow) {
+    let Some(view) = w.contentView() else {
+        return;
+    };
+    extern "C-unwind" fn refuse(_: &AnyObject, _: Sel) -> Bool {
+        Bool::NO
+    }
+    // ObjC `BOOL` encodes as a C99 bool on arm64 and as a signed char elsewhere.
+    #[cfg(target_arch = "aarch64")]
+    const TYPES: &[u8] = b"B@:\0";
+    #[cfg(not(target_arch = "aarch64"))]
+    const TYPES: &[u8] = b"c@:\0";
+    let obj: &AnyObject = &view;
+    let cls: *const AnyClass = obj.class();
+    unsafe {
+        objc2::ffi::class_replaceMethod(
+            cls as *mut AnyClass,
+            sel!(mouseDownCanMoveWindow),
+            std::mem::transmute::<extern "C-unwind" fn(&AnyObject, Sel) -> Bool, Imp>(refuse),
+            TYPES.as_ptr() as *const std::ffi::c_char,
+        );
     }
 }
 
