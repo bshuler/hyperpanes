@@ -74,6 +74,7 @@ pub struct Ui {
     pub ctx_entries: Rc<VecModel<MenuEntry>>,
     pub ctx_swatches: Rc<VecModel<Color>>,
     pub ctx_tabs: Rc<VecModel<CtxTab>>,
+    pub ctx_openwith: Rc<VecModel<SharedString>>,
     pub ctx_layouts: Rc<VecModel<LayoutOption>>,
     // ---- sidebar worktree subtrees ----
     /// Per-project worktree models, keyed by repo path and reused across ticks so each
@@ -151,6 +152,7 @@ impl Ui {
             ctx_entries: Rc::new(VecModel::default()),
             ctx_swatches: Rc::new(VecModel::default()),
             ctx_tabs: Rc::new(VecModel::default()),
+            ctx_openwith: Rc::new(VecModel::default()),
             ctx_layouts: Rc::new(VecModel::default()),
             wt_models: RefCell::new(HashMap::new()),
             claude_models: RefCell::new(HashMap::new()),
@@ -199,6 +201,7 @@ impl Ui {
         app.set_ctx_entries(ModelRc::from(self.ctx_entries.clone()));
         app.set_ctx_swatches(ModelRc::from(self.ctx_swatches.clone()));
         app.set_ctx_tabs(ModelRc::from(self.ctx_tabs.clone()));
+        app.set_ctx_openwith(ModelRc::from(self.ctx_openwith.clone()));
         app.set_ctx_layouts(ModelRc::from(self.ctx_layouts.clone()));
         // The left panel is wired through a global (like RemindersAdapter) rather than new
         // AppWindow properties, so the whole feature stays self-contained.
@@ -1598,6 +1601,7 @@ pub fn resync(
                     .collect();
                 sync_model(&ui.ctx_tabs, tabs);
                 sync_model(&ui.ctx_layouts, Vec::new());
+                sync_model(&ui.ctx_openwith, Vec::new());
             }
             CtxKind::Tab => {
                 // Layout submenu reflects the TARGET tab's layout (checkmark on current).
@@ -1618,6 +1622,7 @@ pub fn resync(
                 sync_model(&ui.ctx_layouts, layouts);
                 sync_model(&ui.ctx_swatches, Vec::new());
                 sync_model(&ui.ctx_tabs, Vec::new());
+                sync_model(&ui.ctx_openwith, Vec::new());
             }
             CtxKind::App => {
                 // The application menu's Layout submenu: Automatic + the 5 presets, radio ✓ on
@@ -1642,13 +1647,16 @@ pub fn resync(
                 sync_model(&ui.ctx_layouts, layouts);
                 sync_model(&ui.ctx_swatches, Vec::new());
                 sync_model(&ui.ctx_tabs, Vec::new());
+                sync_model(&ui.ctx_openwith, Vec::new());
             }
-            // Every row of the file menu carries its own command; there is no submenu, no
-            // swatch and no radio set, so all three auxiliary models are cleared.
+            // Every visible row of the file menu carries its own command, and its one
+            // submenu — "Open With" — is a plain list of labels rather than a radio set or
+            // a swatch grid, so the other three auxiliary models are cleared.
             CtxKind::File => {
                 sync_model(&ui.ctx_layouts, Vec::new());
                 sync_model(&ui.ctx_swatches, Vec::new());
                 sync_model(&ui.ctx_tabs, Vec::new());
+                sync_model(&ui.ctx_openwith, c.openwith.clone());
             }
         }
     }

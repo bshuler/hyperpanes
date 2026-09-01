@@ -155,6 +155,7 @@ export component AppWindow inherits Window {
     in property <bool> ctx-frame: false;
     in property <bool> ctx-dot: false;
     in property <[CtxTab]> ctx-tabs;         // Move-to-Tab destinations
+    in property <[string]> ctx-openwith;     // "Open With" applications
     in property <[LayoutOption]> ctx-layouts; // Layout submenu (for the target tab)
     // ---- Wave-2 drag / tear-off previews (driven by the drag pump) ----
     in property <bool> drop-win-active: false;    // this window is a cross-window tear target
@@ -653,6 +654,7 @@ export component AppWindow inherits Window {
         frame-on: root.ctx-frame;
         dot-on: root.ctx-dot;
         tabs: root.ctx-tabs;
+        openwith: root.ctx-openwith;
         layouts: root.ctx-layouts;
         pick(i) => { root.ctx-pick(i); }
         swatch(i) => { root.ctx-swatch(i); }

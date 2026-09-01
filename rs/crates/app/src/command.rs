@@ -151,6 +151,21 @@ pub enum Command {
         path: String,
         tool: String,
     },
+    /// Hand `path` to one specific application the OS says can open its kind — the
+    /// "Open With" flyout. `app` is a [`hyperpanes_core::open::HandlerApp`]'s launcher,
+    /// which is opaque and per-OS, so it is passed straight back through the same seam
+    /// that produced it.
+    OpenPathInApp {
+        path: String,
+        app: String,
+    },
+    /// Open a shell pane in `path`'s directory with the command that runs it **typed but
+    /// not submitted**. The interpreter is a guess — a shebang when the file has one, an
+    /// extension when it doesn't — and a guess the human can see and correct before
+    /// pressing Enter is worth more than one that runs immediately and wrongly.
+    RunPath(String),
+    /// Open a plain shell pane rooted at `path`, or at its parent when it names a file.
+    TerminalAt(String),
     /// Copy an arbitrary path to the clipboard (the row menu). Goes through the focused
     /// pane's clipboard so it raises the same "Copied …" toast as a Ctrl+click does.
     CopyPathText(String),
@@ -771,6 +786,51 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
             let f = state.active_tab().focused;
             state.copy_link_text(f, &path);
         }
+        Command::OpenPathInApp { path, app } => {
+            if let Err(e) = hyperpanes_core::open::open_path_with(&app, std::path::Path::new(&path))
+            {
+                crate::dbg_log(&format!("OpenPathInApp {path} in {app}: {e}"));
+            }
+        }
+        Command::RunPath(path) => {
+            let p = std::path::PathBuf::from(&path);
+            let dir = p
+                .parent()
+                .filter(|d| !d.as_os_str().is_empty())
+                .map(|d| d.display().to_string());
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.clone());
+            // Relative to the pane's own cwd, which is the file's directory — so the
+            // command reads the way a human would type it standing there.
+            let target = format!("./{name}");
+            let typed = match run_prefix(&p) {
+                Some(bin) => format!("{bin} {}", quote_arg(&target)),
+                None => quote_arg(&target),
+            };
+            state.add_pane_opts(
+                mgr,
+                NewPaneOpts {
+                    label: Some(name),
+                    cwd: dir,
+                    // No trailing carriage return: the pane shows the command and waits.
+                    startup: Some(typed),
+                    ..Default::default()
+                },
+            );
+        }
+        Command::TerminalAt(path) => {
+            let p = std::path::PathBuf::from(&path);
+            let dir = if p.is_dir() {
+                Some(p)
+            } else {
+                p.parent()
+                    .filter(|d| !d.as_os_str().is_empty())
+                    .map(|d| d.to_path_buf())
+            };
+            state.add_pane_cwd(mgr, dir.map(|d| d.display().to_string()), None);
+        }
         Command::RevealPath(path) => {
             if let Err(e) = hyperpanes_core::open::reveal_path(std::path::Path::new(&path)) {
                 crate::dbg_log(&format!("RevealPath {path}: {e}"));
@@ -901,6 +961,51 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
 /// Map a layout menu id (from the Slint picker) to a `SetLayout` command.
 pub fn set_layout_from_id(id: i32) -> Command {
     Command::SetLayout(theme::layout_from_id(id))
+}
+
+/// The interpreter to type in front of a file to run it, or `None` when the file runs
+/// itself (an executable with no shebang, or one whose kind we don't recognise).
+///
+/// A shebang beats the table, because the file has said what it wants. Only the first line
+/// is read, and only when it looks like one: a binary's "first line" can be the whole file.
+pub(crate) fn run_prefix(path: &std::path::Path) -> Option<String> {
+    if let Some(line) = shebang(path) {
+        return Some(line);
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())?
+        .to_ascii_lowercase();
+    let bin = match ext.as_str() {
+        "py" => "python3",
+        "rb" => "ruby",
+        "pl" => "perl",
+        "php" => "php",
+        "js" | "mjs" | "cjs" => "node",
+        "lua" => "lua",
+        "r" => "Rscript",
+        "ps1" => "pwsh",
+        "jar" => "java -jar",
+        "sh" | "bash" | "zsh" | "fish" => &ext,
+        _ => return None,
+    };
+    Some(bin.to_string())
+}
+
+/// The command a file's `#!` line names, without the `#!`. `None` when there isn't one, or
+/// when what follows isn't a plain command line.
+fn shebang(path: &std::path::Path) -> Option<String> {
+    use std::io::Read;
+    let mut head = [0u8; 256];
+    let n = std::fs::File::open(path)
+        .and_then(|mut f| f.read(&mut head))
+        .ok()?;
+    let head = head.get(..n)?;
+    let rest = head.strip_prefix(b"#!")?;
+    let line = rest.split(|b| *b == b'\n' || *b == b'\r').next()?;
+    let line = std::str::from_utf8(line).ok()?.trim();
+    (!line.is_empty() && line.len() <= 200 && !line.chars().any(|c| c.is_control()))
+        .then(|| line.to_string())
 }
 
 /// Wrap a path (or a program path) for the shell that runs a pane's `command`. Single quotes

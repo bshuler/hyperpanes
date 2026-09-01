@@ -36,6 +36,7 @@ pub mod sub {
     pub const MOVE_TO_TAB: i32 = 3;
     pub const LAYOUT: i32 = 4;
     pub const REMINDER: i32 = 5;
+    pub const OPEN_WITH: i32 = 6;
 }
 
 /// `pick(int)` rows at/above this base are not row indices: the Reminder flyout's Custom
@@ -51,7 +52,7 @@ pub struct CtxEntry {
     pub shortcut: SharedString,
     /// Drawn-icon kind (see [`crate::theme::menu_icon`]); `0` = no icon.
     pub icon: i32,
-    /// `-1` separator · `0` item · `2`/`3`/`4` a submenu (see [`sub`]).
+    /// `-1` separator · `0` item · `2`/`3`/`4`/`5`/`6` a submenu (see [`sub`]).
     pub kind: i32,
     pub checked: bool,
     pub show_check: bool,
@@ -83,12 +84,17 @@ pub struct CtxMenu {
     pub y: f32,
     pub entries: Vec<CtxEntry>,
     pub commands: Vec<Option<Command>>,
+    /// Labels for the "Open With" flyout, in the order their commands were appended past
+    /// the visible rows — row `j` runs `commands[entries.len() + j]`. Empty for every menu
+    /// that has no such flyout.
+    pub openwith: Vec<SharedString>,
 }
 
 /// A small builder that keeps `entries` and `commands` in lock-step.
 struct Build {
     entries: Vec<CtxEntry>,
     commands: Vec<Option<Command>>,
+    openwith: Vec<SharedString>,
 }
 
 impl Build {
@@ -96,6 +102,7 @@ impl Build {
         Build {
             entries: Vec::new(),
             commands: Vec::new(),
+            openwith: Vec::new(),
         }
     }
     /// A plain action row.
@@ -152,6 +159,12 @@ impl Build {
         self.commands.push(Some(cmd));
         self
     }
+    /// A row of the "Open With" flyout: a label the flyout draws, and the command it runs,
+    /// which lands in the same past-the-visible-rows slots [`Build::extra`] uses.
+    fn open_with(&mut self, label: &str, cmd: Command) -> &mut Self {
+        self.openwith.push(label.into());
+        self.extra(cmd)
+    }
     fn finish(self, kind: CtxKind, target: usize, x: f32, y: f32) -> CtxMenu {
         CtxMenu {
             kind,
@@ -160,6 +173,7 @@ impl Build {
             y,
             entries: self.entries,
             commands: self.commands,
+            openwith: self.openwith,
         }
     }
 }
@@ -396,13 +410,18 @@ pub fn pane_menu(state: &State, idx: usize, x: f32, y: f32, in_taskbar: bool) ->
 /// Build the tab-strip menu for tab `idx`.
 /// Build the row menu for a file or directory in the left panel's Files tree.
 ///
-/// **Flat, no submenus.** The whole reason a clicked filename lands in the panel instead of
-/// the OS handler is so the human can choose what happens next; hiding that choice one level
-/// down would undo it. The "Open in …" rows are therefore one per *installed* editor —
-/// resolved here, at open time, so an editor installed since launch appears and one that was
-/// never installed never does. That costs a handful of filesystem probes per right-click,
-/// which is the same bargain every other builder in this file already makes by rebuilding
-/// from scratch.
+/// **Flat, with one exception.** The whole reason a clicked filename lands in the panel
+/// instead of the OS handler is so the human can choose what happens next; hiding that
+/// choice one level down would undo it. The "Open in …" rows are therefore one per
+/// *installed* editor — resolved here, at open time, so an editor installed since launch
+/// appears and one that was never installed never does. That costs a handful of filesystem
+/// probes per right-click, which is the same bargain every other builder in this file
+/// already makes by rebuilding from scratch.
+///
+/// The exception is **Open With**, which is a flyout because it is not our list: it is
+/// whatever the OS says can open this kind of file, and on a working machine that is a
+/// dozen applications — long enough to push every other verb off the bottom of the card,
+/// and the one list here a human opens knowing they are going to browse it.
 ///
 /// Each row carries its own fully-formed [`Command`] with the path baked in, so unlike the
 /// pane and tab menus this one needs no target index — which is what lets the row list be
@@ -435,9 +454,18 @@ pub fn file_menu(state: &State, path: &std::path::Path, x: f32, y: f32) -> CtxMe
         }
     }
 
+    // Asked before any row is built, because two rows depend on the answer and the OS is
+    // the one that knows it.
+    let handlers = if is_dir {
+        Vec::new()
+    } else {
+        hyperpanes_core::open::handlers_for(path)
+    };
+
     if is_dir {
         b.item("Open as Root", Command::FilesSetRoot(p.clone()));
         b.item("New File Browser Pane", Command::FilesOpen(p.clone()));
+        b.item("Open in Terminal", Command::TerminalAt(p.clone()));
     } else {
         if is_md {
             // First, because for a `.md` the rendered view is what "open" means to a human.
@@ -464,7 +492,24 @@ pub fn file_menu(state: &State, path: &std::path::Path, x: f32, y: f32) -> CtxMe
                 }),
             );
         }
+        if !handlers.is_empty() {
+            b.row(
+                "Open With",
+                "",
+                0,
+                false,
+                false,
+                false,
+                false,
+                sub::OPEN_WITH,
+                None,
+            );
+        }
         b.sep();
+        if is_runnable(path) {
+            b.item("Run", Command::RunPath(p.clone()));
+        }
+        b.item("Open in Terminal", Command::TerminalAt(p.clone()));
         if let Some(parent) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
             b.item(
                 "Browse Containing Folder",
@@ -474,8 +519,36 @@ pub fn file_menu(state: &State, path: &std::path::Path, x: f32, y: f32) -> CtxMe
     }
     b.sep();
     b.item("Copy Path", Command::CopyPathText(p.clone()));
-    b.item(reveal_label(), Command::RevealPath(p));
+    b.item(reveal_label(), Command::RevealPath(p.clone()));
+
+    // Past the visible rows, so every index above stays what it was — see `Build::extra`.
+    for h in handlers {
+        b.open_with(
+            &h.name,
+            Command::OpenPathInApp {
+                path: p.clone(),
+                app: h.launcher,
+            },
+        );
+    }
     b.finish(CtxKind::File, 0, x, y)
+}
+
+/// Whether "Run" is worth offering: the file says how to run itself (a shebang or a kind we
+/// know an interpreter for), or the filesystem says it is a program.
+fn is_runnable(path: &std::path::Path) -> bool {
+    if crate::command::run_prefix(path).is_some() {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        return std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0);
+    }
+    #[cfg(not(unix))]
+    {
+        hyperpanes_core::paths::is_executable_ext(&path.to_string_lossy())
+    }
 }
 
 /// What the OS calls "show me this file in the file manager".
@@ -778,7 +851,7 @@ pub fn parse_custom_minutes_now(s: &str) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_custom_duration;
+    use super::{is_runnable, parse_custom_duration};
 
     const NOON: u64 = 12 * 3_600;
 
@@ -823,5 +896,34 @@ mod tests {
                 "{bad:?} must not parse"
             );
         }
+    }
+
+    #[test]
+    fn run_is_offered_for_a_kind_we_know_how_to_run() {
+        // Nothing here exists on disk: the name alone has to carry the answer, because
+        // that is all a clicked path in terminal output gives us.
+        for yes in ["a.py", "b.sh", "c.rb", "d.js"] {
+            assert!(is_runnable(std::path::Path::new(yes)), "{yes} runs");
+        }
+        for no in ["notes.md", "data.json", "README", "img.png"] {
+            assert!(!is_runnable(std::path::Path::new(no)), "{no} does not");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_executable_bit_is_enough_on_its_own() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("hp-runnable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("tool");
+        std::fs::write(&f, b"binary").unwrap();
+        assert!(!is_runnable(&f), "no extension, not executable");
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            is_runnable(&f),
+            "no extension, but the OS says it is a program"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

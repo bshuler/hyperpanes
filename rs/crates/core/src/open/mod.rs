@@ -121,6 +121,67 @@ pub fn list_browsers() -> Vec<BrowserApp> {
     platform::list_browsers()
 }
 
+/// An application the OS says can open a particular kind of file — the rows behind
+/// "Open With".
+///
+/// Same launcher contract as [`BrowserApp`]: `id` is stable and ours to persist,
+/// `launcher` is opaque, per-OS, and re-resolved on every run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HandlerApp {
+    pub id: String,
+    pub name: String,
+    pub launcher: String,
+}
+
+/// True when `ext` is a plausible filename extension — short, ASCII alphanumeric, and
+/// nothing else. It gets spliced into an OS query (a plist scan, a registry key, a mime
+/// lookup) and it arrives from a path the user clicked in terminal output, so it is
+/// screened here rather than in each platform half.
+fn is_plain_ext(ext: &str) -> bool {
+    !ext.is_empty() && ext.len() <= 16 && ext.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// Every application registered to open files of `path`'s kind, ordered by display name.
+///
+/// A file with no extension — or one whose extension isn't a plain word — gets an empty
+/// list rather than a guess: the honest answer would be "every application installed",
+/// and a menu that says so helps nobody. The OS's own default handler is not marked and
+/// not excluded; it is offered separately as [`open_path`], the same split
+/// [`list_browsers`] makes for URLs.
+pub fn handlers_for(path: &Path) -> Vec<HandlerApp> {
+    let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+        return Vec::new();
+    };
+    let ext = ext.to_ascii_lowercase();
+    if !is_plain_ext(&ext) {
+        return Vec::new();
+    }
+    platform::handlers_for_ext(&ext)
+}
+
+/// Do the OS's handler lookup once, now, on whatever thread calls this — so the first
+/// right-click on a file doesn't pay for it mid-gesture.
+///
+/// On macOS that scan is the expensive part (every installed bundle's `Info.plist`) and it
+/// is cached for the life of the process, so this call is the whole cost and every later
+/// one is free. On the other two it only warms the OS's file cache, which is cheap enough
+/// not to be worth a second mechanism.
+pub fn warm_handlers() {
+    let _ = handlers_for(Path::new("warm.txt"));
+}
+
+/// Open a file in one specific application (the `launcher` from a [`HandlerApp`]) rather
+/// than in whatever owns its type.
+pub fn open_path_with(launcher: &str, path: &Path) -> Result<(), String> {
+    if path.as_os_str().is_empty() {
+        return Err("empty path".to_string());
+    }
+    if launcher.trim().is_empty() {
+        return Err("no application given".to_string());
+    }
+    platform::open_path_with(launcher, path)
+}
+
 // ---- the browser shim (T10) ----
 
 // The unix shim. `BROWSER` is a *command*, and every convention for reading it splits
@@ -244,6 +305,45 @@ pub fn with_browser_shim(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_name_with_no_usable_extension_offers_no_applications() {
+        // Nothing to ask the OS about, and nothing it could answer but "everything".
+        assert!(handlers_for(Path::new("/tmp/README")).is_empty());
+        assert!(handlers_for(Path::new("/tmp/x.")).is_empty());
+        assert!(handlers_for(Path::new("/tmp/x.tar.gz~")).is_empty());
+        assert!(is_plain_ext("md") && is_plain_ext("py") && is_plain_ext("mp4"));
+        assert!(!is_plain_ext("") && !is_plain_ext("c++") && !is_plain_ext("a b"));
+    }
+
+    #[test]
+    fn asking_the_os_which_applications_open_a_kind_never_panics() {
+        // The answer is whatever this machine has installed, so the assertion is on the
+        // shape: real names, launchers the platform half can actually use, no duplicates.
+        for name in ["a.md", "b.py", "c.png", "d.zzz"] {
+            let hits = handlers_for(Path::new(name));
+            let mut seen = std::collections::HashSet::new();
+            for h in &hits {
+                assert!(!h.name.trim().is_empty(), "{name}: unnamed handler");
+                assert!(
+                    !h.launcher.trim().is_empty(),
+                    "{name}: {} has no launcher",
+                    h.name
+                );
+                assert!(
+                    seen.insert(h.launcher.clone()),
+                    "{name}: {} twice",
+                    h.launcher
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn opening_a_file_in_a_named_application_needs_both() {
+        assert!(open_path_with("com.example.app", Path::new("")).is_err());
+        assert!(open_path_with("  ", Path::new("/tmp/x.md")).is_err());
+    }
 
     #[test]
     fn the_shim_path_is_a_single_space_free_token() {

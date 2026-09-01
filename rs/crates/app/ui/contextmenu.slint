@@ -335,6 +335,7 @@ export component ContextMenu inherits Rectangle {
     in property <bool> frame-on;
     in property <bool> dot-on;
     in property <[CtxTab]> tabs;           // Move-to-Tab destinations
+    in property <[string]> openwith;       // "Open With" applications, in command order
     in property <[LayoutOption]> layouts;  // Layout submenu (checkmark on current)
 
     callback pick(int);          // a plain top-level row
@@ -495,6 +496,24 @@ export component ContextMenu inherits Rectangle {
                         for tb in root.tabs : CtxRow {
                             e: { label: tb.label, shortcut: "", icon: 0, kind: 0, checked: false, show-check: false, disabled: false, danger: false };
                             clicked => { root.move-tab(tb.idx); }
+                        }
+                    }
+                }
+
+                // ---- Open With flyout ----
+                // Row j runs commands[entries.length + j] — the same past-the-visible-rows
+                // channel Build::extra opens, so the visible rows keep their own indices.
+                if entry.kind == 6 && root.open-sub == i : Flyout {
+                    x: root.open-left ? -self.width + 2px : parent.width - 2px;
+                    y: -4px;
+                    width: 220px;
+                    height: vbox-open.preferred-height;
+                    vbox-open := VerticalLayout {
+                        padding: 5px;
+                        spacing: 1px;
+                        for name[j] in root.openwith : CtxRow {
+                            e: { label: name, shortcut: "", icon: 0, kind: 0, checked: false, show-check: false, disabled: false, danger: false };
+                            clicked => { root.pick(root.entries.length + j); }
                         }
                     }
                 }

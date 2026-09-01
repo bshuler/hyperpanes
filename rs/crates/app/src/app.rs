@@ -891,6 +891,10 @@ impl App {
             }
         };
         crate::perf::mark("spawn_window: AppWindow::new done (wgpu device ready)");
+        // The file menu's "Open With" list comes from the OS, and asking costs a scan of
+        // every installed application. Pay it here, off the UI thread, while the window is
+        // still coming up — otherwise the first right-click on a file stalls for it.
+        std::thread::spawn(hyperpanes_core::open::warm_handlers);
         // macOS keeps the native traffic lights overlaid on the custom bar (see
         // window/macos.rs) — tell the UI so it pads past them and drops the custom
         // min/max/close cluster. Constant per build; Slint has no cfg of its own.

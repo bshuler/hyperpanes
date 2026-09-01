@@ -72,6 +72,132 @@ pub fn reveal_path(path: &Path) -> Result<(), String> {
     detached(&mut c)
 }
 
+pub fn open_path_with(launcher: &str, path: &Path) -> Result<(), String> {
+    // The launcher is an absolute .exe path we read out of the registry ourselves, so it
+    // is spawned directly — no shell, nothing to re-parse.
+    let mut c = Command::new(launcher);
+    c.arg(path);
+    detached(&mut c)
+}
+
+// ---- "Open With": which applications declare they can open this kind of file ----
+
+/// `reg query <key>`, as lines. `reg` is the supported command-line reader for the
+/// registry and ships with every Windows; going through it keeps this crate free of a
+/// registry binding it would otherwise need on one platform only.
+fn reg(args: &[&str]) -> Option<String> {
+    let out = Command::new("reg")
+        .arg("query")
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .ok()?;
+    if !out.status.success() || out.stdout.len() > (1 << 20) {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A value line is `<indent><name><spaces><TYPE><spaces><data>`. Returns (name, data).
+fn reg_value(line: &str) -> Option<(String, String)> {
+    let mut parts = line.trim().splitn(3, "    ").map(str::trim);
+    let name = parts.next()?.to_string();
+    let ty = parts.next()?;
+    if !ty.starts_with("REG_") {
+        return None;
+    }
+    Some((name, parts.next().unwrap_or_default().to_string()))
+}
+
+/// The executable out of a `shell\open\command` template: `"C:\...\x.exe" "%1"` or
+/// `C:\...\x.exe %1`. Everything after it is the argument template, which we replace with
+/// the real path rather than substituting into.
+fn exe_of(command: &str) -> Option<String> {
+    let c = command.trim();
+    let exe = if let Some(rest) = c.strip_prefix('"') {
+        rest.split_once('"').map(|(e, _)| e)?
+    } else {
+        c.split_whitespace().next()?
+    };
+    Path::new(exe).is_file().then(|| exe.to_string())
+}
+
+/// The friendly name a progid publishes, falling back to the executable's own file name.
+fn progid_name(progid: &str, exe: &str) -> String {
+    let key = format!(r"HKCR\{progid}");
+    let named = reg(&[&key]).and_then(|body| {
+        body.lines().find_map(|l| match reg_value(l) {
+            Some((n, data)) if n == "(Default)" && !data.is_empty() => Some(data),
+            _ => None,
+        })
+    });
+    named.unwrap_or_else(|| {
+        Path::new(exe)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| progid.to_string())
+    })
+}
+
+pub fn handlers_for_ext(ext: &str) -> Vec<super::HandlerApp> {
+    // The progids registered for the extension: the ones the user has picked from the
+    // Open With dialog (per-user) and the ones installers declared (per-machine).
+    let mut progids: Vec<String> = Vec::new();
+    let user = format!(
+        r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.{ext}\OpenWithProgids"
+    );
+    for key in [user, format!(r"HKCR\.{ext}\OpenWithProgids")] {
+        let Some(body) = reg(&[&key]) else {
+            continue;
+        };
+        for line in body.lines() {
+            if let Some((name, _)) = reg_value(line) {
+                if name != "(Default)" && !progids.iter().any(|p| *p == name) {
+                    progids.push(name);
+                }
+            }
+        }
+    }
+    // The type's own default handler, which is not repeated in OpenWithProgids.
+    if let Some(body) = reg(&[&format!(r"HKCR\.{ext}")]) {
+        if let Some(d) = body.lines().find_map(|l| match reg_value(l) {
+            Some((n, data)) if n == "(Default)" && !data.is_empty() => Some(data),
+            _ => None,
+        }) {
+            if !progids.iter().any(|p| *p == d) {
+                progids.insert(0, d);
+            }
+        }
+    }
+
+    let mut out: Vec<super::HandlerApp> = Vec::new();
+    for progid in progids {
+        let Some(body) = reg(&[&format!(r"HKCR\{progid}\shell\open\command")]) else {
+            continue;
+        };
+        let Some(cmd) = body.lines().find_map(|l| match reg_value(l) {
+            Some((n, data)) if n == "(Default)" => Some(data),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some(exe) = exe_of(&cmd) else {
+            continue;
+        };
+        if out.iter().any(|h| h.launcher.eq_ignore_ascii_case(&exe)) {
+            continue;
+        }
+        out.push(super::HandlerApp {
+            name: progid_name(&progid, &exe),
+            id: progid,
+            launcher: exe,
+        });
+    }
+    out
+}
+
 /// (our id, display name, [(env var naming a root, path under it)])
 const KNOWN: &[(&str, &str, &[(&str, &str)])] = &[
     (
@@ -172,6 +298,32 @@ mod tests {
     fn a_quoted_target_is_refused_rather_than_shell_injected() {
         let err = shell_start("https://e.com/\" & calc").unwrap_err();
         assert!(err.contains("quote"), "{err}");
+    }
+
+    #[test]
+    fn a_command_template_yields_the_executable_and_not_its_arguments() {
+        // A path that doesn't exist is no handler, however well-formed the template is.
+        assert_eq!(exe_of(r#""C:\nope\x.exe" "%1""#), None);
+        let me = std::env::current_exe().expect("this test's own binary");
+        let p = me.to_string_lossy().into_owned();
+        assert_eq!(
+            exe_of(&format!("\"{p}\" \"%1\" %*")).as_deref(),
+            Some(&p[..])
+        );
+        assert_eq!(exe_of(&format!("{p} %1")).as_deref(), Some(&p[..]));
+    }
+
+    #[test]
+    fn a_registry_value_line_splits_into_its_name_and_data() {
+        assert_eq!(
+            reg_value("    (Default)    REG_SZ    Python.File"),
+            Some(("(Default)".to_string(), "Python.File".to_string()))
+        );
+        assert_eq!(
+            reg_value("    Python.File    REG_NONE"),
+            Some(("Python.File".to_string(), String::new()))
+        );
+        assert_eq!(reg_value("HKEY_CLASSES_ROOT\\.py"), None);
     }
 
     #[test]
