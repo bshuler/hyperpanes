@@ -433,10 +433,14 @@ impl ControlHost {
             let healed = self.heal_lost_panes(&mut model, windows, mgr);
 
             // 1. Snapshot the read-model (it may have been mutated off-thread by a `/command`).
+            //    A pending `focusPane` rides along, resolved to the session uid the GUI keys on.
+            let focus_req = model
+                .take_pending_focus()
+                .and_then(|pid| model.pane(&pid).map(|p| p.session_uid.clone()));
             let (cur, cur_active, focus_uid) = self.snapshot_model(&model, windows);
 
             // 2. Reconcile the model→GUI deltas (what the control plane changed) on the UI thread.
-            let reconciled = self.reconcile(windows, mgr, &cur, &cur_active, &focus_uid);
+            let reconciled = self.reconcile(windows, mgr, &cur, &cur_active, &focus_uid, focus_req);
 
             // 3. Republish the (now-updated) live GUI tree into the read-model.
             let republished = self.publish(&mut model, windows);
@@ -610,6 +614,7 @@ impl ControlHost {
         cur: &HashMap<String, ModelPane>,
         cur_active: &HashMap<i64, Option<String>>,
         focus_uid: &HashMap<i64, Option<String>>,
+        focus_req: Option<String>,
     ) -> bool {
         let prev = self.prev.borrow();
         let mut ctl = self.ctl.borrow_mut();
@@ -718,6 +723,20 @@ impl ControlHost {
             }
         }
         drop(prev_active);
+
+        // …and mirror the pane selection itself. The loop above only ever moves between TABS,
+        // so a `focusPane` naming a sibling of the pane already focused in the active tab left
+        // the keyboard where it was — the tab id it diffs on never changed. `focus_pane_in_tab`
+        // switches the tab too, so this covers the cross-tab case on its own.
+        if let Some(uid) = focus_req {
+            for w in windows {
+                let mut st = w.state.borrow_mut();
+                if let Some((ti, pi)) = st.find_pane(&uid) {
+                    st.focus_pane_in_tab(ti, pi);
+                    break;
+                }
+            }
+        }
 
         // Prune side-store entries for panes that no longer exist in the GUI.
         let live = gui_uids(windows);

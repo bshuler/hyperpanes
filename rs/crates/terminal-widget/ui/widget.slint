@@ -382,6 +382,11 @@ export component TerminalPane inherits Rectangle {
     // repeated element that Slint has just re-created never fires `changed refocus-tick`
     // (the new value is its initial value), so an unconfirmed hand-off is retried rather
     // than silently leaving the keystrokes on the pane the user just navigated away from.
+    //
+    // Reported from TWO places: `changed has-focus`, for the focus moves Slint tells us
+    // about, and `changed refocus-tick`, which reads the state back immediately after
+    // calling `fs.focus()` — see there for why the first one alone never confirmed a
+    // controller-driven hand-off.
     callback focus-changed(bool);
     // A key was pressed while this pane had focus → encode to PTY bytes and write.
     callback key(KeyMsg);
@@ -451,7 +456,16 @@ export component TerminalPane inherits Rectangle {
     // Bumped when a keyboard-driven overlay (the New-goal box) opens: re-focus the terminal
     // FocusScope so its `key-pressed` routes keys to `on_key` (and thence to the overlay's
     // controller-owned-mirror handler). Skipped while the in-pane search box owns the keyboard.
-    changed refocus-tick => { if (!root.search-open) { fs.focus(); } }
+    changed refocus-tick => {
+        if (!root.search-open) { fs.focus(); }
+        // Report the focus state right back, instead of waiting for `changed has-focus`.
+        // Slint does not deliver a `changed` for a property that was changed from INSIDE
+        // another `changed` handler — which is exactly this call — so the hand-off landed
+        // silently and the controller retried until it gave up, leaving the keyboard on
+        // whatever held it before. `fs.has-focus` reads back correctly here, so this is the
+        // acknowledgement; `changed has-focus` still covers the gestures Slint does report.
+        root.focus-changed(fs.has-focus);
+    }
 
     // The terminal surface (texture or pixel buffer), clipped to the rounded rect.
     //

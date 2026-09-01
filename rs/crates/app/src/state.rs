@@ -216,9 +216,16 @@ pub const CLOSED_STACK_CAP: usize = 20;
 /// How many consecutive pump ticks may attempt to hand the keyboard to a newly selected pane
 /// before giving up (see [`State::sync_pane_keyboard_focus`]). The hand-off normally lands on
 /// the first or second: the first can arrive before Slint has instantiated the pane's element,
-/// the second is after the repeater has caught up. The rest is headroom for a slow frame — and
-/// a hard stop, so a pane that can never take focus doesn't re-dirty the state forever.
-const KBD_FOCUS_TRIES: u8 = 8;
+/// the second is after the repeater has caught up. The rest is headroom — and a hard stop, so
+/// a pane that can never take focus doesn't re-dirty the state forever.
+///
+/// Sized in ticks (~8 ms each), so this is a little over half a second. Eight was not enough:
+/// a tab switch that changes the pane COUNT re-creates the whole repeater, and on a cold start
+/// the whole budget was spent before the pane's element existed — the hand-off then never
+/// happened at all, which is the "I can't type in it until I click in it" report. The loop
+/// stops the moment the widget confirms, so the extra headroom only ever runs while the
+/// hand-off is genuinely still failing.
+const KBD_FOCUS_TRIES: u8 = 64;
 
 /// How long ago a history entry was closed, for its row's second line. Coarse on purpose:
 /// the first minute is one bucket ("just now") so a fresh close doesn't re-push the whole
@@ -10127,7 +10134,9 @@ mod keyboard_focus_tests {
         let m = mgr();
         st.adopt_pane_as_tab(&m, det("a"));
         let before = seq(&st);
-        for _ in 0..40 {
+        // Derived from the cap, not a fixed count: the loop has to outrun the budget for the
+        // "then gives up" half of the assertion to mean anything.
+        for _ in 0..(KBD_FOCUS_TRIES as u32 + 8) {
             st.sync_pane_keyboard_focus();
         }
         let bumps = seq(&st) - before;

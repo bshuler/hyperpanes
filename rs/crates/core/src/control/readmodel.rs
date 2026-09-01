@@ -148,6 +148,8 @@ pub struct ReadModel {
     /// The pane the GUI currently has focused (`None` = unknown — no GUI publisher
     /// wired up yet). Consulted by the speech service's `focusedOnly` filter.
     focused_pane: Option<String>,
+    /// A `focusPane` waiting for the GUI to mirror it — see [`Self::focus_pane`].
+    pending_focus: Option<String>,
 }
 
 impl ReadModel {
@@ -543,7 +545,14 @@ impl ReadModel {
         Some(merged)
     }
 
-    /// Focus a pane: mark its tab active in its window. Returns false if unknown.
+    /// Focus a pane: mark its tab active in its window, and record the request for the GUI
+    /// host to mirror. Returns false if unknown.
+    ///
+    /// The active-tab flip alone is not enough. The GUI host learns what the control plane
+    /// changed by diffing this model against its last baseline, and a pane selection made
+    /// *within* the already-active tab moves nothing it diffs — so the request was invisible
+    /// and the keyboard stayed on whichever sibling pane already held it. The pane id is
+    /// parked here instead, for [`Self::take_pending_focus`].
     pub fn focus_pane(&mut self, pane_id: &str) -> bool {
         let (w, t) = match self.pane_loc.get(pane_id) {
             Some(loc) => loc.clone(),
@@ -551,9 +560,16 @@ impl ReadModel {
         };
         if let Some(win) = self.windows.iter_mut().find(|win| win.window_id == w) {
             win.active_tab_id = Some(t);
+            self.pending_focus = Some(pane_id.to_string());
             return true;
         }
         false
+    }
+
+    /// Take the pane a `focusPane` asked for, if one is waiting. One-shot: the GUI host
+    /// consumes it on its next sync tick, and re-publishing the live tree must not replay it.
+    pub fn take_pending_focus(&mut self) -> Option<String> {
+        self.pending_focus.take()
     }
 
     /// Mark a pane exited (from a session `Exit` event), returning its id + coords so the
@@ -1034,6 +1050,24 @@ mod tests {
             m.talking_panes(),
             vec![("p2".to_string(), "shell".to_string())]
         );
+    }
+
+    #[test]
+    fn focusing_a_pane_parks_it_for_the_gui_and_hands_it_over_once() {
+        // The active-tab flip is not enough on its own: a pane selection made inside the tab
+        // that is ALREADY active changes nothing the GUI host diffs on, so the request has to
+        // be parked here — and taken exactly once, or every later sync would re-focus it.
+        let mut m = seeded();
+        assert!(m.focus_pane("p1"));
+        assert_eq!(m.take_pending_focus().as_deref(), Some("p1"));
+        assert_eq!(m.take_pending_focus(), None);
+    }
+
+    #[test]
+    fn focusing_an_unknown_pane_parks_nothing() {
+        let mut m = seeded();
+        assert!(!m.focus_pane("nope"));
+        assert_eq!(m.take_pending_focus(), None);
     }
 
     #[test]
