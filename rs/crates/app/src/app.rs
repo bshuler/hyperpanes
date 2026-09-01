@@ -2067,7 +2067,10 @@ impl App {
         if !crate::forwardable(&msg.text) {
             return;
         }
-        if let Some(bytes) = encode_key(&msg.text, msg.control, msg.alt, msg.shift) {
+        // `pty_ctrl`, not `msg.control`: on macOS the two are different keys, and the pty wants
+        // the physical Control (see `crate::pty_ctrl`).
+        let ctrl = crate::pty_ctrl(&msg);
+        if let Some(bytes) = encode_key(&msg.text, ctrl, msg.alt, msg.shift) {
             // Typing clears the selection (#33, standard terminal behavior): a printable
             // character or Enter/Backspace/Delete drops the highlight of ANY active
             // drag-selection — scrollback, command output, or the prompt line — while the key
@@ -2077,7 +2080,7 @@ impl App {
             // chords (Ctrl+C interrupt, Alt-meta) and navigation keys keep the selection —
             // app chords (Ctrl+Shift+…, palette keys) returned before this point. Ctrl+V is a
             // chord too (PasteFocused), and clears the selection inside `paste_pane`.
-            let clears = keys::clears_selection(&msg.text, msg.control, msg.alt);
+            let clears = keys::clears_selection(&msg.text, ctrl, msg.alt);
             let mut st = win.state.borrow_mut();
             if let Some(ps) = st.active_tab_mut().panes.get_mut(idx) {
                 crate::dbg_log(&format!(
@@ -2097,11 +2100,11 @@ impl App {
                     // deletion — letting it through would eat an extra character beside the
                     // caret). Anywhere else (scrollback, multi-row, alt-screen) the highlight
                     // just clears and the key goes through.
-                    let line_delete = !msg.control
+                    let line_delete = !ctrl
                         && !msg.alt
                         && (crate::is_key(&msg.text, Key::Backspace)
                             || crate::is_key(&msg.text, Key::Delete));
-                    if keys::is_printable(&msg.text, msg.control, msg.alt) || line_delete {
+                    if keys::is_printable(&msg.text, ctrl, msg.alt) || line_delete {
                         if let Some(erase) = ps.pane.type_over_selection() {
                             self.mgr.write(&ps.uid, &String::from_utf8_lossy(&erase));
                             if line_delete {

@@ -394,13 +394,16 @@ pub fn default_bindings() -> Vec<Binding> {
             "Paste image (Alt+V)",
             Command::PasteImageFocused,
         ),
-        // Ctrl+Shift+C copies the selection — the explicit copy gesture now that copy-on-select
-        // defaults off (Ctrl+C stays the shell interrupt).
+        // The explicit copy gesture, now that copy-on-select defaults off. Ctrl+Shift+C
+        // everywhere but macOS, where the chord's `ctrl` slot IS Command (see `CTRL_LABEL`) and
+        // the platform gesture is a bare Cmd+C. Shifting it there costs nothing: the shell
+        // interrupt lives on the *physical* Control key on macOS (`crate::pty_ctrl`), so Cmd+C
+        // was never the interrupt to begin with.
         b(
             "pane.copy",
             true,
             false,
-            true,
+            !cfg!(target_os = "macos"),
             Char('c'),
             "Panes",
             "Copy selection",
@@ -951,16 +954,18 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_c_copies_the_focused_selection() {
-        // The explicit copy gesture (copy-on-select defaults off). Plain Ctrl+C stays the
-        // shell interrupt — only the shifted chord is bound.
+    fn the_copy_chord_is_the_platform_one() {
+        // Ctrl+Shift+C everywhere but macOS, where the gesture is a bare Cmd+C (the `ctrl` slot
+        // IS Command there). Exactly one of the two is bound on any given platform: the other
+        // must fall through, so the unshifted chord can still reach the pty off macOS.
         let km = empty_keymap();
+        let shifted = !cfg!(target_os = "macos");
         assert!(matches!(
-            km.match_chord(true, false, true, KeyTok::Char('c')),
+            km.match_chord(true, false, shifted, KeyTok::Char('c')),
             Some(Command::CopyFocused)
         ));
         assert!(km
-            .match_chord(true, false, false, KeyTok::Char('c'))
+            .match_chord(true, false, !shifted, KeyTok::Char('c'))
             .is_none());
     }
 

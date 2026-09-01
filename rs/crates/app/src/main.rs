@@ -697,6 +697,23 @@ pub(crate) fn is_key(text: &str, k: Key) -> bool {
     text == s.as_str()
 }
 
+/// The modifier that means **control to the pty**.
+///
+/// Slint swaps Command and Control on macOS (`i_slint_core::input`), so `KeyMsg.control` is the
+/// Command key there and `KeyMsg.meta` is the physical Control key. App chords deliberately ride
+/// the swapped slot — Cmd+Shift+P opens the palette on a Mac, which is what a Mac user expects.
+/// A terminal is the one place the swap is wrong: Ctrl+C has to interrupt the foreground process
+/// and Cmd+C has to copy, and the swap gave both the other one's job. So the bytes written to the
+/// pty take their control modifier from the *physical* Control key, and Cmd is left free to be
+/// the app's modifier (`pane.copy`, `pane.paste`).
+pub(crate) fn pty_ctrl(msg: &KeyMsg) -> bool {
+    if cfg!(target_os = "macos") {
+        msg.meta
+    } else {
+        msg.control
+    }
+}
+
 /// Whether a key event should reach the shell at all. Drops bare modifiers
 /// (Slint reports Shift/Ctrl/Alt/Meta as low control codepoints), F-keys, and
 /// other special keys Slint delivers as control/private-use codepoints that
@@ -1027,6 +1044,32 @@ mod tests {
         }
     }
 
+    // ---- pty_ctrl: which physical key means "control" to the shell ----
+
+    #[test]
+    fn the_pty_takes_its_control_from_the_physical_control_key() {
+        // On macOS Slint hands us Command in `control` and physical Control in `meta`; the pty
+        // wants the one the user thinks of as Ctrl. Everywhere else the two agree.
+        let physical_ctrl = msg_meta("c");
+        let command = msg("c", true, false, false);
+        if cfg!(target_os = "macos") {
+            assert!(pty_ctrl(&physical_ctrl), "Ctrl+C must still interrupt");
+            assert!(
+                !pty_ctrl(&command),
+                "Cmd+C is the app's copy, not an interrupt"
+            );
+        } else {
+            assert!(pty_ctrl(&command));
+            assert!(!pty_ctrl(&physical_ctrl));
+        }
+    }
+
+    #[test]
+    fn an_unmodified_key_is_never_a_control_key() {
+        assert!(!pty_ctrl(&msg("c", false, false, false)));
+        assert!(!pty_ctrl(&msg("c", false, true, true)));
+    }
+
     fn keymap() -> keybindings::Keymap {
         // No user overrides → the compiled-in defaults (Ctrl+Shift+P → palette).
         keybindings::Keymap::default_for_tests()
@@ -1190,11 +1233,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_shift_c_copies_not_palette() {
-        // The chord that surfaced the phantom: Ctrl+Shift+C must copy — and the bare-Shift
-        // press on the way to it (previous test) must not open the palette first.
+    fn the_copy_chord_copies_not_palette() {
+        // The chord that surfaced the phantom: the copy chord must copy — and the bare-Shift
+        // press on the way to it (previous test) must not open the palette first. Shifted
+        // everywhere but macOS, where copy is a bare Cmd+C.
+        let shift = !cfg!(target_os = "macos");
         for text in ["C", "c"] {
-            let cmd = route_chord(&keymap(), &msg(text, true, false, true));
+            let cmd = route_chord(&keymap(), &msg(text, true, false, shift));
             assert!(
                 matches!(cmd, Some(Command::CopyFocused)),
                 "text {text:?} got {cmd:?}"
