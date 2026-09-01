@@ -579,6 +579,14 @@ export struct LeftSessionItem {
     // `detail` carries the sentence saying why, so the row still teaches rather than just
     // greying out. Decided once per scan on the background thread — never per frame.
     blocked: bool,
+    // Where this conversation ALREADY is, as a chip to draw at the end of the row: "pane"
+    // when some window is showing it, "desktop" when only Claude Desktop holds it. Empty for
+    // a conversation that is nowhere, which is the row that starts one in a new pane.
+    badge: string,
+    // The sentence the chip's row hovers with, saying what a click will do about it. Empty
+    // exactly when `badge` is. Both are written in Rust: the panel draws strings and has no
+    // idea what a desktop session is.
+    badge-tip: string,
 }
 
 // The controller ↔ left-panel bridge. A GLOBAL (not AppWindow props) so the feature stays

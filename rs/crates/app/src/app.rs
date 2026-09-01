@@ -1252,6 +1252,9 @@ impl App {
                         self.openurl_carry.borrow_mut().remove(&uid);
                         self.mgr.kill(&uid);
                     }
+                    // Its panes are going away: stop it claiming their conversations, or a
+                    // session list click would hunt for a pane in a window that is gone.
+                    crate::leftpanel::forget_window(w.id);
                     let _ = w.app.window().hide();
                 } else {
                     survivors.push(w.clone());
@@ -1849,6 +1852,10 @@ impl App {
         for (uid, on) in win.focus_acks.borrow_mut().drain(..) {
             st.note_pane_focus(&uid, on);
         }
+        // Publish which tool conversations this window has a pane in, so the left panel's
+        // session list can badge a row as already-open no matter WHICH window it is open in
+        // — the projection below only ever sees this one window's state.
+        crate::leftpanel::publish_open_sessions(win.id, st.open_tool_sessions());
         paneview::pump(&win.app, &mut st, &win.ui, (aw, ah), scale, &self.mgr)
     }
 
@@ -3659,6 +3666,44 @@ impl App {
                     let Some(row) = crate::leftpanel::tool_session(tool_id, &sid) else {
                         return;
                     };
+
+                    // A click means "take me to this conversation", and where that is
+                    // depends on where it already is. Same order as the row's chip, so the
+                    // panel cannot promise one destination and the click deliver another.
+                    //
+                    // 1. Open in one of OUR panes — go to it. Every window is searched, not
+                    //    just this one: the session list is the same list in all of them.
+                    let found = app.windows.borrow().iter().find_map(|w2| {
+                        let at = w2.state.borrow().pane_in_tool_session(&sid)?;
+                        Some((w2.clone(), at))
+                    });
+                    if let Some((target, (ti, pi))) = found {
+                        // Raise it only when the pane is in ANOTHER window — raising the
+                        // window the human just clicked in is a no-op at best and steals
+                        // the click's own focus at worst.
+                        if !Rc::ptr_eq(&target, &w) {
+                            crate::window::raise(target.hwnd.get());
+                        }
+                        app.run_command(&target, Command::LeftFocusPane(ti, pi));
+                        return;
+                    }
+
+                    // 2. Not in a pane, but Claude Desktop holds it — hand the conversation
+                    //    back to the app that is already hosting it rather than starting a
+                    //    SECOND `claude --resume` on the same transcript. The deep link both
+                    //    launches the app and puts the conversation on top.
+                    if let Some(link) = row
+                        .desktop
+                        .as_deref()
+                        .and_then(hyperpanes_core::tools::claude_desktop::deep_link)
+                    {
+                        if let Err(e) = hyperpanes_core::open::open_url(&link) {
+                            eprintln!("[hyperpanes] could not raise Claude Desktop: {e}");
+                        }
+                        return;
+                    }
+
+                    // 3. Nowhere yet: start it here, on the tab that is open.
                     let Some(command) = row.command else { return };
                     let opts = NewPaneOpts {
                         label: Some(tool_id.to_string()),

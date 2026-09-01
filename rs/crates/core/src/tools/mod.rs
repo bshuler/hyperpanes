@@ -7,6 +7,9 @@
 //!
 //! See `docs/tool-panes-plan.md` for the decisions behind this module.
 
+/// Claude Desktop's record of a Claude Code conversation, and the deep link that raises it
+/// — the bridge between a CLI session uuid and the id every desktop route speaks.
+pub mod claude_desktop;
 pub mod detect;
 /// The kernel's own answer to "what is running in this pane right now" — the pty's
 /// foreground process group, resolved to an executable name and fed to the same

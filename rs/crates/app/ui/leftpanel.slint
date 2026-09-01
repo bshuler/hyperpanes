@@ -784,7 +784,9 @@ component SessionItemView inherits Rectangle {
                 // A blocked row explains itself instead of pretending it will work: the
                 // reason is already on the detail line, and the tip repeats it because the
                 // detail elides in a narrow panel.
-                tip: root.item.blocked ? root.item.detail : "Resume this session";
+                tip: root.item.blocked
+                    ? root.item.detail
+                    : (root.item.badge-tip == "" ? "Resume this session in a new pane" : root.item.badge-tip);
                 mouse-cursor: root.item.blocked ? default : pointer;
                 clicked => { if (!root.item.blocked) { root.activate(); } }
             }
@@ -807,6 +809,7 @@ component SessionItemView inherits Rectangle {
                 }
                 VerticalLayout {
                     alignment: center;
+                    horizontal-stretch: 1;
                     Text {
                         text: root.item.label;
                         color: root.item.blocked ? Theme.subtext : Theme.text;
@@ -818,6 +821,28 @@ component SessionItemView inherits Rectangle {
                         color: Theme.subtext;
                         font-size: 10px;
                         overflow: elide;
+                    }
+                }
+                // Where the conversation already is. Drawn only when there IS somewhere —
+                // an absent chip is the common row, and a chip on every row would say
+                // nothing. Brand-tinted so it reads as part of this tool's list.
+                if root.item.badge != "" : VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        height: 15px;
+                        border-radius: 3px;
+                        background: root.brand.with-alpha(0.16);
+                        HorizontalLayout {
+                            padding-left: 5px;
+                            padding-right: 5px;
+                            Text {
+                                text: root.item.badge;
+                                color: root.brand;
+                                font-size: 9px;
+                                font-weight: 700;
+                                vertical-alignment: center;
+                            }
+                        }
                     }
                 }
             }

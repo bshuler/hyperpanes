@@ -272,6 +272,20 @@ pub fn minimize(raw: isize) {
     }
 }
 
+/// Bring this window to the front and give it the keyboard: restore it if minimized,
+/// then make it foreground. `SetForegroundWindow` can be refused by the shell's
+/// foreground lock, but it is granted for a process the human just clicked in — which is
+/// the only way this is reached.
+pub fn raise(raw: isize) {
+    unsafe {
+        let h = hwnd(raw);
+        if IsIconic(h).as_bool() {
+            let _ = ShowWindow(h, SW_RESTORE);
+        }
+        let _ = SetForegroundWindow(h);
+    }
+}
+
 pub fn toggle_max(raw: isize) {
     unsafe {
         let h = hwnd(raw);

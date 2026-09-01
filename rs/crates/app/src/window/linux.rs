@@ -298,6 +298,20 @@ pub fn toggle_max(raw: isize) {
     with_window(raw, |w| w.set_maximized(!w.is_maximized()));
 }
 
+/// Bring this window to the front and ask for the keyboard. Un-minimize first: a
+/// minimized window ignores a focus request, and the click that got here means "show me
+/// that pane".
+///
+/// Wayland compositors are free to refuse the focus half (there is no click-to-raise
+/// protocol a client can insist on); the request is still the right thing to make, and
+/// the caller's tab/pane switch has already happened either way.
+pub fn raise(raw: isize) {
+    with_window(raw, |w| {
+        w.set_minimized(false);
+        w.focus_window();
+    });
+}
+
 /// Whether the window is currently maximized (drives the restore-vs-maximize icon).
 pub fn is_maximized(raw: isize) -> bool {
     with_window(raw, |w| w.is_maximized()).unwrap_or(false)

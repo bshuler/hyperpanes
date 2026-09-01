@@ -18,6 +18,7 @@
 //! pub fn toggle_max(raw: isize);
 //! pub fn is_maximized(raw: isize) -> bool;
 //! pub fn close(raw: isize);
+//! pub fn raise(raw: isize);                       // un-minimize + key + app to the front
 //! pub fn enter_fullscreen(raw: isize) -> Option<SavedPlacement>;
 //! pub fn exit_fullscreen(raw: isize, saved: SavedPlacement);
 //! pub fn displays() -> Vec<(i32, i32, i32, i32)>; // usable desktop rects, top-left x/y/w/h

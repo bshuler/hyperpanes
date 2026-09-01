@@ -4545,6 +4545,41 @@ impl State {
         self.session_uids().into_iter().collect()
     }
 
+    /// Every tool conversation THIS window currently has a pane in, by the tool's own resume
+    /// id. Only laid-out panes count: a closed tab's session is still alive, but "open in a
+    /// pane" is a claim about something the human can be taken to, and there is nothing to
+    /// take them to until the tab is reopened.
+    pub fn open_tool_sessions(&self) -> std::collections::HashSet<String> {
+        self.tabs
+            .iter()
+            .flat_map(|t| t.panes.iter())
+            .filter_map(|p| p.tool_session.as_ref())
+            .map(|m| m.id.clone())
+            .collect()
+    }
+
+    /// Where conversation `id` is showing in this window: `(tab index, pane index)`.
+    ///
+    /// The ACTIVE tab is searched first, so a session that somehow sits in two panes resolves
+    /// to the one already in front rather than yanking the human to another tab.
+    pub fn pane_in_tool_session(&self, id: &str) -> Option<(usize, usize)> {
+        let order =
+            std::iter::once(self.active).chain((0..self.tabs.len()).filter(|i| *i != self.active));
+        for ti in order {
+            let Some(tab) = self.tabs.get(ti) else {
+                continue;
+            };
+            if let Some(pi) = tab
+                .panes
+                .iter()
+                .position(|p| p.tool_session.as_ref().is_some_and(|m| m.id == id))
+            {
+                return Some((ti, pi));
+            }
+        }
+        None
+    }
+
     /// Save the active tab into the panel's workspace library (no file dialog — that's what
     /// the library is for). Named after the tab; a collision gets a numeric suffix rather
     /// than overwriting the earlier snapshot.
@@ -9860,6 +9895,103 @@ mod browser_routing_tests {
         st.settings.browser_app = "com.example.browser.that.is.not.installed".into();
         assert!(st.settings.browser_launcher().is_none());
         assert!(!st.settings.browser_asks());
+    }
+}
+
+/// "Where is this conversation already?" — the two lookups the left panel's session list
+/// asks before it decides what a click on a resumable row means.
+#[cfg(test)]
+mod tool_session_location {
+    use super::*;
+    use hyperpanes_core::tools::session_mark::ToolSessionMark;
+
+    fn fresh() -> State {
+        State::new(theme::load_font(1.0))
+    }
+
+    fn mgr() -> SessionManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionManager::new(tx)
+    }
+
+    fn det(uid: &str) -> DetachedPane {
+        DetachedPane {
+            uid: uid.into(),
+            title: uid.into(),
+            subtitle: None,
+            pinned_accent: None,
+            show_frame: None,
+            show_dot: None,
+            font_px: prefs::DEFAULT_FONT_PX,
+            spawn_command: None,
+            spawn_args: None,
+            spawn_shell: None,
+            kind: PaneKind::default(),
+            tool_session: None,
+            cwd: None,
+        }
+    }
+
+    fn mark(id: &str) -> ToolSessionMark {
+        ToolSessionMark {
+            id: id.into(),
+            cwd: "/tmp".into(),
+            tool: Some("claude".into()),
+        }
+    }
+
+    #[test]
+    fn a_window_reports_every_conversation_it_has_a_pane_in() {
+        let mut st = fresh();
+        let m = mgr();
+        st.adopt_pane(&m, det("a"));
+        st.adopt_pane(&m, det("plain"));
+        st.adopt_pane_as_tab(&m, det("b"));
+        assert!(st.adopt_tool_session("a", mark("aaa")));
+        assert!(st.adopt_tool_session("b", mark("bbb")));
+
+        let open = st.open_tool_sessions();
+        assert!(open.contains("aaa"), "{open:?}");
+        assert!(
+            open.contains("bbb"),
+            "a conversation in another tab counts: {open:?}"
+        );
+        // The pane running a plain shell is in no conversation and must not invent one.
+        assert_eq!(open.len(), 2, "{open:?}");
+    }
+
+    #[test]
+    fn a_conversation_in_a_background_tab_is_still_found() {
+        // The point of the lookup: the pane the human wants is usually NOT on screen, and
+        // the click's job is to switch to the tab holding it.
+        let mut st = fresh();
+        let m = mgr();
+        st.adopt_pane(&m, det("a"));
+        assert!(st.adopt_tool_session("a", mark("buried")));
+        st.adopt_pane_as_tab(&m, det("b"));
+        assert_ne!(st.active, 0, "the new tab is the one in front");
+
+        assert_eq!(st.pane_in_tool_session("buried"), Some((0, 0)));
+        assert_eq!(st.pane_in_tool_session("never-started"), None);
+    }
+
+    #[test]
+    fn the_tab_already_in_front_wins_a_tie() {
+        // Two panes claiming one conversation should not happen, but a stale mark on a
+        // reopened tab can produce it — and yanking the human away from the copy they are
+        // already looking at is the one outcome that reads as a bug.
+        let mut st = fresh();
+        let m = mgr();
+        st.adopt_pane(&m, det("a"));
+        st.adopt_pane_as_tab(&m, det("b"));
+        assert!(st.adopt_tool_session("a", mark("twice")));
+        assert!(st.adopt_tool_session("b", mark("twice")));
+        let (first, second) = (0usize, st.active);
+        assert_ne!(first, second);
+
+        assert_eq!(st.pane_in_tool_session("twice"), Some((second, 0)));
+        st.switch_tab(first);
+        assert_eq!(st.pane_in_tool_session("twice"), Some((first, 0)));
     }
 }
 

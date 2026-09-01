@@ -21,8 +21,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, Bool, Imp, Sel};
 use objc2::{sel, MainThreadMarker};
 use objc2_app_kit::{
-    NSCursor, NSEvent, NSEventModifierFlags, NSEventType, NSScreen, NSView, NSWindow,
-    NSWindowStyleMask, NSWindowTitleVisibility,
+    NSApplication, NSCursor, NSEvent, NSEventModifierFlags, NSEventType, NSScreen, NSView,
+    NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{NSPoint, NSProcessInfo};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -232,6 +232,27 @@ pub fn close(raw: isize) {
     if let Some(w) = ns_window(raw) {
         w.close();
     }
+}
+
+/// Bring this window to the front and give it the keyboard: un-minimize it, make it key,
+/// and activate the app so it wins over whatever is currently frontmost.
+///
+/// All three steps are needed. `makeKeyAndOrderFront:` alone raises the window WITHIN
+/// Hyperpanes but leaves another app frontmost, and a miniaturized window ignores it
+/// entirely — so a "take me to that pane" click would silently do nothing visible.
+pub fn raise(raw: isize) {
+    let Some(w) = ns_window(raw) else { return };
+    let Some(mtm) = MainThreadMarker::new() else {
+        return;
+    };
+    if w.isMiniaturized() {
+        w.deminiaturize(None);
+    }
+    // Ignoring other apps: this only ever runs from a click the human just made in OUR
+    // window, which is exactly the case the guidance against it does not cover.
+    #[allow(deprecated)]
+    NSApplication::sharedApplication(mtm).activateIgnoringOtherApps(true);
+    w.makeKeyAndOrderFront(None);
 }
 
 /// Enter native fullscreen (own Space). AppKit remembers the prior frame itself, so the

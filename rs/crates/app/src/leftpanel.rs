@@ -619,6 +619,10 @@ pub struct ScannedSession {
     pub command: Option<String>,
     /// The cwd that shell line must run in. Empty when blocked.
     pub cwd: PathBuf,
+    /// `Some(local_… id)` when Claude Desktop also holds this conversation — the id its deep
+    /// link speaks. Resolved on the scan thread with the rest of the row, because it comes
+    /// from a second store on disk and the UI thread must not go looking for it per frame.
+    pub desktop: Option<String>,
 }
 
 impl ScannedSession {
@@ -653,6 +657,13 @@ pub fn scan_with(
     use hyperpanes_core::tools::history::ResumePlan;
     let now = crate::glow::now_epoch_ms();
     let sessions = provider.scan();
+    // One pass over Claude Desktop's store for the whole scan, not one per row — and only
+    // for the tool that has a desktop app at all. Every other tool's rows get `None`.
+    let desktop = if provider.id() == "claude" {
+        hyperpanes_core::tools::claude_desktop::scan()
+    } else {
+        HashMap::new()
+    };
     sessions
         .iter()
         .map(|s| {
@@ -664,6 +675,7 @@ pub fn scan_with(
                 ResumePlan::Blocked(b) => (b.reason(), None, PathBuf::new()),
             };
             ScannedSession {
+                desktop: desktop.get(&s.id).cloned(),
                 id: s.id.clone(),
                 project: s.project.clone(),
                 summary: session_label(s),
@@ -705,6 +717,44 @@ fn session_detail(s: &hyperpanes_core::tools::history::ToolSession, now: u64) ->
         parts.push(rel);
     }
     parts.join(" · ")
+}
+
+// ===== where a conversation is already running =====
+//
+// A resumable row's click means "take me to this conversation", and the answer depends on
+// where it already is. Two of the three places are found here.
+//
+// The pane answer has to be process-wide rather than per-window, because the projection that
+// draws the badge (`paneview::resync`) is handed exactly ONE window's `State` and a session
+// open in another window's pane is just as open. Each window publishes its own set on every
+// pump and the lookup is their union; a window that stops publishing (it closed) is dropped
+// by [`forget_window`] rather than left to claim panes that no longer exist.
+
+thread_local! {
+    /// Per window id, the tool conversations that window has a pane in. Written by
+    /// [`publish_open_sessions`] once per pump — cheap, and it means the badge can never
+    /// outlive the pane by more than a frame.
+    static OPEN_SESSIONS: RefCell<HashMap<usize, HashSet<String>>> = RefCell::new(HashMap::new());
+}
+
+/// Record which conversations window `window_id` is showing, replacing its last answer.
+pub fn publish_open_sessions(window_id: usize, ids: HashSet<String>) {
+    OPEN_SESSIONS.with(|c| {
+        c.borrow_mut().insert(window_id, ids);
+    });
+}
+
+/// Drop a closed window's claims. Without this its sessions would read as open forever and
+/// a click would look for a pane in a window that is gone.
+pub fn forget_window(window_id: usize) {
+    OPEN_SESSIONS.with(|c| {
+        c.borrow_mut().remove(&window_id);
+    });
+}
+
+/// Whether ANY window currently has a pane in conversation `id`.
+pub fn session_open_in_a_pane(id: &str) -> bool {
+    OPEN_SESSIONS.with(|c| c.borrow().values().any(|ids| ids.contains(id)))
 }
 
 /// Store a finished tool scan (called from `history_scan::drain`).
@@ -1199,6 +1249,28 @@ mod tests {
     }
 
     #[test]
+    fn a_conversation_is_open_if_any_window_has_it() {
+        // The reason this registry exists: the projection that draws the badge is handed
+        // ONE window's state, and a session open in another window is just as open.
+        publish_open_sessions(101, HashSet::from(["here".to_string()]));
+        publish_open_sessions(102, HashSet::from(["elsewhere".to_string()]));
+        assert!(session_open_in_a_pane("here"));
+        assert!(session_open_in_a_pane("elsewhere"));
+        assert!(!session_open_in_a_pane("nowhere"));
+
+        // A window republishes its whole set every pump, so closing the pane inside it
+        // retracts the claim without anyone having to say so.
+        publish_open_sessions(102, HashSet::new());
+        assert!(!session_open_in_a_pane("elsewhere"));
+
+        // And a window that closes stops claiming anything at all — otherwise the badge
+        // would outlive the pane and a click would hunt for a window that is gone.
+        forget_window(101);
+        assert!(!session_open_in_a_pane("here"));
+        forget_window(102);
+    }
+
+    #[test]
     fn applied_rows_are_served_from_cache_and_looked_up_by_id() {
         let rows = vec![
             ScannedSession {
@@ -1208,6 +1280,7 @@ mod tests {
                 detail: "main".into(),
                 command: Some("/opt/bin/fake --resume one".into()),
                 cwd: PathBuf::from("/work/app"),
+                desktop: None,
             },
             ScannedSession {
                 id: "two".into(),
@@ -1216,6 +1289,7 @@ mod tests {
                 detail: "gone".into(),
                 command: None,
                 cwd: PathBuf::new(),
+                desktop: None,
             },
         ];
         apply_tool_sessions("cachetest", rows.clone());

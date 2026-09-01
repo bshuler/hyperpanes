@@ -1413,6 +1413,28 @@ pub fn resync(
                         .into_iter()
                         .map(|r| LeftSessionItem {
                             blocked: !r.resumable(),
+                            // Where a click will take you, decided here rather than in the
+                            // .slint: the panel draws strings, it does not know what a
+                            // desktop session id is. Empty means "nowhere yet — it will
+                            // start in a pane", and the row wears no chip at all. The order
+                            // is the click handler's order, so the chip cannot promise one
+                            // destination and the click deliver another.
+                            badge: if crate::leftpanel::session_open_in_a_pane(&r.id) {
+                                "pane"
+                            } else if r.desktop.is_some() {
+                                "desktop"
+                            } else {
+                                ""
+                            }
+                            .into(),
+                            badge_tip: if crate::leftpanel::session_open_in_a_pane(&r.id) {
+                                "Already open in a pane — click to go to it"
+                            } else if r.desktop.is_some() {
+                                "Open in Claude Desktop — click to bring it to the front"
+                            } else {
+                                ""
+                            }
+                            .into(),
                             id: r.id.into(),
                             // The heading is the project's own directory name, not its whole path:
                             // the panel is ~260px wide and the tail is the part that identifies it.
