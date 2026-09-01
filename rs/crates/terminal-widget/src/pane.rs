@@ -23,10 +23,13 @@
 use crate::clipboard::Clipboard;
 use crate::font::Font;
 use crate::grid::TermGrid;
-use crate::links::{extract_path_candidates, extract_url_candidates, UrlCandidate};
+use crate::links::{
+    extract_commit_candidates, extract_path_candidates, extract_url_candidates, UrlCandidate,
+};
 use crate::render::{PaneRenderer, RenderOpts};
 use crate::search::{self, Match};
 use crate::selection::{self, Selection};
+use hyperpanes_core::git;
 use hyperpanes_core::paths::{self, ResolveResult};
 use slint::Image;
 use std::collections::HashMap;
@@ -55,6 +58,11 @@ pub struct TerminalPane {
     /// paths are cached (negatives aren't), so a file the shell creates becomes clickable on the
     /// next hover — mirroring the Electron renderer's `verified` map.
     verified: HashMap<String, ResolveResult>,
+    /// Commit hashes asked about in this pane, keyed by `cwd\x1ftoken`; the value is the full
+    /// object name, or `None` for a hex-shaped word that names nothing. Unlike `verified`, the
+    /// misses ARE cached: history is append-only, so a word that is not an object now will not
+    /// become one, and every uncached lookup is a `git rev-parse` subprocess per hover.
+    commits: HashMap<String, Option<String>>,
     /// The live drag-selection, if any (our own cell-range model — see [`crate::selection`]).
     /// `None` until a press starts one; a non-dragged selection (a plain click) is held but
     /// renders nothing, so the same press can still resolve to a link click.
@@ -100,16 +108,18 @@ const SCROLLBAR_MIN_THUMB_PX: f32 = 24.0;
 /// to collapse a notch back to one mouse-wheel report when forwarding to a mouse-grabbing app.
 const WHEEL_LINES_PER_NOTCH: i32 = 3;
 
-/// A link under the cursor — a path or an http/https URL: where to draw the hover underline (in
-/// the pane's *logical* pixel space) plus the target. Returned by [`TerminalPane::link_at`], which
-/// only ever hands back paths that exist, and by [`TerminalPane::link_target_at`], which does not.
+/// A link under the cursor — a path, an http/https URL, or a commit hash: where to draw the hover
+/// underline (in the pane's *logical* pixel space) plus the target. Returned by
+/// [`TerminalPane::link_at`], which only ever hands back paths that exist, and by
+/// [`TerminalPane::link_target_at`], which does not.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LinkHit {
     /// Underline rect in logical px within the pane surface.
     pub x: f32,
     pub y: f32,
     pub w: f32,
-    /// Absolute path the link points at — or the URL itself when [`is_url`](Self::is_url).
+    /// Absolute path the link points at — the URL itself when [`is_url`](Self::is_url), or the
+    /// full 40-character object name when [`is_commit`](Self::is_commit).
     pub abs_path: String,
     pub line: Option<u32>,
     pub col: Option<u32>,
@@ -117,6 +127,12 @@ pub struct LinkHit {
     pub tip: String,
     /// `true` for an http/https URL (routed by the app, never disk-verified).
     pub is_url: bool,
+    /// `true` for a commit hash git confirmed exists in this pane's repository. `abs_path` then
+    /// holds the full object name and `commit_cwd` the directory the lookup ran in — the app
+    /// needs both to load the commit back out of the right repository.
+    pub is_commit: bool,
+    /// The directory the commit was resolved against, for an [`is_commit`](Self::is_commit) hit.
+    pub commit_cwd: String,
     /// Whether the path was found on disk. Always `true` for a hover hit and for a URL; only a
     /// [`link_target_at`](TerminalPane::link_target_at) lookup can report `false`. Copying a path
     /// works either way — a build log naming a file that failed to generate is exactly when the
@@ -145,6 +161,10 @@ pub enum LinkAction {
     /// Plain click on a URL — the caller should route it through Preferences → Browser (the OS
     /// default, one chosen browser, or the "ask each time" chooser).
     OpenUrl(String),
+    /// Plain click on a commit hash — the caller should show that commit in the left git panel,
+    /// from where the human can read the message, see the diff, or act on any file it touched.
+    /// `cwd` is the directory the hash resolved in, which is what says *which* repository.
+    ShowCommit { cwd: String, hash: String },
 }
 
 impl TerminalPane {
@@ -157,6 +177,7 @@ impl TerminalPane {
             renderer,
             cwd: None,
             verified: HashMap::new(),
+            commits: HashMap::new(),
             selection: None,
             select_origin: None,
             clipboard: Clipboard::new(),
@@ -260,6 +281,7 @@ impl TerminalPane {
         if cwd != self.cwd {
             self.cwd = cwd;
             self.verified.clear();
+            self.commits.clear();
         }
     }
 
@@ -441,6 +463,53 @@ impl TerminalPane {
         Some((cand, start, end, row, cell_w, cell_h))
     }
 
+    /// Find a commit hash under the (logical-px) point, returning the full object name git
+    /// resolved it to, the candidate's column span, and the cell metrics.
+    ///
+    /// The shape gate in [`crate::links`] is deliberately loose, so git is the real one: a
+    /// hex-shaped word only linkifies once `rev-parse` confirms this repository holds a commit by
+    /// that name. That costs one subprocess the first time a given word is hovered in a given
+    /// cwd, and nothing afterwards — both hits and misses are cached, because history does not
+    /// un-write itself.
+    fn commit_under(
+        &mut self,
+        x: f32,
+        y: f32,
+        surf_w: f32,
+        surf_h: f32,
+    ) -> Option<(String, String, usize, usize, usize, f32, f32)> {
+        // No cwd means no repository to ask. Unlike a path, a commit has no sensible fallback:
+        // resolving it against the home directory would answer for whatever repo happens to be
+        // there, which is never the one the text came from.
+        let cwd = self.cwd.clone()?;
+        let (cell_w, cell_h, cols, rows) = self.cell_logical(surf_w, surf_h)?;
+        if x < 0.0 || y < 0.0 {
+            return None;
+        }
+        let col = (x / cell_w) as usize;
+        let row = (y / cell_h) as usize;
+        if col >= cols || row >= rows {
+            return None;
+        }
+        let snap = self.grid.snapshot();
+        let (text, idx, first) = self.logical_line(&snap, row, col)?;
+        let cand = extract_commit_candidates(&text)
+            .into_iter()
+            .find(|c| idx >= c.start && idx < c.end)?;
+
+        let key = self.cache_key(&cand.hash);
+        let full = match self.commits.get(&key) {
+            Some(hit) => hit.clone(),
+            None => {
+                let r = git::resolve_commit(std::path::Path::new(&cwd), &cand.hash);
+                self.commits.insert(key, r.clone());
+                r
+            }
+        }?;
+        let (start, end) = Self::row_segment(cand.start, cand.end, row, first, snap.cols);
+        Some((full, cwd, start, end, row, cell_w, cell_h))
+    }
+
     /// Hit-test a (logical-px) hover point against the rendered grid. Returns the underline rect +
     /// target when the point is over an http/https URL or a path that exists on disk, else `None`.
     /// The candidate's `:line[:col]` is carried through (and shown in the tooltip), but only the
@@ -458,10 +527,13 @@ impl TerminalPane {
                 line: None,
                 col: None,
                 is_url: true,
+                is_commit: false,
+                commit_cwd: String::new(),
                 exists: true,
             });
         }
         self.path_hit(x, y, surf_w, surf_h, true)
+            .or_else(|| self.commit_hit(x, y, surf_w, surf_h))
     }
 
     /// Hit-test for a link the human has *asked about* — a Ctrl/Cmd-click or a context menu —
@@ -480,10 +552,34 @@ impl TerminalPane {
                 line: None,
                 col: None,
                 is_url: true,
+                is_commit: false,
+                commit_cwd: String::new(),
                 exists: true,
             });
         }
         self.path_hit(x, y, surf_w, surf_h, false)
+            .or_else(|| self.commit_hit(x, y, surf_w, surf_h))
+    }
+
+    /// The commit half of both hit-tests. It is the same for either caller: a hash git cannot
+    /// resolve is not a target anybody can copy or open, so there is no "missing but wanted"
+    /// case the way there is for a path.
+    fn commit_hit(&mut self, x: f32, y: f32, surf_w: f32, surf_h: f32) -> Option<LinkHit> {
+        let (full, cwd, start, end, row, cell_w, cell_h) =
+            self.commit_under(x, y, surf_w, surf_h)?;
+        Some(LinkHit {
+            x: start as f32 * cell_w,
+            y: (row as f32 + 1.0) * cell_h - 1.0,
+            w: (end - start) as f32 * cell_w,
+            tip: format!("commit {}", &full[..full.len().min(12)]),
+            abs_path: full,
+            line: None,
+            col: None,
+            is_url: false,
+            is_commit: true,
+            commit_cwd: cwd,
+            exists: true,
+        })
     }
 
     /// The path half of both hit-tests, differing only in whether a missing file still counts.
@@ -512,6 +608,8 @@ impl TerminalPane {
             col,
             tip,
             is_url: false,
+            is_commit: false,
+            commit_cwd: String::new(),
             exists: r.exists,
         })
     }
@@ -551,7 +649,13 @@ impl TerminalPane {
             if self.clipboard.copy(&hit.abs_path) {
                 self.set_toast(format!(
                     "Copied {} to clipboard",
-                    if hit.is_url { "link" } else { "path" }
+                    if hit.is_url {
+                        "link"
+                    } else if hit.is_commit {
+                        "commit"
+                    } else {
+                        "path"
+                    }
                 ));
             }
             return Some(LinkAction::Copy(hit.abs_path));
@@ -559,6 +663,12 @@ impl TerminalPane {
         if hit.is_url {
             // Handed back, not opened — see `LinkAction::OpenUrl`.
             return Some(LinkAction::OpenUrl(hit.abs_path));
+        }
+        if hit.is_commit {
+            return Some(LinkAction::ShowCommit {
+                cwd: hit.commit_cwd,
+                hash: hit.abs_path,
+            });
         }
         Some(LinkAction::Reveal {
             path: hit.abs_path,
@@ -1574,6 +1684,100 @@ mod tests {
             p.activate_link(2.5, 0.5, 20.0, 2.0, true),
             Some(LinkAction::Copy(_))
         ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A throwaway repo with one commit, or `None` when this machine has no usable git — a
+    /// skip, not a failure: this test is about the pane's plumbing, not about git being present.
+    fn commit_fixture() -> Option<(std::path::PathBuf, String)> {
+        let dir = std::env::temp_dir().join(format!(
+            "hp_pane_commit_{}_{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).ok()?;
+        let run = |args: &[&str]| -> bool {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        };
+        if !run(&["init", "-q", "-b", "main"]) {
+            return None;
+        }
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "T"]);
+        run(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(dir.join("f.txt"), "one\n").ok()?;
+        if !run(&["add", "-A"]) || !run(&["commit", "-q", "-m", "s"]) {
+            return None;
+        }
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["rev-parse", "--short", "HEAD"])
+            .output()
+            .ok()?;
+        let short = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Some((dir, short))
+    }
+
+    #[test]
+    fn a_hash_this_repository_knows_becomes_a_link_to_the_commit() {
+        let Some((dir, short)) = commit_fixture() else {
+            return;
+        };
+        let mut p = unit_pane(60, 3);
+        p.set_cwd(Some(dir.to_string_lossy().into_owned()));
+        let line = format!("pushed as {short}, signed");
+        p.feed(&line);
+        let (w, h) = (60.0, 3.0); // 1px per cell
+        let start = "pushed as ".len();
+
+        let hit = p
+            .link_at(start as f32 + 0.5, 0.5, w, h)
+            .expect("hover over the hash should hit");
+        assert!(hit.is_commit);
+        assert!(!hit.is_url);
+        // The full object name rides out, not the abbreviation the screen showed.
+        assert_eq!(hit.abs_path.len(), 40);
+        assert!(hit.abs_path.starts_with(&short));
+        assert_eq!(hit.commit_cwd, dir.to_string_lossy());
+        // Underline spans exactly the hash's columns at 1px/col.
+        assert_eq!(hit.x, start as f32);
+        assert_eq!(hit.w, short.len() as f32);
+
+        // A plain click asks the app to show it, in the repository it was resolved against.
+        match p.activate_link(start as f32 + 0.5, 0.5, w, h, false) {
+            Some(LinkAction::ShowCommit { cwd, hash }) => {
+                assert_eq!(cwd, dir.to_string_lossy());
+                assert_eq!(hash, hit.abs_path);
+            }
+            other => panic!("expected ShowCommit, got {other:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hex_word_naming_no_commit_stays_dark() {
+        let Some((dir, _)) = commit_fixture() else {
+            return;
+        };
+        let mut p = unit_pane(60, 3);
+        p.set_cwd(Some(dir.to_string_lossy().into_owned()));
+        p.feed("saw deadbeef today"); // hex-shaped, but this repo has no such object
+        assert!(p.link_at(6.5, 0.5, 60.0, 3.0).is_none());
+        // Ctrl/Cmd-click has nothing to copy either: an unresolvable hash is not a target.
+        assert!(p.link_target_at(6.5, 0.5, 60.0, 3.0).is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

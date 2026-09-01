@@ -15,6 +15,8 @@ pub mod claude_panes;
 pub mod claude_recovery;
 pub mod cli;
 pub mod control;
+/// Reading one commit out of a repository — what a clicked hash needs to become a view.
+pub mod git;
 pub mod hyperpane;
 pub mod layout;
 pub mod open;

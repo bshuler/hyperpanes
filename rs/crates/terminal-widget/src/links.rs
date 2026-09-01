@@ -7,6 +7,9 @@
 //! open/copy actions live in `core::paths` and the pane's link layer that consumes these
 //! candidates.
 //!
+//! Also detects commit hashes ([`extract_commit_candidates`]) — hex tokens the pane hands to
+//! git for the only verification that means anything, exactly as it hands a path to the disk.
+//!
 //! Also detects `http://`/`https://` URLs ([`extract_url_candidates`]) — same click UX as paths
 //! (plain click opens, Ctrl-click copies), but with no on-disk verification step: a
 //! well-formed URL linkifies as-is and opens in the default browser.
@@ -354,6 +357,79 @@ pub fn cell_from_index(index: usize, start_row: usize, cols: usize) -> (usize, u
     ((index % cols) + 1, start_row + index / cols + 1)
 }
 
+/// A detected commit-hash-shaped token and the column range it occupies on the row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitCandidate {
+    /// The hex token, lowercase, with any wrapping punctuation removed.
+    pub hash: String,
+    /// Inclusive start column into the source row (for the link's underline range).
+    pub start: usize,
+    /// Exclusive end column into the source row.
+    pub end: usize,
+}
+
+/// Extract every abbreviated-or-full commit hash from one rendered terminal row.
+///
+/// The shape gate is deliberately loose — 7 to 40 lowercase hex characters standing as a whole
+/// word, with at least one `a`–`f` in them — because the *real* gate is git: the pane asks
+/// [`hyperpanes_core::git::resolve_commit`] whether the token names a commit, and a token that
+/// does not simply never lights up. So this only has to be cheap and not obviously wrong.
+///
+/// The one thing it does rule out on shape is a run of pure digits. A build log is full of
+/// byte counts, timestamps and PIDs, and `1756742` is neither a hash nor worth a subprocess.
+/// The cost is the ~4% of 7-character hashes that happen to contain no letter; they stay
+/// plain text rather than becoming a link, which is the quieter of the two failures.
+///
+/// Word boundaries are alphanumeric-or-`_`, so the `f1a` in `b99_price` and the tail of
+/// `deadbeefcafe.txt` are not offered — a hash git printed always stands alone.
+pub fn extract_commit_candidates(line: &str) -> Vec<CommitCandidate> {
+    let chars: Vec<char> = line.chars().collect();
+    let n = chars.len();
+    let word = |c: char| c.is_ascii_alphanumeric() || c == '_';
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < n {
+        if !word(chars[i]) {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < n && word(chars[i]) {
+            i += 1;
+        }
+        // A hash is a whole word: `a.b` splits above, but `deadbeef.txt` must not match its
+        // stem either, so a token glued to a path or version separator is out. On the right
+        // the separator only counts when something follows it — the full stop ending `landed
+        // in 1a5bbd8.` is sentence punctuation, not the start of an extension.
+        let sep = |c: Option<&char>| matches!(c, Some('.' | '-' | '/' | '\\'));
+        let left_glued = sep(start.checked_sub(1).and_then(|k| chars.get(k)));
+        let right_glued =
+            sep(chars.get(i)) && chars.get(i + 1).is_some_and(|c| c.is_ascii_alphanumeric());
+        if left_glued || right_glued {
+            continue;
+        }
+        let tok: String = chars[start..i].iter().collect();
+        if !(7..=40).contains(&tok.len()) {
+            continue;
+        }
+        if !tok
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            continue;
+        }
+        if !tok.bytes().any(|b| (b'a'..=b'f').contains(&b)) {
+            continue; // pure digits: a count or a timestamp, not an object name
+        }
+        out.push(CommitCandidate {
+            hash: tok,
+            start,
+            end: i,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,5 +649,61 @@ mod tests {
     fn cell_from_index_wraps_past_the_column_count() {
         assert_eq!(cell_from_index(80, 5, 80), (1, 7));
         assert_eq!(cell_from_index(165, 0, 80), (6, 3));
+    }
+
+    // ---- commit hashes ----
+
+    fn hashes(line: &str) -> Vec<String> {
+        extract_commit_candidates(line)
+            .into_iter()
+            .map(|c| c.hash)
+            .collect()
+    }
+
+    #[test]
+    fn a_hash_git_printed_is_offered_whole() {
+        assert_eq!(hashes("pushed as 2d6909f1a, signed"), ["2d6909f1a"]);
+        assert_eq!(
+            hashes("⎿  0d5ad5323 docs(survey): the build commit"),
+            ["0d5ad5323"]
+        );
+        let full = "a".repeat(39) + "9";
+        assert_eq!(hashes(&format!("commit {full}")), [full]);
+    }
+
+    #[test]
+    fn the_span_covers_exactly_the_hash() {
+        let c = &extract_commit_candidates("see a920101 for it")[0];
+        assert_eq!((c.start, c.end), (4, 11));
+    }
+
+    #[test]
+    fn a_number_is_not_an_object_name() {
+        assert!(hashes("read 1756742 bytes in 1234567 ms").is_empty());
+    }
+
+    #[test]
+    fn a_hash_hiding_inside_a_filename_is_not_a_commit() {
+        // The stem is 8 lowercase hex characters, but it is a file and the click that reveals
+        // it must not be stolen by a git lookup.
+        assert!(hashes("wrote deadbeef.txt").is_empty());
+        assert!(hashes("out/cafebabe-1/x").is_empty());
+        assert!(
+            hashes("b99_deadbeef").is_empty(),
+            "an identifier is one word"
+        );
+    }
+
+    #[test]
+    fn a_token_too_short_or_too_long_to_be_a_hash_is_left_alone() {
+        assert!(hashes("colour #abc123 and abcdef").is_empty());
+        assert!(hashes(&"a".repeat(41)).is_empty());
+    }
+
+    #[test]
+    fn punctuation_around_a_hash_is_not_part_of_it() {
+        assert_eq!(hashes("(a920101)"), ["a920101"]);
+        assert_eq!(hashes("`febe69b`, then"), ["febe69b"]);
+        assert_eq!(hashes("at 1a5bbd8."), ["1a5bbd8"]);
     }
 }

@@ -132,6 +132,19 @@ pub enum Command {
     /// Re-run `git status`. Nothing watches the repository, so this is how a human says "I
     /// just committed something in a pane".
     GitRefresh,
+    /// Show one commit in the panel — sent by clicking a hash in a pane's output. `cwd` says
+    /// which repository (a hash alone does not), and the panel re-roots there so the commit
+    /// and the working tree behind it can never be from two different projects.
+    ShowCommit {
+        cwd: String,
+        hash: String,
+    },
+    /// Leave the commit view and go back to the working tree.
+    GitCommitClose,
+    /// Open a pane running `git show` for the commit on screen — the whole commit when the
+    /// argument is `None`, one file when it names one. A pane running git's own pager gives
+    /// the real, coloured diff; teaching the viewer to render one would give a worse copy.
+    GitCommitDiff(Option<String>),
     /// Open `path` in a terminal pane running tool `tool` — "open in a terminal with vi".
     /// The pane is a `Tool` pane, so it gets the tool's brand and icon like any other.
     OpenPathWith {
@@ -633,6 +646,46 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
                 state.git_click(&path);
                 state.open_file_context(&abs, x, y);
             }
+        }
+        Command::ShowCommit { cwd, hash } => {
+            if !state.show_commit(&cwd, &hash) {
+                state.toast_active(&format!(
+                    "No commit {} in this repository",
+                    &hash[..hash.len().min(9)]
+                ));
+            }
+        }
+        Command::GitCommitClose => state.git_commit_close(),
+        Command::GitCommitDiff(path) => {
+            let Some(c) = state.git_commit.as_ref() else {
+                return Effect::None;
+            };
+            let root = c.root.to_string_lossy().into_owned();
+            let short = c.short.clone();
+            // `git show` with git's own pager: the real diff, coloured the way the human's
+            // own git config colours it. `--color=always` because the pipe git sees is not a
+            // terminal from its point of view once a pager is in the chain.
+            let mut cmd = format!(
+                "git -C {} show --color=always {}",
+                quote_arg(&root),
+                quote_arg(&c.hash)
+            );
+            let label = match &path {
+                Some(p) => {
+                    cmd.push_str(&format!(" -- {}", quote_arg(p)));
+                    format!("{} · {}", short, p.rsplit('/').next().unwrap_or(p))
+                }
+                None => format!("{} · diff", short),
+            };
+            state.add_pane_opts(
+                mgr,
+                NewPaneOpts {
+                    label: Some(label),
+                    cwd: Some(root),
+                    command: Some(cmd),
+                    ..Default::default()
+                },
+            );
         }
         Command::FilesOpen(path) => {
             let p = std::path::PathBuf::from(&path);

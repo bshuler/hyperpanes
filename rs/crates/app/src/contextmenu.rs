@@ -416,6 +416,25 @@ pub fn file_menu(state: &State, path: &std::path::Path, x: f32, y: f32) -> CtxMe
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"));
 
+    // A file reached from the commit view gets the verb that view exists for, first, because
+    // it is why the row was clicked. Everything below still applies: whatever revision put
+    // the name in the list, the file on disk is an ordinary file.
+    if let Some(c) = state.git_commit.as_ref() {
+        if let Some(rel) = path
+            .strip_prefix(&c.root)
+            .ok()
+            .map(|r| r.to_string_lossy().into_owned())
+        {
+            if c.files.iter().any(|f| f.path == rel) {
+                b.item(
+                    &format!("Show Diff in {}", c.short),
+                    Command::GitCommitDiff(Some(rel)),
+                );
+                b.sep();
+            }
+        }
+    }
+
     if is_dir {
         b.item("Open as Root", Command::FilesSetRoot(p.clone()));
         b.item("New File Browser Pane", Command::FilesOpen(p.clone()));

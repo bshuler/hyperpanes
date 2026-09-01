@@ -721,4 +721,21 @@ export global LeftPanelAdapter {
     callback git-context(string, length, length);
     // Re-run `git status` (nothing watches the repository).
     callback git-refresh();
+    // ---- mode 2, commit view: ONE commit, in place of the working tree ----
+    // Reached by clicking a hash in a pane's output. A commit is immutable, so unlike the
+    // working tree there is nothing here to refresh — only a way back out.
+    in property <bool> git-commit-open;
+    // The commit's subject line, and "abc1234 · author · 2026-09-01" under it — both
+    // assembled by Rust, like every other string this panel draws.
+    in property <string> git-commit-title;
+    in property <string> git-commit-meta;
+    // The files the commit touched, in the same row shape the working tree uses: the two
+    // lists answer the same question about the same repository, one now and one then.
+    in property <[LeftGitRow]> git-commit-files;
+    in property <string> git-commit-files-title;
+    // Back to the working tree.
+    callback git-commit-close();
+    // Open a pane running `git show` on the whole commit. One file's diff is reached
+    // through the row's own context menu, where the rest of that file's verbs already live.
+    callback git-commit-diff();
 }

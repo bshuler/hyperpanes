@@ -1290,6 +1290,10 @@ pub struct State {
     /// The selected row, as a REPO-RELATIVE path (git's own identity for the file), for the
     /// same index-is-not-identity reason `files_sel` is a path.
     pub git_sel: Option<String>,
+    /// The commit the panel is showing INSTEAD of the working tree, after a hash was clicked
+    /// in a pane's output. `None` is the ordinary working-tree view. Loaded once on the click
+    /// and then held: a commit is immutable, so nothing can make this projection stale.
+    pub git_commit: Option<hyperpanes_core::git::Commit>,
     /// A one-shot request to switch the left panel to a given mode, consumed by the resync.
     /// The strip's selection lives in the UI as an `in-out` property (switching views is not
     /// a `State` mutation), so a command that needs to change it leaves a note instead of
@@ -1513,6 +1517,7 @@ impl State {
             files_scroll_y: 0.0,
             files_scroll_seq: 0,
             git: crate::gitpanel::GitStatus::none(),
+            git_commit: None,
             git_sel: None,
             left_mode_request: None,
             closed: Vec::new(),
@@ -4275,6 +4280,13 @@ impl State {
     /// [`Command::GitRefresh`](crate::command::Command::GitRefresh), which fires on every
     /// entry into the mode anyway.
     pub fn sync_left_root(&mut self, mode: i32) {
+        // A commit on screen pins the panel to the repository that commit came from. The
+        // anchor otherwise drags the root back to the focused pane the moment the panel is
+        // re-entered, and the header, the tree and the commit's rows would then be
+        // describing two different projects at once.
+        if self.git_commit.is_some() {
+            return;
+        }
         let cwd = self.focused_cwd();
         if self.files_root_from == cwd && self.files_root.is_some() {
             return;
@@ -4480,7 +4492,49 @@ impl State {
     /// git row callback goes through here: what the UI holds is git's relative path, and
     /// every command downstream (open, reveal, the file menu) speaks absolute paths.
     pub fn git_abs(&self, path: &str) -> Option<PathBuf> {
-        self.git.root.as_ref().map(|r| r.join(path))
+        // The commit's own root is the fallback, not an alternative: the two agree whenever
+        // `git status` succeeded, and when it did not (no git, a broken index) the commit
+        // view still knows which repository it was loaded from, so its rows stay openable.
+        let root = self
+            .git
+            .root
+            .as_ref()
+            .or_else(|| self.git_commit.as_ref().map(|c| &c.root))?;
+        Some(root.join(path))
+    }
+
+    /// Show one commit in the panel, replacing the working-tree view. Returns `false` when
+    /// git cannot load it — a hash that resolved on hover can still be gone by the click
+    /// (a fetch --prune, a rebase), and a panel that cleared itself for nothing is worse
+    /// than one that stayed where it was.
+    ///
+    /// The panel re-roots on the commit's repository on the way in. Clicking a hash printed
+    /// by a pane in another project otherwise leaves the header, the file tree and the rows
+    /// describing three different places at once.
+    pub fn show_commit(&mut self, cwd: &str, hash: &str) -> bool {
+        let Some(commit) = hyperpanes_core::git::load_commit(std::path::Path::new(cwd), hash)
+        else {
+            return false;
+        };
+        if self.files_root.as_deref() != Some(commit.root.as_path()) {
+            self.files_set_root(commit.root.clone());
+        }
+        self.git_commit = Some(commit);
+        self.git_sel = None;
+        self.rebuild_git();
+        self.left_panel_open = true;
+        self.left_mode_request = Some(crate::paneview::LEFT_MODE_GIT);
+        self.dirty = true;
+        true
+    }
+
+    /// Leave the commit view; the working tree is re-read on the way out because it may well
+    /// have moved while the commit was on screen.
+    pub fn git_commit_close(&mut self) {
+        if self.git_commit.take().is_some() {
+            self.git_sel = None;
+            self.rebuild_git();
+        }
     }
 
     // ---- sidebar / projects ----
@@ -4809,7 +4863,7 @@ impl State {
 
     /// Flash a line on the focused pane — the same transient the widget uses for
     /// copy/paste confirmations, for an action with no other visible result.
-    fn toast_active(&mut self, msg: &str) {
+    pub fn toast_active(&mut self, msg: &str) {
         let f = self.active_tab().focused;
         if let Some(p) = self.active_tab_mut().panes.get_mut(f) {
             p.pane.set_toast(msg.to_string());

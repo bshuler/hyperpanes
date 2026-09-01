@@ -945,6 +945,32 @@ component RefreshGlyph inherits Rectangle {
     }
 }
 
+// A left arrow — leave the commit and go back to the working tree.
+component BackGlyph inherits Path {
+    in property <color> ink;
+    width: 12px;
+    height: 12px;
+    viewbox-width: 12;
+    viewbox-height: 12;
+    stroke: ink;
+    stroke-width: 1.4px;
+    fill: transparent;
+    commands: "M 10 6 L 2 6 M 5.5 2.5 L 2 6 L 5.5 9.5";
+}
+
+// Two stacked lines, one long one short — a diff.
+component DiffGlyph inherits Rectangle {
+    in property <color> ink;
+    width: 12px;
+    height: 12px;
+    Path {
+        width: 100%; height: 100%;
+        viewbox-width: 12; viewbox-height: 12;
+        stroke: root.ink; stroke-width: 1.4px; fill: transparent;
+        commands: "M 1.5 3.5 L 10.5 3.5 M 1.5 6 L 7 6 M 1.5 8.5 L 9 8.5";
+    }
+}
+
 // A 20x20 hover-lit square holding one glyph — the explorer header's two buttons.
 component HeadButton inherits Rectangle {
     in property <string> tip;
@@ -960,6 +986,16 @@ component HeadButton inherits Rectangle {
         ink: hb.has-hover ? Theme.text : Theme.subtext;
     }
     if root.glyph == 1 : RefreshGlyph {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        ink: hb.has-hover ? Theme.text : Theme.subtext;
+    }
+    if root.glyph == 2 : BackGlyph {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        ink: hb.has-hover ? Theme.text : Theme.subtext;
+    }
+    if root.glyph == 3 : DiffGlyph {
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
         ink: hb.has-hover ? Theme.text : Theme.subtext;
@@ -1139,6 +1175,13 @@ export component LeftPanel inherits Rectangle {
     property <bool> staged-open: true;
     property <bool> changed-open: true;
     property <bool> untracked-open: true;
+    property <bool> commit-open: true;
+
+    // Mode 2 shows ONE of two things: the working tree as it is now, or the single commit
+    // a clicked hash asked for. Naming both here keeps the nine `if` gates below honest —
+    // an `&&` forgotten on one of them would have drawn the two views on top of each other.
+    property <bool> git-tree: LeftPanelAdapter.mode == 2 && !LeftPanelAdapter.git-commit-open;
+    property <bool> git-commit: LeftPanelAdapter.mode == 2 && LeftPanelAdapter.git-commit-open;
 
     background: Theme.mantle;
     clip: true;
@@ -1528,7 +1571,7 @@ export component LeftPanel inherits Rectangle {
         // view answers "what have I changed here", and the terminal does the rest.
 
         // The head line: branch, and how far it has drifted from its upstream.
-        if LeftPanelAdapter.mode == 2 : HorizontalLayout {
+        if root.git-tree : HorizontalLayout {
             spacing: 4px;
             padding-bottom: 2px;
             VerticalLayout {
@@ -1563,7 +1606,7 @@ export component LeftPanel inherits Rectangle {
             }
         }
 
-        if LeftPanelAdapter.mode == 2 && !LeftPanelAdapter.git-repo : Text {
+        if root.git-tree && !LeftPanelAdapter.git-repo : Text {
             text: "This project is not inside a git repository — open a pane in one, or re-root the Files view.";
             color: Theme.subtext;
             font-size: 11px;
@@ -1572,7 +1615,7 @@ export component LeftPanel inherits Rectangle {
 
         // A repo with nothing to report says so. Three empty sections would read as a
         // panel that had not looked yet.
-        if LeftPanelAdapter.mode == 2 && LeftPanelAdapter.git-repo
+        if root.git-tree && LeftPanelAdapter.git-repo
             && LeftPanelAdapter.git-staged.length == 0
             && LeftPanelAdapter.git-changed.length == 0
             && LeftPanelAdapter.git-untracked.length == 0 : Text {
@@ -1583,13 +1626,13 @@ export component LeftPanel inherits Rectangle {
         }
 
         // ---- staged ----
-        if LeftPanelAdapter.mode == 2 && LeftPanelAdapter.git-staged.length > 0 : SectionHead {
+        if root.git-tree && LeftPanelAdapter.git-staged.length > 0 : SectionHead {
             label: LeftPanelAdapter.git-staged-title;
             open: root.staged-open;
             tip: root.staged-open ? "Collapse the staged changes" : "Show the staged changes";
             toggled => { root.staged-open = !root.staged-open; }
         }
-        if LeftPanelAdapter.mode == 2 && root.staged-open && LeftPanelAdapter.git-staged.length > 0 : Rectangle {
+        if root.git-tree && root.staged-open && LeftPanelAdapter.git-staged.length > 0 : Rectangle {
             vertical-stretch: 1;
             min-height: 44px;
             clip: true;
@@ -1615,13 +1658,13 @@ export component LeftPanel inherits Rectangle {
         }
 
         // ---- unstaged ----
-        if LeftPanelAdapter.mode == 2 && LeftPanelAdapter.git-changed.length > 0 : SectionHead {
+        if root.git-tree && LeftPanelAdapter.git-changed.length > 0 : SectionHead {
             label: LeftPanelAdapter.git-changed-title;
             open: root.changed-open;
             tip: root.changed-open ? "Collapse the working-tree changes" : "Show the working-tree changes";
             toggled => { root.changed-open = !root.changed-open; }
         }
-        if LeftPanelAdapter.mode == 2 && root.changed-open && LeftPanelAdapter.git-changed.length > 0 : Rectangle {
+        if root.git-tree && root.changed-open && LeftPanelAdapter.git-changed.length > 0 : Rectangle {
             vertical-stretch: 2;
             min-height: 44px;
             clip: true;
@@ -1644,13 +1687,13 @@ export component LeftPanel inherits Rectangle {
         }
 
         // ---- untracked ----
-        if LeftPanelAdapter.mode == 2 && LeftPanelAdapter.git-untracked.length > 0 : SectionHead {
+        if root.git-tree && LeftPanelAdapter.git-untracked.length > 0 : SectionHead {
             label: LeftPanelAdapter.git-untracked-title;
             open: root.untracked-open;
             tip: root.untracked-open ? "Collapse the untracked files" : "Show the untracked files";
             toggled => { root.untracked-open = !root.untracked-open; }
         }
-        if LeftPanelAdapter.mode == 2 && root.untracked-open && LeftPanelAdapter.git-untracked.length > 0 : Rectangle {
+        if root.git-tree && root.untracked-open && LeftPanelAdapter.git-untracked.length > 0 : Rectangle {
             vertical-stretch: 1;
             min-height: 44px;
             clip: true;
@@ -1663,6 +1706,88 @@ export component LeftPanel inherits Rectangle {
                     alignment: start;
                     spacing: 2px;
                     for g in LeftPanelAdapter.git-untracked : GitRowView {
+                        item: g;
+                        clicked => { LeftPanelAdapter.git-click(g.path); }
+                        opened => { LeftPanelAdapter.git-open(g.path); }
+                        context(cx, cy) => { LeftPanelAdapter.git-context(g.path, cx, cy); }
+                    }
+                }
+            }
+        }
+
+        // ===== mode 2, the other half: ONE commit =====
+        //
+        // Reached by clicking a hash in a pane's output. Deliberately the same rows as the
+        // working tree, wired to the same three callbacks: a file is a file, and a commit's
+        // file should reach the viewer, the explorer and the file menu exactly the way a
+        // changed file does. What differs is only *which* revision the panel is describing.
+
+        if root.git-commit : HorizontalLayout {
+            spacing: 4px;
+            padding-bottom: 2px;
+            VerticalLayout {
+                alignment: center;
+                HeadButton {
+                    tip: "Back to the working tree";
+                    glyph: 2;
+                    clicked => { LeftPanelAdapter.git-commit-close(); }
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 1px;
+                horizontal-stretch: 1;
+                Text {
+                    text: LeftPanelAdapter.git-commit-title;
+                    color: Theme.text;
+                    font-size: 11px;
+                    font-weight: 700;
+                    overflow: elide;
+                }
+                Text {
+                    text: LeftPanelAdapter.git-commit-meta;
+                    color: Theme.faint;
+                    font-size: 9px;
+                    overflow: elide;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                HeadButton {
+                    tip: "Open a pane with this commit's whole diff";
+                    glyph: 3;
+                    clicked => { LeftPanelAdapter.git-commit-diff(); }
+                }
+            }
+        }
+
+        // A merge, or an empty commit. Saying so beats a blank panel that looks unfinished.
+        if root.git-commit && LeftPanelAdapter.git-commit-files.length == 0 : Text {
+            text: "This commit touched no files of its own.";
+            color: Theme.subtext;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+
+        if root.git-commit && LeftPanelAdapter.git-commit-files.length > 0 : SectionHead {
+            label: LeftPanelAdapter.git-commit-files-title;
+            open: root.commit-open;
+            tip: root.commit-open ? "Collapse the files this commit touched" : "Show the files this commit touched";
+            toggled => { root.commit-open = !root.commit-open; }
+        }
+        if root.git-commit && root.commit-open && LeftPanelAdapter.git-commit-files.length > 0 : Rectangle {
+            vertical-stretch: 1;
+            min-height: 44px;
+            clip: true;
+            Flickable {
+                width: 100%;
+                height: 100%;
+                viewport-width: self.width;
+                viewport-height: commitbody.preferred-height;
+                commitbody := VerticalLayout {
+                    alignment: start;
+                    spacing: 2px;
+                    for g in LeftPanelAdapter.git-commit-files : GitRowView {
                         item: g;
                         clicked => { LeftPanelAdapter.git-click(g.path); }
                         opened => { LeftPanelAdapter.git-open(g.path); }

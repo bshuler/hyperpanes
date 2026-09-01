@@ -3045,6 +3045,13 @@ impl App {
                         }) => {
                             app.run_command(&win, Command::RevealInFiles { path, line, col });
                         }
+                        // A clicked COMMIT HASH goes to the left panel too, for the same
+                        // reason: the panel can show the message, the files it touched, and
+                        // hand each of those to the file menu — a `git show` fired straight
+                        // at a pane would answer one question and close the door on the rest.
+                        Some(hyperpanes_terminal_widget::LinkAction::ShowCommit { cwd, hash }) => {
+                            app.run_command(&win, Command::ShowCommit { cwd, hash });
+                        }
                         None => {}
                     }
                 }
@@ -3844,6 +3851,28 @@ impl App {
                 .on_git_refresh(move || {
                     if let Some(w) = app.window_by_id(id) {
                         app.run_command(&w, Command::GitRefresh);
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_git_commit_close(move || {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::GitCommitClose);
+                    }
+                });
+        }
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app
+                .global::<crate::LeftPanelAdapter>()
+                .on_git_commit_diff(move || {
+                    if let Some(w) = app.window_by_id(id) {
+                        app.run_command(&w, Command::GitCommitDiff(None));
                     }
                 });
         }

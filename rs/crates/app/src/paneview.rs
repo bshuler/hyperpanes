@@ -101,6 +101,8 @@ pub struct Ui {
     pub lp_git_staged: Rc<VecModel<LeftGitRow>>,
     pub lp_git_changed: Rc<VecModel<LeftGitRow>>,
     pub lp_git_untracked: Rc<VecModel<LeftGitRow>>,
+    /// The files of the ONE commit the panel is showing, when a clicked hash put it there.
+    pub lp_git_commit_files: Rc<VecModel<LeftGitRow>>,
     /// Per-tab pane models for the tree, keyed by tab index and reused across ticks so each
     /// `LeftTabRow.panes` keeps a STABLE model identity — the same reason `wt_models` exists:
     /// rebuilding the inner repeater every frame would drop an in-flight click or, worse, the
@@ -162,6 +164,7 @@ impl Ui {
             lp_git_staged: Rc::new(VecModel::default()),
             lp_git_changed: Rc::new(VecModel::default()),
             lp_git_untracked: Rc::new(VecModel::default()),
+            lp_git_commit_files: Rc::new(VecModel::default()),
             lp_pane_models: RefCell::new(HashMap::new()),
             pref_tools: Rc::new(VecModel::default()),
             pref_browsers: Rc::new(VecModel::default()),
@@ -211,6 +214,7 @@ impl Ui {
         lp.set_git_staged(ModelRc::from(self.lp_git_staged.clone()));
         lp.set_git_changed(ModelRc::from(self.lp_git_changed.clone()));
         lp.set_git_untracked(ModelRc::from(self.lp_git_untracked.clone()));
+        lp.set_git_commit_files(ModelRc::from(self.lp_git_commit_files.clone()));
     }
 }
 
@@ -1393,6 +1397,30 @@ pub fn resync(
                 sync_model(&ui.lp_git_staged, staged);
                 sync_model(&ui.lp_git_changed, changed);
                 sync_model(&ui.lp_git_untracked, untracked);
+
+                // ---- and, over the top of it, ONE commit ----
+                // A commit is immutable, so this projection is a straight copy of what
+                // `load_commit` read once; nothing here can go stale while it is on screen.
+                lp.set_git_commit_open(state.git_commit.is_some());
+                if let Some(c) = state.git_commit.as_ref() {
+                    lp.set_git_commit_title(c.subject.as_str().into());
+                    lp.set_git_commit_meta(
+                        format!("{} · {} · {}", c.short, c.author, c.date).into(),
+                    );
+                    let files: Vec<LeftGitRow> = c
+                        .files
+                        .iter()
+                        .map(|f| LeftGitRow {
+                            path: f.path.as_str().into(),
+                            label: f.label.as_str().into(),
+                            detail: f.detail.as_str().into(),
+                            code: f.code.to_string().into(),
+                            selected: sel.as_deref() == Some(f.path.as_str()),
+                        })
+                        .collect();
+                    lp.set_git_commit_files_title(format!("Files · {}", files.len()).into());
+                    sync_model(&ui.lp_git_commit_files, files);
+                }
             }
 
             // ---- the current mode's session list ----
