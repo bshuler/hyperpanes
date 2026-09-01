@@ -1672,42 +1672,28 @@ async fn dictation_command(
         _ => {
             let s2 = Arc::clone(shared);
             let pane = found.pane_id.clone();
-            let transcript =
-                match tokio::task::spawn_blocking(move || s2.dictation.stop(&pane)).await {
-                    Ok(r) => r,
-                    Err(_) => Err("dictation task failed".to_string()),
-                };
-            let transcript = match transcript {
-                Ok(t) => t,
-                Err(e) => return jstatus(400, json!({ "error": e, "paneId": found.pane_id })),
+            let uid = found.uid.clone();
+            let delivered = match tokio::task::spawn_blocking(move || {
+                crate::control::dictation_service::stop_and_deliver(&s2, &pane, &uid)
+            })
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => Err("dictation task failed".to_string()),
             };
-            let text = crate::control::dictation_service::sanitize_for_pane(&transcript.text);
-            if text.is_empty() {
-                return jstatus(
-                    400,
-                    json!({ "error": "no speech in the recording", "paneId": found.pane_id }),
-                );
+            match delivered {
+                Ok(d) => jstatus(
+                    200,
+                    json!({
+                        "ok": true,
+                        "paneId": found.pane_id,
+                        "text": d.text,
+                        "backend": d.backend,
+                        "submitted": d.submitted,
+                    }),
+                ),
+                Err(e) => jstatus(400, json!({ "error": e, "paneId": found.pane_id })),
             }
-            let submit = shared.dictation.submit_after_insert();
-            shared.sessions.write(&found.uid, &text);
-            if submit {
-                let sessions = Arc::clone(&shared.sessions);
-                let uid = found.uid.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(SUBMIT_DELAY_MS)).await;
-                    sessions.write(&uid, "\r");
-                });
-            }
-            jstatus(
-                200,
-                json!({
-                    "ok": true,
-                    "paneId": found.pane_id,
-                    "text": text,
-                    "backend": transcript.backend,
-                    "submitted": submit,
-                }),
-            )
         }
     }
 }

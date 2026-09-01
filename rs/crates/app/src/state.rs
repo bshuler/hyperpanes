@@ -894,6 +894,10 @@ pub struct PaneState {
     /// Per-pane "talk": speak NEW assistant replies aloud via local TTS (the pane menu's
     /// "Talk" toggle). New panes default off; mirrors the control read-model's `PaneInfo::talk`.
     pub talk: bool,
+    /// Whether this pane is recording dictation right now (the header microphone). NOT owned
+    /// here and never persisted: the recorder lives on the control server's `DictationService`,
+    /// and this is the projection stamped back each sync tick so the header can light up.
+    pub recording: bool,
     /// Ambient-AI subtitle + typewriter reveal state (the local projection of this pane's
     /// `meta['ai.subtitle']`; produced by the `core::ai` engine when enabled).
     pub ai: AiLine,
@@ -1923,6 +1927,7 @@ impl State {
             shell_title: String::new(),
             ai_muted: false,
             talk: false,
+            recording: false,
             ai: AiLine::default(),
             last_toast: String::new(),
             scrollbar_on: false,
@@ -2193,6 +2198,7 @@ impl State {
             shell_title: String::new(),
             ai_muted: false,
             talk: false,
+            recording: false,
             ai: AiLine::default(),
             last_toast: String::new(),
             scrollbar_on: false,
@@ -5876,6 +5882,7 @@ impl State {
             shell_title: String::new(),
             ai_muted: false,
             talk: false,
+            recording: false,
             ai: AiLine::default(),
             last_toast: String::new(),
             scrollbar_on: false,
@@ -7126,6 +7133,7 @@ impl State {
             shell_title: String::new(),
             ai_muted: false,
             talk: spec.talk.unwrap_or(false),
+            recording: false,
             ai: AiLine::default(),
             last_toast: String::new(),
             scrollbar_on: false,

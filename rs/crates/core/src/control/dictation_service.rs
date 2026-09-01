@@ -9,7 +9,10 @@
 
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::Duration;
 
+use crate::control::input::SUBMIT_DELAY_MS;
+use crate::control::server::Shared;
 use crate::permissions::{self, Grant, Right};
 use crate::stt::dictation::{Dictation, Transcript};
 use crate::stt::{self, SttSettings};
@@ -117,6 +120,40 @@ impl DictationService {
             recording_panes: self.dictation.recording_panes(),
         }
     }
+}
+
+/// What a finished dictation put into a pane.
+pub struct Delivered {
+    pub text: String,
+    pub backend: &'static str,
+    pub submitted: bool,
+}
+
+/// Stop `pane_id`'s recording, transcribe it, and type the result into `uid`'s pty.
+///
+/// **Blocking** — a cold transcriber is seconds. Both callers run it off their own thread:
+/// the control route on `spawn_blocking`, the GUI's mic button on a worker, which is also
+/// why the submit delay here is a plain sleep rather than a timer. They share this function
+/// so a transcript can never reach a pane by two subtly different routes.
+pub fn stop_and_deliver(shared: &Shared, pane_id: &str, uid: &str) -> Result<Delivered, String> {
+    let transcript = shared.dictation.stop(pane_id)?;
+    let text = sanitize_for_pane(&transcript.text);
+    if text.is_empty() {
+        return Err("no speech in the recording".to_string());
+    }
+    let submitted = shared.dictation.submit_after_insert();
+    shared.sessions.write(uid, &text);
+    if submitted {
+        // A separate, later write — exactly as `/panes/{id}/input` does it — so a
+        // bracketed-paste TUI reads the Enter as a keypress and not as pasted content.
+        std::thread::sleep(Duration::from_millis(SUBMIT_DELAY_MS));
+        shared.sessions.write(uid, "\r");
+    }
+    Ok(Delivered {
+        text,
+        backend: transcript.backend,
+        submitted,
+    })
 }
 
 /// Make a transcript safe to write into a live terminal.

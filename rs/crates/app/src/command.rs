@@ -213,6 +213,9 @@ pub enum Command {
     ToggleMuteAi(usize),
     /// Toggle whether pane `0`'s "talk" (speak new assistant replies aloud) is on.
     ToggleTalk(usize),
+    /// Toggle pane `0`'s microphone: start recording dictation, or stop it and type the
+    /// transcript into that pane (the header mic button / the pane menu's "Dictate").
+    ToggleDictation(usize),
     // ---- speech (global; routed to the ControlHost's SpeechService) ----
     /// Kill any in-flight/queued speech immediately (command palette "Speech: Stop Now").
     SpeechStopNow,
@@ -430,6 +433,9 @@ pub enum Effect {
     SpeechStopNow,
     SpeechToggleMuted,
     SpeechToggleFocusedOnly,
+    /// Dictation lives on the same `ControlHost` (its `DictationService`), and the pane index
+    /// is meaningless up there — so `dispatch` resolves it to a session uid and bubbles that.
+    ToggleDictation(String),
 }
 
 /// The keyboard layout-cycle order (skips `single`, which the menu still offers).
@@ -546,6 +552,12 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         Command::SetPaneDot(i, on) => state.set_pane_dot(i, on),
         Command::ToggleMuteAi(i) => state.toggle_mute_ai(i),
         Command::ToggleTalk(i) => state.toggle_talk(i),
+        Command::ToggleDictation(i) => {
+            return match state.active_tab().panes.get(i) {
+                Some(p) => Effect::ToggleDictation(p.uid.clone()),
+                None => Effect::None,
+            }
+        }
         Command::SpeechStopNow => return Effect::SpeechStopNow,
         Command::SpeechToggleMuted => return Effect::SpeechToggleMuted,
         Command::SpeechToggleFocusedOnly => return Effect::SpeechToggleFocusedOnly,
@@ -1095,6 +1107,34 @@ mod rename_from_menu_tests {
         assert_eq!(st.editing_pane, 0, "the pick itself opens the editor");
         dispatch(&mut st, Command::CloseContext, &mgr);
         assert_eq!(st.editing_pane, 0, "dismissing the menu must not cancel it");
+    }
+
+    /// The pane microphone resolves the clicked INDEX to the pane's session uid before it
+    /// leaves `dispatch`: the `ControlHost` above `State` keys dictation by session, and a
+    /// row index would go stale the moment a pane is closed or dragged elsewhere.
+    #[tokio::test]
+    async fn the_microphone_bubbles_up_a_session_uid_not_a_row_index() {
+        let mgr = mgr();
+        let mut st = fresh();
+        st.add_pane(&mgr);
+        let uid = st.active_tab().panes[0].uid.clone();
+
+        match dispatch(&mut st, Command::ToggleDictation(0), &mgr) {
+            Effect::ToggleDictation(got) => assert_eq!(got, uid),
+            other => panic!("expected a dictation effect, got {other:?}"),
+        }
+    }
+
+    /// A stale index (the pane closed between the click and the dispatch) must be a quiet
+    /// no-op — never a panic, and never a microphone opened on the wrong pane.
+    #[test]
+    fn the_microphone_on_a_pane_that_is_gone_does_nothing() {
+        let mgr = mgr();
+        let mut st = fresh();
+        assert!(matches!(
+            dispatch(&mut st, Command::ToggleDictation(9), &mgr),
+            Effect::None
+        ));
     }
 
     /// The guards still do their job: anything that isn't the rename pair (or the menu

@@ -29,11 +29,12 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Handle;
 use tokio::task::JoinHandle;
 
+use hyperpanes_core::control::dictation_service;
 use hyperpanes_core::control::readmodel::{PaneInfo, PaneStatus, ReadModel, TabInfo, WindowInfo};
 use hyperpanes_core::control::server::{self, notify_state, Shared};
 use hyperpanes_core::control::uiops::UiOp;
@@ -109,6 +110,10 @@ pub struct ControlHost {
     /// is stopped, so it fires once per pane (not every sync tick) — cleared once the server
     /// starts, so a later stop→talk-on cycle notices again.
     talk_notice_shown: RefCell<HashSet<String>>,
+    /// Results from dictation stop-workers, waiting for a UI thread to turn into pane toasts.
+    /// A `Mutex` (not a `RefCell`) because the worker thread is the producer — transcription
+    /// blocks for seconds and must never run on the UI thread.
+    dictation_notices: Arc<Mutex<Vec<(String, String)>>>,
     /// Self-heal debounce: control-spawned uid → when it was first seen alive-but-untracked
     /// (live in the session manager, missing from BOTH the read-model and the GUI). Healed
     /// only after [`HEAL_DEBOUNCE`] so a transient mid-flight state (e.g. daemon re-attach
@@ -150,6 +155,7 @@ impl ControlHost {
             prev_active: RefCell::new(HashMap::new()),
             prev_windows: RefCell::new(Vec::new()),
             talk_notice_shown: RefCell::new(HashSet::new()),
+            dictation_notices: Arc::new(Mutex::new(Vec::new())),
             heal_pending: RefCell::new(HashMap::new()),
         };
         if host.enabled.get() {
@@ -384,6 +390,105 @@ impl ControlHost {
         }
     }
 
+    // ---- dictation (DictationService, owned by the running `Shared`) ----
+
+    /// The stable control pane-id behind a GUI session uid. GUI panes use the uid itself; a
+    /// control-created pane keeps the uuid `dispatch` minted, which `pane_ids` remembers.
+    fn pane_id_for(&self, uid: &str) -> String {
+        self.pane_ids
+            .borrow()
+            .get(uid)
+            .cloned()
+            .unwrap_or_else(|| uid.to_string())
+    }
+
+    /// Toggle the pane microphone for session `uid`, returning the message to toast right away.
+    ///
+    /// Starting is cheap (spawn a recorder) and happens inline. STOPPING is not: it waits for
+    /// the recorder to finalize its WAV and then runs the transcriber, which is seconds of
+    /// work — so it goes to a worker thread and reports back through `dictation_notices`,
+    /// which the next [`Self::sync`] tick drains onto the pane.
+    pub fn toggle_dictation(&self, uid: &str) -> String {
+        let shared = match self.shared.borrow().as_ref() {
+            Some(s) => Arc::clone(s),
+            None => return "Dictation needs the control server (Preferences)".to_string(),
+        };
+        let pane_id = self.pane_id_for(uid);
+        if !shared.dictation.is_recording(&pane_id) {
+            return match shared.dictation.start(&pane_id) {
+                Ok(recorder) => format!("Recording ({recorder}) — click the mic again to stop"),
+                Err(e) => e,
+            };
+        }
+        let notices = Arc::clone(&self.dictation_notices);
+        let uid = uid.to_string();
+        std::thread::spawn(move || {
+            let msg = match dictation_service::stop_and_deliver(&shared, &pane_id, &uid) {
+                Ok(d) if d.submitted => format!("Dictated + sent ({})", d.backend),
+                Ok(d) => format!("Dictated ({})", d.backend),
+                Err(e) => e,
+            };
+            if let Ok(mut q) = notices.lock() {
+                q.push((uid, msg));
+            }
+        });
+        "Transcribing…".to_string()
+    }
+
+    /// Project dictation state onto the GUI: light the header mic on every recording pane,
+    /// deliver any worker-thread transcript notice as a toast, and cancel a recorder whose
+    /// pane has gone away (a closed pane must not leave a microphone running — the control
+    /// route does the same on `closePane`).
+    fn sync_dictation(&self, shared: &Arc<Shared>, windows: &[Rc<Window>]) {
+        let recording = shared.dictation.recording_panes();
+        let notices: Vec<(String, String)> = match self.dictation_notices.lock() {
+            Ok(mut q) => q.drain(..).collect(),
+            Err(_) => Vec::new(),
+        };
+        if recording.is_empty() && notices.is_empty() {
+            // The overwhelmingly common case: nothing is recording and nothing came back.
+            // Panes still holding a stale `recording` flag are cleared by the loop below only
+            // when there is something to do, so check that first.
+            let stale = windows.iter().any(|w| {
+                w.state
+                    .borrow()
+                    .tabs
+                    .iter()
+                    .any(|t| t.panes.iter().any(|p| p.recording))
+            });
+            if !stale {
+                return;
+            }
+        }
+        let mut live = HashSet::new();
+        for w in windows {
+            let mut st = w.state.borrow_mut();
+            let mut changed = false;
+            for t in st.tabs.iter_mut() {
+                for p in t.panes.iter_mut() {
+                    let pid = self.pane_id_for(&p.uid);
+                    let on = recording.iter().any(|r| r == &pid);
+                    live.insert(pid);
+                    if p.recording != on {
+                        p.recording = on;
+                        changed = true;
+                    }
+                    for (uid, msg) in &notices {
+                        if &p.uid == uid {
+                            p.pane.set_toast(msg.clone());
+                        }
+                    }
+                }
+            }
+            if changed {
+                st.dirty = true;
+            }
+        }
+        for pid in recording.iter().filter(|p| !live.contains(*p)) {
+            shared.dictation.cancel(pid);
+        }
+    }
+
     // ---- live event tee ----
 
     /// Forward one session event to the running server (model cwd/exit + `/events` WS frames).
@@ -413,6 +518,10 @@ impl ControlHost {
         // The server IS running: clear the notice baseline so a later stop→talk-on cycle
         // notices again.
         self.talk_notice_shown.borrow_mut().clear();
+
+        // Dictation projection + worker-thread results. GUI state only, so it runs before the
+        // model lock (same reasoning as `apply_ui_ops` below).
+        self.sync_dictation(&shared, windows);
 
         // Tab + preferences edits queued by `/command` and `PATCH /settings`. Applied before
         // the model lock: they touch only GUI state, and doing them first means this tick's

@@ -1004,6 +1004,20 @@ impl App {
             Effect::SpeechToggleFocusedOnly => {
                 self.control.speech_toggle_focused_only();
             }
+            Effect::ToggleDictation(uid) => {
+                let msg = self.control.toggle_dictation(&uid);
+                // The mic button lights on the next sync tick, but a refusal ("no recorder
+                // installed", "the control server is off") has to be visible on the click.
+                let mut st = win.state.borrow_mut();
+                if let Some(p) = st
+                    .tabs
+                    .iter_mut()
+                    .flat_map(|t| t.panes.iter_mut())
+                    .find(|p| p.uid == uid)
+                {
+                    p.pane.set_toast(msg);
+                }
+            }
         }
     }
 
@@ -2880,6 +2894,18 @@ impl App {
         cb0!(on_toggle_fullscreen, Command::ToggleFullscreen);
         cb_i32!(on_set_layout, set_layout_from_id);
         cb_usize!(on_pane_close, Command::ClosePane);
+        // Pane-header microphone: focus the pane first (the transcript is typed into it, and
+        // the human's next keystroke should land there too), then toggle the recorder.
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app.on_pane_mic(move |i| {
+                if let Some(w) = app.window_by_id(id) {
+                    app.run_command(&w, Command::FocusPane(i as usize));
+                    app.run_command(&w, Command::ToggleDictation(i as usize));
+                }
+            });
+        }
         // Pane-header zoom/fullscreen act on that pane: focus it first, then the action.
         {
             let app = app.clone();

@@ -72,6 +72,11 @@ MCP** lets an agent — or a whole recursive agent org — watch and drive your 
   command). Replies are normalized (no markdown noise, code blocks skipped), all panes share one
   serialized speech queue with pane‑label prefixes, and the palette has global **Stop / Mute /
   Only Focused Pane**. Off by default; persisted per pane. See `docs/talk-feature.md`.
+- **Dictate — speak into a pane** — every pane header has a **microphone**: click it, talk, click
+  it again, and the recording is transcribed locally (whisper / whisper‑cli) and typed into that
+  pane. Recording uses whatever the machine already has (ffmpeg / sox / arecord); nothing is sent
+  anywhere, a transcript can never press Enter on its own, and a forgotten mic stops itself after
+  5 minutes. See `docs/stt-feature.md`.
 
 ### Layouts
 - **Automatic** layout plus five presets: **Single, Columns, Rows, Grid, Main + Stack**.

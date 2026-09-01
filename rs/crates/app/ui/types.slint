@@ -100,6 +100,10 @@ export struct PaneItem {
     // per-pane "talk" (speak new Claude assistant replies aloud): drives a small speaker
     // glyph in the header, shown only while on.
     talk: bool,
+    // this pane is recording dictation right now: lights the header microphone button and
+    // draws a red dot beside it. Projected from the control server's DictationService each
+    // sync tick; never persisted.
+    recording: bool,
     accent: color,
     // The pane's session uid — the stable identity behind the row. Used to report keyboard
     // focus back to the controller, where a row index would go stale (see `focus-changed`).

@@ -384,6 +384,8 @@ fn pane_item(
         shell_type: ps.shell_label.as_str().into(),
         // Speaker glyph in the header, shown only while this pane's "talk" is on.
         talk: ps.talk,
+        // Lights the header microphone while this pane's dictation recorder is live.
+        recording: ps.recording,
         show_frame: ps.frame_on(show_frame),
         show_dot: ps.dot_on(show_dot),
         editing,

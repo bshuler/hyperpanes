@@ -145,6 +145,12 @@ pub fn build(state: &State) -> Vec<Entry> {
             "remove kill",
             Command::ClosePane(focused),
         ));
+        cmds.push(Entry::new(
+            "Dictate: Toggle Microphone",
+            "Record speech into the focused pane, then type the transcript",
+            "stt mic microphone voice dictation speak whisper",
+            Command::ToggleDictation(focused),
+        ));
     }
 
     // ---- speech (per-pane "talk" — routed to the ControlHost's SpeechService) ----

@@ -190,15 +190,16 @@ pub fn pane_menu(state: &State, idx: usize, x: f32, y: f32, in_taskbar: bool) ->
     let global_frame = state.settings.show_frame;
     let global_dot = state.settings.show_dot;
     // Live per-pane state at open time.
-    let (frame_on, dot_on, muted, talk_on, has_sel) = match t.panes.get(idx) {
+    let (frame_on, dot_on, muted, talk_on, recording, has_sel) = match t.panes.get(idx) {
         Some(p) => (
             p.frame_on(global_frame),
             p.dot_on(global_dot),
             p.ai_muted,
             p.talk,
+            p.recording,
             p.pane.selection_text().is_some(),
         ),
-        None => (global_frame, global_dot, false, false, false),
+        None => (global_frame, global_dot, false, false, false, false),
     };
     let zoomed = t.zoomed == Some(idx);
     let fullscreen = state.fullscreen && t.focused == idx;
@@ -276,6 +277,23 @@ pub fn pane_menu(state: &State, idx: usize, x: f32, y: f32, in_taskbar: bool) ->
         false,
         sub::NONE,
         Some(Command::ToggleTalk(idx)),
+    );
+    // The other half of Talk: the header microphone, reachable from the menu too. Checked
+    // while recording, so the row reads as the stop as well as the start.
+    b.row(
+        if recording {
+            "Dictate (stop and type it)"
+        } else {
+            "Dictate (record speech)"
+        },
+        "",
+        0,
+        recording,
+        true,
+        false,
+        false,
+        sub::NONE,
+        Some(Command::ToggleDictation(idx)),
     );
     b.sep();
     // Maximize is meaningless on the taskbar's single surface, so it's dropped there.
