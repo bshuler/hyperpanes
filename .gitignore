@@ -41,3 +41,11 @@ rs/packaging/out/
 # agent worktrees (git worktrees checked out under the repo, never committed)
 .claude/worktrees/
 worktrees/
+
+# AGENTS.md — written into this working tree by an unrelated third-party tool
+# (Pane, runpane.com), not by this project. Deliberately never committed: it is
+# read as instructions by every agent tool that opens the repo, and its
+# vocabulary collides head-on with ours — it means something different by
+# "pane", "panel" and "tab" than `ctl panes` does. Keeping it untracked keeps
+# the two products from being confused with each other.
+AGENTS.md
