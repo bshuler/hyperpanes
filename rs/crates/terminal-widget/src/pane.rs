@@ -24,7 +24,8 @@ use crate::clipboard::Clipboard;
 use crate::font::Font;
 use crate::grid::TermGrid;
 use crate::links::{
-    extract_commit_candidates, extract_path_candidates, extract_url_candidates, UrlCandidate,
+    extract_commit_candidates, extract_path_candidates, extract_url_candidates, is_path_root,
+    trim_trailing_punct, PathCandidate, UrlCandidate,
 };
 use crate::render::{PaneRenderer, RenderOpts};
 use crate::search::{self, Match};
@@ -418,9 +419,30 @@ impl TerminalPane {
 
         let snap = self.grid.snapshot();
         let (text, idx, first) = self.logical_line(&snap, row, col)?;
-        let cand = extract_path_candidates(&text)
+        let mut cand = extract_path_candidates(&text)
             .into_iter()
             .find(|c| idx >= c.start && idx < c.end)?;
+
+        // A path with a space in it reaches here in pieces, because whitespace is the only
+        // token boundary an unquoted line offers. Only disk can say where such a path ends, so
+        // the repair happens here and not in `links`, which is deliberately diskless.
+        if let Some(wide) = self.widen_across_spaces(&text, &cand) {
+            cand = wide;
+        }
+
+        // A candidate that runs to the last column of a run that does NOT wrap was cut off by
+        // the program that printed it — it chose its own line width and emitted a hard newline
+        // mid-path — and nothing in the grid records what came after. The danger is not the
+        // missing link, it is that the surviving prefix can be a real directory: hovering
+        // `/System/Volumes/Data` broken at the edge would offer to open `/System/Volumes`, and
+        // a link that opens the wrong thing is worse than no link at all. So: refuse.
+        let run_rows = text.chars().count() / snap.cols.max(1);
+        if cand.end >= text.chars().count()
+            && run_rows > 0
+            && !self.grid.row_wraps(first + run_rows - 1)
+        {
+            return None;
+        }
 
         let key = self.cache_key(&cand.path);
         let resolved = match self.verified.get(&key) {
@@ -450,6 +472,108 @@ impl TerminalPane {
         Some((
             resolved, cand.line, cand.col, start, end, row, cell_w, cell_h,
         ))
+    }
+
+    /// Grow `cand` across single spaces, in both directions, while the result keeps naming a
+    /// real file.
+    ///
+    /// `Artifact(/Users/bshuler/Library/Application Support/hyperpanes/lane-watch.html)` is one
+    /// path, but nothing in the *text* says so: the space between `Application` and `Support` is
+    /// indistinguishable from the space between two words of prose. Where such a path starts and
+    /// ends is not a question the characters can answer — only `stat` can — which is why this
+    /// lives beside the grid and not in [`crate::links`], whose whole suite runs without
+    /// touching a disk.
+    ///
+    /// Both directions, because the human hovers wherever the interesting part is: over the
+    /// directory at the front on one line, over the filename at the back on the next. A widening
+    /// that only grew rightwards would light up the first half of that path and leave the half
+    /// with the filename in it dark, which is the harder failure to explain.
+    ///
+    /// So: collect the word boundaries reachable on either side, and keep the LONGEST span that
+    /// exists. Longest rather than first, because `…/Application Support` may itself be a real
+    /// directory on the way to the file that was actually meant.
+    ///
+    /// Three things bound it. The seed must already have failed to resolve, so a path that
+    /// stands on its own is never touched. A grown *start* must land on a path root (`/`, `~/`,
+    /// `./`, `C:\`) — the shape a program prints when it announces a file, and one prose does
+    /// not have. And a grown span is only ever accepted if it stats true, so the failure mode is
+    /// "no link", never "wrong link".
+    fn widen_across_spaces(&self, text: &str, cand: &PathCandidate) -> Option<PathCandidate> {
+        /// Four words each way covers `Application Support` and the deepest spaced name seen in
+        /// the wild; past that the odds tilt towards swallowing the prose around the path.
+        const MAX_WORDS: usize = 4;
+        /// A hard stop for a pathological line of single-character words.
+        const MAX_CHARS: usize = 200;
+
+        if paths::resolve_path(self.cwd.as_deref(), &cand.path).exists {
+            return None;
+        }
+        let chars: Vec<char> = text.chars().collect();
+
+        // Where the path could START: here, or at the root marker inside any of the few words
+        // to the left. Leftmost root within each word, not rightmost — the leading `/` of
+        // `Artifact(/Users/bshuler/Library/Application`, not the one before `Application`.
+        let mut starts = vec![cand.start];
+        let mut word = cand.start;
+        for _ in 0..MAX_WORDS {
+            if word == 0 || chars[word - 1] != ' ' {
+                break;
+            }
+            let mut b = word - 1;
+            while b > 0 && chars[b - 1] != ' ' {
+                b -= 1;
+            }
+            if let Some(k) = (b..word - 1).find(|&i| is_path_root(&chars[i..])) {
+                starts.push(k);
+            }
+            word = b;
+        }
+
+        // Where it could END: here, or at the end of any of the few words to the right, with
+        // that word's sentence punctuation trimmed — the `)` closing `Artifact(`, the full stop
+        // ending the line — so the span stops where the name does.
+        let mut ends = vec![cand.end];
+        let mut e = cand.end;
+        for _ in 0..MAX_WORDS {
+            if chars.get(e) != Some(&' ') {
+                break;
+            }
+            let ws = e + 1;
+            let mut we = ws;
+            while we < chars.len() && chars[we] != ' ' {
+                we += 1;
+            }
+            if we == ws {
+                break;
+            }
+            let w: String = chars[ws..we].iter().collect();
+            ends.push(we - (w.chars().count() - trim_trailing_punct(&w).chars().count()));
+            e = we;
+        }
+
+        let mut best: Option<PathCandidate> = None;
+        for &st in &starts {
+            for &en in &ends {
+                // The seed itself is the one pair already known to miss.
+                if (st, en) == (cand.start, cand.end) || en <= st || en - st > MAX_CHARS {
+                    continue;
+                }
+                if best.as_ref().is_some_and(|b| en - st <= b.end - b.start) {
+                    continue;
+                }
+                let path: String = chars[st..en].iter().collect();
+                if paths::resolve_path(self.cwd.as_deref(), &path).exists {
+                    best = Some(PathCandidate {
+                        path,
+                        line: cand.line,
+                        col: cand.col,
+                        start: st,
+                        end: en,
+                    });
+                }
+            }
+        }
+        best
     }
 
     /// The repository-wide fallback for a name the pane's own cwd could not place.
@@ -1630,6 +1754,65 @@ mod tests {
         assert!(p.link_at(1.5, 0.5, w, h).is_none());
         // Over a blank cell past the text → nothing.
         assert!(p.link_at(30.5, 0.5, w, h).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reported failure, end to end: an agent announcing an artifact under
+    /// `~/Library/Application Support`. The space is not a token boundary here, and only the
+    /// disk can say so.
+    #[test]
+    fn a_path_with_a_space_in_it_links_as_one_path() {
+        let dir = std::env::temp_dir().join(format!("hp_pane_space_{}", std::process::id()));
+        let sub = dir.join("Application Support");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("lane-watch.html");
+        std::fs::write(&file, b"x").unwrap();
+        let abs = file.to_string_lossy().into_owned();
+
+        let line = format!("Artifact({abs})");
+        let cols = line.chars().count() + 8;
+        let mut p = unit_pane(cols, 3);
+        p.feed(&line);
+        let (w, h) = (cols as f32, 3.0);
+
+        // Hover just inside the '(' — over the half of the path the tokenizer kept.
+        let hit = p
+            .link_at(10.5, 0.5, w, h)
+            .expect("the spaced path should be one link");
+        assert_eq!(hit.abs_path.replace('\\', "/"), abs.replace('\\', "/"));
+        // The underline covers the whole name: from just past the '(' to just before the ')'.
+        assert_eq!(hit.x, 9.0);
+        assert_eq!(hit.w, abs.chars().count() as f32);
+
+        // ...and the second half of it is the same link, not a separate one.
+        let tail = p
+            .link_at((line.chars().count() - 3) as f32 + 0.5, 0.5, w, h)
+            .expect("the far side of the space belongs to the same link");
+        assert_eq!(tail.abs_path.replace('\\', "/"), abs.replace('\\', "/"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path the printing program broke across lines itself leaves a prefix that can be a real
+    /// directory. Offering it would open the wrong thing; the honest answer is no link.
+    #[test]
+    fn a_path_cut_off_by_a_hard_wrap_offers_no_link_at_all() {
+        let dir = std::env::temp_dir().join(format!("hp_pane_cut_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Volumes").join("Data")).unwrap();
+
+        // Room to spare: `./Volumes` ends mid-row, so it is plainly whole and links.
+        let mut wide = unit_pane(20, 3);
+        wide.set_cwd(Some(dir.to_string_lossy().into_owned()));
+        wide.feed("xxx ./Volumes");
+        assert!(wide.link_at(6.5, 0.5, 20.0, 3.0).is_some());
+
+        // Same text in a pane exactly its width, with the rest on a line of its own: the run
+        // does not wrap, so `./Volumes` is a fragment and must not stand in for `./Volumes/Data`.
+        let mut tight = unit_pane(13, 3);
+        tight.set_cwd(Some(dir.to_string_lossy().into_owned()));
+        tight.feed("xxx ./Volumes\r\n/Data");
+        assert!(tight.link_at(6.5, 0.5, 13.0, 3.0).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -39,7 +39,7 @@ fn main() {
     // this a dev build registers no hook at all and every hand-started tool pane silently
     // falls back to the scan-and-diff heuristic — the one path we cannot test by running
     // it. This list and the five packaging manifests must all carry every entry of
-    // HOOKED_TOOLS; `hooks_ship_in_every_packaging_manifest` in hyperpanes-core's
+    // HOOKED_TOOLS; `every_hook_ships_in_every_packaging_manifest` in hyperpanes-core's
     // tools::session_hook asserts it, because each of the last two tools added was added
     // to some of those places and not the others.
     let hooks: [(&str, &str); 6] = [
@@ -131,15 +131,12 @@ fn main() {
     let cfg = slint_build::CompilerConfiguration::new().with_library_paths(libs);
     slint_build::compile_with_config("ui/app.slint", cfg).expect("slint compile failed");
 
-    for f in [
-        "ui/app.slint",
-        "ui/topbar.slint",
-        "ui/paneview.slint",
-        "ui/theme.slint",
-        "ui/types.slint",
-    ] {
-        println!("cargo:rerun-if-changed={f}");
-    }
+    // The WHOLE ui/ tree, not a hand-kept list of it. `app.slint` imports fifteen other
+    // files and the list here had five of them, so an edit confined to (say)
+    // `viewpanes.slint` left the compiled UI stale — the build succeeded and the change
+    // simply was not in it, which is the worst shape a build bug can take. Cargo watches a
+    // directory recursively, and one entry cannot fall behind the imports the way a list did.
+    println!("cargo:rerun-if-changed=ui");
     println!("cargo:rerun-if-changed={}", widget.display());
 }
 

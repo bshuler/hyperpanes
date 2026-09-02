@@ -5481,8 +5481,16 @@ impl State {
 
     /// Open the in-pane search box on pane `idx` (or, if already open, re-focus it). Bumps the
     /// focus sequence so the widget (re)focuses the query input even when the box was already up.
+    ///
+    /// A view pane is skipped. The box is drawn BY the terminal widget, and a view pane covers
+    /// that widget completely (D3) — opening it there would put the pane into a searching state
+    /// with nothing on screen to show for it and no visible way back out. The pane menu already
+    /// omits the row; this is the same answer for the keyboard chord.
     pub fn open_search(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
+            if !p.kind.is_pty() {
+                return;
+            }
             p.pane.search_open();
             p.search_focus_seq = p.search_focus_seq.wrapping_add(1);
             self.dirty = true;
@@ -5514,10 +5522,34 @@ impl State {
     }
 
     /// Copy pane `idx`'s current selection to the clipboard (no-op without a selection).
+    ///
+    /// Two panes, two selections. A pty pane's lives in the terminal widget's grid; a view
+    /// pane has no grid at all (D3), so its selection is a row range on the projection and
+    /// the text has to be re-joined from the rows. Both end at the same clipboard, and both
+    /// raise the same "Copied …" toast, because from the human's side this is one gesture.
     pub fn copy_pane(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
-            p.pane.copy_selection();
+            if p.kind.is_pty() {
+                p.pane.copy_selection();
+            } else if let Some((lo, hi)) = crate::viewpane::selected_range(&p.uid) {
+                let text = crate::viewpane::copy_range(&p.uid, lo, hi);
+                if !text.is_empty() {
+                    p.pane.copy_text(&text);
+                }
+            }
             self.dirty = true;
+        }
+    }
+
+    /// Move a view pane's row selection: plain click replaces it, shift-click stretches it
+    /// from the anchor. Lives here rather than in the view because the selection has to
+    /// outlive a re-render and be readable by Copy, which is a controller concern.
+    pub fn view_select(&mut self, idx: usize, row: usize, extend: bool) {
+        if let Some(p) = self.active_tab().panes.get(idx) {
+            if !p.kind.is_pty() {
+                crate::viewpane::select_row(&p.uid, row, extend);
+                self.dirty = true;
+            }
         }
     }
 
@@ -5669,10 +5701,15 @@ impl State {
         }
     }
 
-    /// Select all of pane `idx`'s viewport.
+    /// Select all of pane `idx`'s viewport — its grid on a pty pane, every projected row
+    /// on a view pane (see [`State::copy_pane`] for why those are two different selections).
     pub fn select_all_pane(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
-            p.pane.select_all();
+            if p.kind.is_pty() {
+                p.pane.select_all();
+            } else {
+                crate::viewpane::select_all(&p.uid);
+            }
             self.dirty = true;
         }
     }
@@ -5736,9 +5773,13 @@ impl State {
         }
     }
 
-    /// Clear pane `idx`'s screen + scrollback.
+    /// Clear pane `idx`'s screen + scrollback. A view pane's content is a projection of a file,
+    /// not a grid the human typed into, so there is nothing here for a clear to mean.
     pub fn clear_pane(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
+            if !p.kind.is_pty() {
+                return;
+            }
             p.pane.clear();
             self.dirty = true;
         }
@@ -7320,7 +7361,12 @@ impl State {
             title: ps.title.clone(),
             final_close: self.ends_window_pane(ti, idx),
         };
-        if self.skip_confirm(&pending) {
+        // A view pane is read-only and has no session behind it (D3): there is no work in
+        // flight to interrupt and nothing to lose but a scroll position, so the card has
+        // nothing to warn about and would be pure nagging. The window-ending close still
+        // asks — that one quits, and no pane kind makes quitting undoable.
+        let read_only = !ps.kind.is_pty();
+        if self.skip_confirm(&pending) || (read_only && !pending.final_close) {
             return self.close_pane_menu(ti, idx, mgr);
         }
         self.ask_close(pending);
@@ -8471,6 +8517,50 @@ mod view_pane_tests {
         let a = st.add_pane_opts(&m, view_opts(PaneKind::Markdown)).unwrap();
         let b = st.add_pane_opts(&m, view_opts(PaneKind::Markdown)).unwrap();
         assert_ne!(a, b);
+    }
+
+    /// A view pane has no text grid to select into (D3), so Select All and Copy have to
+    /// reach the projection instead. This pins the ROUTING: the controller must send a
+    /// non-pty pane's selection to `viewpane`, not to the terminal widget that is not even
+    /// drawn there.
+    #[test]
+    fn select_all_on_a_view_pane_selects_its_projected_rows() {
+        let dir = std::env::temp_dir().join("hp-state-viewsel");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("notes.txt");
+        std::fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        let uid = st
+            .add_pane_opts(
+                &m,
+                NewPaneOpts {
+                    kind: Some(PaneKind::FileViewer),
+                    cwd: Some(f.display().to_string()),
+                    ..Default::default()
+                },
+            )
+            .expect("view pane added");
+        // The projection is normally built by the render pass; a headless test builds it
+        // itself so there are rows for a selection to name.
+        crate::viewpane::model_for(&uid, &PaneKind::FileViewer, Some(&f.display().to_string()));
+
+        st.select_all_pane(0);
+        assert_eq!(crate::viewpane::selected_range(&uid), Some((0, 2)));
+        assert_eq!(
+            crate::viewpane::copy_range(&uid, 0, 2),
+            "alpha\nbeta\ngamma"
+        );
+
+        // A click narrows it to one row; a shift-click stretches back from that anchor.
+        st.view_select(0, 2, false);
+        assert_eq!(crate::viewpane::selected_range(&uid), Some((2, 2)));
+        st.view_select(0, 1, true);
+        assert_eq!(crate::viewpane::selected_range(&uid), Some((1, 2)));
+
+        crate::viewpane::forget(&uid);
     }
 
     /// D3's other half: a view pane's `cwd` is not bookkeeping, it is the CONTENT — the file
@@ -10544,6 +10634,54 @@ mod close_history_tests {
             .iter()
             .flat_map(|t| t.panes.iter().map(|p| p.uid.to_string()))
             .collect()
+    }
+
+    /// A view pane is read-only and has no session behind it (D3): there is no work in
+    /// flight for the card to warn about, so the × just closes it. The close is still
+    /// reversible — it goes on the same history as any other.
+    #[test]
+    fn closing_a_read_only_pane_asks_nothing() {
+        let m = mgr();
+        let mut st = fresh();
+        for u in ["view-a", "view-b"] {
+            st.adopt_pane(
+                &m,
+                DetachedPane {
+                    kind: PaneKind::Markdown,
+                    ..det(u)
+                },
+            );
+        }
+
+        assert!(st.request_close_pane(0, 0, &m), "the window lives on");
+        assert!(
+            !matches!(st.overlay, Overlay::ConfirmClose),
+            "a read-only pane must not raise the confirm card"
+        );
+        assert_eq!(laid_out(&st), ["view-b"]);
+        assert_eq!(st.closed.len(), 1, "and it is still reopenable");
+    }
+
+    /// The exception: the last pane of the last tab ends the WINDOW. Being read-only says
+    /// nothing about that close, so the card comes up as it would for any other pane.
+    #[test]
+    fn the_last_read_only_pane_still_asks_because_it_quits() {
+        let m = mgr();
+        let mut st = fresh();
+        st.adopt_pane(
+            &m,
+            DetachedPane {
+                kind: PaneKind::Markdown,
+                ..det("view-only")
+            },
+        );
+
+        assert!(st.request_close_pane(0, 0, &m));
+        assert!(
+            matches!(st.overlay, Overlay::ConfirmClose),
+            "the close that ends the window asks whatever the pane is"
+        );
+        assert_eq!(laid_out(&st), ["view-only"], "and nothing closed yet");
     }
 
     #[test]

@@ -669,7 +669,106 @@ Probed on this machine: `vim -> /usr/bin/vim`, `nvim -> /opt/homebrew/bin/nvim`,
 `nano -> /usr/bin/nano`. `emacs` is not installed; the registry entry does not require
 it to be, which is the point of D4.
 
+### D16 — A read-only pane is offered only what a read-only pane can do
+
+**Asked for:** "a md preview pane is read only. read only panes dont need a record icon
+for stt. review all panes for read only, and adjust appropriately", "read only panes
+dont need close pane confirmation", "when in a view only pane, you should be able to
+select and copy the contents".
+
+Family B — `FileBrowser`, `FileViewer`, `Markdown`, `Browser` — has no pty (D3). Half
+the pane's affordances act on a *session*, and on these panes there is no session for
+them to act on. The rule is: **omit, don't disable**. A row that can never apply to this
+kind of pane is not a greyed-out action, it is a different pane's menu; and a header
+button that is present but inert is a promise the app cannot keep.
+
+Gone on a view pane: the microphone (header button *and* menu row — there is nowhere for
+a transcript to be typed), Talk, Mute AI Summary, Search…, Restart, Refresh Env, Paste,
+Clear. `Command::ToggleDictation`, `paste_pane`, `drop_files`, `open_search`,
+`clear_pane` and `restart_pane_with` each refuse independently, so the guard does not
+depend on the UI having hidden the control.
+
+Kept: Copy, Select All, Open Folder, Browse Files, Rename…, colour, move, zoom,
+fullscreen, close. These are about the *pane*, not its session.
+
+**Closing.** The confirm card exists to warn about work in flight. A view pane has none,
+so its × just closes it — the close is still reversible, on the same history as any
+other. The one exception is the close that ends the *window*: being read-only says
+nothing about quitting, so that one still asks whatever the pane is.
+
+**Selecting.** A view pane covers the terminal widget completely, so the grid selection
+the widget owns cannot reach it. Selection is therefore a **row range** held next to the
+projection in `viewpane.rs`, as `(anchor, focus)` — it lives with the rows it indexes and
+dies with them, because row 40 of the old file has no claim on row 40 of the new one. The
+gesture is click + shift-click (Slint's `TouchArea` grabs the mouse on press and the
+`ListView`'s Flickable owns the vertical drag, so cross-row drag selection is not
+tractable); on an *openable* row a plain click still opens it and shift-click selects,
+because that gesture was there first and is what a file browser is for. `copy_text()`
+decides what a row is worth on the clipboard: a viewer's line is byte-for-byte, prose
+comes back with its inline markup resolved the way it was drawn, and structure that was
+visible *as* structure (a bullet's marker, nesting and task box; a quote; a table's
+columns) is re-spelled the plain-text way, because a paste has no other way to carry it.
+The copy toast is drawn by `ViewPane` itself for the same reason the selection is: the
+widget that normally draws it is not on screen.
+
 ---
+
+### D17 — Why paths in an agent pane were not linking
+
+**Asked for:** `"Artifact(/Users/bshuler/Library/Application Support/hyperpanes/lane-watch.html)"
+isnt being hot linked`, then `/System/Volumes/Data`, `/usr/bin/python3`, `/dev/disk3s5`,
+`/Users/bshuler/Library/Application Support/hyperpanes/hyperpane` and
+`.claude/skills/hyperpanes/relay.py` — six reports, and it turned out to be three bugs.
+
+D14 built the detector and it worked. What failed was everything around it.
+
+**1. A pane running a full-screen app had no link layer at all.** Both halves of it —
+`link-moved` (the hover hit-test) and `link-activated` (the click) — lived in the `else`
+of `if (root.app-grabs-mouse && !e.modifiers.shift)` in `widget.slint`. Any program that
+sets DECSET 1000/1002/1003 to read the mouse — Claude Code, vim, htop — therefore turned
+every path it printed into plain text, silently. The model was answering the whole time;
+the UI had stopped asking. That is the single cause of four of the six reports, including
+the three paths that resolve perfectly in a shell.
+
+The hit-test is now unconditional: it is a pure query that sets an underline and nothing
+else, so it costs the grabbing app nothing, and its pointer report still goes through
+untouched. The click is the part that has to be shared, and it is shared the way every
+terminal shares it — the app keeps the plain click, a modifier buys the link. Ctrl/Cmd
+means **open** in a grabbing pane rather than the copy it means in a plain shell, because
+open is the gesture with nowhere else to go; copy stays on Shift, which is already the
+escape hatch for selecting inside such an app. A modifier-click that goes to the link is
+withheld from the app in full — down, moves and up — because reporting only the press
+would leave a mouse-aware TUI stuck mid-drag with no matching release.
+
+**2. A path with a space in it arrived in pieces.** Whitespace is the only token boundary
+an unquoted line has, so `…/Application Support/…` is two tokens and neither is a file.
+Where such a path starts and ends is not a question the characters can answer — only
+`stat` can — so the repair lives in `pane.rs`, next to the disk, and `links.rs` stays
+diskless and pure. On a candidate that fails to resolve, the pane collects the word
+boundaries a few words either side, and keeps the **longest** span that exists. Both
+directions, because the human hovers wherever the interesting part is — the directory at
+the front, or the filename at the back — and a rightward-only widening would light up the
+first half of that path and leave the half with the filename in it dark.
+
+Bounded three ways: the seed must already have missed, so a path that stands on its own is
+never touched; a grown *start* must land on a path root (`/`, `~/`, `./`, `C:\`), the shape
+a program prints when it announces a file and one prose does not have; and a grown span is
+accepted only if it stats true. The failure mode is "no link", never "wrong link".
+
+**3. `Artifact(` is not part of the filename.** The wrapping-punctuation trim only ever
+looked at the ends of a token, and this bracket is in the middle of one. An opening
+delimiter mid-token now splits it — but only when what follows is a *rooted* path. Testing
+the other side ("is `Artifact` a bare word?") reads the same on `a(b).txt`, where the
+bracket really is part of the name, and would cut it to `b).txt`.
+
+**What is deliberately not fixed.** A path the printing program broke across lines itself
+cannot be rejoined: it emitted a real newline, and nothing in the grid distinguishes that
+from any other. The danger there is not the missing link but the surviving prefix —
+`/System/Volumes/Data` cut at the column edge leaves `/System/Volumes`, which is a real
+directory, so the link would quietly open the wrong thing. A candidate that runs to the
+last column of a run that does not wrap is therefore refused outright: no link beats a
+wrong one. The trailing `…` in a line an agent truncated is not ours either — that text
+never reached the terminal.
 
 ## 10. Build log
 

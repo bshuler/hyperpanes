@@ -368,6 +368,14 @@ fn pane_item(
             SharedString::new(),
         )
     };
+    // Only meaningful for a view pane; -1/-1 everywhere else says "nothing selected".
+    let (view_sel_lo, view_sel_hi) = match is_view
+        .then(|| crate::viewpane::selected_range(&ps.uid))
+        .flatten()
+    {
+        Some((lo, hi)) => (lo as i32, hi as i32),
+        None => (-1, -1),
+    };
     let manual_subtitle = ps.subtitle.as_ref().is_some_and(|s| !s.is_empty());
     let ai_subtitle: SharedString = if manual_subtitle || ps.ai_muted || ps.ai.full.is_empty() {
         SharedString::new()
@@ -442,6 +450,8 @@ fn pane_item(
         },
         view_rows,
         view_title,
+        view_sel_lo,
+        view_sel_hi,
     }
 }
 

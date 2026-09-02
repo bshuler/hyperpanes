@@ -319,6 +319,9 @@ export component PaneView inherits Rectangle {
     // the same one it handed to the view — a stale index can only miss, never open the
     // wrong path.
     callback pane-view-activate(int, int);
+    // A row of a view pane was SELECTED (not opened): pane index, row index, and
+    // whether shift was held to extend the range.
+    callback pane-view-select(int, int, bool);
     // A markdown link clicked inside a view pane: the pane index and the href.
     callback pane-view-link(int, string);
     // Wave-2 overlay callbacks (each maps to a Command in the controller).
@@ -555,7 +558,11 @@ export component PaneView inherits Rectangle {
                             }
                         }
                         // each wrapped so it centres vertically against the title
-                        VerticalLayout {
+                        // The microphone only on a PTY pane (`kind < 2`, the same test
+                        // `tp.visible` uses). A view pane is read-only — there is nowhere
+                        // for a transcript to be typed — so the button is absent rather
+                        // than present and inert.
+                        if pane.kind < 2 : VerticalLayout {
                             alignment: center;
                             PaneBtn {
                                 kind: 3;
@@ -593,7 +600,11 @@ export component PaneView inherits Rectangle {
                             PaneBtn {
                                 kind: 2;
                                 danger: true;
-                                tip: "Close this pane and end its shell";
+                                // A view pane has no shell to end (D3), so it must not be
+                                // promised one — the tip is the only place the difference shows.
+                                tip: pane.kind < 2
+                                    ? "Close this pane and end its shell"
+                                    : "Close this pane";
                                 clicked => { root.pane-close(idx); }
                             }
                         }
@@ -704,9 +715,16 @@ export component PaneView inherits Rectangle {
                         rows: pane.view-rows;
                         title: pane.view-title;
                         accent: pane.accent;
+                        sel-lo: pane.view-sel-lo;
+                        sel-hi: pane.view-sel-hi;
+                        toast: pane.toast;
                         activate(i) => {
                             root.focus-pane(idx);
                             root.pane-view-activate(idx, i);
+                        }
+                        select(i, ext) => {
+                            root.focus-pane(idx);
+                            root.pane-view-select(idx, i, ext);
                         }
                         link-clicked(l) => {
                             root.focus-pane(idx);

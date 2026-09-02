@@ -220,6 +220,24 @@ pub fn extract_path_candidates(line: &str) -> Vec<PathCandidate> {
         if e <= s {
             continue;
         }
+        // A delimiter that OPENS mid-token is prose punctuation introducing a path, not part of
+        // its name: `Artifact(/Users/…)` has to yield `/Users/…`. `tokenize` cannot see this —
+        // it splits on whitespace and quotes, and there is no whitespace here.
+        //
+        // The test is what stands to the RIGHT of the bracket, and it is deliberately strict:
+        // only a token that begins at a path ROOT (`/`, `\`, `~/`, `./`, `../`, `C:\`) counts.
+        // That is the shape a program prints when it announces a file, and it is a shape prose
+        // does not have. Testing the left side instead — "is `Artifact` a bare word?" — reads
+        // the same on `a(b).txt`, where the bracket really is part of the filename, and would
+        // cut it to `b).txt`.
+        for i in (s + 1..e).rev() {
+            if LEAD.contains(&tok[i]) {
+                if i + 1 < e && is_path_root(&tok[i + 1..e]) {
+                    s = i + 1;
+                }
+                break;
+            }
+        }
         let core: String = tok[s..e].iter().collect();
         let (path, line_no, col_no) = split_suffix(&core);
         if path.is_empty() || !has_path_shape(&path) {
@@ -235,6 +253,30 @@ pub fn extract_path_candidates(line: &str) -> Vec<PathCandidate> {
     }
 
     out
+}
+
+/// Does `t` begin the way an *explicitly rooted* path begins? Absolute (`/`, `\\`), home
+/// (`~/`), pointedly relative (`./`, `../`), or a Windows drive (`C:\\`, `C:/`). A bare
+/// `src/main.rs` is a path too, but it is not *rooted*, and this asks the narrower question:
+/// see the interior-delimiter split in [`extract_path_candidates`].
+pub fn is_path_root(t: &[char]) -> bool {
+    match t {
+        [] => false,
+        ['/', ..] | ['\\', ..] => true,
+        ['~', '/', ..] | ['~', '\\', ..] => true,
+        ['.', '/', ..] | ['.', '\\', ..] => true,
+        ['.', '.', '/', ..] | ['.', '.', '\\', ..] => true,
+        [d, ':', sep, ..] if d.is_ascii_alphabetic() && (*sep == '/' || *sep == '\\') => true,
+        _ => false,
+    }
+}
+
+/// Strip the sentence punctuation and unbalanced closers off the end of `s` — the same
+/// `TRAIL` set [`extract_path_candidates`] trims from an unquoted token. Public because the
+/// space-widening pass in the pane has to do it to a word this module never tokenised on its
+/// own (see `Pane::widen_across_spaces`), and there must be exactly one such list.
+pub fn trim_trailing_punct(s: &str) -> &str {
+    s.trim_end_matches(TRAIL)
 }
 
 /// A detected `http://`/`https://` URL and the column range it occupies on the row.
@@ -510,6 +552,28 @@ mod tests {
         let c = only("\"a b.ts\":10:3");
         assert_eq!(c[0].path, "a b.ts");
         assert_eq!((c[0].line, c[0].col), (Some(10), Some(3)));
+    }
+
+    #[test]
+    fn an_opening_delimiter_after_prose_is_not_part_of_the_path() {
+        // The shape a coding agent prints when it announces a file it touched. `tokenize` sees
+        // no whitespace between `Artifact(` and the path, so the split has to happen here.
+        let c = extract_path_candidates("Artifact(/Users/me/a.txt)");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].path, "/Users/me/a.txt");
+        assert_eq!(
+            &"Artifact(/Users/me/a.txt)"[c[0].start..c[0].end],
+            "/Users/me/a.txt"
+        );
+    }
+
+    #[test]
+    fn a_bracket_inside_a_filename_stays_part_of_it() {
+        // The counterexample the rooted-path test exists for: `b).txt` is not a path root, so
+        // the token is left whole and the duplicate-download name survives.
+        let c = extract_path_candidates("a(b).txt");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].path, "a(b).txt");
     }
 
     #[test]

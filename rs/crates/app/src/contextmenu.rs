@@ -190,16 +190,27 @@ pub fn pane_menu(state: &State, idx: usize, x: f32, y: f32, in_taskbar: bool) ->
     let global_frame = state.settings.show_frame;
     let global_dot = state.settings.show_dot;
     // Live per-pane state at open time.
-    let (frame_on, dot_on, muted, talk_on, recording, has_sel) = match t.panes.get(idx) {
+    //
+    // `pty` is the read-only test. Half of this menu acts on a pane's *session* — talk and
+    // dictation, paste, restart, refresh env, clear, the in-pane search over the terminal
+    // grid — and a view pane (file browser / viewer / markdown preview) has no session at
+    // all (D3). Those rows are omitted there rather than shown greyed: a row that can never
+    // apply to this pane is not a disabled action, it is a different pane's menu.
+    let (frame_on, dot_on, muted, talk_on, recording, has_sel, pty) = match t.panes.get(idx) {
         Some(p) => (
             p.frame_on(global_frame),
             p.dot_on(global_dot),
             p.ai_muted,
             p.talk,
             p.recording,
-            p.pane.selection_text().is_some(),
+            if p.kind.is_pty() {
+                p.pane.selection_text().is_some()
+            } else {
+                crate::viewpane::selected_range(&p.uid).is_some()
+            },
+            p.kind.is_pty(),
         ),
-        None => (global_frame, global_dot, false, false, false, false),
+        None => (global_frame, global_dot, false, false, false, false, true),
     };
     let zoomed = t.zoomed == Some(idx);
     let fullscreen = state.fullscreen && t.focused == idx;
@@ -256,45 +267,47 @@ pub fn pane_menu(state: &State, idx: usize, x: f32, y: f32, in_taskbar: bool) ->
         sub::NONE,
         Some(Command::SetPaneDot(idx, !dot_on)),
     );
-    b.row(
-        "Mute AI Summary",
-        "",
-        0,
-        muted,
-        true,
-        false,
-        false,
-        sub::NONE,
-        Some(Command::ToggleMuteAi(idx)),
-    );
-    b.row(
-        "Talk (speak replies)",
-        "",
-        0,
-        talk_on,
-        true,
-        false,
-        false,
-        sub::NONE,
-        Some(Command::ToggleTalk(idx)),
-    );
-    // The other half of Talk: the header microphone, reachable from the menu too. Checked
-    // while recording, so the row reads as the stop as well as the start.
-    b.row(
-        if recording {
-            "Dictate (stop and type it)"
-        } else {
-            "Dictate (record speech)"
-        },
-        "",
-        0,
-        recording,
-        true,
-        false,
-        false,
-        sub::NONE,
-        Some(Command::ToggleDictation(idx)),
-    );
+    if pty {
+        b.row(
+            "Mute AI Summary",
+            "",
+            0,
+            muted,
+            true,
+            false,
+            false,
+            sub::NONE,
+            Some(Command::ToggleMuteAi(idx)),
+        );
+        b.row(
+            "Talk (speak replies)",
+            "",
+            0,
+            talk_on,
+            true,
+            false,
+            false,
+            sub::NONE,
+            Some(Command::ToggleTalk(idx)),
+        );
+        // The other half of Talk: the header microphone, reachable from the menu too. Checked
+        // while recording, so the row reads as the stop as well as the start.
+        b.row(
+            if recording {
+                "Dictate (stop and type it)"
+            } else {
+                "Dictate (record speech)"
+            },
+            "",
+            0,
+            recording,
+            true,
+            false,
+            false,
+            sub::NONE,
+            Some(Command::ToggleDictation(idx)),
+        );
+    }
     b.sep();
     // Maximize is meaningless on the taskbar's single surface, so it's dropped there.
     if !in_taskbar {
@@ -325,22 +338,26 @@ pub fn pane_menu(state: &State, idx: usize, x: f32, y: f32, in_taskbar: bool) ->
         sub::NONE,
         Some(Command::FullscreenPane(idx)),
     );
-    // The widget's in-pane search shortcut, shown with the platform modifier label
-    // (Slint's control slot is Cmd on macOS).
-    let search_sc = format!("{}+F", crate::keybindings::CTRL_LABEL);
-    b.row(
-        "Search…",
-        &search_sc,
-        0,
-        false,
-        false,
-        false,
-        false,
-        sub::NONE,
-        Some(Command::SearchPane(idx)),
-    );
-    b.item("Restart", Command::RestartPane(idx));
-    b.item("Refresh Env", Command::RefreshEnvPane(idx));
+    if pty {
+        // The widget's in-pane search shortcut, shown with the platform modifier label
+        // (Slint's control slot is Cmd on macOS).
+        let search_sc = format!("{}+F", crate::keybindings::CTRL_LABEL);
+        b.row(
+            "Search…",
+            &search_sc,
+            0,
+            false,
+            false,
+            false,
+            false,
+            sub::NONE,
+            Some(Command::SearchPane(idx)),
+        );
+        b.item("Restart", Command::RestartPane(idx));
+        b.item("Refresh Env", Command::RefreshEnvPane(idx));
+    }
+    // Both survive on a view pane: its cwd is the file or directory it is showing, which is
+    // exactly what "reveal it" and "browse from here" should mean.
     b.item("Open Folder", Command::RevealPaneCwd(idx));
     b.item("Browse Files", Command::OpenFileBrowser(idx));
     b.sep();
@@ -355,9 +372,13 @@ pub fn pane_menu(state: &State, idx: usize, x: f32, y: f32, in_taskbar: bool) ->
         sub::NONE,
         Some(Command::CopyPane(idx)),
     );
-    b.item("Paste", Command::PastePane(idx));
+    if pty {
+        b.item("Paste", Command::PastePane(idx));
+    }
     b.item("Select All", Command::SelectAllPane(idx));
-    b.item("Clear", Command::ClearPane(idx));
+    if pty {
+        b.item("Clear", Command::ClearPane(idx));
+    }
     b.sep();
     // ---- "Reminder ▸" — park the pane (session alive) until the chosen time. A single
     // submenu row; the flyout offers the four quick offsets plus an inline Custom input.
@@ -865,6 +886,100 @@ pub fn parse_custom_duration(s: &str, now_secs_since_midnight: u64) -> Option<u3
 /// into the `ReminderCustom` Slint global's `parse-minutes` callback.
 pub fn parse_custom_minutes_now(s: &str) -> Option<u32> {
     parse_custom_duration(s, crate::state::local_secs_since_midnight())
+}
+
+#[cfg(test)]
+mod read_only_menu_tests {
+    //! Half the pane menu acts on a pane's SESSION, and a view pane has none (D3). Those
+    //! rows are omitted rather than greyed: a row that can never apply to this pane is not
+    //! a disabled action, it is a different pane's menu.
+    use super::*;
+    use crate::state::{DetachedPane, State};
+    use hyperpanes_core::session_manager::SessionManager;
+    use hyperpanes_core::tools::PaneKind;
+
+    fn labels(st: &State) -> Vec<String> {
+        pane_menu(st, 0, 0.0, 0.0, false)
+            .entries
+            .iter()
+            .map(|e| e.label.to_string())
+            .collect()
+    }
+
+    fn with_kind(kind: PaneKind) -> State {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mgr = SessionManager::new(tx);
+        let mut st = State::new(crate::theme::load_font(1.0));
+        st.adopt_pane(
+            &mgr,
+            DetachedPane {
+                uid: "p".into(),
+                title: "p".into(),
+                subtitle: None,
+                pinned_accent: None,
+                show_frame: None,
+                show_dot: None,
+                font_px: 14.0,
+                spawn_command: None,
+                spawn_args: None,
+                spawn_shell: None,
+                kind,
+                tool_session: None,
+                cwd: None,
+            },
+        );
+        st
+    }
+
+    /// The session rows are gone on a view pane — and every one of them is present on a
+    /// terminal pane, so the test fails if a label is simply renamed out from under it.
+    #[test]
+    fn a_view_pane_is_offered_nothing_that_needs_a_session() {
+        let session_only = [
+            "Mute AI Summary",
+            "Talk (speak replies)",
+            "Search…",
+            "Restart",
+            "Refresh Env",
+            "Paste",
+            "Clear",
+        ];
+        let term = labels(&with_kind(PaneKind::Terminal));
+        for row in session_only {
+            assert!(term.iter().any(|l| l == row), "{row} exists on a pty pane");
+        }
+        // Dictation's label flips with the recording state, so it is matched by prefix.
+        assert!(
+            term.iter().any(|l| l.starts_with("Dictate")),
+            "the microphone row exists on a pty pane"
+        );
+
+        let view = labels(&with_kind(PaneKind::Markdown));
+        for row in session_only {
+            assert!(!view.iter().any(|l| l == row), "{row} must be absent");
+        }
+        assert!(
+            !view.iter().any(|l| l.starts_with("Dictate")),
+            "a read-only pane has nowhere to type a transcript"
+        );
+    }
+
+    /// The rows that survive: a view pane still has content to copy, a cwd to open, and a
+    /// pane to rename, colour, move and close.
+    #[test]
+    fn a_view_pane_keeps_everything_that_is_about_the_pane_itself() {
+        let view = labels(&with_kind(PaneKind::Markdown));
+        for row in [
+            "Copy",
+            "Select All",
+            "Open Folder",
+            "Browse Files",
+            "Rename…",
+            "Close Pane",
+        ] {
+            assert!(view.iter().any(|l| l == row), "{row} must survive");
+        }
+    }
 }
 
 #[cfg(test)]

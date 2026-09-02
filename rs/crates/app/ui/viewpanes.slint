@@ -61,7 +61,12 @@ component RowMark inherits Rectangle {
 component ViewRowView inherits Rectangle {
     in property <PaneViewRow> item;
     in property <color> accent;
+    // Inside the pane's selected row range: paints the highlight.
+    in property <bool> selected;
     callback activate();
+    // The human picked this row. `extend` is a shift-click — stretch the existing
+    // selection to reach here instead of starting a new one.
+    callback select(bool);
     // A link inside rendered markdown. Reported as the href, not the row: the
     // controller opens it through the same browser-choice path an OSC 8 link in a
     // terminal pane takes, so one preference governs both.
@@ -88,12 +93,32 @@ component ViewRowView inherits Rectangle {
         : root.flows ? max(19px, flow.preferred-height + 5px)
         : root.heads ? max(22px, head.preferred-height + 8px)
         : 19px;
-    background: ta.has-hover && root.item.activatable ? #ffffff12 : transparent;
+    // Selection wins over hover: while a range is highlighted, the pointer moving
+    // across it must not make one row of it look different from the rest.
+    background: root.selected ? root.accent.with-alpha(0.22)
+        : ta.has-hover && root.item.activatable ? #ffffff12
+        : transparent;
 
     ta := TouchArea {
-        mouse-cursor: root.item.activatable ? pointer : default;
+        // A row you can open reads as a link; a row you can only select reads as
+        // text, which is exactly what it now is.
+        mouse-cursor: root.item.activatable ? pointer : text;
+        // Shift is captured on the press because `clicked` does not carry the
+        // modifiers (same pattern as the sidebar's shift-range select).
+        property <bool> shift;
+        pointer-event(e) => {
+            if (e.kind == PointerEventKind.down) { self.shift = e.modifiers.shift; }
+        }
         clicked => {
-            if (root.item.activatable) { root.activate(); }
+            // A plain click on an openable row still opens it — that gesture was
+            // there first and is what a file browser is for. Shift-click is the
+            // way to select one of those instead, and on an inert row (a line of
+            // a file, a paragraph of a preview) a plain click already selects.
+            if (root.item.activatable && !self.shift) {
+                root.activate();
+            } else {
+                root.select(self.shift);
+            }
         }
     }
 
@@ -432,9 +457,19 @@ export component ViewPane inherits Rectangle {
     in property <[PaneViewRow]> rows;
     in property <string> title;
     in property <color> accent;
+    // The selected row range, inclusive; -1/-1 for none. Decided Rust-side — this
+    // view only paints it (see `viewpane::select_row`).
+    in property <int> sel-lo;
+    in property <int> sel-hi;
+    // The pane's transient bottom-right message ("Copied 12 lines"). A PTY pane gets this
+    // drawn by the terminal widget; a view pane covers that widget entirely, so without a
+    // copy of it here a copy from a view pane would confirm itself to nobody.
+    in property <string> toast;
     // Reports the row INDEX; the controller resolves it against the same cached
     // projection it handed to this view.
     callback activate(int);
+    // Row INDEX + whether shift was held.
+    callback select(int, bool);
     // Reports a clicked markdown link by href. Not a row index: the row is a
     // paragraph and the link is one span inside it, so the index would not say
     // which.
@@ -471,9 +506,31 @@ export component ViewPane inherits Rectangle {
             for it[i] in root.rows : ViewRowView {
                 item: it;
                 accent: root.accent;
+                selected: root.sel-lo >= 0 && i >= root.sel-lo && i <= root.sel-hi;
                 activate => { root.activate(i); }
+                select(ext) => { root.select(i, ext); }
                 link-clicked(l) => { root.link-clicked(l); }
             }
+        }
+    }
+
+    if root.toast != "" : Rectangle {
+        x: parent.width - self.width - 10px;
+        y: parent.height - self.height - 10px;
+        width: tt.width + 16px;
+        height: 22px;
+        background: Theme.surface2;
+        border-radius: 4px;
+        border-width: 1px;
+        border-color: Theme.border;
+        tt := Text {
+            x: 8px;
+            y: 0;
+            height: parent.height;
+            text: root.toast;
+            color: Theme.text;
+            font-size: 11px;
+            vertical-alignment: center;
         }
     }
 }

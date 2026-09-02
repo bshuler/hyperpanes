@@ -143,6 +143,57 @@ impl ViewRow {
     pub fn activatable(&self) -> bool {
         !self.path.as_os_str().is_empty()
     }
+
+    /// This row as one line of plain text, for the clipboard.
+    ///
+    /// What a copy owes the reader is what the pane *showed* them, so the flowing
+    /// roles come back with their inline markers resolved rather than raw — the
+    /// same words the `StyledText` drew. Structure that was visible *as*
+    /// structure (a bullet and its nesting, a quote, a table's columns) is
+    /// re-spelled the plain-text way, because a paste has no other way to carry
+    /// it. A file viewer's line is the one exception and is copied byte for byte:
+    /// there the pane was never rendering markup in the first place.
+    pub fn copy_text(&self) -> String {
+        match self.role {
+            // Listing rows and the plain viewer: the text is already what was drawn.
+            role::PARENT | role::DIR | role::FILE | role::LINE | role::CODE | role::NOTICE => {
+                self.text.clone()
+            }
+            // Headings arrive with their `#` markers already stripped by `heading()`,
+            // and the count is not recoverable (`####` and deeper all render as H3),
+            // so they are copied as the words they showed.
+            role::H1 | role::H2 | role::H3 => self.text.clone(),
+            role::QUOTE => format!("> {}", strip_inline(&self.text)),
+            role::BULLET => {
+                let marker = if self.marker.is_empty() {
+                    "-".to_string()
+                } else {
+                    self.marker.clone()
+                };
+                let box_ = match self.check {
+                    0 => "[ ] ",
+                    1 => "[x] ",
+                    _ => "",
+                };
+                format!(
+                    "{}{marker} {box_}{}",
+                    "  ".repeat(self.indent.max(0) as usize),
+                    strip_inline(&self.text)
+                )
+            }
+            role::TABLE_HEAD | role::TABLE_ROW => self
+                .cells
+                .iter()
+                .map(|c| strip_inline(&c.text))
+                .collect::<Vec<_>>()
+                .join(" | "),
+            role::RULE => "---".to_string(),
+            // A laid-out diagram keeps no source (see `mermaid::Diagram`) and its
+            // shapes are not text, so it copies as the blank line it occupies.
+            role::DIAGRAM | role::SPACE => String::new(),
+            _ => strip_inline(&self.text),
+        }
+    }
 }
 
 /// Most lines a file viewer will read. A view pane is a *preview*, not an editor:
@@ -1043,6 +1094,11 @@ struct Cached {
     gen: u64,
     rows: Vec<ViewRow>,
     model: ModelRc<PaneViewRow>,
+    /// The human's row selection as (anchor, focus), or `None` for nothing
+    /// selected. It lives here, beside the rows it indexes, so it dies with them:
+    /// a reprojection replaces this whole struct, and row 40 of the old file has
+    /// no claim on row 40 of the new one.
+    sel: Option<(usize, usize)>,
 }
 
 thread_local! {
@@ -1192,6 +1248,7 @@ pub fn model_for(uid: &str, kind: &PaneKind, target: Option<&str>) -> ModelRc<Pa
                 gen,
                 rows,
                 model: model.clone(),
+                sel: None,
             },
         );
         model
@@ -1211,6 +1268,91 @@ pub fn generation(uid: &str) -> Option<u64> {
 /// miss, never resolve to a different row's path.
 pub fn row_at(uid: &str, index: usize) -> Option<ViewRow> {
     VIEW_CACHE.with(|c| c.borrow().get(uid).and_then(|e| e.rows.get(index).cloned()))
+}
+
+/// Pane `uid`'s selection as (anchor, focus) — unordered, in the order the human
+/// made it. `None` when nothing is selected or the pane has no projection.
+pub fn selection(uid: &str) -> Option<(usize, usize)> {
+    VIEW_CACHE.with(|c| c.borrow().get(uid).and_then(|e| e.sel))
+}
+
+/// The selected range as (lo, hi), or `None`. What the view and the clipboard both
+/// want; [`selection`] is for the code that has to know which end the human is
+/// dragging.
+pub fn selected_range(uid: &str) -> Option<(usize, usize)> {
+    selection(uid).map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
+}
+
+/// Move pane `uid`'s selection to `row`, either replacing it (`extend` false) or
+/// stretching the existing anchor to reach it (`extend` true). A shift-click with
+/// nothing selected yet has no anchor to stretch, so it starts one.
+pub fn select_row(uid: &str, row: usize, extend: bool) {
+    VIEW_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let Some(e) = c.get_mut(uid) else { return };
+        if row >= e.rows.len() {
+            return;
+        }
+        e.sel = Some(match (extend, e.sel) {
+            (true, Some((anchor, _))) => (anchor, row),
+            _ => (row, row),
+        });
+    });
+}
+
+/// Select every row of pane `uid`. A no-op on a pane with no projection.
+pub fn select_all(uid: &str) {
+    VIEW_CACHE.with(|c| {
+        let mut c = c.borrow_mut();
+        let Some(e) = c.get_mut(uid) else { return };
+        e.sel = (!e.rows.is_empty()).then(|| (0, e.rows.len() - 1));
+    });
+}
+
+/// Drop pane `uid`'s selection. Test-only: in the app a selection is dropped by the thing
+/// that made it meaningless — `forget` when the pane goes, a rebuilt projection when the
+/// file changes — and never on its own, so an always-compiled version would be dead code.
+#[cfg(test)]
+pub fn clear_selection(uid: &str) {
+    VIEW_CACHE.with(|c| {
+        if let Some(e) = c.borrow_mut().get_mut(uid) {
+            e.sel = None;
+        }
+    });
+}
+
+/// How many rows pane `uid` is currently showing. `0` when it has no projection
+/// (a pty pane, or a view pane whose model has not been built yet), which is also
+/// the answer that makes "select all" a no-op there. Test-only for the same reason
+/// [`clear_selection`] is: the app reads the rows themselves, never just their count.
+#[cfg(test)]
+pub fn row_count(uid: &str) -> usize {
+    VIEW_CACHE.with(|c| c.borrow().get(uid).map_or(0, |e| e.rows.len()))
+}
+
+/// Rows `lo..=hi` of pane `uid` joined into one clipboard string.
+///
+/// Reads the retained `Vec<ViewRow>` rather than the Slint model: the rows are the
+/// projection's own form, and the model has already thrown away everything a copy
+/// needs (a heading's level, a table's cells, a bullet's nesting). The range is
+/// clamped and order-normalised here so callers may hand over a selection anchor
+/// and focus in whichever order the human dragged them.
+pub fn copy_range(uid: &str, a: usize, b: usize) -> String {
+    let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+    VIEW_CACHE.with(|c| {
+        let c = c.borrow();
+        let Some(e) = c.get(uid) else {
+            return String::new();
+        };
+        if lo >= e.rows.len() {
+            return String::new();
+        }
+        e.rows[lo..=hi.min(e.rows.len() - 1)]
+            .iter()
+            .map(|r| r.copy_text())
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
 }
 
 /// Drop a pane's projection. Called when the pane closes so a long-lived window
@@ -1703,6 +1845,112 @@ mod tests {
         forget(uid);
         assert!(row_at(uid, 0).is_none());
         assert_eq!(generation(uid), None);
+    }
+
+    #[test]
+    fn a_row_copies_as_the_words_it_showed() {
+        // The plain viewer is verbatim — it was never rendering markup.
+        assert_eq!(
+            ViewRow::inert(role::LINE, "  let x = *p;").copy_text(),
+            "  let x = *p;"
+        );
+        // A preview's prose showed the *resolved* inline markup, so that is what a
+        // copy of it owes the reader.
+        assert_eq!(
+            ViewRow::inert(role::PROSE, "a **bold** and `code`").copy_text(),
+            "a bold and code"
+        );
+        // A heading arrives with its markers already gone (see `heading`).
+        assert_eq!(ViewRow::inert(role::H2, "Design").copy_text(), "Design");
+        assert_eq!(
+            ViewRow::inert(role::QUOTE, "so said he").copy_text(),
+            "> so said he"
+        );
+        assert_eq!(ViewRow::inert(role::RULE, "").copy_text(), "---");
+        assert_eq!(ViewRow::inert(role::SPACE, "").copy_text(), "");
+
+        // A bullet re-spells the structure that was drawn as a dot, an ordinal,
+        // a task box and an indent — plain text has no other way to carry it.
+        let mut b = ViewRow::inert(role::BULLET, "ship it");
+        b.indent = 2;
+        b.check = 0;
+        assert_eq!(b.copy_text(), "    - [ ] ship it");
+        b.marker = "3.".into();
+        b.check = 1;
+        b.indent = 0;
+        assert_eq!(b.copy_text(), "3. [x] ship it");
+
+        let mut t = ViewRow::inert(role::TABLE_ROW, "");
+        t.cells = vec![
+            TableCell {
+                text: "**a**".into(),
+                align: 0,
+            },
+            TableCell {
+                text: "b".into(),
+                align: 0,
+            },
+        ];
+        assert_eq!(t.copy_text(), "a | b");
+    }
+
+    #[test]
+    fn a_selection_is_a_row_range_that_dies_with_its_projection() {
+        let d = scratch("select");
+        let f = write(&d, "a.txt", "one\ntwo\nthree\nfour\n");
+        let target = f.display().to_string();
+        let uid = "view-sel";
+        model_for(uid, &PaneKind::FileViewer, Some(&target));
+        assert_eq!(row_count(uid), 4);
+        assert_eq!(selected_range(uid), None);
+
+        // A plain click starts a one-row selection; shift-click stretches the anchor.
+        select_row(uid, 1, false);
+        assert_eq!(selected_range(uid), Some((1, 1)));
+        select_row(uid, 3, true);
+        assert_eq!(selection(uid), Some((1, 3)));
+        assert_eq!(copy_range(uid, 1, 3), "two\nthree\nfour");
+
+        // Backwards is the same range: the anchor is where the human started, not
+        // where the range begins.
+        select_row(uid, 0, true);
+        assert_eq!(selection(uid), Some((1, 0)));
+        assert_eq!(selected_range(uid), Some((0, 1)));
+        assert_eq!(copy_range(uid, 1, 0), "one\ntwo");
+
+        // Past the end is refused rather than clamped: an index that no longer
+        // exists names no row, and pretending it named the last one would copy
+        // something the human never clicked.
+        select_row(uid, 99, false);
+        assert_eq!(
+            selection(uid),
+            Some((1, 0)),
+            "an out-of-range row changes nothing"
+        );
+
+        select_all(uid);
+        assert_eq!(selected_range(uid), Some((0, 3)));
+        assert_eq!(copy_range(uid, 0, 3), "one\ntwo\nthree\nfour");
+        // A range running off the end still copies what is there.
+        assert_eq!(copy_range(uid, 2, 99), "three\nfour");
+        assert_eq!(copy_range(uid, 99, 99), "");
+        assert_eq!(copy_range("no-such-pane", 0, 0), "");
+
+        clear_selection(uid);
+        assert_eq!(selected_range(uid), None);
+
+        // An edit reprojects, and row 3 of the old file has no claim on the new one.
+        select_all(uid);
+        assert!(selected_range(uid).is_some());
+        fs::write(&f, "one\n").unwrap();
+        model_for(uid, &PaneKind::FileViewer, Some(&target));
+        assert_eq!(
+            selected_range(uid),
+            None,
+            "a reprojection must drop the selection it indexed"
+        );
+        forget(uid);
+        assert_eq!(row_count(uid), 0);
     }
 
     #[test]

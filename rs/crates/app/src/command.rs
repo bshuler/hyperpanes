@@ -216,6 +216,9 @@ pub enum Command {
     /// Toggle pane `0`'s microphone: start recording dictation, or stop it and type the
     /// transcript into that pane (the header mic button / the pane menu's "Dictate").
     ToggleDictation(usize),
+    /// Move view pane `0`'s row selection to row `1`; `2` extends from the existing anchor
+    /// (shift-click) instead of replacing the selection.
+    ViewSelect(usize, usize, bool),
     // ---- speech (global; routed to the ControlHost's SpeechService) ----
     /// Kill any in-flight/queued speech immediately (command palette "Speech: Stop Now").
     SpeechStopNow,
@@ -554,10 +557,15 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         Command::ToggleTalk(i) => state.toggle_talk(i),
         Command::ToggleDictation(i) => {
             return match state.active_tab().panes.get(i) {
-                Some(p) => Effect::ToggleDictation(p.uid.clone()),
-                None => Effect::None,
-            }
+                // A view pane is read-only: there is no pty to type the transcript into
+                // (D3), so dictating into one could only ever throw the recording away.
+                // The mic is hidden there too — this is the belt to that braces, for the
+                // palette and any other caller that reaches the command directly.
+                Some(p) if p.kind.is_pty() => Effect::ToggleDictation(p.uid.clone()),
+                _ => Effect::None,
+            };
         }
+        Command::ViewSelect(i, row, extend) => state.view_select(i, row, extend),
         Command::SpeechStopNow => return Effect::SpeechStopNow,
         Command::SpeechToggleMuted => return Effect::SpeechToggleMuted,
         Command::SpeechToggleFocusedOnly => return Effect::SpeechToggleFocusedOnly,
@@ -1133,6 +1141,27 @@ mod rename_from_menu_tests {
         let mut st = fresh();
         assert!(matches!(
             dispatch(&mut st, Command::ToggleDictation(9), &mgr),
+            Effect::None
+        ));
+    }
+
+    /// A view pane is read-only: there is no pty for a transcript to be typed into (D3),
+    /// so the microphone is absent from its header and its menu. This is the belt to that
+    /// braces — the command itself refuses, whoever reaches it.
+    #[test]
+    fn the_microphone_on_a_read_only_pane_does_nothing() {
+        let mgr = mgr();
+        let mut st = fresh();
+        st.add_pane_opts(
+            &mgr,
+            NewPaneOpts {
+                kind: Some(hyperpanes_core::tools::PaneKind::Markdown),
+                ..Default::default()
+            },
+        )
+        .expect("view pane added");
+        assert!(matches!(
+            dispatch(&mut st, Command::ToggleDictation(0), &mgr),
             Effect::None
         ));
     }

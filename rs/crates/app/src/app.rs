@@ -3252,6 +3252,23 @@ impl App {
             });
         }
 
+        // A row of a view pane was selected rather than opened (a click on an inert row,
+        // or a shift-click on any row). The range itself lives with the projection — see
+        // `viewpane::select_row` — so all this does is name the row.
+        {
+            let app = app.clone();
+            let id = win.id;
+            win.app.on_pane_view_select(move |pane, row, extend| {
+                let Some(w) = app.window_by_id(id) else {
+                    return;
+                };
+                app.run_command(
+                    &w,
+                    Command::ViewSelect(pane as usize, row.max(0) as usize, extend),
+                );
+            });
+        }
+
         // A row of a Family B (non-PTY) view pane was clicked. Two outcomes, decided
         // here rather than in `.slint` so the rule is testable: a directory (or the
         // "..") retargets the SAME browser pane, and a file opens a NEW viewer pane —

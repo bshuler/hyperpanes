@@ -72,6 +72,37 @@ A gemini chat file is also not a plain log of messages: it is a mutation stream,
 context preamble). Those are ignored outright — gemini's version of codex's triple-record
 trap, locked down by `gemini_set_records_are_never_spoken`.
 
+### On Windows, one hook script instead of five
+
+The POSIX hooks are `/bin/sh` wrappers around `python3`. Neither part survives a default
+Windows install: `/bin/sh` is not there, `python3` is not on `PATH` (the Store stub that *is*
+opens a shop page rather than running), and the state directory those scripts compute with
+`uname` resolves under a Git-Bash-ish shell to the XDG path rather than
+`%APPDATA%\hyperpanes` — so shipping them there would write markers to a directory the
+reader never looks in, and, like every unregistered or failed hook, would do it silently.
+
+Windows therefore registers **one** script, `resources/hooks/hp-session-hook.ps1`, told which
+tool it is running for on the command line. The five payload shapes are small enough to be a
+`switch`, and the part that is genuinely easy to get wrong — BOM-less UTF-8, an atomic
+replace — is then written once instead of five times. The registered command is
+
+```
+powershell -NoProfile -ExecutionPolicy Bypass -File "<install>\resources\hooks\hp-session-hook.ps1" -Tool <id>
+```
+
+Each flag is load-bearing. `-ExecutionPolicy Bypass` because the default policy on a fresh
+install is `Restricted`, which refuses the script before its first line; `-NoProfile` so a
+user profile cannot slow down or break something that runs at every session start; the quotes
+because an install under `C:\Program Files\…` contains a space. `powershell` rather than
+`pwsh`, because Windows PowerShell 5.1 ships in the box and PowerShell 7 does not.
+
+**What is verified and what is not.** The script's own logic is tested — the payload switch,
+the marker it writes, and the command string (including the `Program Files` spaces and the
+restricted-policy case) all have unit coverage, and the script has been run against real
+payloads with `pwsh` on macOS. What has **not** been checked on a Windows machine is whether
+each agent CLI actually spawns the registered command as written. That is the one remaining
+gap in the Windows story, and it needs a Windows host, not another test.
+
 A pane running anything else — aider, goose, a plain shell — resolves to no
 transcript and **stays silent**. That is deliberate, not a gap waiting to be filled by reading
 the terminal: a terminal carries spinners, progress bars, box drawing and the human's own

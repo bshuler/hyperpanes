@@ -196,6 +196,11 @@ export struct PaneItem {
     view-rows: [PaneViewRow],
     // The view's header line (the target's last two path components). "" = not a view.
     view-title: string,
+    // The selected row range, inclusive; -1/-1 for nothing selected. A view pane has no
+    // text grid to highlight into, so its selection is a range of ROWS, decided Rust-side
+    // (see `viewpane::select_row`) and projected here purely so the rows can paint it.
+    view-sel-lo: int,
+    view-sel-hi: int,
 }
 
 // One tab (workspace group) chip in the strip.

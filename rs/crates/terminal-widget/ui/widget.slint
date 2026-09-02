@@ -493,6 +493,10 @@ export component TerminalPane inherits Rectangle {
     // I-beam, since the surface is selectable text.
     ta := TouchArea {
         mouse-cursor: root.link-visible ? pointer : text;
+        // A Ctrl/Cmd press that landed on a live link while the APP owns the mouse. The whole
+        // down/move/up of that gesture is ours and is withheld from the app — reporting only
+        // the down would leave a mouse-aware TUI stuck mid-drag with no matching release.
+        property <bool> link-gesture: false;
         changed has-hover => {
             if (!self.has-hover) { root.link-exited(); }
         }
@@ -509,16 +513,41 @@ export component TerminalPane inherits Rectangle {
                 if (e.kind == PointerEventKind.down) {
                     root.focus-requested();
                     fs.focus();
-                    root.held-button = e.button == PointerEventButton.left ? 0
-                                     : e.button == PointerEventButton.middle ? 1 : 2;
-                    root.pointer-report(0, root.held-button, self.mouse-x, self.mouse-y);
+                    // Ctrl/Cmd on a link the hover already lit is a LINK click, not the app's.
+                    // This is the standard terminal bargain (iTerm2, Windows Terminal, VS Code):
+                    // the app keeps the plain click, the modifier buys the link. Ctrl means OPEN
+                    // here rather than the copy it means in a plain shell, because opening is the
+                    // gesture with nowhere else to go — copy is still reachable through the
+                    // Shift escape hatch below, which is what Shift is for.
+                    self.link-gesture = root.link-visible
+                        && e.button == PointerEventButton.left
+                        && (e.modifiers.control || e.modifiers.meta || root.ctrl-held);
+                    if (!self.link-gesture) {
+                        root.held-button = e.button == PointerEventButton.left ? 0
+                                         : e.button == PointerEventButton.middle ? 1 : 2;
+                        root.pointer-report(0, root.held-button, self.mouse-x, self.mouse-y);
+                    }
                 } else if (e.kind == PointerEventKind.move) {
-                    root.pointer-report(1, root.held-button, self.mouse-x, self.mouse-y);
+                    // Hover hit-testing runs HERE TOO, and this is the whole reason paths looked
+                    // dead in a Claude Code / vim / htop pane: both halves of the link layer used
+                    // to live in the `else`, so an app that sets DECSET 1000/1002/1003 silently
+                    // turned every clickable path in its output into plain text. The hit-test is
+                    // a pure query — it sets the underline and nothing else — so it costs the app
+                    // nothing to run it, and the report still goes through untouched below.
+                    if (!self.pressed) { root.link-moved(self.mouse-x, self.mouse-y); }
+                    if (!self.link-gesture) {
+                        root.pointer-report(1, root.held-button, self.mouse-x, self.mouse-y);
+                    }
                 } else if (e.kind == PointerEventKind.up) {
-                    root.pointer-report(2, e.button == PointerEventButton.left ? 0
-                                         : e.button == PointerEventButton.middle ? 1 : 2,
-                                        self.mouse-x, self.mouse-y);
-                    root.held-button = 3;
+                    if (self.link-gesture) {
+                        self.link-gesture = false;
+                        root.link-activated(self.mouse-x, self.mouse-y, false);
+                    } else {
+                        root.pointer-report(2, e.button == PointerEventButton.left ? 0
+                                             : e.button == PointerEventButton.middle ? 1 : 2,
+                                            self.mouse-x, self.mouse-y);
+                        root.held-button = 3;
+                    }
                 }
             } else {
                 // --- Local terminal selection / link hit-testing (normal shells, or Shift-drag) ---
@@ -727,9 +756,13 @@ export component TerminalPane inherits Rectangle {
             // Hint line — emphasizes "Ctrl+click to copy" (brighter + bold) while Ctrl is held,
             // otherwise shows both actions dimmed. Mirrors the plain-click-opens / Ctrl-copies split.
             Text {
-                text: root.ctrl-held ? "Ctrl+click to copy" : "click to open · Ctrl+click to copy";
-                color: root.ctrl-held ? #cdd6f4 : #7f849c;
-                font-weight: root.ctrl-held ? 700 : 400;
+                // While the app owns the mouse the plain click is not ours to offer, so the
+                // hint has to name the gesture that actually works there.
+                text: root.app-grabs-mouse ? "Ctrl+click to open"
+                    : root.ctrl-held ? "Ctrl+click to copy"
+                    : "click to open · Ctrl+click to copy";
+                color: (root.app-grabs-mouse || root.ctrl-held) ? #cdd6f4 : #7f849c;
+                font-weight: (root.app-grabs-mouse || root.ctrl-held) ? 700 : 400;
                 font-size: 10px;
             }
         }
