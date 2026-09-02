@@ -65,10 +65,11 @@ install -m 644 "$SHELL_INT/hp-init.ps1" "$APPDIR/usr/bin/resources/shell-integra
 mkdir -p "$APPDIR/usr/bin/resources/shell-integration/zdotdir"
 install -m 644 "$SHELL_INT/zdotdir/.zshenv" "$APPDIR/usr/bin/resources/shell-integration/zdotdir/.zshenv"
 install -m 644 "$SHELL_INT/zdotdir/.zshrc"  "$APPDIR/usr/bin/resources/shell-integration/zdotdir/.zshrc"
-# CLI-agent session hooks (tool-resume feature) — same exe_dir/resources layout. All three
+# CLI-agent session hooks (tool-resume feature) — same exe_dir/resources layout. All four
 # must ship: registration degrades to a silent no-op when a script is missing, so a dropped
 # one costs the hand-started panes of that tool their conversation id with no error anywhere.
-for h in claude/hp-claude-session-hook.sh cursor/hp-cursor-session-hook.sh copilot/hp-copilot-session-hook.sh; do
+for h in claude/hp-claude-session-hook.sh cursor/hp-cursor-session-hook.sh copilot/hp-copilot-session-hook.sh \
+         codex/hp-codex-session-hook.sh; do
   mkdir -p "$APPDIR/usr/bin/resources/$(dirname "$h")"
   install -m 755 "$ROOT/resources/$h" "$APPDIR/usr/bin/resources/$h"
 done

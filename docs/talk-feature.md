@@ -4,16 +4,17 @@ A per-pane **Talk** toggle: while it is on, that pane speaks every NEW assistant
 through a local TTS backend. Off by default, per pane, persisted in the workspace snapshot. The
 text comes from the conversation's own transcript (the pane→session marker JSONL), never from
 scraping the terminal — so what is spoken is the assistant's actual reply, normalized from
-markdown to listenable prose. All panes share ONE serialized speech queue with pane-label
+whatever text format it was written in — plain text, Markdown, HTML, JSON, CSV/TSV — to
+listenable prose. All panes share ONE serialized speech queue with pane-label
 prefixes, a global mute/stop, and an optional focused-pane-only mode.
 
 **Status: BUILT** — core pipeline + control API + GUI + MCP tools; verified end-to-end against
 the headless binary (see "Verifying" below). Generalized past Claude-only and Unix-only on
-2026-09-01: three transcript formats, four TTS backends across three platforms.
+2026-09-02: four transcript formats, four TTS backends across three platforms.
 
 ## Which tools can talk, and why not all of them
 
-Talk needs the tool's own record of what it said. Three tools keep one Hyperpanes can bind to a
+Talk needs the tool's own record of what it said. Four tools keep one Hyperpanes can bind to a
 pane and tail:
 
 | Tool | Pane→session binding | Transcript | Record shape |
@@ -21,10 +22,31 @@ pane and tail:
 | claude | `claude-sessions/<paneId>.json` (SessionStart hook) | `<configDir>/projects/<encoded-cwd>/<sid>.jsonl` | `{"type":"assistant","message":{"content":[…]}}` |
 | cursor-agent | `tool-sessions/cursor-agent/<paneId>.json` (`~/.cursor/hooks.json`) | `~/.cursor/projects/<Encoded-Cwd>/agent-transcripts/<sid>/<sid>.jsonl` | `{"role":"assistant","message":{"content":[…]}}` — no `type` on message records; `type` marks control records like `turn_ended` |
 | copilot | `tool-sessions/copilot/<paneId>.json` (`~/.copilot/settings.json`) | `~/.copilot/session-state/<sid>/events.jsonl` | `{"type":"assistant.message","data":{"content":"…"}}` — flat event log |
+| codex | `tool-sessions/codex/<paneId>.json` (`$CODEX_HOME/hooks.json`) | `$CODEX_HOME/sessions/<YYYY>/<MM>/<DD>/rollout-<stamp>-<sid>.jsonl` | `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text",…}]}}` — every line is a `{timestamp,ordinal,type,payload}` envelope |
 
 Every shape above was read off a real install, not off documentation.
 
-A pane running anything else — aider, gemini, goose, codex, a plain shell — resolves to no
+Three things about codex specifically, each of which cost a wrong first guess:
+
+* Its hooks live in **`$CODEX_HOME/hooks.json`**, not in `config.toml` — which silently
+  accepts unknown keys, so a hook written there looks accepted and never fires. The
+  project-scoped `<cwd>/.codex/hooks.json` did not fire either.
+* It takes **Claude's** nested matcher group (`{"hooks":[{"type":"command","command":…}]}`),
+  not cursor/copilot's flat `{"command":…}`, and its event names are **PascalCase**
+  (`SessionStart`/`SessionEnd`). An event under the wrong casing is never called, with no
+  error. `HookShape` in `tools::session_hook` exists for exactly this split.
+* Hooks are **trust-gated**. Hyperpanes writes `hooks.json`; codex then asks the human to
+  approve it once, and until they do the hook does not run (the escape hatch,
+  `--dangerously-bypass-hook-trust`, is for testing). That is a security control, so the
+  approval is left to the person at the keyboard — nothing here forges a trust record.
+
+The same reply appears three times in a codex rollout: as the `response_item` (the model
+transcript), as an `event_msg`/`item_completed` carrying an `AgentMessage` (the UI event
+stream), and as an `event_msg`/`task_complete` carrying `last_agent_message` (the final
+message only). Only the first is read; reading a second would speak every reply twice, which
+`codex_says_each_reply_once_and_not_three_times` in `speech::tailer` locks down.
+
+A pane running anything else — aider, gemini, goose, a plain shell — resolves to no
 transcript and **stays silent**. That is deliberate, not a gap waiting to be filled by reading
 the terminal: a terminal carries spinners, progress bars, box drawing and the human's own
 echoed keystrokes with no way to tell them from prose, so a scraped tier would make Talk worse,
@@ -36,10 +58,10 @@ not better. Adding a tool means adding a hook that writes a pane marker plus a
 ```
 pane (talk on)                       core, every 750ms (speech_service::run_ticker)
   └─ resolve_transcript(paneId)      claude marker first, then any hooked tool's marker
-       └─ TranscriptRef {path, format}  path + which of the three record shapes to read
+       └─ TranscriptRef {path, format}  path + which of the four record shapes to read
             └─ TranscriptTail        byte-cursor tail, starts at EOF (history is never spoken)
                  └─ extract_assistant_text   per-format; tool_use/tool_result dropped
-                      └─ normalize_for_speech  markdown → prose (see below)
+                      └─ normalize_for_speech  any text format → prose (see below)
                            └─ SpeechEngine     ONE global queue, one utterance at a time
                                 └─ backend      custom | spd-say | espeak-ng | say | SAPI
 ```
@@ -57,10 +79,37 @@ identically, and the whole feature is testable without audio or a display.
 
 - **Default-off costs nothing**: the engine thread spawns lazily on the first enabled pane, and
   the ticker's no-talkers fast path does no filesystem work at all.
-- **Normalization** (`speech/normalize.rs`): fenced code blocks become the phrase
-  "code block omitted."; inline code/emphasis/heading/list/table markup is stripped to its text;
-  links keep their label (bare URLs become "link"); whitespace collapses; long replies truncate
-  at a sentence boundary (~1200 chars) with a spoken "Truncated."
+- **Normalization** (`speech/normalize.rs` + `speech/markup.rs`): a tool writes down whatever
+  format its answer was in, and a synthesizer reads every one of them literally, so each is
+  recognized and reduced:
+  - **terminal noise** first, because it turns up inside any of the others: ANSI colour and
+    cursor sequences, OSC titles, box drawing, braille spinner frames, zero-width and
+    bidi characters. Each dropped character becomes a space, so two cells either side of a
+    box edge do not fuse into one word.
+  - **JSON and CSV/TSV** next, whole-document, *before* anything is stripped — their
+    punctuation is their structure. JSON is flattened to its readable leaves with `snake_case`
+    keys read as words ("exit code"); delimited rows become `", "`-joined cells, `". "`-joined.
+    Both guesses are deliberately hard to trip: English is full of commas, so a row that reads
+    like a sentence (a sentence break inside a field, a field over 12 words, a final field
+    ending in `.`/`!`/`?`), ragged rows, a lone column, or anything wearing Markdown's clothes
+    all veto the CSV reading.
+  - **Markdown**, the common case: fenced code becomes the phrase "code block omitted.";
+    headings, rules and setext underlines, blockquotes, list markers, task boxes, tables,
+    emphasis, strikethrough and link syntax are stripped to their text; an image's alt text is
+    spoken (it was written for someone who cannot see the image); bare URLs, autolinks and link
+    reference definitions are dropped.
+  - **HTML**, which arrives both on its own and embedded in Markdown: detection is by tag
+    *name*, so `Vec<String>` and `a < b` survive as prose. Tag text is kept with block tags
+    breaking paragraphs and inline tags not breaking words (`re<b>run</b>` is one word);
+    `<script>`, `<style>`, `<svg>`, `<template>` and comments are dropped whole; `<td>`/`<th>`
+    become `", "`; `<img alt>` is spoken; named, Latin-1 and numeric entities are decoded, and
+    an entity that is not recognized is left verbatim rather than guessed at.
+  - finally whitespace collapses and long replies truncate at a sentence boundary (~1200 chars)
+    with a spoken "Truncated."
+
+  Every guess fails soft: detection is conservative and each transform is close to the identity
+  on text that is really just prose, because the listener hears the output and the input is
+  already gone.
 - **Serialization** (`speech/engine.rs`): one utterance plays at a time, FIFO (bounded queue,
   cap 64, drop-oldest). With two or more panes talking, each utterance is prefixed with its
   pane's label ("build. Tests are green."). `stop_all` kills the in-flight backend process
@@ -135,5 +184,9 @@ and clobbers the live app's discovery file), fakes two panes' session markers + 
 points `commandTemplate` at an evidence-file writer, and asserts: talk toggles are observable
 in `/state`; interleaved appends to two transcripts come out as serialized, pane-labelled,
 non-interleaved utterances of normalized prose; pre-existing history is never spoken; and
-`stopSpeech` kills an in-flight utterance. Unit coverage lives in `speech/{normalize,engine,
-tailer}.rs` and the `setTalk`/`setSpeech*`/`stopSpeech` dispatch tests.
+`stopSpeech` kills an in-flight utterance. Unit coverage lives in `speech/{markup,normalize,
+engine,tailer}.rs` and the `setTalk`/`setSpeech*`/`stopSpeech` dispatch tests. The format tests
+carry the negative cases as well as the positive ones, because the failure that matters here is
+mangling ordinary prose: `Vec<String>` must not be HTML, a paragraph with commas must not be
+CSV, `exit_code` and `~/.config` must come through intact, and an unknown entity must be left
+alone rather than guessed at.

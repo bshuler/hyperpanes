@@ -27,6 +27,7 @@ use std::path::PathBuf;
 use crate::claude_history::{HistorySource, ProjectOrigin};
 
 pub mod claude;
+pub mod codex;
 pub mod copilot;
 pub mod cursor;
 

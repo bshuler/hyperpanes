@@ -68,8 +68,11 @@ MCP** lets an agent — or a whole recursive agent org — watch and drive your 
   prompt, its frame glows so you notice it's waiting for you — in one of five styles (**firefly,
   pulse, blink, fluorescent, solid**). Tunable threshold; off‑window panes glow even when focused.
 - **Talk — spoken replies** — toggle **Talk** on a pane (right‑click → *Talk (speak replies)*) and it
-  reads each NEW Claude reply aloud via local TTS (spd‑say / espeak‑ng / macOS `say`, or a custom
-  command). Replies are normalized (no markdown noise, code blocks skipped), all panes share one
+  reads each NEW assistant reply aloud via local TTS (spd‑say / espeak‑ng / macOS `say`, Windows
+  SAPI, or a custom command). Works for **claude, cursor‑agent, copilot and codex** — each tool's
+  own transcript, never a terminal scrape. Replies are normalized whatever format they arrive in —
+  Markdown, HTML, JSON, CSV/TSV or plain text, with ANSI colour and spinner frames stripped and code
+  blocks skipped — all panes share one
   serialized speech queue with pane‑label prefixes, and the palette has global **Stop / Mute /
   Only Focused Pane**. Off by default; persisted per pane. See `docs/talk-feature.md`.
 - **Dictate — speak into a pane** — every pane header has a **microphone**: click it, talk, click

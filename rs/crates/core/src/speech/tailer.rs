@@ -1,7 +1,7 @@
 //! Incremental tailer over a pane's agent session transcript — yields the text of NEW
 //! assistant replies only, never history and never terminal output.
 //!
-//! Three tools write their conversation to a growing JSONL file as it happens, which is
+//! Four tools write their conversation to a growing JSONL file as it happens, which is
 //! exactly what a tailer needs. The paths and the record shapes differ, so
 //! [`TranscriptFormat`] names which one a given file speaks; the byte-cursor machinery
 //! below is shared:
@@ -12,6 +12,9 @@
 //!   same `message.content` block array, but keyed `"role":"assistant"` with no `type`.
 //! * **copilot** — `~/.copilot/session-state/<id>/events.jsonl`; a flat event log whose
 //!   `{"type":"assistant.message","data":{"content":"…"}}` carries the reply as a string.
+//! * **codex** — `$CODEX_HOME/sessions/<YYYY>/<MM>/<DD>/rollout-<stamp>-<id>.jsonl`; every
+//!   line is a `{"timestamp","ordinal","type","payload"}` envelope, and the reply rides in
+//!   the `response_item` whose payload is a `role:"assistant"` message.
 //!
 //! Every shape here was read off a real install on this machine, not inferred from docs —
 //! the same standard [`crate::tools::session_hook`] holds itself to.
@@ -64,6 +67,16 @@ pub enum TranscriptFormat {
     CursorJsonl,
     /// `{"type":"assistant.message","data":{"content":"…"}}`
     CopilotEvents,
+    /// `{"type":"response_item","payload":{"type":"message","role":"assistant",
+    /// "content":[{"type":"output_text","text":"…"}]}}` — one line of a codex rollout.
+    ///
+    /// The same reply also appears twice more in the same file, and both are deliberately
+    /// ignored: an `event_msg`/`item_completed` carrying an `AgentMessage` (the UI event
+    /// stream) and an `event_msg`/`task_complete` carrying `last_agent_message` (the final
+    /// message only). Reading any second one would speak every reply twice. `response_item`
+    /// is the model transcript proper — exactly one record per assistant message, no
+    /// streaming deltas, and every message of a multi-message turn rather than just the last.
+    CodexRollout,
 }
 
 /// Resolve a hooked tool's live conversation to its transcript file.
@@ -95,6 +108,18 @@ pub fn tool_transcript(tool_id: &str, session_id: &str, cwd: &str) -> Option<Tra
                 .join(session_id)
                 .join("events.jsonl"),
             format: TranscriptFormat::CopilotEvents,
+        }),
+        // Codex's rollout filename embeds the session id but also the session's start
+        // *time*, which no marker records — so the file is found by searching the dated
+        // tree newest-first rather than derived. Its `SessionStart` hook does hand over a
+        // `transcript_path`, but the marker contract here is id + cwd for every tool, and
+        // an exact match on the id in the filename gets the same file without widening it.
+        "codex" => Some(TranscriptRef {
+            path: crate::tools::history::codex::rollout_for_session(
+                &crate::tools::history::codex::codex_root()?,
+                session_id,
+            )?,
+            format: TranscriptFormat::CodexRollout,
         }),
         _ => None,
     }
@@ -252,6 +277,21 @@ pub fn extract_assistant_text(line: &str, format: TranscriptFormat) -> Option<St
                 Some(text.to_string())
             }
         }
+        TranscriptFormat::CodexRollout => {
+            if v.get("type").and_then(|t| t.as_str()) != Some("response_item") {
+                return None;
+            }
+            let payload = v.get("payload")?;
+            // `type` gates out the `function_call`, `reasoning` and tool records that share
+            // the `response_item` envelope; `role` gates out the developer and user turns,
+            // which are `input_text` and are not ours to speak.
+            if payload.get("type").and_then(|t| t.as_str()) != Some("message")
+                || payload.get("role").and_then(|r| r.as_str()) != Some("assistant")
+            {
+                return None;
+            }
+            output_text(payload)
+        }
     }
 }
 
@@ -262,6 +302,30 @@ fn content_block_text(v: &serde_json::Value) -> Option<String> {
     let mut out = String::new();
     for block in blocks {
         if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+            if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(t);
+            }
+        }
+    }
+    if out.is_empty() {
+        None
+    } else {
+        Some(out)
+    }
+}
+
+/// Space-join the `{"type":"output_text"}` blocks of a codex message payload's `content`
+/// array — the sibling of [`content_block_text`] for a payload that holds its blocks
+/// directly rather than under `message`. Refusal blocks and any future non-text block kind
+/// are skipped for the same reason `tool_use` is above: they are not speech.
+fn output_text(payload: &serde_json::Value) -> Option<String> {
+    let blocks = payload.get("content")?.as_array()?;
+    let mut out = String::new();
+    for block in blocks {
+        if block.get("type").and_then(|t| t.as_str()) == Some("output_text") {
             if let Some(t) = block.get("text").and_then(|t| t.as_str()) {
                 if !out.is_empty() {
                     out.push(' ');
@@ -428,6 +492,62 @@ mod tests {
         }
     }
 
+    // ---- extract_assistant_text: codex ----
+
+    #[test]
+    fn codex_reply_text_comes_from_the_response_item() {
+        // Verbatim from a real `codex exec` rollout (0.151.0), trimmed of its timestamp.
+        let line = r#"{"type":"response_item","ordinal":9,"payload":{"type":"message","id":"msg_1","role":"assistant","content":[{"type":"output_text","text":"Hello from the stub."}]}}"#;
+        assert_eq!(
+            extract_assistant_text(line, TranscriptFormat::CodexRollout).as_deref(),
+            Some("Hello from the stub.")
+        );
+    }
+
+    #[test]
+    fn codex_joins_multiple_output_text_blocks() {
+        let line = r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"One."},{"type":"refusal","refusal":"no"},{"type":"output_text","text":"Two."}]}}"#;
+        assert_eq!(
+            extract_assistant_text(line, TranscriptFormat::CodexRollout).as_deref(),
+            Some("One. Two.")
+        );
+    }
+
+    #[test]
+    fn codex_says_each_reply_once_and_not_three_times() {
+        // The load-bearing negative case. A codex rollout carries the SAME reply text in
+        // three records; only the `response_item` above is read. If either of these ever
+        // started matching, every codex reply would be spoken two or three times over.
+        let item_completed = r#"{"type":"event_msg","payload":{"type":"item_completed","item":{"type":"AgentMessage","id":"msg_1","content":[{"type":"Text","text":"Hello from the stub."}]}}}"#;
+        let task_complete = r#"{"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"Hello from the stub.","duration_ms":91}}"#;
+        assert!(extract_assistant_text(item_completed, TranscriptFormat::CodexRollout).is_none());
+        assert!(extract_assistant_text(task_complete, TranscriptFormat::CodexRollout).is_none());
+    }
+
+    #[test]
+    fn codex_non_assistant_records_are_not_speech() {
+        for line in [
+            // The developer preamble and the human's own prompt: same envelope, same
+            // `message` payload type, different role — and `input_text`, not `output_text`.
+            r#"{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"You are Codex."}]}}"#,
+            r#"{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"say hello"}]}}"#,
+            // Tool calls and reasoning share the envelope with real messages.
+            r#"{"type":"response_item","payload":{"type":"function_call","name":"shell","arguments":"{}"}}"#,
+            r#"{"type":"response_item","payload":{"type":"reasoning","summary":[]}}"#,
+            // The session envelope and the non-`response_item` line kinds.
+            r#"{"type":"session_meta","payload":{"id":"01a0","cli_version":"0.151.0"}}"#,
+            r#"{"type":"turn_context","payload":{"cwd":"/tmp"}}"#,
+            r#"{"type":"event_msg","payload":{"type":"task_started"}}"#,
+            // An assistant message with no text block yields nothing rather than "".
+            r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[]}}"#,
+        ] {
+            assert!(
+                extract_assistant_text(line, TranscriptFormat::CodexRollout).is_none(),
+                "{line} is not a spoken reply"
+            );
+        }
+    }
+
     #[test]
     fn a_format_only_reads_its_own_shape() {
         // The same line under the wrong format yields nothing rather than garbage —
@@ -435,6 +555,11 @@ mod tests {
         let claude = "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"hi\"}]}}";
         assert!(extract_assistant_text(claude, TranscriptFormat::CopilotEvents).is_none());
         assert!(extract_assistant_text(claude, TranscriptFormat::CursorJsonl).is_none());
+        assert!(extract_assistant_text(claude, TranscriptFormat::CodexRollout).is_none());
+        let codex = r#"{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hi"}]}}"#;
+        assert!(extract_assistant_text(codex, TranscriptFormat::ClaudeJsonl).is_none());
+        assert!(extract_assistant_text(codex, TranscriptFormat::CursorJsonl).is_none());
+        assert!(extract_assistant_text(codex, TranscriptFormat::CopilotEvents).is_none());
     }
 
     // ---- tool_transcript ----
@@ -469,7 +594,7 @@ mod tests {
     fn a_tool_with_no_transcript_store_resolves_to_nothing() {
         // aider, gemini, goose, plain shells: no store, so Talk stays silent for them
         // rather than being spoken from a guess.
-        for tool in ["aider", "gemini", "goose", "codex", ""] {
+        for tool in ["aider", "gemini", "goose", ""] {
             assert!(
                 tool_transcript(tool, "sid", "/tmp/proj").is_none(),
                 "{tool}"

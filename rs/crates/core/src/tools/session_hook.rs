@@ -21,11 +21,27 @@
 //!   itself prints as `copilot --resume=<id>`. The same block written into `config.json`
 //!   also fires, but the CLI *migrates* it into `settings.json`, so `settings.json` is the
 //!   file to own.
+//! * **Codex CLI** (0.151.0) — `$CODEX_HOME/hooks.json`, and it is Claude's shape rather
+//!   than the other two's: PascalCase event names and a nested matcher group,
+//!   `{"hooks": {"SessionStart": [{"hooks": [{"type": "command", "command": "…"}]}]}}`.
+//!   The payload is Claude's too — `session_id`, `cwd`, `hook_event_name`, and a
+//!   first-class `transcript_path` naming the rollout JSONL. A **project-level**
+//!   `<cwd>/.codex/hooks.json` is not read, and `[hooks.*]` tables in `config.toml` are
+//!   silently ignored (codex accepts unknown config keys without complaint, which is why
+//!   the working shape had to be found by a matrix test rather than by reading one).
 //!
-//! Neither shape is Claude's (Claude nests a matcher group: `[{"hooks": [{"type":
-//! "command", "command": "…"}]}]`), so this is a sibling of `claude_hook` rather than a
-//! generalisation of it — sharing the *policy* (additive, idempotent, best-effort, never
-//! create a config the tool itself has not created) and not the JSON.
+//!   Codex additionally **trust-gates** hooks: a `hooks.json` it has not been told to
+//!   trust does not fire, and the trust is persisted as `[hooks.state]` in `config.toml`
+//!   over a normalized hook identity rather than a plain digest of the file. That is a
+//!   security control, so the file is written and the human approves it inside codex once
+//!   — nothing here forges a trust record.
+//!
+//! Cursor's and Copilot's shapes are not Claude's (Claude nests a matcher group:
+//! `[{"hooks": [{"type": "command", "command": "…"}]}]`), so this is a sibling of
+//! `claude_hook` rather than a generalisation of it — sharing the *policy* (additive,
+//! idempotent, best-effort, never create a config the tool itself has not created) and not
+//! the JSON. Codex, arriving later, happens to share Claude's JSON but none of its
+//! multi-account fan-out, so it lives here with a shape flag rather than there.
 //!
 //! # Why a hook beats every other signal
 //!
@@ -48,6 +64,16 @@ use crate::claude_panes::{valid_resume_cwd, valid_session_id};
 use crate::persistence::paths::{state_dir, write_atomic};
 use crate::tools::session_mark::ToolSessionMark;
 
+/// How a tool spells one registered hook inside its `hooks.<event>` array.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HookShape {
+    /// cursor-agent and Copilot CLI: `{"command": "…"}`.
+    Flat,
+    /// Codex CLI (and Claude Code): a matcher group wrapping the command,
+    /// `{"hooks": [{"type": "command", "command": "…"}]}`.
+    Nested,
+}
+
 /// One tool whose lifecycle hook we have verified against a real install.
 pub struct HookedTool {
     /// Registry id ([`crate::tools::registry`]) — also the marker sub-directory name.
@@ -55,10 +81,41 @@ pub struct HookedTool {
     /// `resources/<dir>/<script>` in the shipped tree.
     dir: &'static str,
     script: &'static str,
-    /// The settings file to merge into, relative to the user's home.
+    /// The settings file to merge into, relative to the user's home. Overridden by
+    /// `home_env` when that variable is set.
     settings_rel: &'static [&'static str],
-    /// Whether the file's top level wants `"version": 1` (cursor does, copilot does not).
+    /// An environment variable naming the tool's config *directory*, which then holds the
+    /// last element of `settings_rel`. Codex has one (`CODEX_HOME`) and honours it for
+    /// hooks; the other two have none, so their path is home-relative and nothing else.
+    home_env: Option<&'static str>,
+    /// The two lifecycle events, start first. Spelled differently per tool — cursor and
+    /// copilot use `sessionStart`/`sessionEnd`, codex uses `SessionStart`/`SessionEnd` —
+    /// and an event under the wrong casing is silently never called.
+    events: [&'static str; 2],
+    /// How one entry in an event array is spelled.
+    shape: HookShape,
+    /// Whether the file's top level wants `"version": 1` (cursor does; copilot and codex
+    /// do not).
     versioned: bool,
+}
+
+impl HookedTool {
+    /// Where this tool's hook settings live under `home`.
+    ///
+    /// `home_env` wins when it is set and non-empty: it is the tool's OWN override for its
+    /// config directory, so a human who moved `$CODEX_HOME` has moved the file codex reads
+    /// — writing the home-relative path instead would register a hook nothing ever loads.
+    fn settings_file(&self, home: &Path) -> PathBuf {
+        let file = self.settings_rel.last().copied().unwrap_or("hooks.json");
+        if let Some(var) = self.home_env {
+            if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+                return PathBuf::from(v).join(file);
+            }
+        }
+        self.settings_rel
+            .iter()
+            .fold(home.to_path_buf(), |p, s| p.join(s))
+    }
 }
 
 /// The tools with a verified hook. Claude is deliberately absent: it has one, but
@@ -71,6 +128,9 @@ pub static HOOKED_TOOLS: &[HookedTool] = &[
         dir: "cursor",
         script: "hp-cursor-session-hook.sh",
         settings_rel: &[".cursor", "hooks.json"],
+        home_env: None,
+        events: ["sessionStart", "sessionEnd"],
+        shape: HookShape::Flat,
         versioned: true,
     },
     HookedTool {
@@ -78,6 +138,19 @@ pub static HOOKED_TOOLS: &[HookedTool] = &[
         dir: "copilot",
         script: "hp-copilot-session-hook.sh",
         settings_rel: &[".copilot", "settings.json"],
+        home_env: None,
+        events: ["sessionStart", "sessionEnd"],
+        shape: HookShape::Flat,
+        versioned: false,
+    },
+    HookedTool {
+        id: "codex",
+        dir: "codex",
+        script: "hp-codex-session-hook.sh",
+        settings_rel: &[".codex", "hooks.json"],
+        home_env: Some("CODEX_HOME"),
+        events: ["SessionStart", "SessionEnd"],
+        shape: HookShape::Nested,
         versioned: false,
     },
 ];
@@ -90,7 +163,7 @@ pub static HOOKED_TOOLS: &[HookedTool] = &[
 /// durable. Namespaced per tool because a pane can run one agent, exit it, and run another
 /// — un-namespaced, the second tool's marker would silently answer for the first.
 ///
-/// The two shipped hook scripts recompute this path in `sh`; the two must move together.
+/// The shipped hook scripts recompute this path in `sh`; the two must move together.
 pub fn marker_dir(tool_id: &str) -> PathBuf {
     state_dir().join("tool-sessions").join(tool_id)
 }
@@ -160,7 +233,7 @@ fn bundled_script(dir: &str, script: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-/// The user's home, for locating `~/.cursor` and `~/.copilot`.
+/// The user's home, for locating `~/.cursor`, `~/.copilot` and `~/.codex`.
 fn home_dir() -> Option<PathBuf> {
     if let Some(v) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(v));
@@ -180,16 +253,15 @@ pub fn ensure_registered() -> usize {
         let Some(script) = bundled_script(tool.dir, tool.script) else {
             continue; // not shipped in this build's layout — nothing to register
         };
-        let file = tool
-            .settings_rel
-            .iter()
-            .fold(home.clone(), |p, s| p.join(s));
+        let file = tool.settings_file(&home);
         let cmd = script.to_string_lossy().to_string();
-        match ensure_in_file(&file, &cmd, tool.versioned) {
+        match ensure_in_file(&file, &cmd, tool) {
             Ok(true) => {
                 eprintln!(
-                    "[{}-hook] registered sessionStart/End in {}",
+                    "[{}-hook] registered {}/{} in {}",
                     tool.id,
+                    tool.events[0],
+                    tool.events[1],
                     file.display()
                 );
                 changed += 1;
@@ -201,14 +273,14 @@ pub fn ensure_registered() -> usize {
     changed
 }
 
-/// Merge the hook command into one settings file's `sessionStart` + `sessionEnd`. Returns
-/// whether the file was written.
+/// Merge the hook command into one settings file's two lifecycle events, under the spelling
+/// and shape that tool takes. Returns whether the file was written.
 ///
 /// The parent-directory gate is the same one `claude_hook` applies, and for the same
 /// reason: a `~/.cursor` that does not exist means cursor-agent is not installed (or has
 /// never run), and conjuring a config for a tool the human does not use is not this
 /// program's business.
-fn ensure_in_file(file: &Path, cmd: &str, versioned: bool) -> Result<bool, String> {
+fn ensure_in_file(file: &Path, cmd: &str, tool: &HookedTool) -> Result<bool, String> {
     match file.parent() {
         Some(p) if p.is_dir() => {}
         _ => return Ok(false), // no such config dir — skip
@@ -222,13 +294,13 @@ fn ensure_in_file(file: &Path, cmd: &str, versioned: bool) -> Result<bool, Strin
     }
     // `|` not `||`: both events must be attempted, and short-circuiting on the first
     // would leave a file with a start hook and no end hook — markers that never clear.
-    let modified = ["sessionStart", "sessionEnd"]
-        .iter()
-        .fold(false, |acc, ev| ensure_event(&mut root, ev, cmd) | acc);
+    let modified = tool.events.iter().fold(false, |acc, ev| {
+        ensure_event(&mut root, ev, cmd, tool.shape) | acc
+    });
     // The version stamp is added only alongside a hook we are adding, and only when the
     // file does not already declare one: a file we are not otherwise changing is left
     // exactly as found, version included — that field is the tool's business, not ours.
-    if modified && versioned && root.get("version").is_none() {
+    if modified && tool.versioned && root.get("version").is_none() {
         root["version"] = json!(1);
     }
     if modified {
@@ -238,10 +310,10 @@ fn ensure_in_file(file: &Path, cmd: &str, versioned: bool) -> Result<bool, Strin
     Ok(modified)
 }
 
-/// Ensure `hooks.<event>` contains an entry whose `command == cmd`. Returns whether it
-/// added one (idempotent: a no-op if already present; leaves a malformed shape untouched,
-/// returning false rather than repairing a file the human may have meant).
-fn ensure_event(root: &mut Value, event: &str, cmd: &str) -> bool {
+/// Ensure `hooks.<event>` contains an entry running `cmd`, spelled `shape`'s way. Returns
+/// whether it added one (idempotent: a no-op if already present; leaves a malformed shape
+/// untouched, returning false rather than repairing a file the human may have meant).
+fn ensure_event(root: &mut Value, event: &str, cmd: &str, shape: HookShape) -> bool {
     let Some(obj) = root.as_object_mut() else {
         return false;
     };
@@ -253,28 +325,77 @@ fn ensure_event(root: &mut Value, event: &str, cmd: &str) -> bool {
     let Some(entries) = arr.as_array_mut() else {
         return false;
     };
-    if entries
-        .iter()
-        .any(|e| e.get("command").and_then(Value::as_str) == Some(cmd))
-    {
+    if entries.iter().any(|e| entry_runs(e, cmd)) {
         return false;
     }
-    entries.push(json!({ "command": cmd }));
+    entries.push(match shape {
+        HookShape::Flat => json!({ "command": cmd }),
+        HookShape::Nested => json!({ "hooks": [ { "type": "command", "command": cmd } ] }),
+    });
     true
+}
+
+/// Whether one already-present entry runs `cmd`, in either spelling.
+///
+/// Both are checked regardless of the tool's own shape so that a file already carrying the
+/// hook in the *other* form is left alone rather than gaining a duplicate — the cost of
+/// being wrong here is a tool that calls the same script twice per session, and the check
+/// is free.
+fn entry_runs(entry: &Value, cmd: &str) -> bool {
+    if entry.get("command").and_then(Value::as_str) == Some(cmd) {
+        return true;
+    }
+    entry
+        .get("hooks")
+        .and_then(Value::as_array)
+        .is_some_and(|inner| {
+            inner
+                .iter()
+                .any(|h| h.get("command").and_then(Value::as_str) == Some(cmd))
+        })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The tool row for `id`, for a test that needs a real shape rather than a made-up one.
+    fn tool(id: &str) -> &'static HookedTool {
+        HOOKED_TOOLS.iter().find(|t| t.id == id).unwrap()
+    }
+
     #[test]
-    fn adds_a_flat_command_entry_not_claudes_matcher_group() {
-        // The whole reason this is not a call into `claude_hook`: cursor and copilot take
-        // `[{"command": …}]`, Claude takes `[{"hooks": [{"type": "command", …}]}]`.
+    fn adds_a_flat_command_entry_for_the_tools_that_take_one() {
+        // The original reason this is not a call into `claude_hook`: cursor and copilot
+        // take `[{"command": …}]` where Claude takes a matcher group.
         let mut root = json!({});
-        assert!(ensure_event(&mut root, "sessionStart", "/hook.sh"));
+        assert!(ensure_event(
+            &mut root,
+            "sessionStart",
+            "/hook.sh",
+            HookShape::Flat
+        ));
         assert_eq!(root["hooks"]["sessionStart"][0]["command"], "/hook.sh");
         assert!(root["hooks"]["sessionStart"][0].get("hooks").is_none());
+    }
+
+    #[test]
+    fn adds_codexs_nested_matcher_group_under_its_pascal_case_event() {
+        // Codex takes Claude's JSON, and the event name is `SessionStart`, not
+        // `sessionStart` — an event under the wrong casing is silently never called, which
+        // is exactly the failure this shape flag exists to prevent.
+        let mut root = json!({});
+        assert!(ensure_event(
+            &mut root,
+            "SessionStart",
+            "/hook.sh",
+            HookShape::Nested
+        ));
+        let entry = &root["hooks"]["SessionStart"][0];
+        assert_eq!(entry["hooks"][0]["type"], "command");
+        assert_eq!(entry["hooks"][0]["command"], "/hook.sh");
+        assert!(entry.get("command").is_none());
+        assert!(root["hooks"].get("sessionStart").is_none());
     }
 
     #[test]
@@ -283,17 +404,54 @@ mod tests {
             "model": "auto",
             "hooks": { "sessionStart": [ { "command": "/hook.sh" } ] }
         });
-        assert!(!ensure_event(&mut root, "sessionStart", "/hook.sh"));
+        assert!(!ensure_event(
+            &mut root,
+            "sessionStart",
+            "/hook.sh",
+            HookShape::Flat
+        ));
         assert_eq!(root["model"], "auto");
         // Somebody else's hook is appended beside, never replaced.
-        assert!(ensure_event(&mut root, "sessionStart", "/theirs.sh"));
+        assert!(ensure_event(
+            &mut root,
+            "sessionStart",
+            "/theirs.sh",
+            HookShape::Flat
+        ));
         assert_eq!(root["hooks"]["sessionStart"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_hook_already_present_in_the_other_spelling_is_not_duplicated() {
+        // A human (or an older build) may have registered the same script the other way
+        // round. Adding a second entry would make the tool run it twice per session.
+        let mut root = json!({
+            "hooks": { "SessionStart": [ { "hooks": [ { "type": "command", "command": "/hook.sh" } ] } ] }
+        });
+        assert!(!ensure_event(
+            &mut root,
+            "SessionStart",
+            "/hook.sh",
+            HookShape::Flat
+        ));
+        let mut root = json!({ "hooks": { "SessionStart": [ { "command": "/hook.sh" } ] } });
+        assert!(!ensure_event(
+            &mut root,
+            "SessionStart",
+            "/hook.sh",
+            HookShape::Nested
+        ));
     }
 
     #[test]
     fn leaves_a_malformed_hooks_block_untouched() {
         let mut root = json!({ "hooks": { "sessionStart": "not-an-array" } });
-        assert!(!ensure_event(&mut root, "sessionStart", "/hook.sh"));
+        assert!(!ensure_event(
+            &mut root,
+            "sessionStart",
+            "/hook.sh",
+            HookShape::Flat
+        ));
         assert_eq!(root["hooks"]["sessionStart"], "not-an-array");
     }
 
@@ -303,14 +461,20 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let cursor = dir.join("hooks.json");
-        assert_eq!(ensure_in_file(&cursor, "/hook.sh", true), Ok(true));
+        assert_eq!(
+            ensure_in_file(&cursor, "/hook.sh", tool("cursor-agent")),
+            Ok(true)
+        );
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&cursor).unwrap()).unwrap();
         assert_eq!(v["version"], 1);
         assert_eq!(v["hooks"]["sessionStart"][0]["command"], "/hook.sh");
         assert_eq!(v["hooks"]["sessionEnd"][0]["command"], "/hook.sh");
 
         let copilot = dir.join("settings.json");
-        assert_eq!(ensure_in_file(&copilot, "/hook.sh", false), Ok(true));
+        assert_eq!(
+            ensure_in_file(&copilot, "/hook.sh", tool("copilot")),
+            Ok(true)
+        );
         let v: Value = serde_json::from_str(&std::fs::read_to_string(&copilot).unwrap()).unwrap();
         assert!(
             v.get("version").is_none(),
@@ -318,9 +482,25 @@ mod tests {
         );
         assert_eq!(v["hooks"]["sessionEnd"][0]["command"], "/hook.sh");
 
+        let codex = dir.join("codex-hooks.json");
+        assert_eq!(ensure_in_file(&codex, "/hook.sh", tool("codex")), Ok(true));
+        let v: Value = serde_json::from_str(&std::fs::read_to_string(&codex).unwrap()).unwrap();
+        assert!(v.get("version").is_none());
+        assert_eq!(
+            v["hooks"]["SessionEnd"][0]["hooks"][0]["command"],
+            "/hook.sh"
+        );
+
         // Second pass changes nothing — this runs on every app start.
-        assert_eq!(ensure_in_file(&cursor, "/hook.sh", true), Ok(false));
-        assert_eq!(ensure_in_file(&copilot, "/hook.sh", false), Ok(false));
+        assert_eq!(
+            ensure_in_file(&cursor, "/hook.sh", tool("cursor-agent")),
+            Ok(false)
+        );
+        assert_eq!(
+            ensure_in_file(&copilot, "/hook.sh", tool("copilot")),
+            Ok(false)
+        );
+        assert_eq!(ensure_in_file(&codex, "/hook.sh", tool("codex")), Ok(false));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -330,7 +510,10 @@ mod tests {
         let file = std::env::temp_dir()
             .join("hp-hooked-nope-xyz")
             .join("hooks.json");
-        assert_eq!(ensure_in_file(&file, "/hook.sh", true), Ok(false));
+        assert_eq!(
+            ensure_in_file(&file, "/hook.sh", tool("cursor-agent")),
+            Ok(false)
+        );
         assert!(!file.exists());
     }
 

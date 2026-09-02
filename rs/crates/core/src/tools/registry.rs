@@ -26,11 +26,18 @@ pub enum HistoryKind {
     CursorJsonl,
     /// `~/.copilot/session-state/<uuid>/` + `~/.copilot/session-store.db`
     CopilotSqlite,
-    /// `~/.codex/codex.sqlite` — the thread store Codex 0.151 keeps its rollouts in.
-    /// Legacy installs also leave `~/.codex/sessions/<YYYY>/<MM>/<DD>/rollout-*.jsonl`
-    /// behind; Codex migrates those into the DB, so a provider reads the DB and treats
-    /// the JSONL tree as a fallback for a not-yet-migrated home.
-    CodexSqlite,
+    /// `$CODEX_HOME/sessions/<YYYY>/<MM>/<DD>/rollout-<stamp>-<session id>.jsonl`
+    /// (`$CODEX_HOME` defaults to `~/.codex`).
+    ///
+    /// Read off a real Codex 0.151.0 install rather than its docs. There is no
+    /// `codex.sqlite`: the SQLite files beside the tree (`thread_history_1`, `state_5`,
+    /// `logs_2`, …) are projections *over* the rollouts — `thread_turns` rows carry a
+    /// `rollout_ordinal` and a `rollout_byte_offset` into them. The JSONL is canonical,
+    /// which is what makes it appendable and therefore tailable.
+    ///
+    /// Paths are resolved by [`crate::tools::history::codex`]; the Talk tailer reads the
+    /// records as [`crate::speech::tailer::TranscriptFormat::CodexRollout`].
+    CodexRollout,
 }
 
 /// One tool. All fields are `'static` so the whole table is a compile-time constant.
@@ -109,8 +116,7 @@ pub static TOOLS: &[ToolDef] = &[
         icon: TOOL_ICON_BASE + 2,
         brand: (0x10, 0xA3, 0x7F),
         detect_tokens: &["codex"],
-        // Layout unverified against a real install — registry entry only, by design.
-        history: HistoryKind::CodexSqlite,
+        history: HistoryKind::CodexRollout,
     },
     ToolDef {
         id: "copilot",
