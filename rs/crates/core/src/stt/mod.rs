@@ -4,24 +4,28 @@
 //! external commands, auto-detected, each overridable from a settings file:
 //!
 //! ```text
-//! click mic  → recorder command  → <state>/dictation/<pane>.wav
+//! click mic  → recorder (in-process, or a command) → <state>/dictation/<pane>.wav
 //! click stop → (graceful stop)   → transcriber command → stdout → pane input
 //! ```
 //!
-//! **Why commands and not an audio crate.** Capturing audio in-process means `cpal`,
-//! which means ALSA headers at build time on Linux and a per-platform device-enumeration
-//! layer to maintain. Every desktop that can record already ships something that records
-//! (`ffmpeg`, `sox`/`rec`, `arecord`), the same way every desktop ships something that
-//! speaks. Shelling out keeps the dependency tree flat, makes the whole pipeline testable
-//! headless (point `recordTemplate` at a script that copies a fixture WAV), and degrades
-//! to a one-time notice instead of a build failure when nothing is installed.
+//! **In-process first, commands as the fallback.** This started out as commands only —
+//! `ffmpeg`, `sox`/`rec`, `arecord` — on the reasoning that every desktop that can record
+//! already ships something that records. It doesn't. A stock macOS has none of the three,
+//! and a GUI app cannot see a Homebrew install anyway (see
+//! [`crate::speech::engine::resolve`]), so the mic button's whole job became reporting
+//! "no recorder found" to someone whose microphone was working fine. [`native`] captures
+//! through the OS audio API instead and needs nothing installed; the commands stay as the
+//! fallback and the `{wav}` template stays as the override, which is what keeps the
+//! pipeline testable headless (point `recordTemplate` at a script that copies a fixture
+//! WAV). The bill for it is one build-time dependency on Linux, `libasound2-dev`.
 //!
-//! Owned modules: [`backend`] (detection + argv construction) and [`dictation`] (the
-//! per-pane record → stop → transcribe state machine). This file holds only the
-//! persisted settings shape.
+//! Owned modules: [`native`] (in-process capture), [`backend`] (detection + argv
+//! construction) and [`dictation`] (the per-pane record → stop → transcribe state
+//! machine). This file holds only the persisted settings shape.
 
 pub mod backend;
 pub mod dictation;
+pub mod native;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -31,7 +35,9 @@ use std::path::Path;
 #[serde(rename_all = "camelCase")]
 pub struct SttSettings {
     /// Custom recorder command, e.g. `["ffmpeg", "-f", "avfoundation", "-i", ":default", "{wav}"]`.
-    /// `{wav}` in any argument is replaced with the output path. `None` -> auto-detect.
+    /// `{wav}` in any argument is replaced with the output path. Set, it beats in-process
+    /// capture too — an override that only overrode the fallbacks would be no override at
+    /// all. `None` -> auto-detect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub record_template: Option<Vec<String>>,
     /// Custom transcriber command, e.g. `["whisper-cli", "-f", "{wav}", "-nt"]`. The

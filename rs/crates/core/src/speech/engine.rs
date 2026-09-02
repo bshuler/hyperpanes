@@ -119,15 +119,12 @@ pub(crate) fn resolve(cmd: &str) -> Option<PathBuf> {
     let from_path = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
         .unwrap_or_default();
-    from_path
-        .into_iter()
-        .chain(extra_dirs())
-        .find_map(|dir| {
-            candidates
-                .iter()
-                .map(|name| dir.join(name))
-                .find(|c| c.is_file())
-        })
+    from_path.into_iter().chain(extra_dirs()).find_map(|dir| {
+        candidates
+            .iter()
+            .map(|name| dir.join(name))
+            .find(|c| c.is_file())
+    })
 }
 
 /// Is `cmd` an executable this process can actually spawn?

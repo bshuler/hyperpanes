@@ -39,9 +39,13 @@ pub enum StopKind {
     Interrupt,
 }
 
-/// The command that captures microphone audio to a WAV.
+/// What captures microphone audio to a WAV.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Recorder {
+    /// In-process capture through the OS audio API — CoreAudio, WASAPI, ALSA. The only
+    /// variant that is not a command, and the only one that works on a machine with
+    /// nothing installed. See [`super::native`].
+    Native,
     /// User-supplied argv; `{wav}` in any argument is replaced with the output path.
     /// Stopped like ffmpeg on Windows and by signal elsewhere — a custom recorder is
     /// most often a shell script, and a script reacts to SIGINT.
@@ -60,6 +64,7 @@ pub enum Recorder {
 impl Recorder {
     pub fn name(&self) -> &'static str {
         match self {
+            Recorder::Native => "native",
             Recorder::Custom(_) => "custom",
             Recorder::Ffmpeg { .. } => "ffmpeg",
             Recorder::Rec => "rec",
@@ -68,6 +73,8 @@ impl Recorder {
         }
     }
 
+    /// Only meaningful for the variants that spawn a process; [`Recorder::Native`] is
+    /// stopped over a channel, not a signal, so its answer here is never consulted.
     pub fn stop_kind(&self) -> StopKind {
         match self {
             Recorder::Ffmpeg { .. } => StopKind::FfmpegQuit,
@@ -76,8 +83,9 @@ impl Recorder {
         }
     }
 
-    /// The command to spawn, writing its capture to `wav`. `None` for [`Recorder::None`]
-    /// and for an empty custom template.
+    /// The command to spawn, writing its capture to `wav`. `None` for the variants that
+    /// spawn nothing: [`Recorder::Native`], [`Recorder::None`], and an empty custom
+    /// template.
     pub fn build_command(&self, wav: &Path) -> Option<Command> {
         let wav_s = wav.to_string_lossy().to_string();
         match self {
@@ -113,18 +121,26 @@ impl Recorder {
                 .arg(&wav_s);
                 Some(c)
             }
-            Recorder::None => None,
+            // Captured in-process; there is no command. `dictation` branches on this
+            // variant before it ever asks for one.
+            Recorder::Native | Recorder::None => None,
         }
     }
 }
 
-/// Pick a recorder: the configured template if there is one, else the first thing on
-/// `PATH` that can capture on this platform.
+/// Pick a recorder: the configured template if there is one, else in-process capture,
+/// else the first thing on `PATH` that can capture on this platform.
 pub fn detect_recorder(settings: &SttSettings) -> Recorder {
     if let Some(argv) = settings.record_template.as_ref() {
         if !argv.is_empty() {
             return Recorder::Custom(argv.clone());
         }
+    }
+    // Before every external tool, because it is the one that does not have to be
+    // installed. It steps aside only when this machine has no usable input device at
+    // all, in which case an `ffmpeg` capture would have had nothing to open either.
+    if super::native::available() {
+        return Recorder::Native;
     }
     if on_path("ffmpeg") {
         if let Some((dev, format)) = ffmpeg_input() {

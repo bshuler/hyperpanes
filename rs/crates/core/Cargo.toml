@@ -36,6 +36,19 @@ rand = "0.8"      # 32-random-byte hex master token
 # system dep) — consistent with the single-binary goal of the native rewrite.
 rusqlite = { version = "0.32", features = ["bundled"] }
 
+# --- dictation: in-process microphone capture (stt/native.rs) ---
+# The "batteries included" recorder. Everything else in stt/backend.rs shells out to a
+# tool the user had to install first (ffmpeg, sox, arecord); cpal talks to CoreAudio,
+# WASAPI and ALSA directly, so the mic button works on a machine with nothing on it.
+# Cost, stated plainly: a Linux *build* now needs `libasound2-dev` (alsa-sys is
+# pkg-config'd, there is no vendored path). CI and scripts/gui-harness/Dockerfile
+# install it. At *runtime* Linux needs only libasound.so.2, which every desktop that
+# has sound already has.
+cpal = "0.18"
+# WAV encoding. The recorder has to write the header length itself now that no external
+# tool is doing it, which is the one thing a killed ffmpeg used to get wrong.
+hound = "3.5"
+
 # platform: single-instance (named mutex + named-pipe argv handoff)
 # 0.58 -> 0.62 to unify with the app + wgpu-hal 29 (avoids two `windows` crate versions).
 # Target-gated so Linux/macOS builds never pull the Win32 bindings.

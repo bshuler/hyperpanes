@@ -74,7 +74,8 @@ MCP** lets an agent — or a whole recursive agent org — watch and drive your 
   Only Focused Pane**. Off by default; persisted per pane. See `docs/talk-feature.md`.
 - **Dictate — speak into a pane** — every pane header has a **microphone**: click it, talk, click
   it again, and the recording is transcribed locally (whisper / whisper‑cli) and typed into that
-  pane. Recording uses whatever the machine already has (ffmpeg / sox / arecord); nothing is sent
+  pane. Recording is in‑process (CoreAudio / WASAPI / ALSA) and needs nothing installed, falling
+  back to ffmpeg / sox / arecord if the OS audio device cannot be opened; nothing is sent
   anywhere, a transcript can never press Enter on its own, and a forgotten mic stops itself after
   5 minutes. See `docs/stt-feature.md`.
 

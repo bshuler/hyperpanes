@@ -8,6 +8,7 @@
 //! correct.
 
 use super::backend::{clean_transcript, detect_recorder, detect_transcriber, Recorder, StopKind};
+use super::native::{self, NativeCapture};
 use super::SttSettings;
 use std::collections::HashMap;
 use std::io::Write;
@@ -22,15 +23,31 @@ use std::time::{Duration, Instant};
 const STOP_GRACE: Duration = Duration::from_secs(3);
 /// Poll interval while waiting for the recorder to exit.
 const POLL: Duration = Duration::from_millis(20);
+/// Hard ceiling on one recording. A mic left on by accident should stop itself rather
+/// than fill a disk. The external recorders take it as an argument; the in-process one
+/// takes it here, so the cap survives a GUI that crashes without ever sending a stop.
+const MAX_RECORD: Duration = Duration::from_secs(300);
 /// A WAV smaller than this is a header and nothing else — the mic was released before it
 /// captured anything, which is a "say something" message, not a transcriber's problem.
 const MIN_WAV_BYTES: u64 = 2048;
 
+/// Whatever is currently holding the microphone.
+///
+/// Two shapes, because there are two kinds of recorder: one that is a process to be
+/// stopped and reaped, and one that is a thread inside this process to be signalled and
+/// joined. Everything downstream of the mic button is identical either way — that is the
+/// point of putting the split here and nowhere else.
+enum Capture {
+    /// In-process capture ([`super::native`]).
+    Native(NativeCapture),
+    /// A spawned recorder: `ffmpeg`, `rec`, `arecord`, or a user template.
+    Process { child: Child, stop: StopKind },
+}
+
 /// A recording in progress.
 struct Recording {
-    child: Child,
+    capture: Capture,
     wav: PathBuf,
-    stop: StopKind,
     started: Instant,
 }
 
@@ -76,18 +93,19 @@ impl Dictation {
     /// nobody can stop.
     pub fn start(&self, pane_id: &str, settings: &SttSettings) -> Result<&'static str, String> {
         let mut live = self.live.lock().unwrap();
-        if let Some(r) = live.get(pane_id) {
-            return Ok(match r.stop {
-                StopKind::FfmpegQuit => "already-recording",
-                StopKind::Interrupt => "already-recording",
-            });
+        if live.contains_key(pane_id) {
+            return Ok("already-recording");
         }
         let recorder = detect_recorder(settings);
         if recorder == Recorder::None {
+            // In-process capture needs nothing installed, so reaching here means the
+            // machine has no usable microphone at all — not that something is missing
+            // from PATH. Say the thing that is actually true.
             return Err(format!(
-                "no recorder found: looked on PATH and in the usual install \
-                 prefixes for {}. Install ffmpeg (or sox/alsa-utils), or set \
-                 stt.recordTemplate to a command that captures to {{wav}}.",
+                "no microphone found: this machine reports no usable audio input \
+                 device, and none of {} is installed either. Plug in or enable a \
+                 microphone, or set stt.recordTemplate to a command that captures \
+                 to {{wav}}.",
                 if cfg!(target_os = "linux") {
                     "ffmpeg, rec, arecord"
                 } else {
@@ -99,25 +117,32 @@ impl Dictation {
         let wav = self.dir.join(format!("{}.wav", sanitize(pane_id)));
         let _ = std::fs::remove_file(&wav);
 
-        let mut cmd = recorder
-            .build_command(&wav)
-            .ok_or_else(|| "recorder has no command".to_string())?;
-        // stdin stays open and piped for every recorder, not just ffmpeg: it is how the
-        // graceful stop is delivered, and a recorder that inherits the app's stdin can
-        // steal keystrokes from whatever launched it.
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let child = cmd
-            .spawn()
-            .map_err(|e| format!("{} failed to start: {e}", recorder.name()))?;
+        let capture = if recorder == Recorder::Native {
+            Capture::Native(native::start(&wav, MAX_RECORD)?)
+        } else {
+            let mut cmd = recorder
+                .build_command(&wav)
+                .ok_or_else(|| "recorder has no command".to_string())?;
+            // stdin stays open and piped for every recorder, not just ffmpeg: it is how
+            // the graceful stop is delivered, and a recorder that inherits the app's
+            // stdin can steal keystrokes from whatever launched it.
+            cmd.stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            let child = cmd
+                .spawn()
+                .map_err(|e| format!("{} failed to start: {e}", recorder.name()))?;
+            Capture::Process {
+                child,
+                stop: recorder.stop_kind(),
+            }
+        };
 
         live.insert(
             pane_id.to_string(),
             Recording {
-                child,
+                capture,
                 wav,
-                stop: recorder.stop_kind(),
                 started: Instant::now(),
             },
         );
@@ -167,32 +192,44 @@ impl Dictation {
 /// mid-write leaves a file no decoder will open. Every recorder is therefore asked
 /// politely first — `q` on stdin for ffmpeg, SIGINT for the rest — and killed only after
 /// [`STOP_GRACE`] proves it is not going to exit on its own.
-fn finish_recording(mut rec: Recording) {
-    match rec.stop {
-        StopKind::FfmpegQuit => {
-            if let Some(mut stdin) = rec.child.stdin.take() {
-                let _ = stdin.write_all(b"q\n");
-                let _ = stdin.flush();
+fn finish_recording(rec: Recording) {
+    let mut child = match rec.capture {
+        // The in-process recorder finalizes its own header on the way out, and `finish`
+        // does not return until it has. No grace period to wait out, nothing to kill.
+        Capture::Native(cap) => {
+            let _ = cap.finish();
+            return;
+        }
+        Capture::Process { child, stop } => {
+            let mut child = child;
+            match stop {
+                StopKind::FfmpegQuit => {
+                    if let Some(mut stdin) = child.stdin.take() {
+                        let _ = stdin.write_all(b"q\n");
+                        let _ = stdin.flush();
+                    }
+                }
+                StopKind::Interrupt => {
+                    // Closing stdin first: a recorder reading from it exits on EOF, which
+                    // covers custom shell-script recorders with no SIGINT handler.
+                    drop(child.stdin.take());
+                    interrupt(&child);
+                }
             }
+            child
         }
-        StopKind::Interrupt => {
-            // Closing stdin first: a recorder reading from it exits on EOF, which covers
-            // custom shell-script recorders that do not install a SIGINT handler.
-            drop(rec.child.stdin.take());
-            interrupt(&rec.child);
-        }
-    }
+    };
     let deadline = Instant::now() + STOP_GRACE;
     loop {
-        match rec.child.try_wait() {
+        match child.try_wait() {
             Ok(Some(_)) => return,
             Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
             // Killed, or unwaitable: either way stop waiting on it.
             _ => break,
         }
     }
-    let _ = rec.child.kill();
-    let _ = rec.child.wait();
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Send SIGINT to `child`. No-op off Unix, where the graceful stop is stdin-based.

@@ -9,15 +9,26 @@ back out.
 halves are local commands you already have (or don't, in which case the feature says so and
 stays out of the way).
 
-## Why commands, not an audio crate
+## Why in-process first, with commands as the fallback
 
-Capturing audio in-process means `cpal`, which means ALSA headers at build time on Linux and a
-per-platform device-enumeration layer to maintain forever. Every desktop that can record
-already ships something that records, exactly as every desktop ships something that speaks —
-so dictation shells out the same way `speech` does. The dependency tree stays flat (this
-feature added **zero** Cargo dependencies), the whole pipeline is testable headless (point
-`recordTemplate` at a script that copies a fixture WAV), and "nothing installed" degrades to a
-toast instead of a build failure.
+This shipped as commands only — `ffmpeg`, `sox`/`rec`, `arecord` — on the reasoning that every
+desktop that can record already ships something that records, exactly as every desktop ships
+something that speaks. **That reasoning was wrong**, and it was wrong in the way that mattered:
+a stock macOS has none of the three, a stock Windows has none of the three, and a GUI app
+launched from the Dock cannot see a Homebrew install even when the user has one (see
+`speech::engine::resolve`). The mic button's entire behaviour on a fresh machine was to report
+"no recorder found" to someone whose microphone was working perfectly.
+
+`stt/native.rs` captures through the OS audio API instead — CoreAudio, WASAPI, ALSA, via `cpal`
+— and writes the WAV with `hound`. It needs nothing installed, and it is tried **first**. The
+commands stay as the fallback for a machine cpal cannot open a device on, and `recordTemplate`
+still overrides everything, which is what keeps the pipeline testable headless (point it at a
+script that copies a fixture WAV).
+
+The bill, stated plainly: two Cargo dependencies, and a Linux **build** now needs
+`libasound2-dev` (alsa-sys is pkg-config'd; there is no vendored path). CI and
+`scripts/gui-harness/Dockerfile` install it. At **runtime** Linux needs only `libasound.so.2`,
+which every desktop with working sound already has.
 
 ## Pipeline
 
@@ -29,13 +40,23 @@ click again → graceful stop           → the recorder finalizes its WAV heade
             → (optional) 40ms later   → sessions.write(uid, "\r")      [submit]
 ```
 
-### Recorders (`stt/backend.rs`)
+### Recorders (`stt/backend.rs`, `stt/native.rs`)
+
+Detection order is: `recordTemplate` if set → in-process capture if this machine has a usable
+input device → the commands below.
 
 | Platform | Detected recorder | Stop |
 | --- | --- | --- |
+| all | **in-process (`cpal`)** — the default, needs nothing installed | signal a channel, join the thread |
 | macOS | `ffmpeg -f avfoundation -i :default` | write `q\n` to stdin |
 | Linux | `ffmpeg -f pulse`, else `rec` (sox), else `arecord` | `q\n` / SIGINT |
 | Windows | `ffmpeg -f dshow` with the first enumerated audio device | `q\n` (the only stop that works there) |
+
+Whatever the device offers — f32 on CoreAudio, i16 on most of ALSA, u8 on cheap USB mics, at
+8/44.1/48/96 kHz, mono or multichannel — the in-process recorder hands on the same **mono
+16 kHz signed 16-bit** WAV the external recorders are asked for: channels averaged (so one dead
+channel of a stereo mic is not silence) and resampled by a phase accumulator that is exact over
+any run length.
 
 **The stop is the whole design problem.** A WAV header states the data length, and a recorder
 killed mid-write leaves one that claims zero bytes — a file every transcriber reads as
@@ -45,8 +66,9 @@ graceful stop available on Windows, which has no SIGINT to send), sox/arecord ge
 under `MIN_WAV_BYTES` (2048) is reported as "no audio captured" rather than handed to a
 transcriber that would return an empty string.
 
-`MAX_RECORD_SECS` (300) is enforced **by the recorder itself** (`-t` / `trim` / `-d`), not by a
-timer in the app — so the cap survives a crashed GUI. A forgotten microphone stops on its own.
+`MAX_RECORD_SECS` (300) is enforced **by the recorder itself** (`-t` / `trim` / `-d`, and a
+`recv_timeout` on the capture thread), not by a timer in the GUI — so the cap survives a
+crashed GUI. A forgotten microphone stops on its own.
 
 ### Transcribers
 
@@ -72,7 +94,7 @@ tick, so a per-pane flag in the read model would be stamped straight back out. `
 therefore reports it as one additive top-level block:
 
 ```json
-"dictation": { "recorder": "ffmpeg", "transcriber": "none", "recordingPanes": ["p1"] }
+"dictation": { "recorder": "native", "transcriber": "none", "recordingPanes": ["p1"] }
 ```
 
 Naming both halves even when nothing is installed lets a client tell "no recorder here" apart

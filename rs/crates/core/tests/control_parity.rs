@@ -103,18 +103,32 @@ fn state_is_byte_exact_over_a_real_socket() {
     let port = boot();
     let (status, body) = request(port, "GET", "/state", Some(TOKEN), None);
     assert_eq!(status, 200);
-    // `windows` is byte-exact (the frozen legacy shape); the additive `speech` field's
-    // `backend` is environment-dependent (whatever TTS the test machine has on PATH, if
-    // any) — this crate has no JSON parser available (public-API + std only), so the
-    // known-exact prefix/suffix around that one variable value are checked directly.
+    // `windows` is byte-exact (the frozen legacy shape). The additive `speech` and
+    // `dictation` fields name backends that are environment-dependent — whatever the test
+    // machine can speak with, and whatever it can record and transcribe with — so their
+    // names are checked for presence, not value. This crate has no JSON parser available
+    // (public-API + std only), hence the string surgery.
     let prefix = r##"{"windows":[{"windowId":1,"activeTabId":"t1","keyboardFocusPaneId":null,"tabs":[{"id":"t1","title":"Tab 1","layout":"auto","panes":[{"id":"p1","sessionUid":"u1","label":"shell","color":"#3b82f6","status":"running","activity":"busy"}]}]}],"speech":{"muted":false,"focusedOnly":false,"backend":""##;
-    let suffix = r#"","speakingPane":null}}"#;
     assert!(body.starts_with(prefix), "unexpected body: {body}");
-    assert!(body.ends_with(suffix), "unexpected body: {body}");
+    let rest = &body[prefix.len()..];
+    let (tts, rest) = rest.split_once('"').expect("unterminated backend name");
+    assert!(!tts.is_empty(), "expected a non-empty TTS backend: {body}");
+
+    let mid = r#","speakingPane":null},"dictation":{"recorder":""#;
+    assert!(rest.starts_with(mid), "unexpected body: {body}");
+    let rest = &rest[mid.len()..];
+    let (recorder, rest) = rest.split_once('"').expect("unterminated recorder name");
+    assert!(!recorder.is_empty(), "expected a recorder name: {body}");
+
+    let mid = r#","transcriber":""#;
+    assert!(rest.starts_with(mid), "unexpected body: {body}");
+    let rest = &rest[mid.len()..];
+    let (transcriber, rest) = rest.split_once('"').expect("unterminated transcriber name");
     assert!(
-        body.len() > prefix.len() + suffix.len(),
-        "expected a non-empty backend name: {body}"
+        !transcriber.is_empty(),
+        "expected a transcriber name: {body}"
     );
+    assert_eq!(rest, r#","recordingPanes":[]}}"#, "unexpected body: {body}");
 }
 
 #[test]

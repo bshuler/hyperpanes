@@ -16,6 +16,7 @@ FROM rust:1-bookworm
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev \
         libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config cmake clang \
+        libasound2-dev \
     # runtime: X11 + software Vulkan + fonts
     && apt-get install -y --no-install-recommends \
         libxkbcommon-x11-0 libx11-6 libxcb1 libgl1 libegl1 \

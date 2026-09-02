@@ -56,7 +56,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config cmake clang
+            libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config cmake clang \
+            libasound2-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -89,7 +90,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config cmake clang
+            libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config cmake clang \
+            libasound2-dev
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -161,7 +163,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libfontconfig1-dev libfreetype6-dev libxkbcommon-dev libwayland-dev \
-            libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config cmake clang
+            libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config cmake clang \
+            libasound2-dev
 
       - uses: dtolnay/rust-toolchain@stable
 
