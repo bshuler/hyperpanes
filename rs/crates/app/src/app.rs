@@ -1406,20 +1406,30 @@ impl App {
                 }
                 fed
             }
-            SessionEvent::Exit { uid, .. } => {
+            SessionEvent::Exit { uid, code } => {
                 self.ai.send(crate::ai::AiMsg::Exit { uid: uid.clone() });
                 self.ai_feed.borrow_mut().remove(&uid);
                 self.openurl_carry.borrow_mut().remove(&uid);
                 if let Some(w) = find_window(windows, &uid) {
-                    let alive = {
+                    let out = {
                         let mut st = w.state.borrow_mut();
                         // Belt-and-braces: the laid-out path drops these in `take_pane_in`,
                         // but a PARKED (reminder) pane's exit never goes through it.
                         st.forget_pane_runtime(&uid);
-                        st.pane_exited(&uid, &self.mgr)
+                        st.pane_exited(&uid, &self.mgr, code)
                     };
-                    crate::dbg_log(&format!("exit[{}] uid={uid} alive={alive}", w.id));
-                    if !alive {
+                    // A pane that fell back to a shell is the SAME pane to anyone driving
+                    // this process from outside, so its stable control pane-id has to follow
+                    // the new session uid. Without this the alias is pruned as dead and the
+                    // pane silently gets a new id mid-conversation.
+                    if let Some((old, new)) = &out.rebound {
+                        self.control.rebind_uid(old, new);
+                    }
+                    crate::dbg_log(&format!(
+                        "exit[{}] uid={uid} code={code} alive={} rebound={:?}",
+                        w.id, out.alive, out.rebound
+                    ));
+                    if !out.alive {
                         w.closing.set(true);
                     }
                 }

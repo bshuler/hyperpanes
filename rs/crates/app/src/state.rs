@@ -100,6 +100,33 @@ fn kill_session_of(mgr: &SessionManager, uid: &str, kind: &PaneKind) {
     }
 }
 
+/// What [`State::pane_exited`] did about a session that ended on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneExit {
+    /// Whether the window still has panes. `false` means the workspace is empty and the
+    /// caller quits — the pre-existing contract, unchanged.
+    pub alive: bool,
+    /// `(old uid, new uid)` when the pane fell back to a shell instead of closing. The pane
+    /// is the same pane, but its session is a new one, so callers holding uid-keyed state
+    /// (the control plane's stable pane-id alias) must move it across.
+    pub rebound: Option<(String, String)>,
+}
+
+/// The one line a pane prints when its program exits and the shell takes over.
+///
+/// It has to answer the two questions the old behaviour destroyed the pane before it could
+/// answer: what just ended, and how to get it back. Dim so it reads as chrome rather than
+/// as output the program produced, and CRLF-terminated because this is written into a
+/// terminal grid, not to a file.
+fn exit_banner(program: &str, code: i32) -> String {
+    let how = if code == 0 {
+        format!("{program} exited")
+    } else {
+        format!("{program} exited (code {code})")
+    };
+    format!("\r\n\x1b[2m{how} — this pane is a shell now; run `{program}` to start it again.\x1b[0m\r\n")
+}
+
 /// A session detached from its window for re-hosting in another (Wave-1 multi-window
 /// plumbing). Carries only the session `uid` + chrome; the PTY stays alive centrally in
 /// the [`SessionManager`], so re-hosting is a replay-into-a-fresh-grid, never a restart.
@@ -1664,8 +1691,29 @@ impl State {
     }
 
     fn fresh_tab(&mut self) -> Tab {
-        self.tab_seq += 1;
-        Tab::empty(format!("term {}", self.tab_seq).into())
+        let title = self.fresh_tab_title();
+        Tab::empty(title)
+    }
+
+    /// The next unused default tab name.
+    ///
+    /// `tab_seq` alone is not enough and never was: it is a per-`State` counter that starts
+    /// at 0 and is not persisted, so a window restored with a `term 2` tab in it hands out
+    /// `term 1`, then `term 2` — a second tab with a name already on the strip. Skipping the
+    /// names that are actually taken makes the counter a hint rather than the answer, which
+    /// is all it can be once titles survive a restart and the user can rename freely.
+    ///
+    /// Only the *generated* name is deduped. A title the user typed, or one a workspace file
+    /// names explicitly, is left exactly as written — silently renaming what someone asked
+    /// for is worse than letting two tabs share a name on purpose.
+    fn fresh_tab_title(&mut self) -> SharedString {
+        loop {
+            self.tab_seq += 1;
+            let name = format!("term {}", self.tab_seq);
+            if !self.tabs.iter().any(|t| t.title.as_str() == name) {
+                return name.into();
+            }
+        }
     }
 
     pub fn active_tab(&self) -> &Tab {
@@ -2425,11 +2473,46 @@ impl State {
             .collect()
     }
 
-    /// A session exited on its own — drop its pane wherever it lives. Returns
-    /// `false` if that emptied the whole workspace (caller quits).
-    pub fn pane_exited(&mut self, uid: &str, mgr: &SessionManager) -> bool {
+    /// A session exited on its own. A pane that was *running a program* falls back to a
+    /// shell in place; a plain shell's exit closes the pane as it always has.
+    ///
+    /// The distinction is the whole point. Quitting a program is not the same act as
+    /// closing a terminal: `Ctrl-C` out of `claude` in a one-pane tab used to take the pane,
+    /// the tab, and everything the user could have typed to bring it back — the recovery
+    /// affordance died with the thing it would have recovered. Leaving a shell behind, in
+    /// the same slot and the same cwd, makes the exit undoable by typing the program's name.
+    ///
+    /// A plain shell keeps closing: there `exit` *is* "close this terminal", and respawning
+    /// a shell the user just quit would make the pane impossible to get rid of.
+    pub fn pane_exited(&mut self, uid: &str, mgr: &SessionManager, code: i32) -> PaneExit {
         match self.find_pane(uid) {
-            Some((ti, pi)) => self.close_pane_in(ti, pi, mgr),
+            Some((ti, pi)) => {
+                if let Some(program) = self.exited_program(ti, pi) {
+                    let (cwd, env) = {
+                        let p = &self.tabs[ti].panes[pi];
+                        (p.cwd.clone(), p.env.clone())
+                    };
+                    // Keep the cwd: the point is to land where the program was, so retyping
+                    // its name resumes the same work.
+                    if let Some((old, new)) = self.restart_pane_at(ti, pi, mgr, cwd, env) {
+                        let p = &mut self.tabs[ti].panes[pi];
+                        // The pane runs a shell now, and saying so is not cosmetic: only a
+                        // `Terminal` pane may be re-upgraded by the title/foreground sniffs
+                        // (`note_pane_title`), so a pane left claiming `Tool` would never
+                        // notice the program being started again.
+                        p.kind = PaneKind::Terminal;
+                        p.pane.feed(&exit_banner(&program, code));
+                        return PaneExit {
+                            alive: true,
+                            rebound: Some((old, new)),
+                        };
+                    }
+                }
+                PaneExit {
+                    alive: self.close_pane_in(ti, pi, mgr),
+                    rebound: None,
+                }
+            }
             None => {
                 // A PARKED (reminder) pane's shell exited on its own — its session is gone,
                 // so drop the reminder rather than leave a dead row in the bell list.
@@ -2437,9 +2520,38 @@ impl State {
                     self.reminders.remove(i);
                     self.dirty = true;
                 }
-                true
+                PaneExit {
+                    alive: true,
+                    rebound: None,
+                }
             }
         }
+    }
+
+    /// The display name of the program pane `(ti, pi)` was spawned to run, or `None` if it
+    /// was only ever a shell.
+    ///
+    /// Read from what the pane was *spawned* with — its `PaneKind` and `spawn_command` —
+    /// never from a sniff. A sniff says what the pane happened to be running a moment ago;
+    /// falling back to a shell is a decision about what the pane *is for*, and a shell pane
+    /// that ran `claude` once must not start refusing to close.
+    fn exited_program(&self, ti: usize, pi: usize) -> Option<String> {
+        let p = self.tabs.get(ti)?.panes.get(pi)?;
+        if !p.kind.is_pty() {
+            return None;
+        }
+        if let PaneKind::Tool(id) = &p.kind {
+            return Some(
+                hyperpanes_core::tools::registry::by_id(id)
+                    .map(|t| t.bin.to_string())
+                    .unwrap_or_else(|| id.clone()),
+            );
+        }
+        // A `Terminal` pane spawned with a command (`htop`, a script) is a program pane too —
+        // the kind only records that we could not name the tool, not that there wasn't one.
+        let cmd = p.spawn_command.as_deref()?.trim();
+        let head = cmd.split_whitespace().next()?;
+        Some(head.rsplit(['/', '\\']).next().unwrap_or(head).to_string())
     }
 
     // ---- runtime tool identity (D5: inference upgrades chrome, never the relaunch) ----
@@ -5810,7 +5922,7 @@ impl State {
     /// the grid), and kill the old session. The cwd resets to the default and any per-pane env
     /// overrides are dropped, otherwise chrome (title / color / frame) is preserved.
     pub fn restart_pane(&mut self, idx: usize, mgr: &SessionManager) {
-        self.restart_pane_with(idx, mgr, None, None);
+        self.restart_pane_at(self.active, idx, mgr, None, None);
     }
 
     /// "Refresh Env" (#28): restart pane `idx`'s shell in place but KEEP its live cwd and its
@@ -5822,25 +5934,34 @@ impl State {
             Some(p) => (p.cwd.clone(), p.env.clone()),
             None => return,
         };
-        self.restart_pane_with(idx, mgr, cwd, env);
+        self.restart_pane_at(self.active, idx, mgr, cwd, env);
     }
 
-    /// Shared respawn core of [`Self::restart_pane`] / [`Self::refresh_env_pane`]: spawn a
-    /// replacement session (optionally pinning a cwd + env overrides), swap it into the pane
-    /// slot, and kill the old session.
-    fn restart_pane_with(
+    /// Shared respawn core of [`Self::restart_pane`] / [`Self::refresh_env_pane`] / the
+    /// exit fallback in [`Self::pane_exited`]: spawn a replacement session (optionally
+    /// pinning a cwd + env overrides), swap it into the pane slot, and kill the old session.
+    ///
+    /// Addressed by `(ti, idx)` rather than the active tab: a pane whose program exits is
+    /// very often not the one being looked at, and respawning into the focused tab instead
+    /// would replace a pane the user is working in.
+    ///
+    /// Returns `(old uid, new uid)` — a restart mints a fresh session, so anything keyed by
+    /// the pane's uid outside this `State` (the control plane's stable pane-id alias) has to
+    /// be moved across. `None` when there was nothing to restart.
+    fn restart_pane_at(
         &mut self,
+        ti: usize,
         idx: usize,
         mgr: &SessionManager,
         cwd: Option<String>,
         env: Option<hyperpanes_core::session::spawn::EnvMap>,
-    ) {
-        let (cols, rows) = match self.active_tab().panes.get(idx) {
+    ) -> Option<(String, String)> {
+        let (cols, rows) = match self.tabs.get(ti).and_then(|t| t.panes.get(idx)) {
             // A view pane has no session to restart — restarting it would spawn a shell into a
             // pane that renders no pty, and strand the `view-` uid it was found by (D3).
-            Some(p) if !p.kind.is_pty() => return,
+            Some(p) if !p.kind.is_pty() => return None,
             Some(p) => p.applied,
-            None => return,
+            None => return None,
         };
         let (cols, rows) = (cols.max(2) as u16, rows.max(1) as u16);
         // A restart is a brand-new session — mint via the backend (daemon → cross-run-unique
@@ -5877,7 +5998,7 @@ impl State {
             ..Default::default()
         }) {
             eprintln!("[hyperpanes] failed to restart {uid}: {e}");
-            return;
+            return None;
         }
         let mut newgrid = TerminalPane::new(
             cols as usize,
@@ -5886,7 +6007,8 @@ impl State {
         );
         newgrid.set_palette(theme::terminal_theme(self.settings.terminal_theme));
         let mut stale_uid: Option<String> = None;
-        if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
+        let new_uid = uid.clone();
+        if let Some(p) = self.tabs.get_mut(ti).and_then(|t| t.panes.get_mut(idx)) {
             let old = std::mem::replace(&mut p.uid, uid);
             mgr.kill(&old);
             // The restart mints a NEW uid, so the old key can never be reached again.
@@ -5912,10 +6034,12 @@ impl State {
             p.spawn_args = None;
             p.spawn_shell = shell;
         }
-        if let Some(old) = stale_uid {
+        let swap = stale_uid.map(|old| {
             self.forget_pane_runtime(&old);
-        }
+            (old, new_uid)
+        });
         self.dirty = true;
+        swap
     }
 
     // ---- move panes across tabs ----
@@ -6874,10 +6998,7 @@ impl State {
         let palette = self.settings.frame_palette;
         let title: SharedString = match g.title {
             Some(t) if !t.is_empty() => t.into(),
-            _ => {
-                self.tab_seq += 1;
-                format!("term {}", self.tab_seq).into()
-            }
+            _ => self.fresh_tab_title(),
         };
         let layout = g
             .layout
@@ -8444,7 +8565,7 @@ mod reminder_tests {
         st.remind_pane(0, ReminderOffset::Hour3);
         assert!(st.hosts_session("a"));
         // The parked shell exits on its own → the reminder dies with the session.
-        assert!(st.pane_exited("a", &m));
+        assert!(st.pane_exited("a", &m, 0).alive);
         assert!(st.reminders.is_empty());
         assert!(!st.hosts_session("a"));
     }
@@ -8664,6 +8785,72 @@ mod view_pane_tests {
         assert_eq!(p.uid, uid, "a restart must not strand the pane's identity");
         assert_eq!(p.kind, PaneKind::Markdown, "nor change what the pane is");
         assert!(!m.has(&p.uid), "nor spawn a shell into a pane with no pty");
+    }
+
+    /// The pane a tool was launched into must survive the tool exiting: Ctrl-C out of
+    /// `claude` and you get a shell where the pane was, not a closed tab.
+    #[tokio::test]
+    async fn a_tool_pane_falls_back_to_a_shell_instead_of_closing() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        let uid = st.add_pane_opts(&m, NewPaneOpts::default()).unwrap();
+        // Stand in for a pane the tool launcher opened, without actually running the tool.
+        st.tabs[0].panes[0].kind = PaneKind::Tool("claude".into());
+        st.tabs[0].panes[0].spawn_command = Some("claude".into());
+
+        let out = st.pane_exited(&uid, &m, 130);
+
+        assert!(out.alive, "the workspace must not be torn down by a tool exiting");
+        assert_eq!(st.active_tab().panes.len(), 1, "the pane stays where it was");
+        let p = &st.active_tab().panes[0];
+        assert_ne!(p.uid, uid, "the fallback shell is a new session");
+        assert_eq!(
+            p.kind,
+            PaneKind::Terminal,
+            "it is a plain terminal now, so re-running the tool can re-upgrade it"
+        );
+        assert_eq!(
+            out.rebound,
+            Some((uid, p.uid.clone())),
+            "the uid swap has to be reported so uid-keyed state outside State can follow it"
+        );
+    }
+
+    /// A plain shell keeps the old behaviour — there `exit` means "close this terminal".
+    #[tokio::test]
+    async fn a_plain_terminal_pane_still_closes_on_exit() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        let uid = st.add_pane_opts(&m, NewPaneOpts::default()).unwrap();
+        st.add_pane_opts(&m, NewPaneOpts::default()).unwrap();
+
+        let out = st.pane_exited(&uid, &m, 0);
+
+        assert!(out.alive);
+        assert_eq!(out.rebound, None);
+        assert_eq!(st.active_tab().panes.len(), 1, "the exited pane is gone");
+    }
+
+    /// `tab_seq` restarts at 0 every run while tab titles survive one, so the counter alone
+    /// hands out a name the strip already shows. The generator has to skip what is taken.
+    #[tokio::test]
+    async fn a_new_tab_never_reuses_a_name_already_on_the_strip() {
+        let m = mgr();
+        let mut st = State::new(theme::load_font(1.0));
+        st.tabs[0].title = "term 2".into();
+
+        st.new_tab(&m);
+        st.new_tab(&m);
+
+        let titles: Vec<String> = st.tabs.iter().map(|t| t.title.to_string()).collect();
+        let mut uniq = titles.clone();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(uniq.len(), titles.len(), "duplicate tab names: {titles:?}");
+        assert!(
+            !titles.iter().skip(1).any(|t| t == "term 2"),
+            "the restored tab's name must not be handed out again: {titles:?}"
+        );
     }
 
     #[test]

@@ -182,6 +182,29 @@ impl ControlHost {
             .map(|(k, _)| k.clone())
     }
 
+    /// Move a pane's external id from one session uid to another, for a pane that was
+    /// respawned in place (the GUI-side exit-to-shell fallback in `State::pane_exited`).
+    ///
+    /// Without this the alias still points at the dead uid, [`Self::reconcile`]'s liveness
+    /// prune drops it, and the pane comes back under a different id — breaking every marker
+    /// an MCP client had recorded against it. A pane with no alias (GUI-native, id == uid)
+    /// needs nothing moved, so this is a no-op for it.
+    pub fn rebind_uid(&self, old_uid: &str, new_uid: &str) {
+        let moved = {
+            let mut ids = self.pane_ids.borrow_mut();
+            match ids.remove(old_uid) {
+                Some(pane_id) => {
+                    ids.insert(new_uid.to_string(), pane_id);
+                    true
+                }
+                None => false,
+            }
+        };
+        if moved {
+            self.persist_pane_ids();
+        }
+    }
+
     /// Take (and clear) a pending `restartApp` request: 0 = none, 1 = gui, 2 = full.
     /// Set by the control route off the UI thread; the App tick executes it.
     pub fn take_restart_request(&self) -> u8 {
