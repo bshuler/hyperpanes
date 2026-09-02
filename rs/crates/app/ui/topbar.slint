@@ -147,7 +147,27 @@ component TabChip inherits Rectangle {
     border-top-left-radius: 9px;
     border-top-right-radius: 9px;
     border-width: root.spring-hover ? 2px : (root.active ? 1px : 0px);
-    border-color: root.spring-hover ? Theme.brand : Theme.border;
+    border-color: root.spring-hover ? Theme.brand
+                : (root.active ? Theme.accent.with-alpha(0.55) : Theme.border);
+
+    // The selected tab has to be findable without looking for it, and adopting the pane
+    // background never managed that on its own: `bg` and `mantle` sit seven units of
+    // luminance apart, which is a seam in good light and nothing at all otherwise. So the
+    // connected-to-the-pane look stays and the actual signal is carried by a cap along the
+    // top edge, in the one colour on the strip that is saturated. It reads on any palette,
+    // including the light ones, because it does not depend on two greys being far apart.
+    if root.active && !root.spring-hover : Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: 2.5px;
+        background: Theme.accent;
+        // The chip's own top corners are rounded and it does not clip its children, so a
+        // square cap would hang off both of them. Matching radii here rather than adding
+        // `clip: true` to the chip: clipping would also cut the rename editor's cursor.
+        border-top-left-radius: 9px;
+        border-top-right-radius: 9px;
+    }
 
     ta := TouchArea {
         // The hand cursor over a tab is driven from Win32 (window.rs) so it's a real hand.
@@ -177,6 +197,9 @@ component TabChip inherits Rectangle {
             text: root.title;
             color: (root.active || ta.has-hover || xa.has-hover) ? Theme.text : Theme.subtext;
             font-size: 12px;
+            // Weight, not just colour: the hovered tab is already `Theme.text` too, so
+            // colour alone leaves the selected tab and the one under the pointer identical.
+            font-weight: root.active ? 700 : 400;
             vertical-alignment: center;
             horizontal-stretch: 1;
             overflow: elide;

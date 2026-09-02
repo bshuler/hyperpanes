@@ -203,7 +203,7 @@ component CtxRow inherits Rectangle {
     border-radius: 6px;
     background: e.disabled ? transparent
               : (ta.has-hover || root.sub-open)
-                  ? (e.danger ? #f38ba822 : Theme.surface2)
+                  ? (e.danger ? Theme.danger.with-alpha(0.13) : Theme.surface2)
                   : transparent;
 
     HorizontalLayout {
@@ -296,7 +296,7 @@ component CtxToggle inherits Rectangle {
                 height: 7px;
                 viewbox-width: 12;
                 viewbox-height: 10;
-                stroke: #11111b;
+                stroke: Theme.bg;
                 stroke-width: 2px;
                 fill: transparent;
                 commands: "M 1 5.5 L 4.5 9 L 11 1";

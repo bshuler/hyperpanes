@@ -925,7 +925,7 @@ export component SidebarRail inherits Rectangle {
             background: Theme.accent;
             Text {
                 text: root.projects.length;
-                color: #11111b;
+                color: Theme.bg;
                 font-size: 9px;
                 font-weight: 700;
                 horizontal-alignment: center;
@@ -978,7 +978,7 @@ export component SidebarRail inherits Rectangle {
             background: RemindersAdapter.alert ? Theme.danger : Theme.accent;
             Text {
                 text: RemindersAdapter.rows.length;
-                color: #11111b;
+                color: Theme.bg;
                 font-size: 9px;
                 font-weight: 700;
                 horizontal-alignment: center;
@@ -1081,7 +1081,7 @@ export component SidebarRail inherits Rectangle {
             background: Theme.accent;
             Text {
                 text: ClosedAdapter.rows.length;
-                color: #11111b;
+                color: Theme.bg;
                 font-size: 9px;
                 font-weight: 700;
                 horizontal-alignment: center;
@@ -1287,7 +1287,7 @@ export component SidebarRail inherits Rectangle {
         // scrim — also swallows clicks outside the card (no dismissal on outside click;
         // use Cancel/Esc so a misclick can't silently delete).
         Rectangle {
-            background: #0b0c12cc;
+            background: Theme.veil;
             // Swallow scrim clicks (no outside-click dismissal — use Cancel/Esc) AND, if the
             // click did land here, pull keyboard focus back to the FocusScope so Esc/Enter keep
             // working afterwards.
@@ -1363,7 +1363,7 @@ export component SidebarRail inherits Rectangle {
                         width: 110px;
                         height: 32px;
                         border-radius: 7px;
-                        background: cfa.has-hover ? #ff5b60 : Theme.danger;
+                        background: cfa.has-hover ? Theme.danger.brighter(0.2) : Theme.danger;
                         Text {
                             text: "Remove";
                             color: #ffffff;

@@ -98,7 +98,7 @@ component PrefToggle inherits Rectangle {
                     width: 16px;
                     height: 16px;
                     border-radius: 8px;
-                    background: #ffffff;
+                    background: Theme.bg;
                     y: (parent.height - self.height) / 2;
                     x: root.on ? parent.width - self.width - 3px : 3px;
                     animate x { duration: 120ms; easing: ease-out; }
@@ -156,7 +156,7 @@ component AppearancePreview inherits Rectangle {
         Rectangle {
             height: 26px;
             background: root.bg.darker(0.2);
-            Rectangle { y: parent.height - 1px; height: 1px; background: #ffffff14; }
+            Rectangle { y: parent.height - 1px; height: 1px; background: Theme.text.with-alpha(0.08); }
             HorizontalLayout {
                 padding-left: 8px;
                 padding-right: 8px;
@@ -308,7 +308,7 @@ component Pill inherits Rectangle {
         padding-right: 10px;
         Text {
             text: root.label;
-            color: root.active ? #11111b : Theme.text;
+            color: root.active ? Theme.bg : Theme.text;
             font-size: 12px;
             font-weight: root.active ? 700 : 400;
             vertical-alignment: center;
@@ -442,6 +442,9 @@ export component OverlayLayer inherits Rectangle {
     in property <[PrefOption]> themes;
     in property <string> theme-label;
     in property <[FramePaletteOption]> frame-palettes;
+    // Shell (window chrome) palettes. Same row shape as the frame palettes, hence the
+    // shared struct; the chips are bg/surface2/accent/text rather than the eight hues.
+    in property <[FramePaletteOption]> ui-palettes;
     in property <[PrefOption]> shells;
     // Preferences → Tools / Browser.
     in property <[PrefToolRow]> tools;
@@ -690,6 +693,61 @@ export component OverlayLayer inherits Rectangle {
                         // ===================== Appearance =====================
                         if prefs.sel == 0 : VerticalLayout {
                             spacing: 12px;
+
+            // ---- app color palette (the window chrome itself) ----
+            // First in the Appearance panel on purpose: it is the setting that changes the
+            // most pixels, and the one someone reaches for when the shell is hard to read.
+            // Unlike its neighbours it takes effect the moment it is clicked — there is no
+            // preview tile for a window's own chrome — and Cancel still puts it back.
+            Text { text: "App color palette"; color: Theme.faint; font-size: 11px; }
+            VerticalLayout {
+                spacing: 4px;
+                for opt[i] in root.ui-palettes : Rectangle {
+                    height: 30px;
+                    border-radius: 7px;
+                    border-width: 1px;
+                    border-color: opt.active ? Theme.accent : Theme.border;
+                    background: opt.active ? Theme.surface2 : (upta.has-hover ? Theme.surface : transparent);
+                    HorizontalLayout {
+                        padding-left: 10px;
+                        padding-right: 10px;
+                        spacing: 8px;
+                        Text {
+                            text: opt.label;
+                            color: Theme.text;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            width: 86px;
+                        }
+                        HorizontalLayout {
+                            spacing: 3px;
+                            horizontal-stretch: 1;
+                            alignment: start;
+                            for c in opt.colors : VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    width: 14px;
+                                    height: 14px;
+                                    border-radius: 3px;
+                                    background: c;
+                                    // These chips are the only place in the app where a
+                                    // near-black and a near-white swatch must both be
+                                    // visible against whatever ground is behind them, so
+                                    // they get an outline the other chips don't need.
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                }
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            width: 14px;
+                            if opt.active : Check {}
+                        }
+                    }
+                    upta := TouchArea { clicked => { root.pref-action(26, opt.id); } }
+                }
+            }
 
             // ---- frame color palette (pane dot + border) ----
             Text { text: "Frame color palette"; color: Theme.faint; font-size: 11px; }
@@ -1637,7 +1695,7 @@ export component OverlayLayer inherits Rectangle {
 
         // ---- unsaved appearance changes prompt (Esc / scrim click with edits) ----
         if root.prefs-confirm : Rectangle {
-            background: #00000099;
+            background: Theme.veil;
             TouchArea {} // eat clicks behind the modal
             Rectangle {
                 width: 380px;

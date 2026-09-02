@@ -25,6 +25,8 @@ import { KeyMsg, HiRect } from "@widgets";
 // here only so the Rust controller can reach it via `global::<RemindersAdapter>()`; all its
 // UI lives in sidebar.slint. ReminderCustom likewise (the pane menu's custom-duration
 // parser bridge; UI in contextmenu.slint).
+export { Theme }
+
 export { PaneItem, TabItem, DividerItem, LayoutOption, PaletteItem, ProjectItem, PrefOption, PrefToolRow, PrefBrowserRow, KeybindingItem, MenuEntry, CtxTab, KeyMsg, HiRect, HistoryUi, ReminderItem, RemindersAdapter, ReminderCustom, ClosedItemUi, ClosedAdapter, LeftPaneRow, LeftTabRow, LeftWorkspaceRow, LeftSetRow, LeftSessionRow, LeftModeRow, LeftSessionItem, LeftPanelAdapter }
 
 export component AppWindow inherits Window {
@@ -81,6 +83,7 @@ export component AppWindow inherits Window {
     in property <[PrefOption]> pref-themes;
     in property <string> pref-theme-label;
     in property <[FramePaletteOption]> pref-palettes;
+    in property <[FramePaletteOption]> pref-ui-palettes;
     in property <[PrefOption]> pref-shells;
     // Preferences → Tools / Browser. Every registry tool (favourited or not) and every
     // browser the OS reports as installed; both lists are rebuilt by `resync`.
@@ -529,7 +532,7 @@ export component AppWindow inherits Window {
             y: 0;
             width: parent.width - (root.fullscreen ? 0px : 132px);
             height: root.fullscreen ? 0px : 32px;
-            background: #0b0c12cc;
+            background: Theme.veil;
             TouchArea { clicked => { root.overlay-dismiss(); } }
         }
         // everything below the top bar (pane area + sidebar rail).
@@ -538,7 +541,7 @@ export component AppWindow inherits Window {
             y: root.fullscreen ? 0px : 32px;
             width: parent.width;
             height: parent.height - (root.fullscreen ? 0px : 32px);
-            background: #0b0c12cc;
+            background: Theme.veil;
             TouchArea { clicked => { root.overlay-dismiss(); } }
         }
         OverlayLayer {
@@ -559,6 +562,7 @@ export component AppWindow inherits Window {
             themes: root.pref-themes;
             theme-label: root.pref-theme-label;
             frame-palettes: root.pref-palettes;
+            ui-palettes: root.pref-ui-palettes;
             shells: root.pref-shells;
             tools: root.pref-tools;
             browsers: root.pref-browsers;
@@ -705,13 +709,13 @@ export component AppWindow inherits Window {
                 spacing: 5px * root.zoom-factor;
                 Text {
                     text: "Hold";
-                    color: #cdd6f4;
+                    color: Theme.text;
                     font-size: 12px * root.zoom-factor;
                     font-weight: 700;
                     vertical-alignment: center;
                 }
                 Rectangle {
-                    background: #cdd6f424;          // foreground @ ~14% alpha
+                    background: Theme.text.with-alpha(0.14);          // foreground @ ~14% alpha
                     border-radius: 5px * root.zoom-factor;
                     HorizontalLayout {
                         padding-left: 6px * root.zoom-factor;
@@ -720,7 +724,7 @@ export component AppWindow inherits Window {
                         padding-bottom: 1px * root.zoom-factor;
                         Text {
                             text: "Esc";
-                            color: #cdd6f4;
+                            color: Theme.text;
                             font-size: 12px * root.zoom-factor;
                             font-weight: 700;
                         }
@@ -728,7 +732,7 @@ export component AppWindow inherits Window {
                 }
                 Text {
                     text: "to exit fullscreen";
-                    color: #cdd6f4;
+                    color: Theme.text;
                     font-size: 12px * root.zoom-factor;
                     font-weight: 700;
                     vertical-alignment: center;
@@ -742,13 +746,13 @@ export component AppWindow inherits Window {
                     width: 168px * root.zoom-factor;
                     height: 3px * root.zoom-factor;
                     border-radius: 2px * root.zoom-factor;
-                    background: #cdd6f424;
+                    background: Theme.text.with-alpha(0.14);
                     clip: true;
                     Rectangle {
                         x: 0;
                         height: parent.height;
                         border-radius: 2px * root.zoom-factor;
-                        background: #cdd6f4;
+                        background: Theme.text;
                         width: root.esc-holding ? parent.width : 0px;
                         animate width {
                             duration: root.esc-holding ? 600ms : 150ms;

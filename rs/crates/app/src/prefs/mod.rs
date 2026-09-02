@@ -151,6 +151,12 @@ pub struct Settings {
     /// Index into [`crate::theme::TERMINAL_THEMES`] for the active terminal colour theme
     /// (the terminal's own bg/fg + 16 ANSI colours). Mirrors `terminalTheme`.
     pub terminal_theme: usize,
+    /// Index into [`crate::theme::UI_PALETTES`] for the app *shell* colours — top bar,
+    /// sidebar, menus, overlays. Independent of the two above, which colour a pane's dot
+    /// and a pane's contents; a light shell over dark terminals is a supported combination.
+    /// New in a build after the first settings files were written, so `serde(default)` on
+    /// the struct is what makes an older file load as Mocha rather than fail.
+    pub ui_palette: usize,
     /// Default shell for new panes (the token from [`SHELL_OPTIONS`], e.g. "pwsh"). Empty
     /// = the system default. Mirrors the renderer `Settings.defaultShell`.
     pub default_shell: String,
@@ -237,6 +243,7 @@ impl Default for Settings {
             font_family: String::new(),
             frame_palette: 0,
             terminal_theme: 0,
+            ui_palette: 0,
             default_shell: String::new(),
             font_px: DEFAULT_FONT_PX,
             show_frame: true,
@@ -418,6 +425,7 @@ mod tests {
             font_family: "C:/Fonts/Custom.ttf".into(),
             frame_palette: 2,
             terminal_theme: 1,
+            ui_palette: 3,
             default_shell: "cmd".into(),
             font_px: 18.0,
             show_frame: false,

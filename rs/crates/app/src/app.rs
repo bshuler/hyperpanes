@@ -4410,6 +4410,7 @@ impl App {
                     3 => crate::state::Setting::ShowDot(arg != 0),
                     4 => crate::state::Setting::FramePalette(arg as usize),
                     9 => crate::state::Setting::TerminalTheme(arg as usize),
+                    26 => crate::state::Setting::UiPalette(arg as usize),
                     5 => crate::state::Setting::DefaultShell(
                         crate::prefs::SHELL_OPTIONS
                             .get(arg as usize)
@@ -4424,9 +4425,10 @@ impl App {
                     12 => crate::state::Setting::IdleSeconds(arg),
                     _ => return,
                 };
-                // Appearance settings (0–4, 9 = theme) edit the draft (commit on Done);
-                // General/Terminal/idle settings apply immediately, matching the renderer.
-                let cmd = if kind <= 4 || kind == 9 {
+                // Appearance settings (0–4, 9 = terminal theme, 26 = shell palette) edit
+                // the draft (commit on Done); General/Terminal/idle settings apply
+                // immediately, matching the renderer.
+                let cmd = if kind <= 4 || kind == 9 || kind == 26 {
                     Command::DraftSetting(setting)
                 } else {
                     Command::ApplySetting(setting)

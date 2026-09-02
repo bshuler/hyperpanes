@@ -63,6 +63,15 @@ pub struct Ui {
     pub goal_chips: Rc<VecModel<slint::SharedString>>,
     pub families: Rc<VecModel<PrefOption>>,
     pub palettes: Rc<VecModel<FramePaletteOption>>,
+    /// Shell-palette picker rows. Reuses `FramePaletteOption` because the row is the same
+    /// shape (label + swatches + active); the swatches here are four representative tokens
+    /// rather than the eight pane hues.
+    pub ui_palettes: Rc<VecModel<FramePaletteOption>>,
+    /// Which shell palette the Slint `Theme` global currently holds. The tokens are pushed
+    /// one property at a time, so re-pushing them every frame would be pure waste — and
+    /// `usize::MAX` is a value no index can equal, which makes the first sync a guaranteed
+    /// push without a separate "have we ever pushed" flag.
+    pub ui_palette_pushed: std::cell::Cell<usize>,
     pub shells: Rc<VecModel<PrefOption>>,
     pub themes: Rc<VecModel<PrefOption>>,
     pub idle_effects: Rc<VecModel<PrefOption>>,
@@ -143,6 +152,8 @@ impl Ui {
             goal_chips: Rc::new(VecModel::default()),
             families: Rc::new(VecModel::default()),
             palettes: Rc::new(VecModel::default()),
+            ui_palettes: Rc::new(VecModel::default()),
+            ui_palette_pushed: std::cell::Cell::new(usize::MAX),
             shells: Rc::new(VecModel::default()),
             themes: Rc::new(VecModel::default()),
             idle_effects: Rc::new(VecModel::default()),
@@ -189,6 +200,7 @@ impl Ui {
         app.set_goal_chips(ModelRc::from(self.goal_chips.clone()));
         app.set_pref_families(ModelRc::from(self.families.clone()));
         app.set_pref_palettes(ModelRc::from(self.palettes.clone()));
+        app.set_pref_ui_palettes(ModelRc::from(self.ui_palettes.clone()));
         app.set_pref_shells(ModelRc::from(self.shells.clone()));
         app.set_pref_tools(ModelRc::from(self.pref_tools.clone()));
         app.set_pref_browsers(ModelRc::from(self.pref_browsers.clone()));
@@ -219,6 +231,36 @@ impl Ui {
         lp.set_git_untracked(ModelRc::from(self.lp_git_untracked.clone()));
         lp.set_git_commit_files(ModelRc::from(self.lp_git_commit_files.clone()));
     }
+}
+
+/// Copy a shell palette into the Slint `Theme` global.
+///
+/// Only the fourteen *base* tokens are written. The aliases at the bottom of
+/// `ui/theme.slint` (`brand`, `ink`, `hover`, …) are plain `out` properties bound to the
+/// bases, so they re-derive themselves the instant a base changes — setting them here would
+/// need a setter per alias and would silently rot the moment someone adds a fifteenth.
+///
+/// `from_argb_encoded` rather than `from_rgb_u8`: `scrim` and `veil` are translucent, and
+/// the alpha is part of the palette (a light theme wants a lighter shadow).
+fn push_ui_palette(app: &AppWindow, p: crate::theme::UiPalette) {
+    use slint::ComponentHandle as _;
+    let t = app.global::<crate::Theme>();
+    let c = slint::Color::from_argb_encoded;
+    t.set_bg(c(p.bg));
+    t.set_mantle(c(p.mantle));
+    t.set_surface(c(p.surface));
+    t.set_surface2(c(p.surface2));
+    t.set_border(c(p.border));
+    t.set_text(c(p.text));
+    t.set_subtext(c(p.subtext));
+    t.set_faint(c(p.faint));
+    t.set_accent(c(p.accent));
+    t.set_danger(c(p.danger));
+    t.set_ok(c(p.ok));
+    t.set_warn(c(p.warn));
+    t.set_link(c(p.link));
+    t.set_scrim(c(p.scrim));
+    t.set_veil(c(p.veil));
 }
 
 /// Push `items` into `model`, reusing the existing elements when the row count is
@@ -857,8 +899,17 @@ pub fn resync(
 
     // Appearance controls reflect the DRAFT while Preferences is open (so edits preview
     // without touching the live panes), else the committed settings.
-    let (_view_font, view_palette, view_theme, view_px, view_frame, view_dot) =
+    let (_view_font, view_palette, view_theme, view_ui, view_px, view_frame, view_dot) =
         state.appearance_view();
+
+    // The shell palette follows the DRAFT, not the committed setting: a window's own chrome
+    // has nowhere to be previewed except in the window, so picking a palette recolours the
+    // whole shell at once and Cancel puts it back (`prefs_cancel` drops the draft, which
+    // moves `view_ui` back to the committed index and this same push undoes it).
+    if ui.ui_palette_pushed.get() != view_ui {
+        ui.ui_palette_pushed.set(view_ui);
+        push_ui_palette(app, theme::ui_palette(view_ui));
+    }
 
     // Font family: the fixed option list (mirrors the renderer) + a trailing "Custom…"
     // entry. Active = the option whose value matches the drafted raw value, or Custom when
@@ -920,6 +971,26 @@ pub fn resync(
         })
         .collect();
     sync_model(&ui.palettes, palettes);
+
+    // shell-palette options. Four swatches, in the order that actually tells them apart:
+    // the window ground, the raised surface, the accent, and the ink — enough to see at a
+    // glance that Latte is light and High Contrast is not.
+    let ui_palettes: Vec<FramePaletteOption> = theme::UI_PALETTES
+        .iter()
+        .enumerate()
+        .map(|(id, p)| FramePaletteOption {
+            id: id as i32,
+            label: p.name.into(),
+            active: id == view_ui,
+            colors: ModelRc::from(Rc::new(VecModel::from(vec![
+                slint::Color::from_argb_encoded(p.bg),
+                slint::Color::from_argb_encoded(p.surface2),
+                slint::Color::from_argb_encoded(p.accent),
+                slint::Color::from_argb_encoded(p.text),
+            ]))),
+        })
+        .collect();
+    sync_model(&ui.ui_palettes, ui_palettes);
 
     // terminal colour-theme options (active = drafted/current); preview colors come from it.
     let mut theme_label = String::new();

@@ -1,27 +1,46 @@
 // Shared theme tokens + small reusable chrome widgets for the hyperpanes shell.
-// Palette is Catppuccin Mocha — matched 1:1 to the Electron app's `:root` vars so
-// the native top bar reads identically.
+//
+// The values written here are Catppuccin Mocha — matched 1:1 to the Electron app's
+// `:root` vars so the native top bar reads identically — but they are only the
+// *defaults*. Every one of them is `in-out` because the controller overwrites the whole
+// set from `theme::UI_PALETTES` on startup and whenever the user picks another palette
+// (`state::Setting::UiPalette`); a `out property` would have made the picker impossible.
+//
+// Two rules keep a palette swap total:
+//   * no colour is written anywhere but here — a literal hex elsewhere is a token that
+//     stops changing when the palette does, which is worse than an imperfect token;
+//   * the aliases at the bottom stay plain `out`, so they keep tracking the token they
+//     were derived from instead of being frozen by a Rust setter that forgot them.
+//
+// Exactly two literals survive elsewhere, and both are deliberate: the eight project
+// swatch hues in `sidebar.slint` (a user's chosen label colour, not a theme token), and
+// `#ffffff` where it is ink sitting on a saturated `danger` fill — white on red is the
+// right answer on every palette, so deriving it from one would only make it wrong.
 
 export global Theme {
     // surfaces
-    out property <color> bg: #11111b;        // --hp-bg (pane area + active tab)
-    out property <color> mantle: #181825;    // --hp-mantle (top bar)
-    out property <color> surface: #1e1e2e;   // --hp-surface (tab hover)
-    out property <color> surface2: #313244;  // --hp-surface2 (hover / chips)
-    out property <color> border: #313244;    // --hp-border
+    in-out property <color> bg: #11111b;        // --hp-bg (pane area + active tab)
+    in-out property <color> mantle: #181825;    // --hp-mantle (top bar)
+    in-out property <color> surface: #1e1e2e;   // --hp-surface (tab hover)
+    in-out property <color> surface2: #313244;  // --hp-surface2 (hover / chips)
+    in-out property <color> border: #313244;    // --hp-border
     // ink
-    out property <color> text: #cdd6f4;       // --hp-text
-    out property <color> subtext: #9399b2;    // --hp-subtext
-    out property <color> faint: #6c7086;
+    in-out property <color> text: #cdd6f4;       // --hp-text
+    in-out property <color> subtext: #9399b2;    // --hp-subtext
+    in-out property <color> faint: #6c7086;
     // accent
-    out property <color> accent: #89b4fa;     // --hp-accent
-    out property <color> danger: #e5484d;     // window close hover
-    out property <color> ok: #a6e3a1;         // a finished/healthy state (agent liveness)
-    out property <color> warn: #f9e2af;       // a state wanting attention (agent awaiting input)
+    in-out property <color> accent: #89b4fa;     // --hp-accent
+    in-out property <color> danger: #e5484d;     // window close hover
+    in-out property <color> ok: #a6e3a1;         // a finished/healthy state (agent liveness)
+    in-out property <color> warn: #f9e2af;       // a state wanting attention (agent awaiting input)
     // A link inside rendered markdown. Distinct from `accent`, which headings
     // already use — a heading that looks clickable is a lie.
-    out property <color> link: #94e2d5;
-    out property <color> scrim: #0000008c;
+    in-out property <color> link: #94e2d5;
+    in-out property <color> scrim: #0000008c;
+    // The wash drawn over the whole window behind a modal. Separate from `scrim`,
+    // which is only ever a drop-shadow colour — a backdrop wants far more opacity
+    // than a shadow does, and on a light palette the two want different hues.
+    in-out property <color> veil: #0b0c12cc;
 
     // ---- aliases kept for the rest of the UI (paneview/app) ----
     out property <color> brand: self.accent;

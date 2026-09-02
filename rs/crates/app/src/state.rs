@@ -281,6 +281,9 @@ pub enum Setting {
     FramePalette(usize),
     /// Select the terminal colour theme by index into `theme::TERMINAL_THEMES`.
     TerminalTheme(usize),
+    /// Select the app *shell* colour palette by index into `theme::UI_PALETTES`. Unlike the
+    /// two above it changes nothing inside a pane — it repaints the window around them.
+    UiPalette(usize),
     /// Set the default shell token for new panes ("" = system default).
     DefaultShell(String),
     /// Nudge the base font size by ±N points.
@@ -786,6 +789,11 @@ pub struct PrefsDraft {
     pub font_family: String,
     pub frame_palette: usize,
     pub terminal_theme: usize,
+    /// Index into `theme::UI_PALETTES`. Drafted like the rest so Cancel restores it — but
+    /// unlike the rest the *shell* follows the draft live (there is nowhere to preview a
+    /// window's own chrome except in the window), so picking a palette recolours
+    /// immediately and Cancel puts it back.
+    pub ui_palette: usize,
     pub font_px: f32,
     pub show_frame: bool,
     pub show_dot: bool,
@@ -798,6 +806,7 @@ impl PrefsDraft {
             font_family: s.font_family.clone(),
             frame_palette: s.frame_palette,
             terminal_theme: s.terminal_theme,
+            ui_palette: s.ui_palette,
             font_px: s.font_px,
             show_frame: s.show_frame,
             show_dot: s.show_dot,
@@ -3785,13 +3794,14 @@ impl State {
 
     /// The appearance values the dialog should display: the draft while Preferences is open,
     /// else the committed settings. Returns `(resolved_font_path, frame_palette, terminal_theme,
-    /// font_px, show_frame, show_dot)`.
-    pub fn appearance_view(&self) -> (String, usize, usize, f32, bool, bool) {
+    /// ui_palette, font_px, show_frame, show_dot)`.
+    pub fn appearance_view(&self) -> (String, usize, usize, usize, f32, bool, bool) {
         match &self.prefs_draft {
             Some(d) => (
                 prefs::resolve_or_default(&d.font_family),
                 d.frame_palette,
                 d.terminal_theme,
+                d.ui_palette,
                 d.font_px,
                 d.show_frame,
                 d.show_dot,
@@ -3800,6 +3810,7 @@ impl State {
                 self.settings.font_path(),
                 self.settings.frame_palette,
                 self.settings.terminal_theme,
+                self.settings.ui_palette,
                 self.settings.font_px,
                 self.settings.show_frame,
                 self.settings.show_dot,
@@ -3817,6 +3828,7 @@ impl State {
             Setting::FontFamily(path) => d.font_family = path,
             Setting::FramePalette(idx) => d.frame_palette = idx,
             Setting::TerminalTheme(idx) => d.terminal_theme = idx,
+            Setting::UiPalette(idx) => d.ui_palette = idx,
             Setting::FontDelta(delta) => d.font_px = Settings::clamp_font(d.font_px + delta as f32),
             Setting::ShowFrame(on) => d.show_frame = on,
             Setting::ShowDot(on) => d.show_dot = on,
@@ -3858,6 +3870,9 @@ impl State {
             }
             if d.terminal_theme != self.settings.terminal_theme {
                 self.apply_setting(Setting::TerminalTheme(d.terminal_theme));
+            }
+            if d.ui_palette != self.settings.ui_palette {
+                self.apply_setting(Setting::UiPalette(d.ui_palette));
             }
             if d.font_px != self.settings.font_px {
                 // Apply the absolute drafted size (apply_setting takes a delta).
@@ -3930,6 +3945,12 @@ impl State {
                         }
                     }
                 }
+            }
+            Setting::UiPalette(idx) => {
+                // Nothing to recompute here: the shell's colours live in the Slint `Theme`
+                // global, and the resync pushes them from `appearance_view` every frame the
+                // index changes. This arm only has to make the choice stick.
+                self.settings.ui_palette = idx;
             }
             Setting::FontDelta(d) => {
                 let next = Settings::clamp_font(self.settings.font_px + d as f32);

@@ -26,7 +26,7 @@ component DividerHandle inherits Rectangle {
         height: desc.vertical ? parent.height : 1px;
         x: (parent.width - self.width) / 2;
         y: (parent.height - self.height) / 2;
-        background: ta.has-hover || ta.pressed ? Theme.brand : #ffffff14;
+        background: ta.has-hover || ta.pressed ? Theme.brand : Theme.text.with-alpha(0.08);
         animate background { duration: 90ms; }
     }
 
@@ -102,10 +102,10 @@ component PaneBtn inherits Rectangle {
     border-radius: 4px;
     background: root.recording ? Theme.danger
               : root.active ? Theme.accent
-              : ta.has-hover ? (root.danger ? #f38ba833 : Theme.surface2)
+              : ta.has-hover ? (root.danger ? Theme.danger.with-alpha(0.2) : Theme.surface2)
               : transparent;
-    property <color> ink: (root.active || root.recording) ? #11111b
-             : (ta.has-hover && root.danger) ? #f38ba8
+    property <color> ink: (root.active || root.recording) ? Theme.bg
+             : (ta.has-hover && root.danger) ? Theme.danger
              : ta.has-hover ? Theme.text
              : Theme.subtext;
 
@@ -171,7 +171,7 @@ component TaskItem inherits Rectangle {
         if root.p.exited : VerticalLayout {
             alignment: center;
             Rectangle {
-                background: #f38ba822;
+                background: Theme.danger.with-alpha(0.13);
                 border-radius: 4px;
                 HorizontalLayout {
                     padding-left: 5px;
@@ -797,7 +797,7 @@ export component PaneView inherits Rectangle {
         // empty-state hint
         if root.panes.length == 0 : Text {
             text: "starting shell…";
-            color: #44444f;
+            color: Theme.faint;
             font-size: 14px;
         }
         }   // end `area`

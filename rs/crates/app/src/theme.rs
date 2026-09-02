@@ -185,6 +185,156 @@ pub fn theme_color(idx: usize, slot: usize) -> Color {
     Color::from_rgb_u8(c[0], c[1], c[2])
 }
 
+/// The colour tokens of the app *shell* — top bar, sidebar, menus, overlays. Field-for-field
+/// the `Theme` global in `ui/theme.slint`; the controller copies one of these into that
+/// global on startup and again whenever the user picks another palette, so a swap is one
+/// assignment per token rather than a rebuild.
+///
+/// Every value is 0xAARRGGBB. Alpha is carried explicitly (rather than the `(u8,u8,u8)`
+/// triples [`FRAME_PALETTES`] uses) because two of the tokens — `scrim` and `veil` — are
+/// translucent by definition, and a palette that could not set their opacity would leave a
+/// light theme wearing a dark theme's shadows.
+///
+/// Distinct from [`FRAME_PALETTES`] (the eight pane hues) and [`TERMINAL_THEMES`] (the
+/// base-16 inside a pane): those two colour a pane's *contents*, this one colours the
+/// window around them. All three are independent settings on purpose — a light shell over
+/// dark terminals is a normal way to work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UiPalette {
+    pub name: &'static str,
+    pub bg: u32,
+    pub mantle: u32,
+    pub surface: u32,
+    pub surface2: u32,
+    pub border: u32,
+    pub text: u32,
+    pub subtext: u32,
+    pub faint: u32,
+    pub accent: u32,
+    pub danger: u32,
+    pub ok: u32,
+    pub warn: u32,
+    pub link: u32,
+    pub scrim: u32,
+    pub veil: u32,
+}
+
+/// The selectable shell palettes, in picker order. Index 0 (Mocha) is the default and is
+/// byte-identical to the literals `ui/theme.slint` still carries as its property defaults —
+/// so a build that somehow never pushes a palette looks exactly as it always has.
+///
+/// The set deliberately spans more than hue: Latte is the light option and High Contrast
+/// the accessibility one, because the complaint that produced this table was "I can't tell
+/// which tab is selected", and for some eyes the fix is contrast, not colour.
+pub const UI_PALETTES: [UiPalette; 5] = [
+    // Catppuccin Mocha — the original shell, matched to the Electron app's `:root` vars.
+    UiPalette {
+        name: "Mocha",
+        bg: 0xff11111b,
+        mantle: 0xff181825,
+        surface: 0xff1e1e2e,
+        surface2: 0xff313244,
+        border: 0xff313244,
+        text: 0xffcdd6f4,
+        subtext: 0xff9399b2,
+        faint: 0xff6c7086,
+        accent: 0xff89b4fa,
+        danger: 0xffe5484d,
+        ok: 0xffa6e3a1,
+        warn: 0xfff9e2af,
+        link: 0xff94e2d5,
+        scrim: 0x8c000000,
+        veil: 0xcc0b0c12,
+    },
+    // Catppuccin Latte — the light one. `bg` is the *lightest* surface here, which is what
+    // keeps "ink on an accent chip" (`Theme.bg` over `Theme.accent`) legible either way up.
+    UiPalette {
+        name: "Latte",
+        bg: 0xffeff1f5,
+        mantle: 0xffe6e9ef,
+        surface: 0xffdce0e8,
+        surface2: 0xffccd0da,
+        border: 0xffbcc0cc,
+        text: 0xff4c4f69,
+        subtext: 0xff6c6f85,
+        faint: 0xff8c8fa1,
+        accent: 0xff1e66d5,
+        danger: 0xffd20f39,
+        ok: 0xff40a02b,
+        warn: 0xffdf8e1d,
+        link: 0xff179299,
+        // A light shell wants a *lighter* shadow and a *thinner* veil: Mocha's 55% black
+        // shadow under a white card reads as a smudge, and its 80% backdrop as a blackout.
+        scrim: 0x59000000,
+        veil: 0x66313244,
+    },
+    // Nord — cooler and lower-contrast than Mocha; the "easy on the eyes" option.
+    UiPalette {
+        name: "Nord",
+        bg: 0xff2e3440,
+        mantle: 0xff272b35,
+        surface: 0xff3b4252,
+        surface2: 0xff434c5e,
+        border: 0xff434c5e,
+        text: 0xffeceff4,
+        subtext: 0xffaeb7c7,
+        faint: 0xff7b8494,
+        accent: 0xff88c0d0,
+        danger: 0xffbf616a,
+        ok: 0xffa3be8c,
+        warn: 0xffebcb8b,
+        link: 0xff8fbcbb,
+        scrim: 0x8c000000,
+        veil: 0xcc1c2029,
+    },
+    // Gruvbox Dark — warm, high-legibility, the long-standing terminal favourite.
+    UiPalette {
+        name: "Gruvbox",
+        bg: 0xff1d2021,
+        mantle: 0xff282828,
+        surface: 0xff32302f,
+        surface2: 0xff3c3836,
+        border: 0xff504945,
+        text: 0xffebdbb2,
+        subtext: 0xffbdae93,
+        faint: 0xff928374,
+        accent: 0xff83a598,
+        danger: 0xfffb4934,
+        ok: 0xffb8bb26,
+        warn: 0xfffabd2f,
+        link: 0xff8ec07c,
+        scrim: 0x8c000000,
+        veil: 0xcc141617,
+    },
+    // High Contrast — pure black ground, pure white ink, a border light enough to see. The
+    // gap between `bg` and every other surface is far wider than in the other palettes,
+    // which is the whole point: the selected tab has to be obvious, not merely present.
+    UiPalette {
+        name: "High Contrast",
+        bg: 0xff000000,
+        mantle: 0xff0d0d0d,
+        surface: 0xff1a1a1a,
+        surface2: 0xff2e2e2e,
+        border: 0xff6e6e6e,
+        text: 0xffffffff,
+        subtext: 0xffd0d0d0,
+        faint: 0xff9a9a9a,
+        accent: 0xff4cc2ff,
+        danger: 0xffff5f5f,
+        ok: 0xff4ff07a,
+        warn: 0xffffd000,
+        link: 0xff6ee7d5,
+        scrim: 0xb3000000,
+        veil: 0xe6000000,
+    },
+];
+
+/// Clamp a (possibly stale) shell-palette index to a real palette — a settings file written
+/// by a later build, or hand-edited, must not panic the startup path (defaults to Mocha).
+pub fn ui_palette(idx: usize) -> UiPalette {
+    UI_PALETTES[idx.min(UI_PALETTES.len() - 1)]
+}
+
 /// The pane accent for creation index `i` under frame-palette `palette`.
 pub fn accent_for(i: usize, palette: usize) -> Color {
     let slots = frame_palette(palette);
@@ -424,5 +574,76 @@ mod tests {
             Layout::from_token(&super::layout_name(Layout::GridFixed(2, 3))),
             Some(Layout::GridFixed(2, 3))
         );
+    }
+
+    /// A stale or hand-edited `uiPalette` index must clamp, not panic: settings are loaded
+    /// before the window exists, so an out-of-range value here would take the app down on
+    /// startup with no UI to report it.
+    #[test]
+    fn an_out_of_range_shell_palette_clamps_to_the_default() {
+        assert_eq!(super::ui_palette(0).name, "Mocha");
+        assert_eq!(super::ui_palette(999).name, super::UI_PALETTES[4].name);
+    }
+
+    /// Every shell token except the two translucent ones must be fully opaque. A palette
+    /// that leaves alpha at 0 (the easy typo when writing `0x11111b` instead of
+    /// `0xff11111b`) renders as an invisible top bar — a failure that only shows up by
+    /// running the app, so it is worth a test that shows up by running the suite.
+    #[test]
+    fn shell_palettes_are_opaque_except_the_shadow_and_the_backdrop() {
+        for p in super::UI_PALETTES {
+            for (token, v) in [
+                ("bg", p.bg),
+                ("mantle", p.mantle),
+                ("surface", p.surface),
+                ("surface2", p.surface2),
+                ("border", p.border),
+                ("text", p.text),
+                ("subtext", p.subtext),
+                ("faint", p.faint),
+                ("accent", p.accent),
+                ("danger", p.danger),
+                ("ok", p.ok),
+                ("warn", p.warn),
+                ("link", p.link),
+            ] {
+                assert_eq!(v >> 24, 0xff, "{} {} is not opaque", p.name, token);
+            }
+            // The other two are translucent by definition — a fully opaque one would paint
+            // over the window instead of washing it.
+            assert!(p.scrim >> 24 < 0xff, "{} scrim is opaque", p.name);
+            assert!(p.veil >> 24 < 0xff, "{} veil is opaque", p.name);
+        }
+    }
+
+    /// Index 0 is what a settings file with no `uiPalette` field falls back to, and what
+    /// `ui/theme.slint` still carries as its property defaults. If the two ever drift, a
+    /// build that failed to push a palette would look subtly wrong rather than identical.
+    #[test]
+    fn the_default_shell_palette_matches_the_slint_defaults() {
+        let p = super::ui_palette(0);
+        let ui = include_str!("../ui/theme.slint");
+        for (prop, v) in [
+            ("bg", p.bg),
+            ("mantle", p.mantle),
+            ("surface", p.surface),
+            ("surface2", p.surface2),
+            ("border", p.border),
+            ("text", p.text),
+            ("subtext", p.subtext),
+            ("faint", p.faint),
+            ("accent", p.accent),
+            ("danger", p.danger),
+            ("ok", p.ok),
+            ("warn", p.warn),
+            ("link", p.link),
+        ] {
+            let needle = format!("> {}: #{:06x};", prop, v & 0x00ff_ffff);
+            assert!(
+                ui.contains(&needle),
+                "ui/theme.slint has no `{}` — Mocha and the Slint defaults have drifted",
+                needle
+            );
+        }
     }
 }
