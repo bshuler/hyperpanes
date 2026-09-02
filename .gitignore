@@ -20,6 +20,10 @@ reference/
 # benchmark harness output (json + report + per-run temp wrappers)
 bench/results/
 
+# GUI harness photographs (scripts/gui-harness/ptah.sh shot) — evidence for a
+# rendering change, regenerated on demand, never worth a commit
+shots/
+
 # Rust build output (native rewrite under rs/ and spikes)
 target/
 

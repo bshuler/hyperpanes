@@ -195,10 +195,19 @@ component TabChip inherits Rectangle {
 
         Text {
             text: root.title;
-            color: (root.active || ta.has-hover || xa.has-hover) ? Theme.text : Theme.subtext;
+            // A three-step ladder, because "which one is selected" is a question about the
+            // strip and not about one chip: a resting tab is `faint`, the tab under the
+            // pointer lifts to `subtext`, and only the selected one is full-strength ink.
+            // The earlier pair — `subtext` resting, `text` for active *and* hover — failed
+            // twice over: hover and active were the identical colour, and `subtext` sits
+            // close enough to `text` that the difference read as anti-aliasing.
+            color: root.active ? Theme.text
+                 : (ta.has-hover || xa.has-hover) ? Theme.subtext
+                 : Theme.faint;
             font-size: 12px;
-            // Weight, not just colour: the hovered tab is already `Theme.text` too, so
-            // colour alone leaves the selected tab and the one under the pointer identical.
+            // Weight carries the signal where colour cannot: on a light palette the ink
+            // tokens are much closer together than they are on a dark one, and a bold
+            // word is bold on every palette there is.
             font-weight: root.active ? 700 : 400;
             vertical-alignment: center;
             horizontal-stretch: 1;

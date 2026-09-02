@@ -87,20 +87,26 @@ component ViewRowView inherits Rectangle {
     // sizes itself: its height was decided by the layout in `src/mermaid.rs`, and
     // nothing here may second-guess it.
     //
-    // The flow padding is 2px, not the 5px it reads like it wants to be, and that is
-    // load-bearing. Slint 1.17 has no `line-height` on `Text` or `StyledText`: the pitch
-    // *inside* a wrapped run is pinned to the font's own line box — 1.178 em for the macOS
-    // system font, so 14.1px at 12px — and nothing here can loosen it. Whatever padding a
-    // row adds lands between rows only, so a generous value buys air everywhere except the
-    // one place a paragraph needs it and leaves a wrapped second line sitting 5px above the
-    // rhythm the rows around it just taught the eye to expect. Reading it, that line looks
-    // like it crept up into the one above. Paragraph separation comes from the blank-line
-    // rows (role 15) instead, which is where the document actually asked for it.
+    // A flowing row adds NO padding, and that is the whole fix for a complaint that
+    // wrapped lines "encroach on the line above". Slint 1.17 has no `line-height` on
+    // `Text` or `StyledText`: the pitch *inside* a wrapped run is pinned to the requested
+    // font's own line box (`textlayout/sharedparley.rs` — (ascent − descent + leading) /
+    // upem, which is 1.178 em for the macOS system font, so 14.1px at 12px) and nothing
+    // declarable here can loosen it. Any padding a row adds lands *between* rows only, so
+    // every pixel of it widens the gap between two blocks while the gap inside a wrapped
+    // block stays put — and a continuation line sitting tighter than the rhythm its
+    // neighbours just established is precisely what reads as creeping upward. Since the
+    // inner pitch cannot be raised, the outer one is brought down to meet it: row height
+    // *is* the text's height, so one pitch governs the whole column.
+    //
+    // The air a document wants then comes from the places that asked for it — the
+    // blank-line rows (role 15) between paragraphs, and the heading padding below — rather
+    // than from a uniform tax on every line.
     height: root.item.role == 12 ? root.item.diagram.h + 12px
         : root.item.role == 10 ? 15px
         : root.item.role == 15 ? 7px
         : root.item.role == 13 || root.item.role == 14 ? 24px
-        : root.flows ? max(16px, flow.preferred-height + 2px)
+        : root.flows ? max(14px, flow.preferred-height)
         : root.heads ? max(22px, head.preferred-height + 8px)
         : 19px;
     // Selection wins over hover: while a range is highlighted, the pointer moving
@@ -137,9 +143,8 @@ component ViewRowView inherits Rectangle {
     // on screen, so the pair costs ~40 idle elements, not 5,000.
     flow := StyledText {
         x: root.lead;
-        // Splits the row's 2px of padding evenly above and below, so the gap a row leaves
-        // its neighbour matches the gap it leaves itself when it wraps.
-        y: 1px;
+        // Flush: the row is exactly as tall as the text, so there is nothing to split.
+        y: 0;
         width: root.width - root.lead - 8px;
         visible: root.flows;
         // Empty on every non-flowing role, which is what keeps a 2,000-character
@@ -203,7 +208,7 @@ component ViewRowView inherits Rectangle {
         x: root.lead - 12px;
         // Each gutter mark tracks `flow.y`: they line up with the item's *first* line, not
         // with the row box, which grows downward as the item wraps.
-        y: 6px;
+        y: 5px;
         width: 3px; height: 3px;
         border-radius: 1.5px;
         background: Theme.subtext;
@@ -212,7 +217,7 @@ component ViewRowView inherits Rectangle {
         // Right-aligned so "9." and "10." share an edge instead of ragging.
         x: 0;
         width: root.lead - 6px;
-        y: 1px;
+        y: 0;
         horizontal-alignment: right;
         text: root.item.marker;
         color: Theme.subtext;
@@ -220,7 +225,7 @@ component ViewRowView inherits Rectangle {
     }
     if root.item.role == 8 && root.item.check >= 0 : Rectangle {
         x: root.lead - 15px;
-        y: 2px;
+        y: 1px;
         width: 11px; height: 11px;
         border-radius: 2px;
         border-width: 1px;
