@@ -525,7 +525,10 @@ mod tests {
         // The regression this whole module exists to prevent: a machine with nothing
         // installed used to get `None`, i.e. a mic button that records and then reports
         // "no transcriber found". Whatever else detection decides, it never decides that.
-        assert_ne!(detect_transcriber(&SttSettings::default()), Transcriber::None);
+        assert_ne!(
+            detect_transcriber(&SttSettings::default()),
+            Transcriber::None
+        );
     }
 
     #[test]

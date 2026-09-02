@@ -225,7 +225,9 @@ fn download(url: &str, dest: &Path, expect: u64) -> Result<(), String> {
             rt.block_on(stream_to_file(&url, &dest, expect))
         })
         .map_err(|e| format!("model download thread: {e}"))?;
-    let r = handle.join().unwrap_or_else(|_| Err("model download thread panicked".into()));
+    let r = handle
+        .join()
+        .unwrap_or_else(|_| Err("model download thread panicked".into()));
     FETCH_TOTAL.store(0, Ordering::Relaxed);
     FETCHED.store(0, Ordering::Relaxed);
     r
@@ -334,7 +336,11 @@ fn run(model: &Path, audio: &[f32]) -> Result<String, String> {
     params.set_translate(false);
     // The `.en` models have no language to choose; a multilingual one the user supplied
     // gets whisper's own detection rather than a hard-coded English.
-    params.set_language(if ctx.is_multilingual() { None } else { Some("en") });
+    params.set_language(if ctx.is_multilingual() {
+        None
+    } else {
+        Some("en")
+    });
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -379,10 +385,7 @@ fn read_wav(path: &Path) -> Result<Vec<f32>, String> {
     // whisper's mel front end is scale-sensitive: feeding it raw i16 magnitudes
     // transcribes to silence rather than to something wrong-but-visible.
     let interleaved: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader
-            .samples::<f32>()
-            .map(|s| s.unwrap_or(0.0))
-            .collect(),
+        hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect(),
         hound::SampleFormat::Int => {
             let scale = 1.0 / (1i64 << (spec.bits_per_sample.max(1) - 1)) as f32;
             reader
@@ -460,7 +463,10 @@ mod tests {
 
     #[test]
     fn a_bare_model_name_is_a_model_not_a_relative_path() {
-        assert_eq!(choose(&settings(Some("tiny.en"))), Choice::Builtin(&MODELS[0]));
+        assert_eq!(
+            choose(&settings(Some("tiny.en"))),
+            Choice::Builtin(&MODELS[0])
+        );
         assert_eq!(
             choose(&settings(Some("  base.en  "))),
             Choice::Builtin(&MODELS[1])
