@@ -7,7 +7,9 @@
 //! `tokio::task::spawn_blocking` — so nothing about this file has to be async to be
 //! correct.
 
-use super::backend::{clean_transcript, detect_recorder, detect_transcriber, Recorder, StopKind};
+use super::backend::{
+    clean_transcript, detect_recorder, detect_transcriber, Recorder, StopKind, Transcriber,
+};
 use super::native::{self, NativeCapture};
 use super::SttSettings;
 use std::collections::HashMap;
@@ -113,6 +115,14 @@ impl Dictation {
                 }
             ));
         }
+        // Started here, while the mic is opening, rather than at transcribe time: the
+        // model download and the person talking then overlap, so the first-ever dictation
+        // costs a few seconds of wait instead of the full 142 MB of it. A no-op once the
+        // model is cached, and a failure here is deliberately ignored — the recording must
+        // not be blocked by it, and the same fetch is retried, with its error reported,
+        // when there is finally a transcript to make.
+        super::whisper::prefetch(settings);
+
         std::fs::create_dir_all(&self.dir).map_err(|e| format!("dictation dir: {e}"))?;
         let wav = self.dir.join(format!("{}.wav", sanitize(pane_id)));
         let _ = std::fs::remove_file(&wav);
@@ -257,8 +267,22 @@ fn transcribe(wav: &Path, elapsed: Duration, settings: &SttSettings) -> Result<T
     }
     let transcriber = detect_transcriber(settings);
     let backend = transcriber.name();
+    if transcriber == Transcriber::Native {
+        // No process, no PATH, no stdout to parse — but the output still goes through
+        // `clean_transcript`, because whisper.cpp emits the same `[BLANK_AUDIO]` markers
+        // whichever way it is driven.
+        let raw = super::whisper::transcribe(wav, settings)?;
+        let text = clean_transcript(&raw);
+        if text.is_empty() {
+            return Err("no speech in the recording".to_string());
+        }
+        return Ok(Transcript { text, backend });
+    }
+    // Unreachable from detection now that the in-process engine is the floor; what is
+    // left is a `transcribeTemplate` that resolved to no runnable command.
     let mut cmd = transcriber.build_command(wav).ok_or_else(|| {
-        "no transcriber found (install whisper, or set transcribeTemplate in stt.json)".to_string()
+        "stt.transcribeTemplate is not a command that can be run — fix it, or remove it to          use the built-in transcriber"
+            .to_string()
     })?;
     let out = cmd
         .stdin(Stdio::null())

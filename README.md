@@ -73,11 +73,14 @@ MCP** lets an agent — or a whole recursive agent org — watch and drive your 
   serialized speech queue with pane‑label prefixes, and the palette has global **Stop / Mute /
   Only Focused Pane**. Off by default; persisted per pane. See `docs/talk-feature.md`.
 - **Dictate — speak into a pane** — every pane header has a **microphone**: click it, talk, click
-  it again, and the recording is transcribed locally (whisper / whisper‑cli) and typed into that
-  pane. Recording is in‑process (CoreAudio / WASAPI / ALSA) and needs nothing installed, falling
-  back to ffmpeg / sox / arecord if the OS audio device cannot be opened; nothing is sent
-  anywhere, a transcript can never press Enter on its own, and a forgotten mic stops itself after
-  5 minutes. See `docs/stt-feature.md`.
+  it again, and the recording is transcribed and typed into that pane. **Batteries included on
+  all three OSes:** recording is in‑process (CoreAudio / WASAPI / ALSA) and transcription is
+  whisper.cpp compiled into the binary, so nothing has to be installed — the only thing fetched
+  is the speech model itself, once, on the first dictation (~148 MB, checked against a pinned
+  SHA‑256). External tools stay as overrides: ffmpeg / sox / arecord for capture, whisper /
+  whisper‑cli or your own `transcribeTemplate` for the transcript. After that one download it is
+  entirely offline — the audio never leaves the machine — a transcript can never press Enter on
+  its own, and a forgotten mic stops itself after 5 minutes. See `docs/stt-feature.md`.
 
 ### Layouts
 - **Automatic** layout plus five presets: **Single, Columns, Rows, Grid, Main + Stack**.

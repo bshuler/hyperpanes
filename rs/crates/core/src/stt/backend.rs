@@ -237,11 +237,17 @@ fn quoted(line: &str) -> Option<String> {
 pub enum Transcriber {
     /// User-supplied argv; `{wav}` is replaced with the recording's path.
     Custom(Vec<String>),
+    /// whisper.cpp, compiled into this binary ([`super::whisper`]). Has no command:
+    /// [`build_command`](Transcriber::build_command) returns `None` and
+    /// [`super::dictation`] calls the library directly.
+    Native,
     /// The Python `whisper` CLI, which fetches its own weights on first use.
     Whisper,
     /// whisper.cpp's `whisper-cli`, which needs a model file passed to `-m`.
     WhisperCpp { model: String },
-    /// Nothing on this machine can transcribe.
+    /// Nothing on this machine can transcribe. No longer produced by
+    /// [`detect_transcriber`] — [`Transcriber::Native`] always can — but kept because it
+    /// is the honest answer for a caller that constructs one by hand.
     None,
 }
 
@@ -249,6 +255,7 @@ impl Transcriber {
     pub fn name(&self) -> &'static str {
         match self {
             Transcriber::Custom(_) => "custom",
+            Transcriber::Native => "native",
             Transcriber::Whisper => "whisper",
             Transcriber::WhisperCpp { .. } => "whisper-cli",
             Transcriber::None => "none",
@@ -259,6 +266,8 @@ impl Transcriber {
         let wav_s = wav.to_string_lossy().to_string();
         match self {
             Transcriber::Custom(argv) => custom_command(argv, WAV_PLACEHOLDER, &wav_s),
+            // In-process: there is no subprocess to describe.
+            Transcriber::Native => None,
             Transcriber::Whisper => {
                 let mut c = command_for("whisper");
                 // `--output_format txt` still prints the timed transcript to stdout;
@@ -278,14 +287,26 @@ impl Transcriber {
     }
 }
 
-/// Pick a transcriber. A configured template wins; otherwise `whisper` is preferred over
-/// `whisper-cli` because it needs no model path — and `whisper-cli` is only offered when
-/// a model was actually configured, since without one it exits before reading the audio.
+/// Pick a transcriber. A configured template wins; then the in-process engine if its
+/// model is already downloaded; then an installed `whisper`, preferred over `whisper-cli`
+/// because it needs no model path — and `whisper-cli` only when a model was actually
+/// configured, since without one it exits before reading the audio. Failing all of those,
+/// the in-process engine again, this time fetching its model.
+///
+/// The in-process engine appears twice on purpose. It is the only one guaranteed to be
+/// here, so it must be the floor; but a cached model beats an external tool (same engine,
+/// no process, no PATH lookup) while an *uncached* one does not — someone who installed
+/// `whisper` deliberately should not be made to wait on a 142 MB download they have no
+/// use for. Both arms are cheap and synchronous: neither touches the network, so `/state`
+/// can ask this on every poll.
 pub fn detect_transcriber(settings: &SttSettings) -> Transcriber {
     if let Some(argv) = settings.transcribe_template.as_ref() {
         if !argv.is_empty() {
             return Transcriber::Custom(argv.clone());
         }
+    }
+    if super::whisper::ready(settings) {
+        return Transcriber::Native;
     }
     if on_path("whisper") {
         return Transcriber::Whisper;
@@ -297,7 +318,7 @@ pub fn detect_transcriber(settings: &SttSettings) -> Transcriber {
             };
         }
     }
-    Transcriber::None
+    Transcriber::Native
 }
 
 /// Strip a transcriber's decoration down to the words that were said.
@@ -483,19 +504,47 @@ mod tests {
 
     #[test]
     fn whisper_cpp_is_never_offered_without_the_model_it_cannot_run_without() {
-        let s = SttSettings::default();
-        assert!(!matches!(
-            detect_transcriber(&s),
-            Transcriber::WhisperCpp { .. }
-        ));
-        let with_model = SttSettings {
-            model: Some("".into()),
+        // Both of these leave `model` unusable, which is the whole point: `whisper-cli`
+        // must not be chosen when the one argument it cannot start without is missing.
+        for s in [
+            SttSettings::default(),
+            SttSettings {
+                model: Some("".into()),
+                ..Default::default()
+            },
+        ] {
+            assert!(!matches!(
+                detect_transcriber(&s),
+                Transcriber::WhisperCpp { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn there_is_always_a_transcriber_now() {
+        // The regression this whole module exists to prevent: a machine with nothing
+        // installed used to get `None`, i.e. a mic button that records and then reports
+        // "no transcriber found". Whatever else detection decides, it never decides that.
+        assert_ne!(detect_transcriber(&SttSettings::default()), Transcriber::None);
+    }
+
+    #[test]
+    fn the_in_process_transcriber_has_no_command_to_run() {
+        assert_eq!(Transcriber::Native.name(), "native");
+        assert!(Transcriber::Native
+            .build_command(Path::new("/tmp/a.wav"))
+            .is_none());
+    }
+
+    #[test]
+    fn a_custom_template_still_outranks_the_built_in_engine() {
+        // Even when the built-in model is sitting in the cache — an override that the
+        // batteries-included path could silently win against would be no override.
+        let s = SttSettings {
+            transcribe_template: Some(vec!["stt".into(), "{wav}".into()]),
             ..Default::default()
         };
-        assert!(!matches!(
-            detect_transcriber(&with_model),
-            Transcriber::WhisperCpp { .. }
-        ));
+        assert!(matches!(detect_transcriber(&s), Transcriber::Custom(_)));
     }
 
     #[test]

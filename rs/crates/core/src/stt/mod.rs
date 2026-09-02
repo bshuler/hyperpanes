@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! click mic  → recorder (in-process, or a command) → <state>/dictation/<pane>.wav
-//! click stop → (graceful stop)   → transcriber command → stdout → pane input
+//! click stop → (graceful stop)   → transcriber (in-process, or a command) → pane input
 //! ```
 //!
 //! **In-process first, commands as the fallback.** This started out as commands only —
@@ -19,13 +19,23 @@
 //! pipeline testable headless (point `recordTemplate` at a script that copies a fixture
 //! WAV). The bill for it is one build-time dependency on Linux, `libasound2-dev`.
 //!
-//! Owned modules: [`native`] (in-process capture), [`backend`] (detection + argv
-//! construction) and [`dictation`] (the per-pane record → stop → transcribe state
+//! The transcript half had the same hole and got the same treatment. `whisper` (a Python
+//! package) and `whisper-cli` (Homebrew/apt) are on no stock machine either, so a recorder
+//! that finally worked just moved the failure one step later, to "no transcriber found".
+//! [`whisper`] compiles whisper.cpp into this binary. What it cannot compile in are the
+//! weights — those are downloaded once, checked against a pinned SHA-256, and cached; from
+//! then on dictation is entirely offline and entirely local. Nothing is ever uploaded: the
+//! audio does not leave the machine, which is the other reason this is in-process rather
+//! than a cloud API.
+//!
+//! Owned modules: [`native`] (in-process capture), [`whisper`] (in-process transcription
+//! and its model cache), [`backend`] (detection + argv construction) and [`dictation`] (the per-pane record → stop → transcribe state
 //! machine). This file holds only the persisted settings shape.
 
 pub mod backend;
 pub mod dictation;
 pub mod native;
+pub mod whisper;
 
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -44,9 +54,10 @@ pub struct SttSettings {
     /// transcript is read from stdout. `None` -> auto-detect.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcribe_template: Option<Vec<String>>,
-    /// whisper.cpp's model file (`-m`). Only consulted when the auto-detected
-    /// transcriber is `whisper-cli`, which — unlike the Python `whisper`, which fetches
-    /// its own weights — cannot run without one.
+    /// Which model to transcribe with. Either one of [`whisper::MODELS`]' names
+    /// (`tiny.en`, `base.en`, `small.en`) — downloaded on demand by the in-process
+    /// transcriber — or a path to a `ggml-*.bin` of the user's own, which is also what
+    /// `whisper-cli` is passed as `-m`. `None` -> [`whisper::DEFAULT_MODEL`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     /// Press Enter after inserting the transcript. Off by default: dictation is not

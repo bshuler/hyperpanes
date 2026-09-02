@@ -85,6 +85,19 @@ jobs:
             libxcb-shape0-dev libxcb-xfixes0-dev libssl-dev pkg-config cmake clang \
             libasound2-dev
 
+      # whisper-rs-sys runs bindgen over whisper.cpp's headers, and bindgen needs
+      # libclang. The Windows runner image ships LLVM but does not point clang-sys at it;
+      # macOS and Linux find their own (the apt list above installs clang). Guarded on the
+      # directory existing so a future image layout change degrades to clang-sys's own
+      # search rather than to a hard failure.
+      - name: Point bindgen at libclang (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = "C:\Program Files\LLVM\bin"
+          if (Test-Path $p) { "LIBCLANG_PATH=$p" | Out-File -FilePath $env:GITHUB_ENV -Append }
+          else { Write-Host "no LLVM at $p — leaving clang-sys to find its own" }
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -120,6 +133,19 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
+
+      # whisper-rs-sys runs bindgen over whisper.cpp's headers, and bindgen needs
+      # libclang. The Windows runner image ships LLVM but does not point clang-sys at it;
+      # macOS and Linux find their own (the apt list above installs clang). Guarded on the
+      # directory existing so a future image layout change degrades to clang-sys's own
+      # search rather than to a hard failure.
+      - name: Point bindgen at libclang (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = "C:\Program Files\LLVM\bin"
+          if (Test-Path $p) { "LIBCLANG_PATH=$p" | Out-File -FilePath $env:GITHUB_ENV -Append }
+          else { Write-Host "no LLVM at $p — leaving clang-sys to find its own" }
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -158,6 +184,19 @@ jobs:
             libasound2-dev \
             libfuse2
 
+      # whisper-rs-sys runs bindgen over whisper.cpp's headers, and bindgen needs
+      # libclang. The Windows runner image ships LLVM but does not point clang-sys at it;
+      # macOS and Linux find their own (the apt list above installs clang). Guarded on the
+      # directory existing so a future image layout change degrades to clang-sys's own
+      # search rather than to a hard failure.
+      - name: Point bindgen at libclang (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = "C:\Program Files\LLVM\bin"
+          if (Test-Path $p) { "LIBCLANG_PATH=$p" | Out-File -FilePath $env:GITHUB_ENV -Append }
+          else { Write-Host "no LLVM at $p — leaving clang-sys to find its own" }
+
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
@@ -193,6 +232,19 @@ jobs:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v5
+
+      # whisper-rs-sys runs bindgen over whisper.cpp's headers, and bindgen needs
+      # libclang. The Windows runner image ships LLVM but does not point clang-sys at it;
+      # macOS and Linux find their own (the apt list above installs clang). Guarded on the
+      # directory existing so a future image layout change degrades to clang-sys's own
+      # search rather than to a hard failure.
+      - name: Point bindgen at libclang (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $p = "C:\Program Files\LLVM\bin"
+          if (Test-Path $p) { "LIBCLANG_PATH=$p" | Out-File -FilePath $env:GITHUB_ENV -Append }
+          else { Write-Host "no LLVM at $p — leaving clang-sys to find its own" }
 
       - uses: dtolnay/rust-toolchain@stable
 

@@ -202,6 +202,13 @@ pub fn stt_json() -> PathBuf {
     config_dir().join("stt.json")
 }
 
+/// Where downloaded speech-recognition models are cached. Durable user data →
+/// [`data_dir`]: a 142 MB model is expensive to re-fetch and survives restarts, which is
+/// exactly what `data_dir` means and exactly what `state_dir` does not.
+pub fn stt_models_dir() -> PathBuf {
+    data_dir().join("models")
+}
+
 /// Ambient-AI per-pane memory. Durable user data → [`data_dir`].
 pub fn ai_memory_json() -> PathBuf {
     data_dir().join("ai-memory.json")

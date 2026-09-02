@@ -25,17 +25,22 @@ commands stay as the fallback for a machine cpal cannot open a device on, and `r
 still overrides everything, which is what keeps the pipeline testable headless (point it at a
 script that copies a fixture WAV).
 
-The bill, stated plainly: two Cargo dependencies, and a Linux **build** now needs
-`libasound2-dev` (alsa-sys is pkg-config'd; there is no vendored path). CI and
-`scripts/gui-harness/Dockerfile` install it. At **runtime** Linux needs only `libasound.so.2`,
-which every desktop with working sound already has.
+The bill, stated plainly: four Cargo dependencies; a Linux **build** now needs
+`libasound2-dev` (alsa-sys is pkg-config'd; there is no vendored path) and CI and
+`scripts/gui-harness/Dockerfile` install it; and CI now compiles C++ (whisper.cpp, via
+cmake + libclang for bindgen — already on all three runners; the Windows jobs set
+`LIBCLANG_PATH` explicitly). At **runtime** Linux needs only `libasound.so.2`, which every
+desktop with working sound already has, and the first dictation on a fresh machine downloads
+one model file. Nothing else.
 
 ## Pipeline
 
 ```
-click mic   → recorder command        → <temp>/hyperpanes-dictation-<pid>/<pane>.wav
+click mic   → recorder (in-process, or a command)
+                                      → <temp>/hyperpanes-dictation-<pid>/<pane>.wav
+            → (in the background)     → fetch the speech model if it is not cached yet
 click again → graceful stop           → the recorder finalizes its WAV header
-            → transcriber command     → stdout
+            → transcriber (in-process, or a command)
             → sanitize                → sessions.write(uid, text)      [the pane's pty]
             → (optional) 40ms later   → sessions.write(uid, "\r")      [submit]
 ```
@@ -70,11 +75,64 @@ transcriber that would return an empty string.
 `recv_timeout` on the capture thread), not by a timer in the GUI — so the cap survives a
 crashed GUI. A forgotten microphone stops on its own.
 
-### Transcribers
+### Transcribers (`stt/backend.rs`, `stt/whisper.rs`)
 
-`whisper` (the Python one, which fetches its own weights) or `whisper-cli` (whisper.cpp, which
-needs a model file — set `model` in `stt.json`). First on `PATH` wins. `whisper`'s progress
-chatter and timestamp brackets are stripped (`clean_transcript`).
+The recorder half had a hole and so did this one, in the same shape: `whisper` (the Python
+package) and `whisper-cli` (Homebrew/apt) are on no stock machine, so a recorder that finally
+worked just moved the failure one step later — from "no recorder found" to "no transcriber
+found". `stt/whisper.rs` compiles whisper.cpp **into the binary** (`whisper-rs`), so the
+inference is one code path on macOS, Windows and Linux.
+
+Detection order: `transcribeTemplate` if set → in-process if its model is already downloaded →
+`whisper` → `whisper-cli` (only when `model` is set, since it exits without one) → in-process,
+this time fetching the model. The built-in engine appears twice on purpose. It is the only one
+guaranteed to be present, so it has to be the floor; but a *cached* model beats an external
+tool (same engine, no process, no `PATH` lookup) while an *uncached* one does not — someone who
+installed `whisper` deliberately should not be made to wait on a download they have no use for.
+Both arms are synchronous and touch no network, so `GET /state` can ask on every poll.
+
+| Transcriber | Needs | Notes |
+| --- | --- | --- |
+| **in-process (`whisper-rs`)** — the default | nothing installed; one model download | CPU only: no Metal/CoreML/CUDA, so all three OSes run identical code |
+| `whisper` | the Python package on `PATH` | fetches its own weights |
+| `whisper-cli` | whisper.cpp on `PATH` **and** `model` set | `-m <model>` |
+| `transcribeTemplate` | whatever you point it at | transcript read from stdout |
+
+Both paths' output goes through `clean_transcript`, which strips whisper's timestamp brackets
+and its `[BLANK_AUDIO]` / `(Music)` markers.
+
+#### The model, and why it is not vendored
+
+Weights are data, not code: a few hundred megabytes that would sit in every download whether or
+not anyone dictates. So the binary ships the engine and fetches the model once, from
+whisper.cpp's own upstream distribution, into `<data>/models/`:
+
+| `model` | Size | SHA-256 pinned in `MODELS` |
+| --- | --- | --- |
+| `tiny.en` | 78 MB | `921e4cf8…20b1f` |
+| `base.en` **(default)** | 148 MB | `a03779c8…6d002` |
+| `small.en` | 488 MB | `c6138d6d…41e5d` |
+
+`model` takes one of those names, **or** a path to a `ggml-*.bin` of your own (which is also
+what `whisper-cli` gets as `-m`). A name is read as a name, not as a relative path; a
+configured path that has gone missing falls back to the default rather than leaving a dead mic
+button.
+
+Three things make the download defensible rather than a 148 MB act of faith:
+
+- **It is verified.** Every built-in model has a pinned SHA-256, checked before the blob is
+  handed to a C++ inference engine — a truncated download and a substituted one look identical
+  from in there. A mismatch is deleted and reported, never used.
+- **It is atomic.** The body streams to a `.part` sibling and is renamed only after the digest
+  matches, so an interrupted fetch can never leave a short file at the name the loader trusts.
+  A `Mutex` means two panes reaching for the mic at once fetch one model, not two into one path.
+- **It overlaps the talking.** The fetch starts when the mic *opens*, not when it closes, so
+  the first-ever dictation costs a few seconds of waiting rather than the whole download. A
+  failure there is ignored — it must not block the recording — and retried, with its error
+  reported and a percentage attached, when there is finally a transcript to make.
+
+After that one download there is no network path at all: the audio never leaves the machine,
+which is the other reason this is in-process rather than a cloud API.
 
 ## The transcript is untrusted input
 
@@ -94,11 +152,13 @@ tick, so a per-pane flag in the read model would be stamped straight back out. `
 therefore reports it as one additive top-level block:
 
 ```json
-"dictation": { "recorder": "native", "transcriber": "none", "recordingPanes": ["p1"] }
+"dictation": { "recorder": "native", "transcriber": "native", "recordingPanes": ["p1"] }
 ```
 
-Naming both halves even when nothing is installed lets a client tell "no recorder here" apart
-from "old server". The GUI reads the same list each tick and lights the header microphone.
+Naming both halves lets a client tell "no microphone on this machine" apart from "old server".
+`transcriber` is now `"native"` on a stock install rather than `"none"`; `recorder` is `"none"`
+only when the machine reports no audio input device at all. The GUI reads the same list each
+tick and lights the header microphone.
 
 ## Control API
 
@@ -141,13 +201,14 @@ Beside `speech.json`; all fields optional:
 {
   "recordTemplate": ["ffmpeg", "-f", "avfoundation", "-i", ":default", "-t", "300", "{wav}"],
   "transcribeTemplate": ["whisper-cli", "-f", "{wav}", "-nt"],
-  "model": "/path/to/ggml-base.en.bin",
+  "model": "base.en",
   "submit": false
 }
 ```
 
 `{wav}` in any argument is replaced with the recording's path. A template runs WITHOUT a
-shell. This is also the testing seam: a `recordTemplate` that copies a fixture and a
+shell. `model` is a built-in name (`tiny.en` / `base.en` / `small.en`) or a path to your own
+`ggml-*.bin`. This is also the testing seam: a `recordTemplate` that copies a fixture and a
 `transcribeTemplate` that `cat`s a text file make the whole feature observable headless.
 
 ## GUI
@@ -156,6 +217,7 @@ shell. This is also the testing seam: a `recordTemplate` that copies a fixture a
   pane context menu that reads as the stop while recording.
 - Command palette: **Dictate: Toggle Microphone** (focused pane).
 - Toasts carry the outcome — which recorder started, what the transcriber produced, or why
-  nothing happened ("no recorder installed", "Dictation needs the control server").
+  nothing happened ("no microphone found", "Dictation needs the control server"). A first
+  dictation that is still waiting on the model download says so with a percentage.
 - Like talk, dictation lives on the control server: with it disabled in Preferences the button
   says so rather than failing silently.

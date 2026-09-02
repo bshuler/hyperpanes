@@ -1006,8 +1006,8 @@ impl App {
             }
             Effect::ToggleDictation(uid) => {
                 let msg = self.control.toggle_dictation(&uid);
-                // The mic button lights on the next sync tick, but a refusal ("no recorder
-                // installed", "the control server is off") has to be visible on the click.
+                // The mic button lights on the next sync tick, but a refusal ("no microphone
+                // found", "the control server is off") has to be visible on the click.
                 let mut st = win.state.borrow_mut();
                 if let Some(p) = st
                     .tabs

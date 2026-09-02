@@ -20,7 +20,9 @@ alacritty_terminal = "0.26"
 # async runtime (ai scheduler/client; the live core broadly)
 tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "io-util", "macros", "process", "fs"] }
 # ai: Ollama HTTP client (rustls to avoid an OpenSSL build dep on Windows)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `stream` is for the speech-model download (stt/whisper.rs): a 142 MB body is written
+# to disk chunk by chunk with a progress counter, not buffered whole in memory.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 # persistence-cli: userData dir + ids
 directories = "5"
 uuid = { version = "1", features = ["v4"] }
@@ -48,6 +50,19 @@ cpal = "0.18"
 # WAV encoding. The recorder has to write the header length itself now that no external
 # tool is doing it, which is the one thing a killed ffmpeg used to get wrong.
 hound = "3.5"
+
+# --- dictation: in-process transcription (stt/whisper.rs) ---
+# The second half of "batteries included". whisper-rs compiles whisper.cpp into this
+# binary, so transcription is one code path on macOS, Windows and Linux and needs no
+# `whisper` / `whisper-cli` on PATH. The weights are not vendored — a ~142 MB model is
+# fetched once, on the first dictation, and cached; everything after that is offline.
+# Cost, stated plainly: CI now builds C++ (cmake + a C++ toolchain + libclang for
+# bindgen, all already present on the three runners) and the binary grows by a few MB.
+whisper-rs = { version = "0.16", default-features = false }
+# SHA-256 for the downloaded model. A 142 MB blob fetched over the network and then fed
+# to a C++ inference engine is exactly the thing that should be checked against a pinned
+# digest before it is opened.
+sha2 = "0.10"
 
 # platform: single-instance (named mutex + named-pipe argv handoff)
 # 0.58 -> 0.62 to unify with the app + wgpu-hal 29 (avoids two `windows` crate versions).
