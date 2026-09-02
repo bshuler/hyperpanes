@@ -979,6 +979,28 @@ mod read_only_menu_tests {
         );
     }
 
+    /// The Restart row has to reach the app tick, not just look like a menu item: the whole
+    /// point is that a freshly installed build goes live from here. Follows the row to the
+    /// command it carries and dispatches it, so a renamed label or a row wired to `None`
+    /// fails here rather than silently doing nothing on click.
+    #[test]
+    fn the_app_menu_can_restart_the_gui() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mgr = SessionManager::new(tx);
+        let mut st = State::new(crate::theme::load_font(1.0));
+        let menu = app_menu(&st, 0.0, 0.0);
+        let at = menu
+            .entries
+            .iter()
+            .position(|e| e.label == "Restart Hyperpanes")
+            .expect("the app menu offers a restart");
+        let cmd = menu.commands[at].clone().expect("the row carries a command");
+        assert!(matches!(
+            crate::command::dispatch(&mut st, cmd, &mgr),
+            crate::command::Effect::RestartApp
+        ));
+    }
+
     /// The rows that survive: a view pane still has content to copy, a cwd to open, and a
     /// pane to rename, colour, move and close.
     #[test]
