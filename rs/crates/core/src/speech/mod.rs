@@ -7,6 +7,7 @@
 //! kept additive-only here so that merge stays a small, conflict-free diff.
 
 pub mod engine;
+pub mod markup;
 pub mod normalize;
 pub mod tailer;
 
