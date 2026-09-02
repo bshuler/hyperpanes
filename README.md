@@ -69,7 +69,7 @@ MCP** lets an agent — or a whole recursive agent org — watch and drive your 
   pulse, blink, fluorescent, solid**). Tunable threshold; off‑window panes glow even when focused.
 - **Talk — spoken replies** — toggle **Talk** on a pane (right‑click → *Talk (speak replies)*) and it
   reads each NEW assistant reply aloud via local TTS (spd‑say / espeak‑ng / macOS `say`, Windows
-  SAPI, or a custom command). Works for **claude, cursor‑agent, copilot and codex** — each tool's
+  SAPI, or a custom command). Works for **claude, cursor‑agent, copilot, codex and gemini** — each tool's
   own transcript, never a terminal scrape. Replies are normalized whatever format they arrive in —
   Markdown, HTML, JSON, CSV/TSV or plain text, with ANSI colour and spinner frames stripped and code
   blocks skipped — all panes share one

@@ -74,6 +74,24 @@ enum HookShape {
     Nested,
 }
 
+/// What a tool's config-location environment variable actually names.
+///
+/// The distinction is not pedantry: `CODEX_HOME` and `GEMINI_CLI_HOME` read alike and mean
+/// different things, and treating either as the other writes the hook into a file the tool
+/// never opens — which fails silently, because a hook that is not registered simply never
+/// fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RootEnv {
+    /// Names the config **directory** itself; the settings file's own name is joined onto
+    /// it. Codex's `CODEX_HOME` — `$CODEX_HOME/hooks.json`.
+    ConfigDir(&'static str),
+    /// Names the **home** directory; the whole home-relative path is joined onto it.
+    /// Gemini's `GEMINI_CLI_HOME` — `$GEMINI_CLI_HOME/.gemini/settings.json`. (Gemini's
+    /// bundle also exports a `GEMINI_DIR`, which is a compile-time constant holding the
+    /// string `.gemini` and not an environment variable at all.)
+    Home(&'static str),
+}
+
 /// One tool whose lifecycle hook we have verified against a real install.
 pub struct HookedTool {
     /// Registry id ([`crate::tools::registry`]) — also the marker sub-directory name.
@@ -81,13 +99,11 @@ pub struct HookedTool {
     /// `resources/<dir>/<script>` in the shipped tree.
     dir: &'static str,
     script: &'static str,
-    /// The settings file to merge into, relative to the user's home. Overridden by
-    /// `home_env` when that variable is set.
+    /// The settings file to merge into, relative to the user's home. Rebased by
+    /// `root_env` when that tool's own override is set.
     settings_rel: &'static [&'static str],
-    /// An environment variable naming the tool's config *directory*, which then holds the
-    /// last element of `settings_rel`. Codex has one (`CODEX_HOME`) and honours it for
-    /// hooks; the other two have none, so their path is home-relative and nothing else.
-    home_env: Option<&'static str>,
+    /// The tool's OWN environment override for where its config lives, if it has one.
+    root_env: Option<RootEnv>,
     /// The two lifecycle events, start first. Spelled differently per tool — cursor and
     /// copilot use `sessionStart`/`sessionEnd`, codex uses `SessionStart`/`SessionEnd` —
     /// and an event under the wrong casing is silently never called.
@@ -102,19 +118,26 @@ pub struct HookedTool {
 impl HookedTool {
     /// Where this tool's hook settings live under `home`.
     ///
-    /// `home_env` wins when it is set and non-empty: it is the tool's OWN override for its
-    /// config directory, so a human who moved `$CODEX_HOME` has moved the file codex reads
-    /// — writing the home-relative path instead would register a hook nothing ever loads.
+    /// `root_env` wins when it is set and non-empty: it is the tool's OWN override, so a
+    /// human who moved `$CODEX_HOME` has moved the file codex reads — writing the
+    /// home-relative path instead would register a hook nothing ever loads.
     fn settings_file(&self, home: &Path) -> PathBuf {
-        let file = self.settings_rel.last().copied().unwrap_or("hooks.json");
-        if let Some(var) = self.home_env {
-            if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty()) {
-                return PathBuf::from(v).join(file);
+        let rel = |base: PathBuf| self.settings_rel.iter().fold(base, |p, s| p.join(s));
+        match self.root_env {
+            Some(RootEnv::ConfigDir(var)) => {
+                if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+                    let file = self.settings_rel.last().copied().unwrap_or("hooks.json");
+                    return PathBuf::from(v).join(file);
+                }
             }
+            Some(RootEnv::Home(var)) => {
+                if let Some(v) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+                    return rel(PathBuf::from(v));
+                }
+            }
+            None => {}
         }
-        self.settings_rel
-            .iter()
-            .fold(home.to_path_buf(), |p, s| p.join(s))
+        rel(home.to_path_buf())
     }
 }
 
@@ -128,7 +151,7 @@ pub static HOOKED_TOOLS: &[HookedTool] = &[
         dir: "cursor",
         script: "hp-cursor-session-hook.sh",
         settings_rel: &[".cursor", "hooks.json"],
-        home_env: None,
+        root_env: None,
         events: ["sessionStart", "sessionEnd"],
         shape: HookShape::Flat,
         versioned: true,
@@ -138,7 +161,7 @@ pub static HOOKED_TOOLS: &[HookedTool] = &[
         dir: "copilot",
         script: "hp-copilot-session-hook.sh",
         settings_rel: &[".copilot", "settings.json"],
-        home_env: None,
+        root_env: None,
         events: ["sessionStart", "sessionEnd"],
         shape: HookShape::Flat,
         versioned: false,
@@ -148,7 +171,20 @@ pub static HOOKED_TOOLS: &[HookedTool] = &[
         dir: "codex",
         script: "hp-codex-session-hook.sh",
         settings_rel: &[".codex", "hooks.json"],
-        home_env: Some("CODEX_HOME"),
+        root_env: Some(RootEnv::ConfigDir("CODEX_HOME")),
+        events: ["SessionStart", "SessionEnd"],
+        shape: HookShape::Nested,
+        versioned: false,
+    },
+    // Gemini takes the same nested, PascalCase shape as codex — it ships a
+    // `gemini hooks migrate` that imports Claude Code's config, which is why. Unlike codex
+    // it does NOT trust-gate hooks: writing the file is enough, nothing has to be approved.
+    HookedTool {
+        id: "gemini",
+        dir: "gemini",
+        script: "hp-gemini-session-hook.sh",
+        settings_rel: &[".gemini", "settings.json"],
+        root_env: Some(RootEnv::Home("GEMINI_CLI_HOME")),
         events: ["SessionStart", "SessionEnd"],
         shape: HookShape::Nested,
         versioned: false,
@@ -233,7 +269,7 @@ fn bundled_script(dir: &str, script: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
-/// The user's home, for locating `~/.cursor`, `~/.copilot` and `~/.codex`.
+/// The user's home, for locating `~/.cursor`, `~/.copilot`, `~/.codex` and `~/.gemini`.
 fn home_dir() -> Option<PathBuf> {
     if let Some(v) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(v));
@@ -515,6 +551,44 @@ mod tests {
             Ok(false)
         );
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn a_config_dir_override_and_a_home_override_land_in_different_places() {
+        // `CODEX_HOME` and `GEMINI_CLI_HOME` read alike and are not alike: codex's names the
+        // config directory (`$CODEX_HOME/hooks.json`) and gemini's names the home
+        // (`$GEMINI_CLI_HOME/.gemini/settings.json`). Confusing them writes a valid hook
+        // into a file the tool never opens, and an unregistered hook does not fail — it
+        // just never fires, which is the hardest kind of wrong to notice.
+        let home = Path::new("/home/someone");
+        let over = std::env::temp_dir().join("hp-root-env-probe");
+
+        let prev_c = std::env::var_os("CODEX_HOME");
+        let prev_g = std::env::var_os("GEMINI_CLI_HOME");
+        std::env::set_var("CODEX_HOME", &over);
+        std::env::set_var("GEMINI_CLI_HOME", &over);
+        let codex = tool("codex").settings_file(home);
+        let gemini = tool("gemini").settings_file(home);
+        // A tool with no override is home-relative no matter what those variables say.
+        let cursor = tool("cursor-agent").settings_file(home);
+        std::env::remove_var("CODEX_HOME");
+        std::env::remove_var("GEMINI_CLI_HOME");
+        let codex_unset = tool("codex").settings_file(home);
+        let gemini_unset = tool("gemini").settings_file(home);
+        match prev_c {
+            Some(v) => std::env::set_var("CODEX_HOME", v),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        match prev_g {
+            Some(v) => std::env::set_var("GEMINI_CLI_HOME", v),
+            None => std::env::remove_var("GEMINI_CLI_HOME"),
+        }
+
+        assert_eq!(codex, over.join("hooks.json"));
+        assert_eq!(gemini, over.join(".gemini").join("settings.json"));
+        assert_eq!(cursor, home.join(".cursor").join("hooks.json"));
+        assert_eq!(codex_unset, home.join(".codex").join("hooks.json"));
+        assert_eq!(gemini_unset, home.join(".gemini").join("settings.json"));
     }
 
     #[test]

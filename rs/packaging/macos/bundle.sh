@@ -111,7 +111,7 @@ cp -R "$ROOT/resources/claude/hyperpane" "$APP/Contents/Resources/claude/hyperpa
 # scan-and-diff heuristic. They go in Contents/Resources for the same signing reason as the
 # personas above, and are reached through the MacOS/resources symlink.
 for h in claude/hp-claude-session-hook.sh cursor/hp-cursor-session-hook.sh copilot/hp-copilot-session-hook.sh \
-         codex/hp-codex-session-hook.sh; do
+         codex/hp-codex-session-hook.sh gemini/hp-gemini-session-hook.sh; do
   mkdir -p "$APP/Contents/Resources/$(dirname "$h")"
   install -m 755 "$ROOT/resources/$h" "$APP/Contents/Resources/$h"
 done

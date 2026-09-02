@@ -10,11 +10,11 @@ prefixes, a global mute/stop, and an optional focused-pane-only mode.
 
 **Status: BUILT** — core pipeline + control API + GUI + MCP tools; verified end-to-end against
 the headless binary (see "Verifying" below). Generalized past Claude-only and Unix-only on
-2026-09-02: four transcript formats, four TTS backends across three platforms.
+2026-09-02: five transcript formats, four TTS backends across three platforms.
 
 ## Which tools can talk, and why not all of them
 
-Talk needs the tool's own record of what it said. Four tools keep one Hyperpanes can bind to a
+Talk needs the tool's own record of what it said. Five tools keep one Hyperpanes can bind to a
 pane and tail:
 
 | Tool | Pane→session binding | Transcript | Record shape |
@@ -23,6 +23,7 @@ pane and tail:
 | cursor-agent | `tool-sessions/cursor-agent/<paneId>.json` (`~/.cursor/hooks.json`) | `~/.cursor/projects/<Encoded-Cwd>/agent-transcripts/<sid>/<sid>.jsonl` | `{"role":"assistant","message":{"content":[…]}}` — no `type` on message records; `type` marks control records like `turn_ended` |
 | copilot | `tool-sessions/copilot/<paneId>.json` (`~/.copilot/settings.json`) | `~/.copilot/session-state/<sid>/events.jsonl` | `{"type":"assistant.message","data":{"content":"…"}}` — flat event log |
 | codex | `tool-sessions/codex/<paneId>.json` (`$CODEX_HOME/hooks.json`) | `$CODEX_HOME/sessions/<YYYY>/<MM>/<DD>/rollout-<stamp>-<sid>.jsonl` | `{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text",…}]}}` — every line is a `{timestamp,ordinal,type,payload}` envelope |
+| gemini | `tool-sessions/gemini/<paneId>.json` (`~/.gemini/settings.json`) | `~/.gemini/tmp/<project dir>/chats/session-<stamp>-<first 8 of sid>.jsonl` | `{"type":"gemini","content":"…"}` — `content` is a bare **string** here and an array of `{text}` blocks on a `"type":"user"` record |
 
 Every shape above was read off a real install, not off documentation.
 
@@ -46,7 +47,32 @@ stream), and as an `event_msg`/`task_complete` carrying `last_agent_message` (th
 message only). Only the first is read; reading a second would speak every reply twice, which
 `codex_says_each_reply_once_and_not_three_times` in `speech::tailer` locks down.
 
-A pane running anything else — aider, gemini, goose, a plain shell — resolves to no
+Three things about gemini, likewise:
+
+* Its hooks go in **`~/.gemini/settings.json`** under a top-level `"hooks"` key, in the same
+  nested, PascalCase shape codex takes — gemini ships a `gemini hooks migrate` that imports
+  Claude Code's config, which is the corroboration for that. Unlike codex it does **not**
+  trust-gate hooks: writing the file is enough, with nothing for the human to approve.
+* Its config override is **`GEMINI_CLI_HOME`**, and it names the **home directory** — the
+  `.gemini` is still appended. (`GEMINI_DIR` appears in the bundle and is a compile-time
+  constant holding the string `.gemini`, not an environment variable.) `RootEnv` in
+  `tools::session_hook` carries that distinction against codex's `CODEX_HOME`, which names
+  the config directory itself. Reading either as the other writes a valid hook into a file
+  the tool never opens, and an unregistered hook does not error — it just never fires.
+* `<project dir>` is **not derivable from the cwd**. It is the cwd's basename, suffixed
+  `-1`, `-2`, … when an earlier directory already claimed that basename, allocated
+  first-seen-wins and recorded in `~/.gemini/projects.json`. Two checkouts both called `api`
+  map to `api` and `api-1` depending on which gemini saw first. So the transcript is found
+  by searching `~/.gemini/tmp/*/chats` for the filename's 8-character id prefix and then
+  confirming the **full** id on the file's first line — the prefix narrows, the header
+  decides.
+
+A gemini chat file is also not a plain log of messages: it is a mutation stream, and its
+`$set` records rewrite state. One of them carries an entire `messages` array (the session
+context preamble). Those are ignored outright — gemini's version of codex's triple-record
+trap, locked down by `gemini_set_records_are_never_spoken`.
+
+A pane running anything else — aider, goose, a plain shell — resolves to no
 transcript and **stays silent**. That is deliberate, not a gap waiting to be filled by reading
 the terminal: a terminal carries spinners, progress bars, box drawing and the human's own
 echoed keystrokes with no way to tell them from prose, so a scraped tier would make Talk worse,
@@ -58,7 +84,7 @@ not better. Adding a tool means adding a hook that writes a pane marker plus a
 ```
 pane (talk on)                       core, every 750ms (speech_service::run_ticker)
   └─ resolve_transcript(paneId)      claude marker first, then any hooked tool's marker
-       └─ TranscriptRef {path, format}  path + which of the four record shapes to read
+       └─ TranscriptRef {path, format}  path + which of the five record shapes to read
             └─ TranscriptTail        byte-cursor tail, starts at EOF (history is never spoken)
                  └─ extract_assistant_text   per-format; tool_use/tool_result dropped
                       └─ normalize_for_speech  any text format → prose (see below)

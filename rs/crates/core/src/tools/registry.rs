@@ -38,6 +38,18 @@ pub enum HistoryKind {
     /// Paths are resolved by [`crate::tools::history::codex`]; the Talk tailer reads the
     /// records as [`crate::speech::tailer::TranscriptFormat::CodexRollout`].
     CodexRollout,
+    /// `~/.gemini/tmp/<project dir>/chats/session-<YYYY-MM-DD>T<HH-MM>-<first 8 of session
+    /// id>.jsonl` (rebased by `$GEMINI_CLI_HOME`, which names the *home*, not `.gemini`).
+    ///
+    /// Read off a real Gemini 0.58.0 install rather than its docs. `<project dir>` is the
+    /// working directory's basename, suffixed `-1`, `-2`, … when an earlier directory
+    /// already claimed that basename — allocated first-seen-wins and recorded in
+    /// `~/.gemini/projects.json`, so which suffix a given checkout gets is a fact about
+    /// that machine's history and is not computable from the path.
+    ///
+    /// Paths are resolved by [`crate::tools::history::gemini`]; the Talk tailer reads the
+    /// records as [`crate::speech::tailer::TranscriptFormat::GeminiChat`].
+    GeminiChat,
 }
 
 /// One tool. All fields are `'static` so the whole table is a compile-time constant.
@@ -146,7 +158,7 @@ pub static TOOLS: &[ToolDef] = &[
         icon: TOOL_ICON_BASE + 5,
         brand: (0x42, 0x85, 0xF4),
         detect_tokens: &["gemini"],
-        history: HistoryKind::None,
+        history: HistoryKind::GeminiChat,
     },
     ToolDef {
         id: "goose",

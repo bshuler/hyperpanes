@@ -1,7 +1,7 @@
 //! Incremental tailer over a pane's agent session transcript — yields the text of NEW
 //! assistant replies only, never history and never terminal output.
 //!
-//! Four tools write their conversation to a growing JSONL file as it happens, which is
+//! Five tools write their conversation to a growing JSONL file as it happens, which is
 //! exactly what a tailer needs. The paths and the record shapes differ, so
 //! [`TranscriptFormat`] names which one a given file speaks; the byte-cursor machinery
 //! below is shared:
@@ -15,6 +15,9 @@
 //! * **codex** — `$CODEX_HOME/sessions/<YYYY>/<MM>/<DD>/rollout-<stamp>-<id>.jsonl`; every
 //!   line is a `{"timestamp","ordinal","type","payload"}` envelope, and the reply rides in
 //!   the `response_item` whose payload is a `role:"assistant"` message.
+//! * **gemini** — `~/.gemini/tmp/<project dir>/chats/session-<stamp>-<id prefix>.jsonl`; a
+//!   log-structured mutation stream whose plain records are messages and whose `$set`
+//!   records rewrite state, with the reply in a `{"type":"gemini","content":"…"}`.
 //!
 //! Every shape here was read off a real install on this machine, not inferred from docs —
 //! the same standard [`crate::tools::session_hook`] holds itself to.
@@ -77,6 +80,18 @@ pub enum TranscriptFormat {
     /// is the model transcript proper — exactly one record per assistant message, no
     /// streaming deltas, and every message of a multi-message turn rather than just the last.
     CodexRollout,
+    /// `{"type":"gemini","content":"…"}` — one message of a gemini chat log.
+    ///
+    /// `content` is a plain string here; on a `"type":"user"` record the same key holds an
+    /// array of `{"text":…}` blocks instead, so the type gate is doing real work rather
+    /// than being a formality.
+    ///
+    /// The file is not a plain append-only log of messages: gemini also writes `$set`
+    /// records that rewrite state, and one of them carries a whole `messages` array
+    /// (the session-context preamble). Those are ignored entirely — reading into a `$set`
+    /// would re-speak replies already spoken, which is gemini's version of the triple-record
+    /// trap [`TranscriptFormat::CodexRollout`] documents.
+    GeminiChat,
 }
 
 /// Resolve a hooked tool's live conversation to its transcript file.
@@ -120,6 +135,17 @@ pub fn tool_transcript(tool_id: &str, session_id: &str, cwd: &str) -> Option<Tra
                 session_id,
             )?,
             format: TranscriptFormat::CodexRollout,
+        }),
+        // Gemini's chat filename embeds the session's start *time* and only the first 8
+        // characters of the id, and its parent directory is named by a first-seen-wins
+        // scheme that no marker records — so, like codex, the file is found by searching
+        // and confirming rather than derived. See `tools::history::gemini`.
+        "gemini" => Some(TranscriptRef {
+            path: crate::tools::history::gemini::chat_for_session(
+                &crate::tools::history::gemini::gemini_root()?,
+                session_id,
+            )?,
+            format: TranscriptFormat::GeminiChat,
         }),
         _ => None,
     }
@@ -291,6 +317,23 @@ pub fn extract_assistant_text(line: &str, format: TranscriptFormat) -> Option<St
                 return None;
             }
             output_text(payload)
+        }
+        TranscriptFormat::GeminiChat => {
+            // A `$set` record has no `type` of its own, so this gate excludes it for free —
+            // but it is the reason the gate is on `type` rather than on the presence of
+            // `content`: the preamble `$set` carries a whole `messages` array, and reaching
+            // into that would speak a reply a second time.
+            if v.get("type").and_then(|t| t.as_str()) != Some("gemini") {
+                return None;
+            }
+            // A string on an assistant record; an array of `{text}` blocks on a user one.
+            // `as_str` therefore does the speaker check a second time, for free.
+            let text = v.get("content")?.as_str()?;
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
         }
     }
 }
@@ -560,6 +603,59 @@ mod tests {
         assert!(extract_assistant_text(codex, TranscriptFormat::ClaudeJsonl).is_none());
         assert!(extract_assistant_text(codex, TranscriptFormat::CursorJsonl).is_none());
         assert!(extract_assistant_text(codex, TranscriptFormat::CopilotEvents).is_none());
+        assert!(extract_assistant_text(codex, TranscriptFormat::GeminiChat).is_none());
+        let gemini = r#"{"id":"86d5","type":"gemini","content":"hi","thoughts":[]}"#;
+        assert!(extract_assistant_text(gemini, TranscriptFormat::ClaudeJsonl).is_none());
+        assert!(extract_assistant_text(gemini, TranscriptFormat::CursorJsonl).is_none());
+        assert!(extract_assistant_text(gemini, TranscriptFormat::CopilotEvents).is_none());
+        assert!(extract_assistant_text(gemini, TranscriptFormat::CodexRollout).is_none());
+    }
+
+    // ---- gemini ----
+
+    #[test]
+    fn gemini_reply_text_comes_from_the_message_record() {
+        // Shape captured from a real gemini 0.58.0 run: `content` is a bare string on an
+        // assistant record, not the block array every other format uses.
+        let line = r#"{"id":"86d50b21-9dbb-4c50-8ba6-99f2b0d2f6b7","timestamp":"2026-09-02T09:39:06.826Z","type":"gemini","content":"Hello from the stub. Second sentence.","thoughts":[],"tokens":{"total":3},"model":"stub"}"#;
+        assert_eq!(
+            extract_assistant_text(line, TranscriptFormat::GeminiChat).as_deref(),
+            Some("Hello from the stub. Second sentence.")
+        );
+    }
+
+    #[test]
+    fn gemini_set_records_are_never_spoken() {
+        // The load-bearing negative case, and gemini's analogue of codex's triple record.
+        // The chat file is a mutation log: `$set` records rewrite session state, and the
+        // preamble one carries an entire `messages` array. Speaking into a `$set` would
+        // re-speak replies already spoken — and the big one would dictate the session
+        // context preamble at the human.
+        let preamble = r#"{"$set": {"messages": [{"id":"a","type":"user","content":[{"text":"<session_context>"}]},{"id":"b","type":"gemini","content":"already said this"}]}}"#;
+        let touch = r#"{"$set": {"lastUpdated":"2026-09-02T09:39:06.830Z"}}"#;
+        assert!(extract_assistant_text(preamble, TranscriptFormat::GeminiChat).is_none());
+        assert!(extract_assistant_text(touch, TranscriptFormat::GeminiChat).is_none());
+    }
+
+    #[test]
+    fn gemini_non_assistant_records_are_not_speech() {
+        for line in [
+            // The human's turn: same file, same `content` key, but an array of `{text}`
+            // blocks rather than a string — so this must fail the type gate, and would fail
+            // `as_str` even if it did not.
+            r#"{"id":"67cc","timestamp":"2026-09-02T09:39:05.101Z","type":"user","content":[{"text":"say hi"}]}"#,
+            // The header line gemini writes before any message.
+            r#"{"sessionId":"70c6bdeb-e601-4fe5-8349-45d82a818ea7","projectHash":"cb3c9bf1","kind":"main"}"#,
+            // An assistant record with nothing in it yields nothing rather than "".
+            r#"{"id":"86d5","type":"gemini","content":""}"#,
+            // A future record type must be silent, not spoken on the strength of `content`.
+            r#"{"id":"9f01","type":"tool","content":"ran ls"}"#,
+        ] {
+            assert!(
+                extract_assistant_text(line, TranscriptFormat::GeminiChat).is_none(),
+                "{line} is not a spoken reply"
+            );
+        }
     }
 
     // ---- tool_transcript ----
@@ -592,9 +688,11 @@ mod tests {
 
     #[test]
     fn a_tool_with_no_transcript_store_resolves_to_nothing() {
-        // aider, gemini, goose, plain shells: no store, so Talk stays silent for them
-        // rather than being spoken from a guess.
-        for tool in ["aider", "gemini", "goose", ""] {
+        // aider, goose, plain shells: no store, so Talk stays silent for them rather than
+        // being spoken from a guess. (aider does keep a log, but a Markdown one whose
+        // records span lines — `extract_assistant_text` is per-line, so it is not tailable
+        // by this machinery as written.)
+        for tool in ["aider", "goose", ""] {
             assert!(
                 tool_transcript(tool, "sid", "/tmp/proj").is_none(),
                 "{tool}"
