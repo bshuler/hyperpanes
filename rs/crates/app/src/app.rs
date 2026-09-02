@@ -81,6 +81,41 @@ fn persist_last_session(file: &hyperpanes_core::workspace::model::WorkspaceFile)
 /// Absolute path to `systemd-run` if this is a systemd host, else `None`. Used to launch
 /// the self-restart relauncher in its OWN cgroup so our scope's teardown can't kill it.
 #[cfg(unix)]
+/// The shell command that brings the GUI back after we exit.
+///
+/// The brief sleep lets the old single-instance socket be released before the new GUI binds
+/// it. On macOS we relaunch the *bundle*, not the binary, and we do it via LaunchServices so
+/// the new process gets a proper app identity (Dock tile, activation) instead of inheriting
+/// our headless one.
+///
+/// The redirection matters more than it looks: the installer retires the previous bundle by
+/// renaming it into `/Applications/.hyperpanes-attic/…`, and `current_exe()` follows that
+/// rename. A GUI that has been running across an install therefore reports a path inside the
+/// attic — exec'ing it would relaunch the build the user just replaced, which is exactly the
+/// case this menu item exists to serve. Prefer the installed bundle whenever ours has been
+/// retired out from under us.
+fn relaunch_command() -> Option<String> {
+    let exe = std::env::current_exe().ok()?;
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(bundle) = exe.ancestors().find(|p| {
+            p.extension()
+                .is_some_and(|e| e.eq_ignore_ascii_case("app"))
+        }) {
+            let installed = std::path::Path::new("/Applications/Hyperpanes.app");
+            let target = if bundle.starts_with("/Applications/.hyperpanes-attic")
+                && installed.is_dir()
+            {
+                installed
+            } else {
+                bundle
+            };
+            return Some(format!("sleep 2; exec /usr/bin/open '{}'", target.display()));
+        }
+    }
+    Some(format!("sleep 2; exec '{}'", exe.display()))
+}
+
 fn which_systemd_run() -> Option<std::path::PathBuf> {
     for dir in ["/usr/bin", "/bin", "/usr/local/bin"] {
         let p = std::path::Path::new(dir).join("systemd-run");
@@ -737,8 +772,12 @@ impl App {
         // `systemd-run --user --scope` (own transient scope = own cgroup, survives our
         // teardown); fall back to a bare setsid spawn on non-systemd hosts. The brief sleep
         // lets the old single-instance socket be released before the new GUI binds it.
-        if let Ok(exe) = std::env::current_exe() {
-            let relaunch = format!("sleep 2; exec '{}'", exe.display());
+        if scope == 1 {
+            // Tell the quit path not to take the daemon down with us (see `GUI_RESTARTING`):
+            // a `keep_alive = false` preference is about quitting, not about restarting.
+            crate::GUI_RESTARTING.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        if let Some(relaunch) = relaunch_command() {
             let systemd_run = which_systemd_run();
             let mut cmd = if let Some(sr) = &systemd_run {
                 let mut c = std::process::Command::new(sr);
@@ -994,6 +1033,12 @@ impl App {
                 if !source_alive {
                     win.closing.set(true);
                 }
+            }
+            Effect::RestartApp => {
+                // Scope 1: the GUI comes back, the session daemon (and every pane) stays up.
+                // Serviced by the next tick — `service_restart_request` snapshots, spawns the
+                // relauncher and quits the loop, which must not happen inside this click.
+                self.control.request_restart(1);
             }
             Effect::SpeechStopNow => {
                 self.control.speech_stop_all();

@@ -119,6 +119,10 @@ pub struct ControlHost {
     /// only after [`HEAL_DEBOUNCE`] so a transient mid-flight state (e.g. daemon re-attach
     /// during startup) is never misread as a lost pane.
     heal_pending: RefCell<HashMap<String, std::time::Instant>>,
+    /// A restart the GUI asked for itself (the app menu's Restart row), as opposed to one a
+    /// control client asked for. Kept here and not on `Shared` because `Shared` exists only
+    /// while the control server is running, and the menu row has to work either way.
+    pending_restart: Cell<u8>,
 }
 
 /// How long a live control-spawned session must stay untracked before the self-heal
@@ -157,6 +161,7 @@ impl ControlHost {
             talk_notice_shown: RefCell::new(HashSet::new()),
             dictation_notices: Arc::new(Mutex::new(Vec::new())),
             heal_pending: RefCell::new(HashMap::new()),
+            pending_restart: Cell::new(0),
         };
         if host.enabled.get() {
             host.start(mgr);
@@ -205,12 +210,23 @@ impl ControlHost {
         }
     }
 
+    /// Ask for a restart from inside the GUI: 1 = relaunch the GUI only, 2 = full (the
+    /// daemon goes down with us and every pane dies). Serviced by the next app tick, which
+    /// is what makes this safe to call from a menu click — the quit happens after the click
+    /// handler has returned, not underneath it.
+    pub fn request_restart(&self, scope: u8) {
+        self.pending_restart.set(scope.max(self.pending_restart.get()));
+    }
+
     /// Take (and clear) a pending `restartApp` request: 0 = none, 1 = gui, 2 = full.
-    /// Set by the control route off the UI thread; the App tick executes it.
+    /// Set by the control route off the UI thread, or by [`Self::request_restart`] on it;
+    /// the App tick executes it. The wider scope wins when both asked at once.
     pub fn take_restart_request(&self) -> u8 {
-        self.shared.borrow().as_ref().map_or(0, |s| {
+        let local = self.pending_restart.replace(0);
+        let remote = self.shared.borrow().as_ref().map_or(0, |s| {
             s.restart_app.swap(0, std::sync::atomic::Ordering::SeqCst)
-        })
+        });
+        local.max(remote)
     }
 
     /// Mirror `pane_ids` to disk. A pane's `HYPERPANES_PANE_ID` is baked into its environment

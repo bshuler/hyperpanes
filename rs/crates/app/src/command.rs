@@ -405,6 +405,9 @@ pub enum Command {
     LeftSaveSet,
     /// Detached: adopt live session uid `0` into the active tab (re-attach + replay).
     LeftAdoptSession(String),
+    /// Relaunch the GUI from the installed bundle, leaving the session daemon (and every
+    /// pane) alone. How a freshly installed build goes live without touching the panes.
+    RestartApp,
 }
 
 /// A side effect the controller must apply outside the state (UI/window layer). The
@@ -439,6 +442,9 @@ pub enum Effect {
     /// Dictation lives on the same `ControlHost` (its `DictationService`), and the pane index
     /// is meaningless up there — so `dispatch` resolves it to a session uid and bubbles that.
     ToggleDictation(String),
+    /// Relaunch the GUI (scope 1 — the daemon and its panes are left running). Bubbled
+    /// rather than done here: the restart is serviced by the app tick, above `State`.
+    RestartApp,
 }
 
 /// The keyboard layout-cycle order (skips `single`, which the menu still offers).
@@ -567,6 +573,7 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         }
         Command::ViewSelect(i, row, extend) => state.view_select(i, row, extend),
         Command::SpeechStopNow => return Effect::SpeechStopNow,
+        Command::RestartApp => return Effect::RestartApp,
         Command::SpeechToggleMuted => return Effect::SpeechToggleMuted,
         Command::SpeechToggleFocusedOnly => return Effect::SpeechToggleFocusedOnly,
         Command::ZoomPane(i) => state.zoom_pane(i),

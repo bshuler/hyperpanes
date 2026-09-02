@@ -826,6 +826,21 @@ pub fn app_menu(state: &State, x: f32, y: f32) -> CtxMenu {
         sub::NONE,
         Some(Command::PrefsOpen),
     );
+    b.sep();
+    // Relaunching the GUI is how a new build goes live. It is safe to offer here because the
+    // panes are not ours to lose: the session daemon owns every PTY and outlives us, so this
+    // is a client reconnecting, not a workspace being torn down.
+    b.row(
+        "Restart Hyperpanes",
+        "",
+        crate::theme::menu_icon::RESTART,
+        false,
+        false,
+        false,
+        false,
+        sub::NONE,
+        Some(Command::RestartApp),
+    );
 
     // Target = the active tab, so the Layout submenu (which routes through `ctx_target` →
     // `SetTabLayout`) retargets the *current* tab's layout (mirrors Electron's `setLayout`).

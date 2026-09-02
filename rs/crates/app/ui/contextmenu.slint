@@ -83,6 +83,32 @@ component IconSave inherits Path {
     commands: "M 2 2 L 9.8 2 L 12 4.2 L 12 12 L 2 12 Z M 4.2 2 L 4.2 5 L 9 5 L 9 2 M 4 12 L 4 8.2 L 10 8.2 L 10 12";
 }
 
+// A circular arrow (restart): an almost-closed arc with a head on its open end. The arc
+// stops short of 360° so the gap and the head read as one gesture at 14px.
+component IconRestart inherits Rectangle {
+    in property <color> ink;
+    width: 14px;
+    height: 14px;
+    Path {
+        width: 14px;
+        height: 14px;
+        viewbox-width: 14;
+        viewbox-height: 14;
+        stroke: root.ink;
+        stroke-width: 1.3px;
+        fill: transparent;
+        commands: "M 11.6 4.2 A 5 5 0 1 0 12 7";
+    }
+    Path {
+        width: 14px;
+        height: 14px;
+        viewbox-width: 14;
+        viewbox-height: 14;
+        fill: root.ink;
+        commands: "M 8.6 4.4 L 12.2 3.6 L 11.6 7.2 Z";
+    }
+}
+
 // Preference sliders (three bars with offset knobs) — the Settings action icon.
 component IconSliders inherits Rectangle {
     in property <color> ink;
@@ -182,6 +208,7 @@ component MenuIcon inherits Rectangle {
     if root.kind == 4 : IconSave    { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; }
     if root.kind == 5 : IconSliders { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; }
     if root.kind == 6 : IconPanel   { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; }
+    if root.kind == 7 : IconRestart { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; }
     if root.kind >= 10 && root.kind < 40 : IconLayout { x: (parent.width - self.width) / 2; y: (parent.height - self.height) / 2; ink: root.ink; which: root.kind - 10; }
     // 40+ is a registry tool icon (TOOL_ICON_BASE) — the Files row menu's "Open in Vim"
     // rows. Drawn in the row's own ink rather than the tool brand: a menu is a list of

@@ -422,6 +422,8 @@ pub mod menu_icon {
     pub const PREFERENCES: i32 = 5;
     /// Left panel — a drawn window frame with its leading column filled.
     pub const LEFT_PANEL: i32 = 6;
+    /// Restart — a drawn circular arrow.
+    pub const RESTART: i32 = 7;
     /// Base for the layout minis: `LAYOUT_BASE + layout_id(l)` (see [`super::layout_icon_kind`]).
     pub const LAYOUT_BASE: i32 = 10;
     /// Base for the per-tool marks. Kinds from here up are allocated by the core registry

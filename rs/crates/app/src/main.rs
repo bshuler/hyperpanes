@@ -70,6 +70,14 @@ use state::State;
 
 slint::include_modules!();
 
+/// Set while the GUI is relaunching itself (app menu → Restart, or a scope-1 `restartApp`
+/// control command). The quit path at the bottom of `main` must NOT tear the session daemon
+/// down in that case: the point of a GUI restart is that the panes keep running while a new
+/// build re-attaches to them, so the `keep_alive = false` preference — which means "don't
+/// leave terminals running after I *quit*" — does not apply to a restart.
+pub static GUI_RESTARTING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Append a line to the debug log when `HYPERPANES_DEBUG` is set. The path is
 /// printed once at startup. Used to trace the divider/command paths.
 pub fn dbg_log(msg: &str) {
@@ -664,8 +672,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     //    keep-alive preference is INERT, and `kill_all` is the historical clean teardown.
     let keep_alive = prefs::load().keep_alive;
     if mgr.is_daemon() {
-        if keep_alive {
-            dbg_log("quit: keep-alive ON — leaving the daemon + sessions running");
+        if keep_alive || GUI_RESTARTING.load(std::sync::atomic::Ordering::SeqCst) {
+            dbg_log("quit: keep-alive ON (or GUI restart) — leaving the daemon + sessions running");
         } else {
             dbg_log("quit: keep-alive OFF — shutting the daemon down");
             mgr.shutdown_daemon();
