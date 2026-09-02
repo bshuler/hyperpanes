@@ -34,15 +34,25 @@ fn main() {
     // first, so without this a dev build opens the tab into an empty directory and the agent
     // has no idea the app can be driven at all. Packaging ships the same tree.
     let hyperpane = manifest.join("../../../resources/claude/hyperpane");
-    // The three CLI-agent session hooks. `claude_hook::bundled_hook_path` and
+    // Every CLI-agent session hook. `claude_hook::bundled_hook_path` and
     // `tools::session_hook::bundled_script` both look beside the exe FIRST, so without
     // this a dev build registers no hook at all and every hand-started tool pane silently
     // falls back to the scan-and-diff heuristic — the one path we cannot test by running
-    // it. Packaging ships the same three; keep the two lists in step.
-    let hooks: [(&str, &str); 3] = [
+    // it. This list and the five packaging manifests must all carry every entry of
+    // HOOKED_TOOLS; `hooks_ship_in_every_packaging_manifest` in hyperpanes-core's
+    // tools::session_hook asserts it, because each of the last two tools added was added
+    // to some of those places and not the others.
+    let hooks: [(&str, &str); 6] = [
         ("claude", "hp-claude-session-hook.sh"),
         ("cursor", "hp-cursor-session-hook.sh"),
         ("copilot", "hp-copilot-session-hook.sh"),
+        ("codex", "hp-codex-session-hook.sh"),
+        ("gemini", "hp-gemini-session-hook.sh"),
+        // Windows' single script stands in for all five above (session_hook's `# Windows`
+        // section says why). Deployed on every host, not just Windows ones: it costs one
+        // file copy, and gating it would mean a macOS dev build could not exercise the
+        // resolution path at all.
+        ("hooks", "hp-session-hook.ps1"),
     ];
     let res = manifest.join("../../../resources");
     if let Ok(out_dir) = std::env::var("OUT_DIR") {

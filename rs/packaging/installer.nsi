@@ -111,6 +111,15 @@ Section "Install"
   File "${RESOURCES}\shell-integration\zdotdir\.zshenv"
   File "${RESOURCES}\shell-integration\zdotdir\.zshrc"
 
+  ; The CLI-agent session hook (tool-resume feature). One PowerShell script covers all five
+  ; supported agents — it is told which by a `-Tool <id>` argument when hyperpanes registers
+  ; it — where POSIX has a script apiece; see the `# Windows` section of hyperpanes-core's
+  ; tools::session_hook. Resolved as exe_dir\resources\hooks; build.rs deploys the same for
+  ; dev. Registration degrades to a silent no-op when the script is missing, so dropping this
+  ; block costs every hand-started agent pane its conversation id with no error anywhere.
+  SetOutPath "$INSTDIR\resources\hooks"
+  File "${RESOURCES}\hooks\hp-session-hook.ps1"
+
   ; Goal-orchestrator personas (goals system). The app resolves
   ; exe_dir\resources\claude\goal-orchestrator when you create a goal.
   SetOutPath "$INSTDIR\resources\claude\goal-orchestrator"
@@ -168,6 +177,8 @@ Section "Uninstall"
   Delete "$INSTDIR\resources\shell-integration\zdotdir\.zshrc"
   RMDir  "$INSTDIR\resources\shell-integration\zdotdir"
   RMDir  "$INSTDIR\resources\shell-integration"
+  Delete "$INSTDIR\resources\hooks\hp-session-hook.ps1"
+  RMDir  "$INSTDIR\resources\hooks"
   RMDir  "$INSTDIR\resources"
   Delete "$INSTDIR\Uninstall ${PRODUCT_NAME}.exe"
   RMDir  "$INSTDIR"

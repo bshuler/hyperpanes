@@ -36,6 +36,14 @@
 //!   security control, so the file is written and the human approves it inside codex once
 //!   — nothing here forges a trust record.
 //!
+//! * **Gemini CLI** (0.58.0) — `~/.gemini/settings.json` under a top-level `"hooks"` key,
+//!   in codex's (and therefore Claude's) nested PascalCase shape; gemini ships a
+//!   `gemini hooks migrate` that imports Claude Code's config, which is the corroboration
+//!   for that. The payload is Claude's as well. Two things differ from codex: gemini does
+//!   **not** trust-gate hooks — writing the file is enough — and its config override
+//!   `GEMINI_CLI_HOME` names the *home* directory rather than the config directory
+//!   `CODEX_HOME` names, which is the distinction [`RootEnv`] carries.
+//!
 //! Cursor's and Copilot's shapes are not Claude's (Claude nests a matcher group:
 //! `[{"hooks": [{"type": "command", "command": "…"}]}]`), so this is a sibling of
 //! `claude_hook` rather than a generalisation of it — sharing the *policy* (additive,
@@ -54,6 +62,18 @@
 //! Everything here is best-effort: a missing bundled script, a tool that is not installed,
 //! an unreadable settings file, a malformed marker — each is a silent no-op that leaves
 //! the pane exactly as well off as it was before.
+//!
+//! # Windows
+//!
+//! The five POSIX hooks are `/bin/sh` wrappers around `python3`, which is neither present
+//! nor invocable that way on a default Windows install — and their state directory is
+//! computed with `uname`, which under a Git-Bash-ish shell resolves to the XDG path rather
+//! than `%APPDATA%\hyperpanes`, so shipping them there would write markers nowhere the
+//! reader looks. Windows therefore gets one PowerShell script,
+//! `resources/hooks/hp-session-hook.ps1`, told which tool it is running for on the command
+//! line — see [`windows_hook_command`]. The five payload shapes are small enough to be a
+//! switch, and the part that is easy to get wrong (BOM-less UTF-8, an atomic replace) is
+//! identical for all of them.
 
 use std::path::{Path, PathBuf};
 
@@ -269,6 +289,43 @@ fn bundled_script(dir: &str, script: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.is_file())
 }
 
+/// The Windows hook script, which stands in for all five `.sh` ones. See the module's
+/// **Windows** section for why it is one file rather than five.
+const WINDOWS_HOOK: (&str, &str) = ("hooks", "hp-session-hook.ps1");
+
+/// The command string to register for `tool`, or `None` when this build's layout ships no
+/// script for it (a dev build run straight out of `target/`, say).
+fn hook_command(tool: &HookedTool) -> Option<String> {
+    // `cfg!` rather than `#[cfg]` so both arms compile everywhere: the Windows arm is then
+    // type-checked on the machines this is actually developed on, and `HookedTool::script`
+    // does not read as dead on Windows.
+    if cfg!(windows) {
+        let script = bundled_script(WINDOWS_HOOK.0, WINDOWS_HOOK.1)?;
+        Some(windows_hook_command(&script, tool.id))
+    } else {
+        Some(
+            bundled_script(tool.dir, tool.script)?
+                .to_string_lossy()
+                .to_string(),
+        )
+    }
+}
+
+/// How Windows spells "run this hook for this tool".
+///
+/// `-ExecutionPolicy Bypass` is not optional: the default policy on a fresh Windows install
+/// is `Restricted`, under which the script is refused before its first line — and a hook
+/// that fails to start fails *silently*, since no tool surfaces a hook's exit status. The
+/// path is quoted because an install under `C:\Program Files\…` contains a space, and
+/// `-NoProfile` so that a user profile cannot slow down or break something that runs at
+/// every session start.
+fn windows_hook_command(script: &Path, tool_id: &str) -> String {
+    format!(
+        "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\" -Tool {tool_id}",
+        script.display()
+    )
+}
+
 /// The user's home, for locating `~/.cursor`, `~/.copilot`, `~/.codex` and `~/.gemini`.
 fn home_dir() -> Option<PathBuf> {
     if let Some(v) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
@@ -286,11 +343,10 @@ pub fn ensure_registered() -> usize {
     };
     let mut changed = 0;
     for tool in HOOKED_TOOLS {
-        let Some(script) = bundled_script(tool.dir, tool.script) else {
+        let Some(cmd) = hook_command(tool) else {
             continue; // not shipped in this build's layout — nothing to register
         };
         let file = tool.settings_file(&home);
-        let cmd = script.to_string_lossy().to_string();
         match ensure_in_file(&file, &cmd, tool) {
             Ok(true) => {
                 eprintln!(
@@ -639,6 +695,115 @@ mod tests {
         assert_eq!(read_pane_mark("cursor-agent", &pane), None);
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn the_windows_command_survives_a_path_with_spaces_and_a_restricted_policy() {
+        // Both flags are load-bearing and neither failure is visible: `Restricted` is the
+        // default execution policy on a fresh Windows install and refuses the script before
+        // its first line, and an unquoted path breaks on the `C:\Program Files\` install
+        // that most people get. Nothing surfaces a hook's exit status, so either mistake
+        // reads as "the tool just doesn't resume".
+        let cmd = windows_hook_command(
+            Path::new(r"C:\Program Files\Hyperpanes\resources\hooks\hp-session-hook.ps1"),
+            "codex",
+        );
+        assert_eq!(
+            cmd,
+            "powershell -NoProfile -ExecutionPolicy Bypass -File \
+             \"C:\\Program Files\\Hyperpanes\\resources\\hooks\\hp-session-hook.ps1\" -Tool codex"
+        );
+
+        // One script serves every tool, so the `-Tool` argument is the only thing telling
+        // it which payload shape and which marker directory it is running for.
+        for t in HOOKED_TOOLS {
+            let cmd = windows_hook_command(Path::new("C:\\hp\\hook.ps1"), t.id);
+            assert!(cmd.ends_with(&format!(" -Tool {}", t.id)), "{cmd}");
+        }
+    }
+
+    #[test]
+    fn every_hook_ships_in_every_packaging_manifest() {
+        // The set of shipped hooks is spelled out in six places — four packaging manifests,
+        // the deb and rpm asset lists inside one Cargo.toml, and build.rs's dev deploy —
+        // and each of the last two tools added reached some of them and not the others.
+        // A missed one is silent by construction: `bundled_script` returning None makes
+        // registration a no-op, so the only symptom is that panes of that tool stop
+        // resuming, on that platform, months later.
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let read = |rel: &str| {
+            std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| {
+                panic!("{rel}: {e} — packaging manifests must stay in the repo")
+            })
+        };
+        let cargo = read("rs/crates/app/Cargo.toml");
+        // deb and rpm are two independent asset lists in that one file, and checking the
+        // file as a whole would let an entry present in only one of them pass.
+        let (deb, rpm) = cargo
+            .split_once("[package.metadata.generate-rpm]")
+            .expect("rs/crates/app/Cargo.toml still has an rpm asset list");
+        let build_rs = read("rs/crates/app/build.rs");
+        let appimage = read("rs/packaging/appimage.sh");
+        let macos = read("rs/packaging/macos/bundle.sh");
+        let nsis = read("rs/packaging/installer.nsi");
+
+        // Claude's hook is not in HOOKED_TOOLS — `claude_hook` owns it — but it is shipped
+        // by the same manifests and has been dropped from one before.
+        let posix: Vec<&str> = std::iter::once("hp-claude-session-hook.sh")
+            .chain(HOOKED_TOOLS.iter().map(|t| t.script))
+            .collect();
+
+        for script in &posix {
+            for (name, text) in [
+                ("the [package.metadata.deb] asset list", deb),
+                ("the [package.metadata.generate-rpm] asset list", rpm),
+                ("rs/crates/app/build.rs", build_rs.as_str()),
+                ("rs/packaging/appimage.sh", appimage.as_str()),
+                ("rs/packaging/macos/bundle.sh", macos.as_str()),
+            ] {
+                assert!(text.contains(script), "{script} is not shipped by {name}");
+            }
+            // Deliberately NOT installer.nsi: Windows ships one .ps1 instead of the five
+            // `sh` scripts (see the module's `# Windows` section).
+            assert!(
+                !nsis.contains(script),
+                "{script} is a POSIX hook; Windows ships {} instead",
+                WINDOWS_HOOK.1
+            );
+        }
+
+        for (name, text) in [
+            ("rs/packaging/installer.nsi", &nsis),
+            ("rs/crates/app/build.rs", &build_rs),
+        ] {
+            assert!(
+                text.contains(WINDOWS_HOOK.1),
+                "{} is not shipped by {name}",
+                WINDOWS_HOOK.1
+            );
+        }
+
+        // And every script a manifest names has to actually exist to be copied.
+        for script in &posix {
+            let dir = HOOKED_TOOLS
+                .iter()
+                .find(|t| t.script == *script)
+                .map(|t| t.dir)
+                .unwrap_or("claude");
+            assert!(
+                root.join("resources").join(dir).join(script).is_file(),
+                "resources/{dir}/{script} is missing"
+            );
+        }
+        assert!(
+            root.join("resources")
+                .join(WINDOWS_HOOK.0)
+                .join(WINDOWS_HOOK.1)
+                .is_file(),
+            "resources/{}/{} is missing",
+            WINDOWS_HOOK.0,
+            WINDOWS_HOOK.1
+        );
     }
 
     #[test]
