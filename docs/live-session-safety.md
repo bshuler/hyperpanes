@@ -122,6 +122,50 @@ script for it: it starts a real process out of the installed bundle, installs
 four more builds over the top, and requires that the process is still alive at
 the end. `test.yml`'s `guardrails` job runs both on `macos-latest`, blocking.
 
+## The gap that let it happen again (2026-09-02)
+
+Layer 3 is wired through the repository's
+[`.claude/settings.json`](../.claude/settings.json), which points at
+`$CLAUDE_PROJECT_DIR/scripts/guard-live-sessions.py`. Both the settings file and
+the script arrived on `main` in the same commit — so **the guard only exists on
+branches that contain it.**
+
+A session working in a worktree checked out 140 commits back had no
+`.claude/settings.json`, therefore no hook, and `rm -rf /Applications/Hyperpanes.app`
+was submitted with nothing to refuse it. The stale checkout was not obvious from
+inside: the branch built, tested, and packaged normally, and `bundle.sh` reported
+success while relinking nothing, so its five-day-old artifacts looked current.
+
+Layer 2 is what held. The bundle was `uchg`-locked from the previous install, and
+both the GUI and the daemon ran uninterrupted across the attempt.
+
+The fix is to stop layer 3 depending on what is checked out. The guard script has
+no repository dependencies — no `$CLAUDE_PROJECT_DIR`, no `__file__`, no cwd — so
+it runs anywhere:
+
+```sh
+bash scripts/install-guard-hook.sh          # install or refresh
+bash scripts/install-guard-hook.sh --check  # report; exit 1 if absent
+```
+
+It copies the script to `~/.claude/hooks/` and adds a `PreToolUse` entry to
+`~/.claude/settings.json` naming it by absolute path — a path no branch can take
+away. The edit is idempotent: an existing entry is refreshed rather than
+duplicated, other hooks are left alone, and the settings file is backed up first.
+The install ends by feeding the guard `rm -rf /Applications/Hyperpanes.app` and
+failing if it is not refused, so a successful run is evidence and not a claim.
+
+Copy, as with every helper in these repos — a symlink into a worktree
+reintroduces the same dependency. Re-run to pick up changes; the repository copy
+stays the source of truth and the tested one.
+
+Two lessons generalise past this hook:
+
+| Observation | Consequence |
+|---|---|
+| A guard that ships in the repo it guards is absent exactly when someone is working on an old revision of it | Machine-wide guards belong in machine-wide config |
+| `bundle.sh` exits 0 whether or not it relinked anything | Check artifact mtimes before trusting a build; a stale `target/` reports success |
+
 ## Why three layers
 
 They fail differently. The installer is only used by someone who knows it
