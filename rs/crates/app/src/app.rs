@@ -615,11 +615,11 @@ impl App {
             let uid_for_thread = uid.clone();
             std::thread::spawn(move || {
                 for p in pending {
-                    mgr.write(&uid_for_thread, &p.text);
+                    let _ = mgr.write(&uid_for_thread, &p.text);
                     std::thread::sleep(Duration::from_millis(250));
-                    mgr.write(&uid_for_thread, "\r");
+                    let _ = mgr.write(&uid_for_thread, "\r");
                     std::thread::sleep(Duration::from_millis(600));
-                    mgr.write(&uid_for_thread, "\r");
+                    let _ = mgr.write(&uid_for_thread, "\r");
                     std::thread::sleep(Duration::from_millis(400));
                 }
             });
@@ -692,11 +692,11 @@ impl App {
                 std::thread::spawn(move || {
                     // Text via the proven resume-queue cadence (bracketed-paste TUIs need the gap
                     // + an insurance CR — the now-submitted line makes the second CR a no-op).
-                    mgr.write(&g.uid, &g.text);
+                    let _ = mgr.write(&g.uid, &g.text);
                     std::thread::sleep(Duration::from_millis(250));
-                    mgr.write(&g.uid, "\r");
+                    let _ = mgr.write(&g.uid, "\r");
                     std::thread::sleep(Duration::from_millis(600));
-                    mgr.write(&g.uid, "\r");
+                    let _ = mgr.write(&g.uid, "\r");
                     std::thread::sleep(Duration::from_millis(400));
                     // Best-effort image re-paste: set the OS clipboard to each image, then Ctrl+V.
                     // The paths are already in the text above, so this is additive — if Claude's
@@ -704,9 +704,9 @@ impl App {
                     for img in &g.images {
                         if set_clipboard_image_from_file(img) {
                             std::thread::sleep(Duration::from_millis(150));
-                            mgr.write(&g.uid, "\u{16}"); // Ctrl+V
+                            let _ = mgr.write(&g.uid, "\u{16}"); // Ctrl+V
                             std::thread::sleep(Duration::from_millis(700));
-                            mgr.write(&g.uid, "\r");
+                            let _ = mgr.write(&g.uid, "\r");
                             std::thread::sleep(Duration::from_millis(400));
                         }
                     }
@@ -1381,12 +1381,12 @@ impl App {
                     fed = data.len();
                     let replies = pc.pane.take_replies();
                     if !replies.is_empty() {
-                        self.mgr.write(&uid, &String::from_utf8_lossy(&replies));
+                        let _ = self.mgr.write(&uid, &String::from_utf8_lossy(&replies));
                     }
                     if !pc.started {
                         pc.started = true;
                         if let Some(cmd) = pc.startup.take() {
-                            self.mgr.write(&uid, &cmd);
+                            let _ = self.mgr.write(&uid, &cmd);
                         }
                     }
                 }
@@ -2119,7 +2119,7 @@ impl App {
                             || crate::is_key(&msg.text, Key::Delete));
                     if keys::is_printable(&msg.text, ctrl, msg.alt) || line_delete {
                         if let Some(erase) = ps.pane.type_over_selection() {
-                            self.mgr.write(&ps.uid, &String::from_utf8_lossy(&erase));
+                            let _ = self.mgr.write(&ps.uid, &String::from_utf8_lossy(&erase));
                             if line_delete {
                                 ps.pane.scroll_to_bottom();
                                 return;
@@ -2132,7 +2132,12 @@ impl App {
                 // user sees their input echoed at the prompt even after scrolling up to read
                 // history (a no-op when already at the bottom).
                 ps.pane.scroll_to_bottom();
-                self.mgr.write(&ps.uid, &String::from_utf8_lossy(&bytes));
+                // Ignored on purpose, here and at every other GUI write. `write` reports a dead
+                // session now, but there is nothing useful to do with that news one keystroke at
+                // a time: the pane is gone, and the read model's reconciler notices within half a
+                // second and flips the row to `exited`, which is what the user actually needs to
+                // see. Failing loudly per keypress would only add noise to the same fact.
+                let _ = self.mgr.write(&ps.uid, &String::from_utf8_lossy(&bytes));
             }
         }
     }
@@ -3064,7 +3069,7 @@ impl App {
                         })
                     };
                     if let Some((uid, bytes)) = forward {
-                        app.mgr.write(&uid, &String::from_utf8_lossy(&bytes));
+                        let _ = app.mgr.write(&uid, &String::from_utf8_lossy(&bytes));
                     }
                 }
             });
@@ -3089,7 +3094,7 @@ impl App {
                             })
                         };
                         if let Some((uid, bytes)) = forward {
-                            app.mgr.write(&uid, &String::from_utf8_lossy(&bytes));
+                            let _ = app.mgr.write(&uid, &String::from_utf8_lossy(&bytes));
                         }
                     }
                 });

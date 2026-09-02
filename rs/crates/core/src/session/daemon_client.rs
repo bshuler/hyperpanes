@@ -49,7 +49,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -176,6 +176,16 @@ pub struct DaemonSessionManager {
     /// at one would take the user's terminals off screen. Every claim send is therefore
     /// gated on this; see [`claims_supported`](Self::claims_supported).
     daemon_ver: AtomicU64,
+    /// Whether the socket to the daemon is still good. The reader thread is the only thing
+    /// that ever learns the daemon has gone — it is the end that sees EOF — and before this
+    /// flag existed it learned it and told nobody: it broke out of its loop and every
+    /// accessor went on answering out of a shadow map that could no longer change. A pane
+    /// stayed `running` forever and a `write` reported success into a closed socket.
+    ///
+    /// So the reader publishes what it saw. `false` is terminal: this manager owns exactly
+    /// one connection and never reconnects, so once the daemon is gone the honest answer to
+    /// "is this session live" and "did this input land" is `no` until a new manager is built.
+    connected: Arc<AtomicBool>,
     _reader: std::thread::JoinHandle<()>,
 }
 
@@ -372,9 +382,20 @@ impl DaemonSessionManager {
         // forwarded to the GUI channel; replies go to the reply channel.
         let shadows_r = Arc::clone(&shadows);
         let claims_r = Arc::clone(&claims);
+        let connected = Arc::new(AtomicBool::new(true));
+        let connected_r = Arc::clone(&connected);
         let reader = std::thread::Builder::new()
             .name("hp-daemon-sm-reader".into())
-            .spawn(move || reader_loop(read_half, shadows_r, claims_r, events, reply_tx))?;
+            .spawn(move || {
+                reader_loop(
+                    read_half,
+                    shadows_r,
+                    claims_r,
+                    events,
+                    reply_tx,
+                    connected_r,
+                )
+            })?;
 
         let mgr = DaemonSessionManager {
             write_half: Mutex::new(write_half),
@@ -383,6 +404,7 @@ impl DaemonSessionManager {
             claims,
             conn_id: AtomicU64::new(0),
             daemon_ver: AtomicU64::new(0),
+            connected,
             _reader: reader,
         };
 
@@ -530,13 +552,43 @@ impl DaemonSessionManager {
         self.create(opts)
     }
 
-    /// Whether a session with `uid` is live — answered from the shadow (no I/O).
-    pub fn has(&self, uid: &str) -> bool {
-        self.shadows.lock().unwrap().contains_key(uid)
+    /// Whether this manager's socket to the daemon is still good. See the
+    /// [`connected`](Self::connected) field: `false` is terminal for this manager.
+    pub fn is_connected(&self) -> bool {
+        self.connected.load(Ordering::SeqCst)
     }
 
-    /// The uids of all live sessions — from the shadow (no I/O).
+    /// Mark the connection dead. Called by the reader when it sees EOF, and by any send
+    /// that fails — a socket write returning `BrokenPipe` is the same news arriving by the
+    /// other end.
+    fn note_disconnected(&self) {
+        self.connected.store(false, Ordering::SeqCst);
+    }
+
+    /// The error every operation answers with once the daemon is gone. Named so the caller
+    /// can hand it to a user unchanged.
+    fn gone() -> io::Error {
+        io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "the session daemon is no longer running; its panes are gone",
+        )
+    }
+
+    /// Whether a session with `uid` is live — answered from the shadow (no I/O).
+    ///
+    /// A dead daemon holds no sessions, and the shadow cannot know that on its own: nothing
+    /// arrives to remove its entries, because the thing that would send the removal is what
+    /// died. So the connection is checked first, and the frozen map is not consulted at all.
+    pub fn has(&self, uid: &str) -> bool {
+        self.is_connected() && self.shadows.lock().unwrap().contains_key(uid)
+    }
+
+    /// The uids of all live sessions — from the shadow (no I/O). Empty once the daemon is
+    /// gone, for the reason on [`has`](Self::has).
     pub fn uids(&self) -> Vec<String> {
+        if !self.is_connected() {
+            return Vec::new();
+        }
         self.shadows.lock().unwrap().keys().cloned().collect()
     }
 
@@ -627,12 +679,27 @@ impl DaemonSessionManager {
         }
     }
 
-    /// Write input to the pane's pty — fire-and-forget.
-    pub fn write(&self, uid: &str, data: &str) {
-        let _ = self.send(&ClientMsg::Write {
+    /// Write input to the pane's pty.
+    ///
+    /// This used to be fire-and-forget, and the `io::Error` a dead socket already produced
+    /// was dropped on the floor — so a control-API caller typing into a pane whose daemon
+    /// had exited got a `200 {"ok": true}` for keystrokes nobody received. The error is
+    /// reported now.
+    ///
+    /// Two failure shapes, and only one of them is visible here. The daemon *gone* is: the
+    /// reader saw EOF, or this send gets `BrokenPipe` — both end up as an `Err`. The daemon
+    /// *wedged* — alive, not reading — is not: the bytes fit in the socket's send buffer and
+    /// the write succeeds locally. Detecting that needs a round-trip, which does not belong
+    /// on a per-keystroke path.
+    pub fn write(&self, uid: &str, data: &str) -> io::Result<()> {
+        if !self.is_connected() {
+            return Err(Self::gone());
+        }
+        self.send(&ClientMsg::Write {
             uid: uid.to_string(),
             data: data.to_string(),
-        });
+        })
+        .inspect_err(|_| self.note_disconnected())
     }
 
     /// Resize the pane — fire-and-forget.
@@ -797,6 +864,7 @@ fn reader_loop(
     claims: Arc<Mutex<HashMap<String, ConnId>>>,
     events: UnboundedSender<SessionEvent>,
     replies: Sender<DaemonMsg>,
+    connected: Arc<AtomicBool>,
 ) {
     let mut r = read_half;
     loop {
@@ -844,8 +912,18 @@ fn reader_loop(
                     break; // the manager was dropped
                 }
             }
-            // Clean EOF (daemon closed) or a malformed-frame/socket error → done.
-            Ok(None) | Err(_) => break,
+            // Clean EOF (daemon closed) or a malformed-frame/socket error → done, and this
+            // is the ONLY place the process learns the daemon is gone. Publish it before
+            // leaving: `has`, `uids` and `write` all read this flag, and without it they go
+            // on answering out of a shadow map that nothing can ever update again.
+            //
+            // Deliberately not set on the two breaks above: those mean OUR end went away
+            // (the GUI dropped the event receiver, the manager was dropped), which says
+            // nothing about the daemon.
+            Ok(None) | Err(_) => {
+                connected.store(false, Ordering::SeqCst);
+                break;
+            }
         }
     }
 }
@@ -1658,7 +1736,8 @@ mod tests {
         assert!(mgr.uids().contains(&"p1".to_string()));
 
         // Drive a marker; its echo streams back as Data on the GUI channel.
-        mgr.write("p1", "echo HELLO_MARKER\n");
+        mgr.write("p1", "echo HELLO_MARKER\n")
+            .expect("the marker reached the session");
         let data = recv_event_until(
             &mut rx,
             Dur::from_secs(10),
@@ -1746,7 +1825,8 @@ mod tests {
         .expect("create");
 
         // Drive a marker and wait for it to stream so the daemon's screen has content.
-        mgr.write("p1", "echo SCREEN_MARKER\n");
+        mgr.write("p1", "echo SCREEN_MARKER\n")
+            .expect("the marker reached the session");
         let saw = recv_event_until(
             &mut rx,
             Dur::from_secs(10),
@@ -1787,7 +1867,8 @@ mod tests {
             ..Default::default()
         })
         .expect("create");
-        mgr1.write("surv", "echo SURVIVOR_MARKER\n");
+        mgr1.write("surv", "echo SURVIVOR_MARKER\n")
+            .expect("the marker reached the session");
         assert!(
             recv_event_until(&mut rx1, Dur::from_secs(10), |e| {
                 matches!(e, SessionEvent::Data { uid, data, .. } if uid == "surv" && data.contains("SURVIVOR_MARKER"))
@@ -1842,7 +1923,8 @@ mod tests {
             ..Default::default()
         })
         .expect("create");
-        mgr1.write("surv", "echo SEED_SYNC_MARKER\n");
+        mgr1.write("surv", "echo SEED_SYNC_MARKER\n")
+            .expect("the marker reached the session");
         assert!(
             recv_event_until(&mut rx1, Dur::from_secs(10), |e| {
                 matches!(e, SessionEvent::Data { uid, data, .. } if uid == "surv" && data.contains("SEED_SYNC_MARKER"))
@@ -1889,7 +1971,8 @@ mod tests {
         .expect("create");
         // `has` answers from the optimistic local shadow, so it says yes before the daemon
         // has spawned anything — wait for real output instead, which only the pty can produce.
-        mgr1.write("surv", "echo DIMS_READY\n");
+        mgr1.write("surv", "echo DIMS_READY\n")
+            .expect("the marker reached the session");
         assert!(
             recv_event_until(&mut rx1, Dur::from_secs(10), |e| {
                 matches!(e, SessionEvent::Data { uid, data, .. } if uid == "surv" && data.contains("DIMS_READY"))
@@ -1956,7 +2039,8 @@ mod tests {
                 ..Default::default()
             })
             .expect("create");
-            mgr1.write(&uid, "echo REATTACH_MARKER\n");
+            mgr1.write(&uid, "echo REATTACH_MARKER\n")
+                .expect("the marker reached the session");
             assert!(
                 recv_event_until(&mut rx1, Dur::from_secs(10), |e| {
                     matches!(e, SessionEvent::Data { uid: u, data, .. } if *u == uid && data.contains("REATTACH_MARKER"))
@@ -2160,7 +2244,9 @@ mod tests {
         // Drive a marker and wait for its echo so the session is CONFIRMED registered + live
         // daemon-side before we drop (mirrors the reconnect test — without this the daemon may
         // not have finished spawning the pty when ListSessions runs on the next connect).
-        run_a.write(&surv, "echo STABLE_SURVIVOR\n");
+        run_a
+            .write(&surv, "echo STABLE_SURVIVOR\n")
+            .expect("the marker reached the session");
         assert!(
             recv_event_until(&mut rx_a, Dur::from_secs(10), |e| {
                 matches!(e, SessionEvent::Data { uid: u, data, .. } if *u == surv && data.contains("STABLE_SURVIVOR"))
@@ -2255,12 +2341,16 @@ mod tests {
     }
     impl WriteToBackend for crate::session_manager::SessionManager {
         fn write(&self, uid: &str, data: &str) {
+            // A dropped write here would not fail the benchmark, it would silently bias it:
+            // the echo it was waiting for never comes and the sample is a timeout.
             self.write(uid, data)
+                .expect("benchmark write reached the session");
         }
     }
     impl WriteToBackend for DaemonSessionManager {
         fn write(&self, uid: &str, data: &str) {
             self.write(uid, data)
+                .expect("benchmark write reached the session");
         }
     }
 
@@ -2360,7 +2450,8 @@ mod tests {
             ..Default::default()
         })
         .expect("create");
-        mgr.write("pm", "echo PROBE_OK\n");
+        mgr.write("pm", "echo PROBE_OK\n")
+            .expect("the marker reached the session");
         assert!(
             recv_event_until(&mut rx, Dur::from_secs(10), |e| {
                 matches!(e, SessionEvent::Data { uid, data, .. } if uid == "pm" && data.contains("PROBE_OK"))
@@ -2686,6 +2777,71 @@ mod tests {
 
     // The manager-level shutdown_daemon() sends Shutdown and clears the local shadow, and the
     // daemon tears down (the quit-vs-keep-alive "OFF" branch at the client surface).
+    /// A daemon that has gone takes its sessions with it, and the manager still holding the
+    /// socket has to say so.
+    ///
+    /// The reader thread is the only thing in the process that can learn this: it is the end
+    /// that sees EOF. Before `connected` it learned it and told nobody — it broke out of its
+    /// loop, and `has`/`uids`/`write` went on answering out of a shadow map that nothing could
+    /// ever update again. A pane stayed `running` forever and a write reported success into a
+    /// closed socket.
+    ///
+    /// The daemon here is in-process and deliberately does NOT exit the test binary, so the
+    /// socket is closed directly instead: a second descriptor on the same socket, shut down.
+    /// `shutdown(2)` acts on the socket rather than the descriptor, so the manager's reader gets
+    /// exactly the EOF a departed daemon delivers — with the shadow left fully populated, which
+    /// is the state that used to lie.
+    #[test]
+    fn a_dead_socket_empties_has_and_uids_and_fails_writes() {
+        let socket = temp_socket("gone");
+        let _daemon = spawn_in_process(&socket).expect("daemon binds");
+        let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
+        let handle = stream
+            .try_clone()
+            .expect("a second descriptor on the same socket");
+        let (etx, mut rx) = unbounded_channel::<SessionEvent>();
+        let mgr = DaemonSessionManager::from_stream(stream, etx).expect("manager");
+
+        mgr.create(SpawnOptions {
+            uid: "g".into(),
+            shell: Some("/bin/sh".into()),
+            args: Some(vec!["-i".into()]),
+            ..Default::default()
+        })
+        .expect("create");
+        // Drive a marker and wait for its echo, so the session is CONFIRMED live daemon-side and
+        // the shadow is fully populated before the socket goes.
+        mgr.write("g", "echo GONE_READY\n")
+            .expect("a live daemon accepts input");
+        assert!(
+            recv_event_until(&mut rx, Dur::from_secs(10), |e| {
+                matches!(e, SessionEvent::Data { uid, data, .. } if uid == "g" && data.contains("GONE_READY"))
+            })
+            .is_some(),
+            "the session is live daemon-side before the socket dies"
+        );
+        assert!(mgr.has("g"));
+        assert!(mgr.is_connected());
+
+        handle
+            .shutdown(std::net::Shutdown::Both)
+            .expect("close the socket under the manager");
+
+        assert!(
+            wait_until(Dur::from_secs(5), || !mgr.is_connected()),
+            "the reader publishes the socket's death"
+        );
+        assert!(
+            !mgr.has("g"),
+            "a dead daemon holds no sessions, whatever the frozen shadow still says"
+        );
+        assert!(mgr.uids().is_empty(), "and no uids either");
+        let err = mgr
+            .write("g", "x")
+            .expect_err("a write to a gone daemon is an error, not a silent success");
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
     #[test]
     fn manager_shutdown_daemon_tears_the_daemon_down() {
         let socket = temp_socket("mgr-shutdown");

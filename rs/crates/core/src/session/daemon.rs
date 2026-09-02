@@ -1128,7 +1128,15 @@ impl Daemon {
                     let _ = self.bus.send(SessionEvent::Exit { uid, code: -1 });
                 }
             }
-            ClientMsg::Write { uid, data } => self.registry.write(&uid, &data),
+            // No ack frame exists for `Write` (adding one is a proto change), so the only
+            // honest thing the daemon can do with a failure is say so in its log. The
+            // client-side half of this — a write that never left this machine — IS
+            // reported; see `DaemonSessionManager::write`.
+            ClientMsg::Write { uid, data } => {
+                if let Err(e) = self.registry.write(&uid, &data) {
+                    dbg(&format!("write to {uid} failed: {e}"));
+                }
+            }
             ClientMsg::Resize { uid, cols, rows } => self.registry.resize(&uid, cols, rows),
             ClientMsg::Kill { uid } => {
                 self.registry.kill(&uid);

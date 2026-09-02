@@ -141,13 +141,20 @@ pub fn stop_and_deliver(shared: &Shared, pane_id: &str, uid: &str) -> Result<Del
     if text.is_empty() {
         return Err("no speech in the recording".to_string());
     }
-    let submitted = shared.dictation.submit_after_insert();
-    shared.sessions.write(uid, &text);
-    if submitted {
+    let want_submit = shared.dictation.submit_after_insert();
+    // The recording is already consumed by this point, so a failed write means the user's
+    // speech is simply gone. Saying so is the only useful thing left to do — reporting a
+    // successful delivery would leave them looking for words that were never typed.
+    shared
+        .sessions
+        .write(uid, &text)
+        .map_err(|e| format!("the pane did not accept the transcript: {e}"))?;
+    let mut submitted = false;
+    if want_submit {
         // A separate, later write — exactly as `/panes/{id}/input` does it — so a
         // bracketed-paste TUI reads the Enter as a keypress and not as pasted content.
         std::thread::sleep(Duration::from_millis(SUBMIT_DELAY_MS));
-        shared.sessions.write(uid, "\r");
+        submitted = shared.sessions.write(uid, "\r").is_ok();
     }
     Ok(Delivered {
         text,

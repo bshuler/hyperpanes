@@ -516,6 +516,77 @@ fn master_token(shared: &Arc<Shared>) -> String {
     token
 }
 
+/// The exit code recorded for a pane discovered dead rather than reported dead.
+///
+/// A real exit carries the process's own status. This one is inferred: the session backing
+/// the pane is simply not there any more, and no `Exit` frame ever arrived to say why —
+/// because the thing that would have sent it is what died. `-1` is the "we do not know"
+/// answer, and it is deliberately not `0`: nothing here observed a clean exit.
+const EXIT_CODE_UNOBSERVED: i32 = -1;
+
+/// Demote every pane whose session the backend no longer holds.
+///
+/// `PaneInfo.status` is an event-sourced cache: it is set to `Running` when the pane is made
+/// and moved to `Exited` only by an inbound `SessionEvent::Exit`. That is lossless right up
+/// until the thing that sends those events is what goes away — a session daemon that exits
+/// takes both the sessions and the notifications with it, and every pane it held stays
+/// `running` in `/state` and in `ctl panes` forever. An agent reading that status believes it
+/// has a terminal to work in.
+///
+/// So once a tick the cache is checked against the backend instead of trusted. This is not a
+/// probe: `SessionManager::has` is a lock and a map lookup on both backends, and on the daemon
+/// backend it is now gated on whether the socket is still open (see
+/// `DaemonSessionManager::has`), which is exactly the fact the read model was missing. The
+/// zero-I/O contract on the `/state` read path is untouched — the reconciliation happens on
+/// the 500 ms ticker that was already walking every pane.
+///
+/// Panes with no session uid (view panes, GUI-observed rows) are left alone: they have no
+/// session to have lost.
+fn reconcile_exits(shared: &Arc<Shared>) {
+    let stale: Vec<PaneRef> = {
+        let m = shared.model.lock().unwrap();
+        m.panes()
+            .into_iter()
+            .filter(|p| {
+                p.status == PaneStatus::Running
+                    && !p.session_uid.is_empty()
+                    && !shared.sessions.has(&p.session_uid)
+            })
+            .collect()
+    };
+    if stale.is_empty() {
+        return;
+    }
+    for pr in stale {
+        // Same fan-out a reported exit gets. A client that is streaming should learn about a
+        // pane dying this way in the same shape as any other, not only by polling `/state`.
+        let marked = shared
+            .model
+            .lock()
+            .unwrap()
+            .mark_exited(&pr.session_uid, EXIT_CODE_UNOBSERVED);
+        let Some((pane_id, coords)) = marked else {
+            continue;
+        };
+        shared.events.broadcast_for_pane(
+            Some(&coords),
+            &ControlEvent::Exit {
+                session_uid: pr.session_uid.clone(),
+                pane_id: Some(pane_id.clone()),
+                code: EXIT_CODE_UNOBSERVED,
+            },
+        );
+        shared.events.broadcast_for_pane(
+            Some(&coords),
+            &ControlEvent::Activity {
+                pane_id,
+                activity: "exited".to_string(),
+            },
+        );
+    }
+    notify_state(shared);
+}
+
 /// Recompute each pane's activity every tick and broadcast a scope-filtered `activity` frame on
 /// each flip of a KNOWN pane (a freshly-seen pane seeds its baseline silently — it rides the
 /// `state` ping). A pure busy⇄idle flip does NOT trigger a `state` ping (TS #13). Runs forever
@@ -525,6 +596,7 @@ pub async fn run_activity_ticker(shared: Arc<Shared>) {
     let mut last: HashMap<String, Activity> = HashMap::new();
     loop {
         interval.tick().await;
+        reconcile_exits(&shared);
         let panes: Vec<PaneRef> = shared.model.lock().unwrap().panes();
         let mut seen = std::collections::HashSet::new();
         for pr in &panes {
@@ -1068,6 +1140,87 @@ mod tests {
         assert!(f1.contains(r#""type":"exit""#) && f1.contains(r#""code":7"#));
         let f2 = rx.try_recv().unwrap();
         assert!(f2.contains(r#""type":"activity""#) && f2.contains(r#""activity":"exited""#));
+    }
+
+    #[tokio::test]
+    async fn a_pane_whose_session_the_backend_lost_is_demoted_and_fanned_out() {
+        // `PaneInfo.status` is event-sourced: nothing here ever sent an `Exit`, so before
+        // `reconcile_exits` this pane stayed `running` forever — which is exactly what a caller
+        // saw after a session daemon died, because the thing that sends `Exit` is what died.
+        // The manager in this fixture holds no session for `u1`, so it stands in for that.
+        let (shared, _uid) = shared_with_pane();
+        let (_id, mut rx) = shared.events.add_client(None);
+        assert_eq!(
+            shared.model.lock().unwrap().pane("p1").unwrap().status,
+            PaneStatus::Running,
+            "the cache starts out claiming the pane is live"
+        );
+
+        reconcile_exits(&shared);
+
+        assert_eq!(
+            shared.model.lock().unwrap().pane("p1").unwrap().status,
+            PaneStatus::Exited
+        );
+        assert_eq!(
+            shared.model.lock().unwrap().pane("p1").unwrap().exit_code,
+            Some(EXIT_CODE_UNOBSERVED),
+            "the code says `we did not see this exit`, not `it exited cleanly`"
+        );
+        // Same two frames a reported exit fans out — a streaming client learns about a pane
+        // dying this way in the same shape as any other.
+        let f1 = rx.try_recv().unwrap();
+        assert!(
+            f1.contains(r#""type":"exit""#) && f1.contains(r#""code":-1"#),
+            "{f1}"
+        );
+        let f2 = rx.try_recv().unwrap();
+        assert!(f2.contains(r#""type":"activity""#) && f2.contains(r#""activity":"exited""#));
+
+        // Idempotent: the pane is no longer `Running`, so a second pass finds nothing stale and
+        // sends nothing. Otherwise the 500 ms ticker would re-fan the same exit forever.
+        reconcile_exits(&shared);
+        assert!(
+            rx.try_recv().is_err(),
+            "a demoted pane is not demoted twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pane_with_no_session_is_left_alone_by_reconcile() {
+        // View panes (a markdown preview, a file browser) carry no session uid. They have no
+        // process to have lost, and marking them `exited` would put a dead badge on a pane that
+        // is working perfectly.
+        let (shared, _uid) = shared_with_pane();
+        shared.model.lock().unwrap().insert_pane(1, view_pane("v1"));
+
+        reconcile_exits(&shared);
+
+        assert_eq!(
+            shared.model.lock().unwrap().pane("v1").unwrap().status,
+            PaneStatus::Running,
+            "a pane with no session uid is not demoted"
+        );
+    }
+
+    // A non-pty pane as the GUI publishes one: a real id, no session behind it.
+    fn view_pane(id: &str) -> PaneInfo {
+        PaneInfo {
+            id: id.into(),
+            session_uid: String::new(),
+            label: "preview".into(),
+            subtitle: None,
+            color: "#3b82f6".into(),
+            command: None,
+            args: None,
+            cwd: None,
+            shell: None,
+            status: PaneStatus::Running,
+            exit_code: None,
+            meta: None,
+            talk: false,
+            kind: crate::tools::PaneKind::Markdown,
+        }
     }
 
     // Set a pane's meta then reconcile so the supervisor picks up the policy.

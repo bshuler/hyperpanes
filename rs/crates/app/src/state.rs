@@ -5609,9 +5609,9 @@ impl State {
         });
         if let Some((uid, erase, text)) = payload {
             if let Some(erase) = erase {
-                mgr.write(&uid, &String::from_utf8_lossy(&erase));
+                let _ = mgr.write(&uid, &String::from_utf8_lossy(&erase));
             }
-            mgr.write(&uid, &text);
+            let _ = mgr.write(&uid, &text);
             self.dirty = true;
             return;
         }
@@ -5624,7 +5624,7 @@ impl State {
             if p.kind.is_pty() && p.pane.clipboard_has_image() {
                 let uid = p.uid.clone();
                 p.pane.set_toast("Pasting image…");
-                mgr.write(&uid, "\u{16}");
+                let _ = mgr.write(&uid, "\u{16}");
                 self.dirty = true;
             }
         }
@@ -5675,7 +5675,7 @@ impl State {
         self.dirty = true;
         match payload {
             Some((uid, wire)) => {
-                mgr.write(&uid, &wire);
+                let _ = mgr.write(&uid, &wire);
                 true
             }
             None => false,
@@ -5696,7 +5696,7 @@ impl State {
         {
             let uid = p.uid.clone();
             p.pane.set_toast("Pasting image…");
-            mgr.write(&uid, "\u{16}");
+            let _ = mgr.write(&uid, "\u{16}");
             self.dirty = true;
         }
     }
@@ -5769,7 +5769,7 @@ impl State {
             self.dirty = true;
         }
         if let Some((uid, bytes)) = caret {
-            mgr.write(&uid, &String::from_utf8_lossy(&bytes));
+            let _ = mgr.write(&uid, &String::from_utf8_lossy(&bytes));
         }
     }
 

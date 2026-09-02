@@ -552,7 +552,7 @@ impl ControlHost {
             let reconciled = self.reconcile(windows, mgr, &cur, &cur_active, &focus_uid, focus_req);
 
             // 3. Republish the (now-updated) live GUI tree into the read-model.
-            let republished = self.publish(&mut model, windows);
+            let republished = self.publish(&mut model, windows, mgr);
             (reconciled || healed || ui_op_changed, republished)
         };
 
@@ -1010,7 +1010,12 @@ impl ControlHost {
     /// Wholesale-rebuild the read-model from the live GUI tree, re-stamping the control-owned
     /// fields, and refresh the baselines for the next reconcile. Returns whether the published
     /// structure (pane set or active tabs) changed versus the previous publish.
-    fn publish(&self, model: &mut ReadModel, windows: &[Rc<Window>]) -> bool {
+    fn publish(
+        &self,
+        model: &mut ReadModel,
+        windows: &[Rc<Window>],
+        mgr: &Arc<SessionManager>,
+    ) -> bool {
         let pane_ids = self.pane_ids.borrow();
         let ctl = self.ctl.borrow();
 
@@ -1031,6 +1036,28 @@ impl ControlHost {
                 for p in &tab.panes {
                     let uid = p.uid.clone();
                     let pane_id = pane_ids.get(&uid).cloned().unwrap_or_else(|| uid.clone());
+                    // A pane with no session uid is a view pane — a markdown preview, a file
+                    // browser. It has no process, so there is nothing to ask about and nothing
+                    // that can have died: `Running` is the right answer for a row that never
+                    // had one.
+                    //
+                    // For the rest, ask. This rebuild runs every GUI tick (8-32 ms) and
+                    // re-stamps every pane, so the hardcoded `Running` that used to sit here
+                    // did not merely start panes off optimistically — it overwrote
+                    // `mark_exited` within one tick of it landing, and `/state` could never
+                    // report a pane as exited while the GUI still drew a row for it. `has` is a
+                    // map lookup on both backends, and false once a daemon's socket closes,
+                    // which is the case that produced a pane `running` with nothing behind it.
+                    let live = uid.is_empty() || mgr.has(&uid);
+                    // A pane the GUI still draws but whose session is gone keeps whatever exit
+                    // code the model already recorded for it — re-stamping `None` over a real
+                    // code would leave `/state` saying `exited` with no reason. `None` while
+                    // live: a running pane has not exited yet.
+                    let exit_code = if live {
+                        None
+                    } else {
+                        model.pane(&pane_id).and_then(|prev| prev.exit_code)
+                    };
                     let label = p.title.to_string();
                     let color = color_hex(p.accent);
                     let subtitle = p.subtitle.as_ref().map(|s| s.to_string());
@@ -1056,8 +1083,12 @@ impl ControlHost {
                         args: c.args,
                         cwd: p.cwd.clone(),
                         shell: c.shell,
-                        status: PaneStatus::Running,
-                        exit_code: None,
+                        status: if live {
+                            PaneStatus::Running
+                        } else {
+                            PaneStatus::Exited
+                        },
+                        exit_code,
                         meta: c.meta,
                         kind: p.kind.clone(),
                     });

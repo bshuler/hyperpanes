@@ -685,14 +685,22 @@ impl SessionRegistry {
     }
 
     /// Write input to the pane's pty.
-    pub fn write(&self, uid: &str, data: &str) {
+    ///
+    /// An unknown uid is an error, not a no-op: it is what a caller sees when the pane it
+    /// was told about is gone, and answering nothing let the control API report success for
+    /// input that reached no process at all.
+    pub fn write(&self, uid: &str, data: &str) -> io::Result<()> {
         let map = self.sessions.lock().unwrap();
-        if let Some(s) = map.get(uid) {
-            // Phase 4: input was just sent → optimistically clear `prompt_ready` so the
-            // busy edge is reported immediately (a real prompt re-asserts it on its `133;A`).
-            s.shared.note_write();
-            let _ = s.pty.write(data.as_bytes());
-        }
+        let Some(s) = map.get(uid) else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no live session {uid}"),
+            ));
+        };
+        // Phase 4: input was just sent → optimistically clear `prompt_ready` so the
+        // busy edge is reported immediately (a real prompt re-asserts it on its `133;A`).
+        s.shared.note_write();
+        s.pty.write(data.as_bytes()).map(|_| ())
     }
 
     /// Snapshot a session's phase-4 liveness mirror, or `None` if the uid is unknown.
@@ -992,7 +1000,14 @@ impl SessionManager {
     }
 
     /// Write input to the pane's pty.
-    pub fn write(&self, uid: &str, data: &str) {
+    ///
+    /// Fallible on purpose. Both backends could already tell a failed write from a good one
+    /// — the in-process one gets an `io::Result` from the pty, the daemon one gets
+    /// `BrokenPipe` off a closed socket — and both threw it away, which is how
+    /// `POST /panes/{id}/input` came to answer `{"ok": true}` for keystrokes that landed
+    /// nowhere. A caller that genuinely does not care can still say `let _ =`; the point is
+    /// that it has to say so.
+    pub fn write(&self, uid: &str, data: &str) -> io::Result<()> {
         match self {
             SessionManager::InProcess(r) => r.write(uid, data),
             SessionManager::Daemon(d) => d.write(uid, data),

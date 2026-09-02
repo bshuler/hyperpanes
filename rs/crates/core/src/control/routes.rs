@@ -762,6 +762,22 @@ async fn wait_for_quiet(
 
 // ---- /panes/{id}/input --------------------------------------------------------------------
 
+/// Turn a failed pty write into the response the caller deserves.
+///
+/// `409` rather than `500`: nothing malfunctioned here. The pane the caller named is simply
+/// not there any more — its process exited, or the session daemon holding it did — and the
+/// only wrong answer is the `200 {"ok": true}` this used to give.
+fn write_failed(pane_id: &str, e: &std::io::Error) -> Response {
+    jstatus(
+        409,
+        json!({
+            "error": "input not delivered",
+            "paneId": pane_id,
+            "detail": e.to_string(),
+        }),
+    )
+}
+
 async fn input(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -810,10 +826,10 @@ async fn input(
             .unwrap_or_default();
         let refs: Vec<&str> = keys.iter().map(String::as_str).collect();
         return match keys_to_bytes(&refs) {
-            KeysResult::Ok { bytes } => {
-                shared.sessions.write(&uid, &bytes);
-                jstatus(200, json!({ "ok": true, "keys": keys }))
-            }
+            KeysResult::Ok { bytes } => match shared.sessions.write(&uid, &bytes) {
+                Ok(()) => jstatus(200, json!({ "ok": true, "keys": keys })),
+                Err(e) => write_failed(&found.pane_id, &e),
+            },
             KeysResult::Err { unknown } => jstatus(
                 400,
                 json!({ "error": "unknown key(s)", "unknown": unknown }),
@@ -823,11 +839,19 @@ async fn input(
 
     let data = b.get("data").and_then(Value::as_str).unwrap_or("");
     let platform = if cfg!(windows) { "win32" } else { "linux" };
-    shared
+    if let Err(e) = shared
         .sessions
-        .write(&uid, &submit_newlines(data, platform));
+        .write(&uid, &submit_newlines(data, platform))
+    {
+        return write_failed(&found.pane_id, &e);
+    }
     // submit (A1): a bare CR as a SEPARATE pty write a beat later, so bracketed-paste TUIs read it
     // as Enter, not pasted content.
+    //
+    // This second write is genuinely unreportable: it happens after the response has gone
+    // out. What the 200 above now means is precisely "the text landed" — the caller learns
+    // about a pane that died in the intervening beat by watching its output, as it would for
+    // any input it sent by hand.
     if b.get("submit").and_then(Value::as_bool) == Some(true) {
         let delay = b
             .get("submitDelayMs")
@@ -839,7 +863,7 @@ async fn input(
         let uid2 = uid.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(delay)).await;
-            sessions.write(&uid2, "\r");
+            let _ = sessions.write(&uid2, "\r");
         });
     }
     jstatus(200, json!({ "ok": true }))
@@ -991,11 +1015,17 @@ fn arm_inbox_nudge(shared: &Arc<Shared>, pane_id: &str, seq: u64) {
                     // Same cadence the goal/resume delivery uses: text, gap, CR, insurance CR —
                     // a bracketed-paste TUI reads text+CR in one read as a paste otherwise.
                     let sessions = Arc::clone(&shared.sessions);
-                    sessions.write(&uid, &text);
+                    // Nobody is waiting on this task, so a failure has no one to be
+                    // reported to — but it still means the following CRs would be typed
+                    // at a pane that is not there. Give up instead of pressing Enter into
+                    // the void.
+                    if sessions.write(&uid, &text).is_err() {
+                        return;
+                    }
                     tokio::time::sleep(Duration::from_millis(250)).await;
-                    sessions.write(&uid, "\r");
+                    let _ = sessions.write(&uid, "\r");
                     tokio::time::sleep(Duration::from_millis(600)).await;
-                    sessions.write(&uid, "\r");
+                    let _ = sessions.write(&uid, "\r");
                     return;
                 }
             }
@@ -2683,6 +2713,59 @@ mod golden {
         assert_eq!(
             r.text().await.unwrap(),
             r#"{"cursor":0,"output":"","paneId":"p1","status":"running","stripped":false}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn input_to_a_pane_with_no_live_session_is_409_not_200() {
+        // The pane row exists — the GUI published it — but nothing is behind `u1`. This used to
+        // answer `200 {"ok":true}` for keystrokes that reached no process at all, which is how a
+        // control-API caller came to believe it had a terminal to work in.
+        let s = boot(true).await;
+        s.shared
+            .model
+            .lock()
+            .unwrap()
+            .insert_pane(1, pane("p1", "u1"));
+        let r = client()
+            .post(format!("{}/panes/p1/input", s.base))
+            .header("authorization", format!("Bearer {}", s.token))
+            .header("content-type", "application/json")
+            .body(r#"{"data":"hi"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 409);
+        let body: serde_json::Value = r.json().await.unwrap();
+        assert_eq!(body["error"], "input not delivered");
+        assert_eq!(body["paneId"], "p1");
+        assert!(
+            body["detail"].as_str().unwrap().contains("u1"),
+            "the detail names the session that is missing, got {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keys_to_a_pane_with_no_live_session_is_409_not_200() {
+        // Same hole on the `keys` branch, which takes a different path to the same `write`.
+        let s = boot(true).await;
+        s.shared
+            .model
+            .lock()
+            .unwrap()
+            .insert_pane(1, pane("p1", "u1"));
+        let r = client()
+            .post(format!("{}/panes/p1/input", s.base))
+            .header("authorization", format!("Bearer {}", s.token))
+            .header("content-type", "application/json")
+            .body(r#"{"keys":["enter"]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 409);
+        assert_eq!(
+            r.json::<serde_json::Value>().await.unwrap()["error"],
+            "input not delivered"
         );
     }
 

@@ -813,7 +813,11 @@ fn respawn_resuming(
         } else {
             format!("{prefix}claude --resume {}\r", target.session_id)
         };
-        sessions.write(&new_uid, &line);
+        // The pane was respawned a moment ago, so a failure here is not a stale uid — it is
+        // the backend being gone. Report it: the caller is being told its pane recovered.
+        sessions
+            .write(&new_uid, &line)
+            .map_err(|e| format!("could not type the resume command into the new pane: {e}"))?;
     }
     if let Some(p) = prompt_field {
         crate::resume_queue::enqueue(&target.session_id, p)?;
