@@ -100,6 +100,17 @@ const IDLE_POLL_MS: u64 = 100;
 #[cfg(unix)]
 const ACCEPT_POLL_MS: u64 = 15;
 
+/// Capacity of a connection's outbound queue (`out_tx`/`out_rx` in `handle_connection`),
+/// shared by direct replies (`dispatch`) and forwarded broadcast traffic
+/// (`forward_broadcasts`). It bounds the bulk path only: `dispatch` sends control replies
+/// with the queue's blocking `send`, which backpressures its caller rather than ever
+/// dropping, so this cap is a memory ceiling for the forwarder's `try_send` traffic, not a
+/// correctness limit — see `forward_broadcasts`'s doc comment for the drop policy this
+/// enables. Large enough that an ordinary burst (an `Attach` reply plus a screenful of live
+/// output) never needs it.
+#[cfg(unix)]
+const CONN_QUEUE_CAP: usize = 1024;
+
 /// The configured idle grace — [`DEFAULT_IDLE_GRACE_MS`] unless `HYPERPANES_DAEMON_IDLE_MS`
 /// is set to a parseable millisecond count (the test hook for a short grace).
 #[cfg(unix)]
@@ -613,8 +624,12 @@ fn restrict_socket_perms(path: &Path) {
 struct Daemon {
     registry: SessionRegistry,
     /// Broadcasts every [`SessionEvent`] to all connection threads (each filters to the
-    /// uids it has attached to). Bounded — a slow client that lags past the buffer just
-    /// drops events (it can re-`Attach` to reseed), it never stalls the others.
+    /// uids it has attached to). Bounded, so a slow reader can still lag past the ring —
+    /// but a lag no longer strands it silently: `forward_broadcasts` (via
+    /// `classify_bus_event`) notices the `Lagged` and force-resyncs every attached uid with
+    /// a fresh `Replay`, the same mechanism `Attach` uses to seed a mirror, so the
+    /// connection is made whole again instead of quietly missing bytes. It never stalls the
+    /// OTHER connections either way — only the lagging one pays for its own slowness.
     bus: tokio::sync::broadcast::Sender<SessionEvent>,
     /// Last sniffed cwd per uid, accumulated from `Cwd` events so `ListSessions` can
     /// report it (the registry tracks output counters but not the latest cwd).
@@ -932,41 +947,58 @@ impl Daemon {
         };
         let mut read_half = stream;
 
-        // Replies (Hello/Sessions/Replay/Screen/Pong/Created) and broadcast Events both
-        // flow to the single writer thread over this channel, so all writes are serialized
-        // on one thread (a socket write from two threads could interleave a frame).
-        let (out_tx, out_rx) = std::sync::mpsc::channel::<DaemonMsg>();
+        // Replies (Hello/Sessions/Replay/Screen/Pong/Created) and forwarded broadcast
+        // Events/notices both flow to the single writer thread over this one bounded
+        // channel, so all writes stay serialized on one thread (a socket write from two
+        // threads could interleave a frame) AND the writer has exactly one thing to block
+        // on with no poll and no timeout — see `writer_loop`.
+        //
+        // The bound is for the bulk path only. `dispatch` always queues control replies
+        // with the blocking `SyncSender::send` just below (unchanged from before), which
+        // backpressures the sender instead of ever dropping — a reply a client is
+        // synchronously awaiting must not vanish. `forward_broadcasts` uses `try_send` with
+        // an explicit drop policy instead; see its doc comment for why that split is safe.
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<DaemonMsg>(CONN_QUEUE_CAP);
 
         // The uids this connection has attached to → which broadcast events to forward.
         let attached: Arc<Mutex<HashSet<String>>> = Arc::default();
 
-        // Writer thread: drain replies + forward subscribed broadcast events. It selects
-        // across two sources by draining the reply channel first (non-blocking) then doing
-        // a bounded poll on the bus, so neither source starves.
-        let mut bus_rx = self.bus.subscribe();
+        // Subscribe to both broadcast channels here, before the reader loop can process a
+        // `Hello` — the subscriptions used to belong to the writer thread; `forward_broadcasts`
+        // (spawned below) owns them now, but the "subscribe before anything can race the
+        // subscription" requirement is unchanged.
+        let bus_rx = self.bus.subscribe();
         // Subscribe to the unfiltered notice channel BEFORE the seed snapshots below, so a
         // change racing our connect is either in the seed or in the stream — never lost.
-        let mut notice_rx = self.notices.subscribe();
+        let notice_rx = self.notices.subscribe();
         // Push traffic is gated on the client having said `Hello`, because not every peer on
         // this socket is a session-manager client: the live-upgrade `Takeover` path speaks a
         // bare, strictly-ordered frame exchange and would choke on an unsolicited snapshot
         // landing mid-conversation. `Hello` is exactly the "I am a full protocol client"
         // signal, and every such client sends one during its handshake.
         let notices_on = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let attached_w = Arc::clone(&attached);
-        let notices_on_w = Arc::clone(&notices_on);
+
+        // Writer thread: the single blocking consumer of `out_rx` (see `writer_loop`).
         let writer = std::thread::Builder::new()
             .name("hp-daemon-writer".into())
-            .spawn(move || {
-                writer_loop(
-                    write_half,
-                    out_rx,
-                    &mut bus_rx,
-                    &mut notice_rx,
-                    &notices_on_w,
-                    attached_w,
-                )
-            });
+            .spawn(move || writer_loop(write_half, out_rx));
+
+        // Forwarder task: the bus/notice half of what the writer thread used to poll
+        // itself. Runs as a tokio task rather than another OS thread because
+        // `tokio::select!` is how it waits on two broadcast receivers plus its own stop
+        // signal without a timeout — `std::sync::mpsc` has no cross-channel select, so a
+        // plain thread has no equivalent blocking wait. It never touches the socket, only
+        // `out_tx`, so the "exactly one thread writes the socket" invariant above still
+        // holds with two producers feeding it.
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let fanout = ConnFanout {
+            registry: self.registry.clone(),
+            attached: Arc::clone(&attached),
+            notices_on: Arc::clone(&notices_on),
+            out_tx: out_tx.clone(),
+        };
+        self.rt
+            .spawn(forward_broadcasts(conn_id, fanout, bus_rx, notice_rx, stop_rx));
 
         // Reader/dispatch loop: handle each ClientMsg against the registry.
         let mut takeover = false;
@@ -995,9 +1027,18 @@ impl Daemon {
         }
         tracing::info!(conn = conn_id, takeover, "client disconnected");
 
-        // Dropping `out_tx` ends the writer's reply drain; it then exits on its next bus
-        // poll. Best-effort join so the thread is reaped.
+        // Unwind order matters here because `writer_loop` now has exactly one exit
+        // condition — `out_rx.recv()` returning `Err`, i.e. every sender clone dropped —
+        // and two senders feed it: the reader (here) and `forward_broadcasts` (still
+        // running until told to stop).
+        //   1. Drop this thread's `out_tx` clone.
+        //   2. Signal `forward_broadcasts` via `stop_tx`; it wakes immediately (no poll)
+        //      via `tokio::select!`, returns, and drops its own `out_tx` clone.
+        //   3. With both clones gone, `out_rx.recv()` finally returns `Err` and
+        //      `writer_loop` exits, so the `join()` below is bounded rather than a wait on
+        //      a thread that has no other reason to notice we're done.
         drop(out_tx);
+        let _ = stop_tx.send(());
         if let Ok(w) = writer {
             let _ = w.join();
         }
@@ -1070,12 +1111,14 @@ impl Daemon {
     }
 
     /// Handle one [`ClientMsg`]. Returns `false` to close the connection. Replies are sent
-    /// to the writer thread via `out`; mutators act on the registry fire-and-forget.
+    /// to the writer thread via `out`, always with the blocking `send` (never dropped —
+    /// see `forward_broadcasts`'s doc comment for how that differs from the bulk path);
+    /// mutators act on the registry fire-and-forget.
     #[tracing::instrument(level = "debug", skip_all)]
     fn dispatch(
         &self,
         msg: ClientMsg,
-        out: &std::sync::mpsc::Sender<DaemonMsg>,
+        out: &std::sync::mpsc::SyncSender<DaemonMsg>,
         attached: &Arc<Mutex<HashSet<String>>>,
         conn_id: ClaimConnId,
         notices_on: &std::sync::atomic::AtomicBool,
@@ -1306,111 +1349,39 @@ fn session_metas(
         .collect()
 }
 
-/// The per-connection writer loop: forward replies (drained first, non-blocking) and the
-/// broadcast events for attached uids. Exits when the reply channel is closed (the reader
-/// half dropped its sender) and the bus yields nothing pending.
+/// The per-connection writer loop: the single thread allowed to write this connection's
+/// socket (a write from two threads could interleave a frame), and — as of this design —
+/// the single blocking `recv` that thread ever waits on.
+///
+/// Both replies (`dispatch`, via `out_tx.send`) and forwarded bus/notice traffic
+/// (`forward_broadcasts`, via `out_tx.try_send`) funnel into the one `out_rx` queue this
+/// loop drains, so there is exactly one wait source and no poll/timeout tick: the loop is
+/// idle (no wakeups, no CPU) whenever there is nothing to write, and wakes the instant
+/// anything is queued. The previous version parked on `out_rx.recv_timeout(2ms)` so it
+/// could also re-poll the bus and notice channels itself; that polling — and the
+/// forwarding logic it drove — now lives in `forward_broadcasts`, which has an actual
+/// blocking multi-wait (`tokio::select!`) instead of a timer.
+///
+/// Ordering is preserved by construction: a reply and any event it causally triggers are
+/// both produced by code running in program order on their originating thread/task (e.g.
+/// `dispatch`'s `Created` reply is queued before the synthetic `Exit` it can provoke), and
+/// since every producer enqueues onto this same FIFO, the queue's order matches causal
+/// order — no separate "drain replies before events" pass is needed to keep a reply ahead
+/// of an event it caused.
+///
+/// Exits when `out_rx.recv()` returns `Err`, i.e. every `Sender`/`SyncSender` clone is
+/// dropped — both the reader thread's (dropped when the reader loop ends) and
+/// `forward_broadcasts`'s (dropped when it returns, which `handle_connection` prompts via
+/// its stop signal). See `handle_connection`'s teardown for the exact unwind order.
 #[cfg(unix)]
 #[tracing::instrument(level = "debug", skip_all)]
 fn writer_loop(
     mut write_half: std::os::unix::net::UnixStream,
     out_rx: std::sync::mpsc::Receiver<DaemonMsg>,
-    bus_rx: &mut tokio::sync::broadcast::Receiver<SessionEvent>,
-    notice_rx: &mut tokio::sync::broadcast::Receiver<DaemonMsg>,
-    notices_on: &std::sync::atomic::AtomicBool,
-    attached: Arc<Mutex<HashSet<String>>>,
 ) {
-    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
-    use tokio::sync::broadcast::error::TryRecvError as BusErr;
-
-    loop {
-        // 1) Flush any pending replies first (they're the responses the client awaits).
-        let mut reader_gone = false;
-        loop {
-            match out_rx.try_recv() {
-                Ok(reply) => {
-                    if write_frame(&mut write_half, &reply).is_err() {
-                        return; // client went away
-                    }
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    reader_gone = true;
-                    break;
-                }
-            }
-        }
-
-        // 2) Forward any broadcast events for uids this connection attached to. `bus_idle`
-        // is set when the bus yields nothing more this pass (Empty or Closed).
-        let bus_idle;
-        loop {
-            match bus_rx.try_recv() {
-                Ok(ev) => {
-                    let is_attached = attached.lock().unwrap().contains(event_uid(&ev));
-                    if is_attached && write_frame(&mut write_half, &DaemonMsg::Event(ev)).is_err() {
-                        return;
-                    }
-                }
-                // Lagged: the bounded bus dropped events for this slow connection. It can
-                // re-Attach to reseed; just keep going.
-                Err(BusErr::Lagged(_)) => continue,
-                // Empty (nothing pending) or Closed (no senders) → done draining this pass.
-                Err(BusErr::Empty) | Err(BusErr::Closed) => {
-                    bus_idle = true;
-                    break;
-                }
-            }
-        }
-
-        // 2b) Forward every pending NOTICE verbatim (M7). Unfiltered by design — claim and
-        // session-set snapshots are about sessions this connection may not know about yet.
-        // Drained even while the gate is shut, so a client that says `Hello` late is not
-        // handed a backlog of pre-`Hello` snapshots; its own seed broadcast follows the gate
-        // opening, so nothing it needs is lost.
-        //
-        // The gate is read PER MESSAGE, not once per pass. The reader thread opens it and
-        // *then* broadcasts the seed; a gate read taken before that store but applied to a
-        // message received after it would drop the seed on the floor and leave this client
-        // with no snapshot until the next unrelated change. Loading after `try_recv` hands
-        // back the message orders the two correctly.
-        let notices_idle;
-        loop {
-            match notice_rx.try_recv() {
-                Ok(msg) => {
-                    let gate_open = notices_on.load(std::sync::atomic::Ordering::SeqCst);
-                    if gate_open && write_frame(&mut write_half, &msg).is_err() {
-                        return;
-                    }
-                }
-                // Lagged: only full snapshots ride this channel, so a dropped one is
-                // harmless — the next push carries the complete state again.
-                Err(BusErr::Lagged(_)) => continue,
-                Err(BusErr::Empty) | Err(BusErr::Closed) => {
-                    notices_idle = true;
-                    break;
-                }
-            }
-        }
-
-        // If the reader is gone AND we've drained both channels, the connection is finished.
-        if reader_gone && bus_idle && notices_idle {
-            return;
-        }
-        // Nothing to do this pass → park on the reply channel for a beat rather than
-        // sleeping blind: a reply the client is awaiting wakes us at once, while the bus and
-        // notice channels (which have no blocking receive we can share a wait with) are
-        // re-polled within the same 2 ms the old sleep gave them. `reader_gone` is already
-        // true here if the channel was found disconnected above, so only a live channel
-        // gets waited on.
-        if bus_idle && !reader_gone {
-            match out_rx.recv_timeout(std::time::Duration::from_millis(2)) {
-                Ok(reply) => {
-                    if write_frame(&mut write_half, &reply).is_err() {
-                        return; // client went away
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {}
-            }
+    while let Ok(msg) = out_rx.recv() {
+        if write_frame(&mut write_half, &msg).is_err() {
+            return; // client went away
         }
     }
 }
@@ -1427,6 +1398,173 @@ fn event_uid(ev: &SessionEvent) -> &str {
         | SessionEvent::CommandEnd { uid, .. }
         | SessionEvent::PromptReady { uid }
         | SessionEvent::AgentState { uid, .. } => uid,
+    }
+}
+
+/// What `forward_broadcasts` should do with one `bus_rx.recv()` outcome, split out as a
+/// pure function so the lag/ignore/forward decision is unit-testable without a running
+/// daemon, a socket, or an async runtime.
+#[cfg(unix)]
+#[derive(Debug, PartialEq)]
+enum BusAction {
+    /// An event for a uid this connection is attached to — forward it.
+    Forward(SessionEvent),
+    /// An event for some other uid — this connection doesn't care.
+    Ignore,
+    /// The bounded bus overwrote `n` events before we could read them. Silently dropping
+    /// these used to be the only option; now the caller resyncs instead (see
+    /// `forward_broadcasts`).
+    Lagged(u64),
+    /// No senders remain (the daemon is tearing down the bus) — nothing more will arrive.
+    Closed,
+}
+
+/// Classify one `broadcast::Receiver<SessionEvent>::recv()` outcome against the
+/// connection's current attach-set. Pure and side-effect-free so lag handling (task: make a
+/// dropped-event lag visible instead of silently continuing) has a seam a test can drive
+/// directly with a synthetic `RecvError::Lagged`, rather than needing to actually starve a
+/// live broadcast channel to exercise it.
+#[cfg(unix)]
+fn classify_bus_event(
+    res: Result<SessionEvent, tokio::sync::broadcast::error::RecvError>,
+    attached: &HashSet<String>,
+) -> BusAction {
+    use tokio::sync::broadcast::error::RecvError;
+    match res {
+        Ok(ev) if attached.contains(event_uid(&ev)) => BusAction::Forward(ev),
+        Ok(_) => BusAction::Ignore,
+        Err(RecvError::Lagged(n)) => BusAction::Lagged(n),
+        Err(RecvError::Closed) => BusAction::Closed,
+    }
+}
+
+/// `forward_broadcasts`'s per-connection targets, bundled into one value rather than four
+/// separate parameters: they are always constructed and threaded through together (one
+/// clone/`Arc::clone` each per connection, right where the task is spawned), so a struct
+/// says "this connection's fan-out state" where a flat parameter list would just be the
+/// same four things spelled out by hand — and keeps the function's own argument count
+/// down to the wait sources (`conn_id`, the two receivers, the stop signal) it actually
+/// branches on.
+#[cfg(unix)]
+struct ConnFanout {
+    /// For `replay_with_cursor` when a `Lagged` forces a resync.
+    registry: SessionRegistry,
+    /// The uids this connection has attached to, shared with the reader thread (`Attach`/
+    /// `Detach` mutate it; here it's read-only).
+    attached: Arc<Mutex<HashSet<String>>>,
+    /// Whether this connection has said `Hello` yet (gates notice forwarding).
+    notices_on: Arc<std::sync::atomic::AtomicBool>,
+    /// The writer thread's inbound queue — everything this task decides to forward lands
+    /// here.
+    out_tx: std::sync::mpsc::SyncSender<DaemonMsg>,
+}
+
+/// The bus/notice half of what `writer_loop` used to poll itself (see its doc comment).
+/// Runs as a tokio task, not another OS thread, because `tokio::select!` is the only
+/// no-poll way available here to wait on two broadcast receivers and a stop signal at once
+/// — `std::sync::mpsc` (what `writer_loop` uses) has no cross-channel select, but tokio's
+/// broadcast receivers are async-native, so splitting the single-source blocking write
+/// (`writer_loop`, a thread) from the multi-source blocking read (this, a task) is what
+/// lets both sides block instead of poll. This task never touches the socket, only
+/// `out_tx`, so "exactly one thread writes the socket" still holds with two producers
+/// feeding that one thread.
+///
+/// Bulk traffic (`Event`, resync `Replay`) is queued with `try_send` and dropped on
+/// `Full`; a stalled writer must not let a large `Replay` (or an unbounded run of `Event`s)
+/// queue without limit. Control replies are `dispatch`'s job and always use the blocking
+/// `send` on the same channel instead, so a reply a client is synchronously awaiting is
+/// never the thing that gets dropped — only bulk traffic pays for backpressure. Losing a
+/// `Data`/`Event` is also self-healing here: a `Lagged` resyncs every attached uid below,
+/// and a dropped `Event` (as opposed to a dropped `Replay`) is superseded by the state the
+/// next resync (or reconnect) will carry anyway.
+///
+/// On `Lagged(n)`, instead of silently continuing (the old behavior — the bug this exists
+/// to fix), it logs the loss at `warn` and forces every attached uid through the same
+/// `Replay` path `Attach` uses to seed a fresh mirror, so the client's view is made whole
+/// again rather than quietly missing bytes it has no way to detect.
+#[cfg(unix)]
+#[tracing::instrument(level = "debug", skip_all, fields(conn = conn_id))]
+async fn forward_broadcasts(
+    conn_id: ClaimConnId,
+    fanout: ConnFanout,
+    mut bus_rx: tokio::sync::broadcast::Receiver<SessionEvent>,
+    mut notice_rx: tokio::sync::broadcast::Receiver<DaemonMsg>,
+    mut stop_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    use std::sync::mpsc::TrySendError;
+    use tokio::sync::broadcast::error::RecvError;
+    let ConnFanout {
+        registry,
+        attached,
+        notices_on,
+        out_tx,
+    } = fanout;
+
+    loop {
+        tokio::select! {
+            // Checked first (and every iteration) so a connection that is already tearing
+            // down stops promptly instead of possibly picking up one more event first.
+            biased;
+            _ = &mut stop_rx => return,
+            res = bus_rx.recv() => {
+                let action = {
+                    let attached = attached.lock().unwrap();
+                    classify_bus_event(res, &attached)
+                };
+                match action {
+                    BusAction::Forward(ev) => {
+                        if let Err(TrySendError::Disconnected(_)) =
+                            out_tx.try_send(DaemonMsg::Event(ev))
+                        {
+                            return; // writer gone
+                        }
+                        // TrySendError::Full: bulk traffic is dropped by design (see doc
+                        // comment above) rather than blocking this task on a stalled writer.
+                    }
+                    BusAction::Ignore => {}
+                    BusAction::Lagged(n) => {
+                        tracing::warn!(
+                            conn = conn_id,
+                            dropped = n,
+                            "broadcast bus lagged for this connection; resyncing every attached session"
+                        );
+                        let uids: Vec<String> = attached.lock().unwrap().iter().cloned().collect();
+                        for uid in uids {
+                            let (data, cursor) = registry.replay_with_cursor(&uid).unwrap_or_default();
+                            // A resync `Replay` must not be dropped the way a plain `Event`
+                            // may be — it's the thing repairing the loss, not routine
+                            // traffic — so this uses the blocking `send`, same as a reply.
+                            if out_tx.send(DaemonMsg::Replay { uid, data, cursor }).is_err() {
+                                return; // writer gone
+                            }
+                        }
+                    }
+                    BusAction::Closed => return,
+                }
+            }
+            res = notice_rx.recv() => {
+                match res {
+                    Ok(msg) => {
+                        let gate_open = notices_on.load(std::sync::atomic::Ordering::SeqCst);
+                        if gate_open {
+                            if let Err(TrySendError::Disconnected(_)) = out_tx.try_send(msg) {
+                                return; // writer gone
+                            }
+                        }
+                    }
+                    // Lagged: only full snapshots ride this channel, so a dropped one is
+                    // harmless — the next push carries the complete state again.
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::debug!(
+                            conn = conn_id,
+                            dropped = n,
+                            "notice channel lagged; next snapshot will still be complete"
+                        );
+                    }
+                    Err(RecvError::Closed) => return,
+                }
+            }
+        }
     }
 }
 
@@ -2734,6 +2872,141 @@ mod tests {
         assert!(
             !observer.has(&uid),
             "a session another client killed must leave the shadow"
+        );
+    }
+
+    // `writer_loop` no longer takes a poll interval at all — its only wait is a plain,
+    // untimed `out_rx.recv()` (see its doc comment). Exercise it directly, bypassing the
+    // rest of the daemon, so this is a test of that function's actual blocking behavior
+    // rather than of pty/process timing: an idle gap several times longer than the OLD
+    // 2 ms tick, followed by one send, must still be answered promptly — nothing about the
+    // wait is quantized to a periodic wakeup because there is no periodic wakeup to be
+    // quantized to.
+    #[test]
+    fn writer_loop_delivers_a_reply_after_an_idle_gap_with_no_poll_wait() {
+        let (mut here, there) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+        let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<DaemonMsg>(CONN_QUEUE_CAP);
+
+        let writer = std::thread::Builder::new()
+            .name("test-writer".into())
+            .spawn(move || writer_loop(there, out_rx))
+            .expect("spawn writer");
+
+        // Sit idle for well over 10x the old 2 ms tick before sending anything — a
+        // poll-based implementation would still "work" here (it would just keep spinning
+        // underneath us), so this gap is about giving a regression the best chance to show
+        // up as added latency below, not about detecting the idle spin itself.
+        std::thread::sleep(Duration::from_millis(25));
+
+        let start = Instant::now();
+        out_tx.send(DaemonMsg::Pong).expect("writer still alive");
+        let reply: DaemonMsg = read_frame(&mut here)
+            .expect("read")
+            .expect("a frame, not EOF");
+        let elapsed = start.elapsed();
+
+        assert!(matches!(reply, DaemonMsg::Pong));
+        assert!(
+            elapsed < Duration::from_millis(200),
+            "reply took {elapsed:?} after an idle gap; a poll/timeout-based writer would \
+             be the first place to suspect"
+        );
+
+        drop(out_tx);
+        let _ = writer.join();
+    }
+
+    // Task 2: a `Lagged` used to be silently swallowed (`continue`) — the client's mirror
+    // fell behind with nothing telling it so. `classify_bus_event` is the pure decision
+    // point that replaced that `continue`; test it directly with synthetic `RecvError`
+    // values rather than trying to actually starve a live broadcast channel (racy and slow
+    // to arrange deterministically — 4096 events would have to be produced faster than the
+    // test can drain them).
+    #[test]
+    fn a_bus_lag_is_reported_rather_than_silently_continued() {
+        use tokio::sync::broadcast::error::RecvError;
+
+        let mut attached = HashSet::new();
+        attached.insert("s1".to_string());
+
+        // Lagged is surfaced as its own action, not folded into Ignore/Forward — this is
+        // the "make the loss visible" fix itself: the old code's `Err(Lagged(_)) =>
+        // continue` had no analogue that carried the count anywhere.
+        assert_eq!(
+            classify_bus_event(Err(RecvError::Lagged(7)), &attached),
+            BusAction::Lagged(7)
+        );
+
+        // An event for an attached uid is forwarded...
+        let ev = SessionEvent::Exit {
+            uid: "s1".to_string(),
+            code: 0,
+        };
+        assert_eq!(
+            classify_bus_event(Ok(ev.clone()), &attached),
+            BusAction::Forward(ev)
+        );
+
+        // ...but the same shape of event for a uid this connection never attached to is
+        // filtered out, same as before.
+        let other = SessionEvent::Exit {
+            uid: "s2".to_string(),
+            code: 0,
+        };
+        assert_eq!(classify_bus_event(Ok(other), &attached), BusAction::Ignore);
+
+        // Closed (no senders left) is its own terminal case, distinct from a lag.
+        assert_eq!(
+            classify_bus_event(Err(RecvError::Closed), &attached),
+            BusAction::Closed
+        );
+    }
+
+    // Task 5: `proto::read_frame` already rejects an oversized length prefix before
+    // allocating the body (verified directly in `proto.rs`'s own unit tests). This is the
+    // end-to-end companion, entirely within `daemon.rs`: a real connection to a real
+    // in-process daemon that sends a hostile length prefix must be dropped promptly rather
+    // than the daemon hanging (waiting for a body that will never arrive) or wedging on a
+    // huge allocation, and the daemon itself must stay healthy for other clients.
+    #[test]
+    fn an_oversized_frame_length_is_refused_without_hanging_the_daemon() {
+        use std::io::{Read, Write};
+
+        let socket = temp_socket("oversized-frame");
+        let _daemon = spawn_in_process(&socket).expect("daemon binds");
+
+        // A bare length prefix — MAX_FRAME_LEN + 1 — and nothing else. No JSON body ever
+        // follows; if the daemon allocated `len` bytes and tried to read them, this would
+        // hang forever instead of erroring out immediately.
+        let mut raw = std::os::unix::net::UnixStream::connect(&socket).expect("raw connect");
+        let oversized = crate::session::proto::MAX_FRAME_LEN + 1;
+        raw.write_all(&oversized.to_le_bytes())
+            .expect("write length prefix");
+
+        // The daemon's reader rejects the length before reading a body, closes its own
+        // read half, and tears the connection down — so our side observes EOF (0 bytes)
+        // rather than a timeout. Bound the wait so a regression that DOES hang fails fast
+        // instead of stalling the suite.
+        raw.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        let mut buf = [0u8; 1];
+        let n = raw.read(&mut buf).expect("read does not hang or error");
+        assert_eq!(n, 0, "daemon should close the connection, not send a reply");
+
+        // The daemon itself must have survived the hostile frame: a fresh, well-behaved
+        // client can still complete a normal handshake against the same socket.
+        let client = DaemonClient::connect_path(&socket).expect("second client connects");
+        client
+            .send(&ClientMsg::Hello {
+                proto_ver: PROTO_VER,
+            })
+            .unwrap();
+        let hello = recv_until(&client, Duration::from_secs(2), |m| {
+            matches!(m, DaemonMsg::Hello { .. })
+        });
+        assert!(
+            matches!(hello, Some(DaemonMsg::Hello { .. })),
+            "daemon still serving normal clients after the hostile frame"
         );
     }
 }
