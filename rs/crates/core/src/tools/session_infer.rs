@@ -116,6 +116,7 @@ impl PaneWatch {
     /// `None` when `cwd` is not a directory a mark could be built from — a pane whose
     /// tracked cwd is empty or relative can never produce an adoptable mark, so refusing
     /// here is cheaper and clearer than watching it for ten minutes to find out.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new(tool: &str, cwd: &str) -> Option<Self> {
         let cwd = normalize(cwd);
         valid_resume_cwd(&cwd).then_some(PaneWatch {
@@ -129,12 +130,14 @@ impl PaneWatch {
     }
 
     /// The tool whose store this watch reads.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn tool(&self) -> &str {
         &self.tool
     }
 
     /// Whether enough time has passed for another look. `true` before the first one, so a
     /// fresh watch takes its baseline at the next opportunity rather than one interval late.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn due(&self, now: Instant) -> bool {
         self.done.is_none()
             && self
@@ -147,6 +150,7 @@ impl PaneWatch {
     /// `sessions` is every conversation the tool knows about, as `(id, project directory)`
     /// — the whole store, not a pre-filtered slice, because the directory match is part of
     /// the decision and belongs next to the rest of it.
+    #[tracing::instrument(level = "debug", ret, skip(sessions))]
     pub fn observe<'a, I>(&mut self, now: Instant, sessions: I) -> Outcome
     where
         I: IntoIterator<Item = (&'a str, &'a str)>,
@@ -198,6 +202,7 @@ impl PaneWatch {
     }
 
     /// Keep watching, unless the budget is spent.
+    #[tracing::instrument(level = "debug", ret)]
     fn expire_or_watch(&mut self) -> Outcome {
         if self.looks >= MAX_OBSERVATIONS {
             self.done = Some(Stopped::Expired);
@@ -212,6 +217,7 @@ impl PaneWatch {
 /// often enough to matter. Nothing more clever than that — resolving symlinks would make
 /// two genuinely different recorded paths compare equal, which is exactly the kind of
 /// widening that turns "one new conversation" into "two".
+#[tracing::instrument(level = "debug", ret)]
 fn normalize(dir: &str) -> String {
     let t = dir.trim_end_matches(['/', '\\']);
     if t.is_empty() {

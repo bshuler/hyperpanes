@@ -80,6 +80,7 @@ impl PointerTrack {
 }
 
 /// Snapshot of the tracked pointer state (for `drag/linux.rs`).
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn pointer_track() -> PointerTrack {
     POINTER.with(|p| p.get())
 }
@@ -91,12 +92,14 @@ static WAYLAND: OnceLock<bool> = OnceLock::new();
 /// e.g. `SLINT_BACKEND=winit-x11`); before any window exists, fall back to winit's own
 /// selection rule — Wayland whenever `WAYLAND_DISPLAY` is set (WSLg sets both
 /// `WAYLAND_DISPLAY` and `DISPLAY`; force X11 by clearing the former).
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn is_wayland() -> bool {
     *WAYLAND.get_or_init(|| std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()))
 }
 
 /// Run `f` against the winit window `raw` encodes; `None` for 0 / unknown / dead
 /// handles (the contractual no-op cases).
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn with_window<T>(raw: isize, f: impl FnOnce(&WinitWindow) -> T) -> Option<T> {
     if raw == 0 {
         return None;
@@ -112,6 +115,7 @@ pub(crate) fn with_window<T>(raw: isize, f: impl FnOnce(&WinitWindow) -> T) -> O
 
 /// Run `f` on every live registered window (cursor overrides are global on Win32; the
 /// closest Linux equivalent is applying to all our windows).
+#[tracing::instrument(level = "debug", ret)]
 fn for_each_window(f: impl Fn(&WinitWindow)) {
     REGISTRY.with(|r| {
         for e in r.borrow().iter() {
@@ -132,6 +136,7 @@ pub struct SavedPlacement {
 /// Native handle of a Slint window, encoded as the winit window's allocation address.
 /// `0` until winit realizes the window (callers retry each tick). First success
 /// registers the window and installs the pointer-tracking event hook.
+#[tracing::instrument(level = "debug", ret)]
 pub fn hwnd_of(win: &slint::Window) -> isize {
     // `winit_window()` resolves immediately once the window exists; a single poll with a
     // no-op waker turns the async accessor into the sync probe this call site needs
@@ -239,6 +244,7 @@ pub fn hwnd_of(win: &slint::Window) -> isize {
 /// window simply turns borderless.) Also arms the per-window event hook's re-strip:
 /// Slint's property sync re-enables decorations behind our back (see `hwnd_of`), so the
 /// strip must be standing, not one-shot.
+#[tracing::instrument(level = "debug", ret)]
 pub fn make_frameless(raw: isize) {
     REGISTRY.with(|r| {
         if let Some(e) = r.borrow().iter().find(|e| e.raw == raw) {
@@ -251,6 +257,7 @@ pub fn make_frameless(raw: isize) {
 /// Begin a compositor-driven interactive move (the frameless "drag the bar" trick).
 /// Must be called from a pointer-down gesture (both backends key the move off the
 /// active button grab) — which is exactly how the top bar wires it.
+#[tracing::instrument(level = "debug", ret)]
 pub fn start_drag(raw: isize) {
     tracing::debug!("start_drag raw={raw}");
     with_window(raw, |w| {
@@ -264,11 +271,13 @@ pub fn start_drag(raw: isize) {
 /// pointer grab during a held button keeps events (and the cursor) on that window for
 /// the whole gesture, so setting it there is enough — no global capture exists or is
 /// needed on Linux.
+#[tracing::instrument(level = "debug", ret)]
 pub fn begin_drag_cursor(raw: isize) {
     with_window(raw, |w| w.set_cursor(CursorIcon::Grabbing));
 }
 
 /// Stop forcing the drag cursor. `0` (the defensive caller) resets every window.
+#[tracing::instrument(level = "debug", ret)]
 pub fn end_drag_cursor(raw: isize) {
     if raw == 0 {
         for_each_window(|w| w.set_cursor(CursorIcon::Default));
@@ -281,6 +290,7 @@ pub fn end_drag_cursor(raw: isize) {
 /// threshold). Transition-edged: the pump calls this every tick, but only state flips
 /// touch the windows (Slint re-asserts its own cursor on the next pointer move, which
 /// also naturally undoes our `Default` reset).
+#[tracing::instrument(level = "debug", ret)]
 pub fn set_hover_cursor(on: bool) {
     let was = HOVER_ON.with(|h| h.replace(on));
     if was == on {
@@ -294,10 +304,12 @@ pub fn set_hover_cursor(on: bool) {
     for_each_window(|w| w.set_cursor(icon));
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn minimize(raw: isize) {
     with_window(raw, |w| w.set_minimized(true));
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn toggle_max(raw: isize) {
     with_window(raw, |w| w.set_maximized(!w.is_maximized()));
 }
@@ -309,6 +321,7 @@ pub fn toggle_max(raw: isize) {
 /// Wayland compositors are free to refuse the focus half (there is no click-to-raise
 /// protocol a client can insist on); the request is still the right thing to make, and
 /// the caller's tab/pane switch has already happened either way.
+#[tracing::instrument(level = "debug", ret)]
 pub fn raise(raw: isize) {
     with_window(raw, |w| {
         w.set_minimized(false);
@@ -317,6 +330,7 @@ pub fn raise(raw: isize) {
 }
 
 /// Whether the window is currently maximized (drives the restore-vs-maximize icon).
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_maximized(raw: isize) -> bool {
     with_window(raw, |w| w.is_maximized()).unwrap_or(false)
 }
@@ -325,10 +339,12 @@ pub fn is_maximized(raw: isize) -> bool {
 /// and drops the component); winit exposes no way to synthesize a close request on
 /// another window, so this stays a no-op on Linux.
 #[allow(dead_code)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn close(_raw: isize) {}
 
 /// Cover the current monitor borderlessly. winit remembers the floating geometry and
 /// restores it on exit; we only need to carry the maximized flag across.
+#[tracing::instrument(level = "debug", ret)]
 pub fn enter_fullscreen(raw: isize) -> Option<SavedPlacement> {
     with_window(raw, |w| {
         let maximized = w.is_maximized();
@@ -338,6 +354,7 @@ pub fn enter_fullscreen(raw: isize) -> Option<SavedPlacement> {
 }
 
 /// Restore the placement captured by [`enter_fullscreen`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn exit_fullscreen(raw: isize, saved: SavedPlacement) {
     with_window(raw, |w| {
         w.set_fullscreen(None);
@@ -364,6 +381,7 @@ pub fn exit_fullscreen(raw: isize, saved: SavedPlacement) {
 /// tells the caller not to clamp rather than to clamp against a guess. A Wayland session
 /// running XWayland may still answer here; the rect is then whatever XWayland reports,
 /// which is harmless because the position it would guard is being ignored anyway.
+#[tracing::instrument(level = "debug", ret)]
 pub fn displays() -> Vec<(i32, i32, i32, i32)> {
     // A fresh short-lived connection: this runs exactly once, at startup, before any
     // window exists — there is nothing yet to borrow a connection from.

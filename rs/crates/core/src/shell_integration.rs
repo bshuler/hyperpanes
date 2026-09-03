@@ -37,6 +37,7 @@ pub struct Integration {
 
 /// Classify a shell by its executable name/path. PowerShell is checked FIRST because
 /// "powershell" also ends in "sh", so a naive POSIX test would misfire.
+#[tracing::instrument(level = "debug", ret)]
 pub fn classify(shell: &str) -> ShellKind {
     let lower = shell.to_lowercase();
     if lower.contains("pwsh") || lower.contains("powershell") {
@@ -59,6 +60,7 @@ pub fn classify(shell: &str) -> ShellKind {
 }
 
 // The final path segment, splitting on BOTH separators (a Windows path may use either).
+#[tracing::instrument(level = "debug", ret)]
 fn basename(path: &str) -> &str {
     match path.rfind(['\\', '/']) {
         Some(i) => &path[i + 1..],
@@ -74,6 +76,7 @@ fn basename(path: &str) -> &str {
 /// Returns the first existing candidate, else the first candidate as a default — a missing
 /// directory simply yields no integration (`integration_for` → `None`), staying additive.
 /// The exact packaged layout is finalized at packaging time (Phase 5).
+#[tracing::instrument(level = "debug", ret)]
 pub fn shell_integration_dir() -> PathBuf {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -123,6 +126,7 @@ pub fn shell_integration_dir() -> PathBuf {
 /// Spawn additions for an interactive shell, given the shell path and the directory holding
 /// the init scripts. Returns `None` (→ plain shell, no integration) for `cmd`'s unknown
 /// siblings, `other`, or when the expected script is missing on disk.
+#[tracing::instrument(level = "debug", ret)]
 pub fn integration_for(shell: &str, dir: &Path) -> Option<Integration> {
     match classify(shell) {
         ShellKind::Pwsh => {

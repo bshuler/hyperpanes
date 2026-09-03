@@ -27,6 +27,7 @@ trait NoWindow {
 }
 impl NoWindow for Command {
     #[cfg(windows)]
+    #[tracing::instrument(level = "debug", ret)]
     fn no_window(&mut self) -> &mut Self {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -44,6 +45,7 @@ const MAX_OUTPUT_BYTES: usize = 1 << 20;
 
 /// Run `git -C dir <args>` and return its stdout, or `None` for any failure at all — a
 /// missing git, a non-zero exit, output that is not UTF-8, or output past [`MAX_OUTPUT_BYTES`].
+#[tracing::instrument(level = "debug", ret)]
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let out = Command::new("git")
         .arg("-C")
@@ -63,6 +65,7 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
 }
 
 /// The work tree root containing `dir`, or `None` when it is in no repository.
+#[tracing::instrument(level = "debug", ret)]
 pub fn repo_root(dir: &Path) -> Option<PathBuf> {
     let out = git(dir, &["rev-parse", "--show-toplevel"])?;
     let line = out.trim();
@@ -77,6 +80,7 @@ pub fn repo_root(dir: &Path) -> Option<PathBuf> {
 /// Deliberately narrow — a hex object name and nothing else. `rev-parse` happily accepts
 /// `HEAD@{yesterday}`, `:/fix the thing` and other forms whose text comes from a pane's
 /// output, and none of them is what a clicked hash means.
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_hex_rev(rev: &str) -> bool {
     let n = rev.len();
     (7..=40).contains(&n)
@@ -98,6 +102,7 @@ pub fn is_hex_rev(rev: &str) -> bool {
 ///
 /// `name` may carry directories (`src/b99_price.py`); it matches on a whole-segment suffix,
 /// so `price.py` never answers for `b99_price.py`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn find_in_repo(dir: &Path, name: &str) -> Option<PathBuf> {
     if name.is_empty() || name.starts_with('/') || name.contains('\\') || name.contains("..") {
         return None;
@@ -138,6 +143,7 @@ pub fn find_in_repo(dir: &Path, name: &str) -> Option<PathBuf> {
 /// Resolve `rev` to the full hash of a **commit** in the repository containing `dir`, or
 /// `None`. The `^{commit}` peel is what makes this an answer rather than a guess: a tree or
 /// blob whose abbreviation happens to match is not something a commit link can show.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_commit(dir: &Path, rev: &str) -> Option<String> {
     if !is_hex_rev(rev) {
         return None;
@@ -169,6 +175,7 @@ pub struct CommitFile {
 }
 
 impl CommitFile {
+    #[tracing::instrument(level = "debug", ret)]
     fn new(path: String, code: char) -> Self {
         let (detail, label) = match path.rsplit_once('/') {
             Some((dir, name)) => (dir.to_string(), name.to_string()),
@@ -205,6 +212,7 @@ const FIELD: &str = "\u{1f}";
 
 /// Load the commit `rev` names, as seen from `dir`. `None` when `dir` is in no repository or
 /// `rev` is not a commit in it.
+#[tracing::instrument(level = "debug", ret)]
 pub fn load_commit(dir: &Path, rev: &str) -> Option<Commit> {
     let root = repo_root(dir)?;
     let hash = resolve_commit(&root, rev)?;
@@ -231,6 +239,7 @@ pub fn load_commit(dir: &Path, rev: &str) -> Option<Commit> {
 /// The files `hash` touched. `-z` so a path containing a space, a quote or a newline arrives
 /// verbatim — the same reason the working-tree view uses it. A merge commit legitimately
 /// reports nothing here (`git show` diffs it against no parent), and that is not an error.
+#[tracing::instrument(level = "debug", ret)]
 fn files_of(root: &Path, hash: &str) -> Vec<CommitFile> {
     let Some(out) = git(root, &["show", "--name-status", "--format=", "-z", hash]) else {
         return Vec::new();

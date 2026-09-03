@@ -77,11 +77,13 @@ pub struct ToolDef {
 
 impl ToolDef {
     /// Every binary name this tool may be installed under, `bin` first.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn candidate_bins(&self) -> impl Iterator<Item = &'static str> + '_ {
         std::iter::once(self.bin).chain(self.alt_bins.iter().copied())
     }
 
     /// Whether a session-history provider can exist for this tool.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn has_history(&self) -> bool {
         self.history != HistoryKind::None
     }
@@ -291,11 +293,13 @@ pub static GENERIC_AI_TOKENS: &[&str] = &["llm", "chatgpt", "agent"];
 pub static EDITOR_IDS: &[&str] = &["vim", "emacs", "nano", "edit"];
 
 /// The editor entries, in chooser order.
+#[tracing::instrument(level = "debug", ret)]
 pub fn editors() -> impl Iterator<Item = &'static ToolDef> {
     EDITOR_IDS.iter().filter_map(|id| by_id(id))
 }
 
 /// Look a tool up by its stable id.
+#[tracing::instrument(level = "debug", ret)]
 pub fn by_id(id: &str) -> Option<&'static ToolDef> {
     TOOLS.iter().find(|t| t.id == id)
 }
@@ -305,6 +309,7 @@ pub fn by_id(id: &str) -> Option<&'static ToolDef> {
 /// Exact, case-insensitive match against `bin` and `alt_bins` — the binary the user
 /// asked to run is direct evidence, not a hint, so unlike [`by_title`] this needs no
 /// ambiguity rule: two tools may share a title word, never an executable name.
+#[tracing::instrument(level = "debug", ret)]
 pub fn by_bin(name: &str) -> Option<&'static ToolDef> {
     let lower = name.to_ascii_lowercase();
     TOOLS
@@ -317,6 +322,7 @@ pub fn by_bin(name: &str) -> Option<&'static ToolDef> {
 /// Case-insensitive **token** match, so `user@host: claude` hits and `ssh-agent`
 /// does not accidentally resolve to an agent tool. Ambiguity returns `None`: a title
 /// mentioning two tools is not evidence for either.
+#[tracing::instrument(level = "debug", ret)]
 pub fn by_title(title: &str) -> Option<&'static ToolDef> {
     let lower = title.to_ascii_lowercase();
     let mut hit: Option<&'static ToolDef> = None;
@@ -337,6 +343,7 @@ pub fn by_title(title: &str) -> Option<&'static ToolDef> {
 /// Every token that marks a pane as worth watching for agent idle — the union of the
 /// registry's detect tokens and the generic ones. `glow::is_ai_pane` reads this so the
 /// two lists cannot drift.
+#[tracing::instrument(level = "debug", ret)]
 pub fn ai_tokens() -> Vec<&'static str> {
     let mut v: Vec<&'static str> = TOOLS
         .iter()

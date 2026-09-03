@@ -46,12 +46,14 @@ pub const LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
 pub const DEFAULT_LEVEL: &str = "info";
 
 /// Whether `level` is one of [`LEVELS`] (case-insensitive).
+#[tracing::instrument(level = "debug", ret)]
 pub fn valid_level(level: &str) -> bool {
     LEVELS.iter().any(|l| l.eq_ignore_ascii_case(level))
 }
 
 /// The directive string [`init`] will use, given the persisted level. Exposed so the
 /// resolution order is testable without installing a subscriber.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_directives(default_level: &str) -> String {
     resolve_from(
         std::env::var(ENV_LOG).ok().as_deref(),
@@ -60,6 +62,7 @@ pub fn resolve_directives(default_level: &str) -> String {
     )
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn resolve_from(env_log: Option<&str>, env_debug: bool, default_level: &str) -> String {
     if let Some(d) = env_log.map(str::trim).filter(|d| !d.is_empty()) {
         return d.to_string();
@@ -76,6 +79,7 @@ fn resolve_from(env_log: Option<&str>, env_debug: bool, default_level: &str) -> 
 }
 
 /// The log file for a process role (`app`, `daemon`, `cli`, `worker`, `crash`, `headless`).
+#[tracing::instrument(level = "debug", ret)]
 pub fn log_path(role: &str) -> PathBuf {
     crate::persistence::paths::logs_dir().join(format!("hyperpanes-{role}.log"))
 }
@@ -84,6 +88,7 @@ pub fn log_path(role: &str) -> PathBuf {
 /// `default_level` is the persisted `logLevel` setting (any unknown value means `info`).
 /// A second call is a no-op (tests and embedded callers may race), and any failure to open
 /// the file degrades to stderr-only rather than aborting the process.
+#[tracing::instrument(level = "debug", ret)]
 pub fn init(role: &str, default_level: &str) {
     let directives = resolve_directives(default_level);
     let filter = EnvFilter::try_new(&directives)
@@ -142,6 +147,7 @@ struct Rotating {
 
 impl RotatingWriter {
     /// A writer for `path`, rolling at `max_bytes` and keeping `keep` rolled files.
+    #[tracing::instrument(level = "debug")]
     pub fn new(path: PathBuf, max_bytes: u64, keep: usize) -> Self {
         RotatingWriter {
             inner: Arc::new(Mutex::new(Rotating {
@@ -156,12 +162,14 @@ impl RotatingWriter {
     }
 
     /// The live file's path.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn path(&self) -> PathBuf {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).path.clone()
     }
 }
 
 impl Rotating {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn open(&mut self) -> io::Result<()> {
         if let Some(dir) = self.path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -175,12 +183,14 @@ impl Rotating {
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn rotate(&mut self) {
         self.file = None;
         rotate_files(&self.path, self.keep);
         self.written = 0;
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn write_all(&mut self, buf: &[u8]) -> io::Result<()> {
         if self.file.is_none() {
             if let Err(e) = self.open() {
@@ -207,6 +217,7 @@ impl Rotating {
 }
 
 /// Shift `path.{keep-1}` → `path.{keep}` … `path` → `path.1`, dropping the oldest.
+#[tracing::instrument(level = "debug", ret)]
 fn rotate_files(path: &Path, keep: usize) {
     if keep == 0 {
         let _ = std::fs::remove_file(path);
@@ -230,11 +241,13 @@ pub struct RotatingHandle {
 }
 
 impl Write for RotatingHandle {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         g.write_all(buf)?;
         Ok(buf.len())
     }
+    #[tracing::instrument(level = "debug", ret, skip_all)]
     fn flush(&mut self) -> io::Result<()> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         match g.file.as_mut() {

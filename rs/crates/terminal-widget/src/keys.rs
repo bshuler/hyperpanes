@@ -11,6 +11,7 @@ use slint::platform::Key;
 /// Encode a key press into PTY bytes, or `None` if nothing should be sent (e.g. a bare
 /// modifier press). `text` is the Slint `KeyEvent.text`; `ctrl`/`alt`/`shift` are its
 /// modifier flags.
+#[tracing::instrument(level = "debug", ret)]
 pub fn encode_key(text: &str, ctrl: bool, alt: bool, shift: bool) -> Option<Vec<u8>> {
     if text.is_empty() {
         return None;
@@ -157,6 +158,7 @@ pub fn encode_key(text: &str, ctrl: bool, alt: bool, shift: bool) -> Option<Vec<
 /// [`encode_key`]. The app shell calls this first and, on `Some`, scrolls the focused pane
 /// ([`TerminalPane::scroll_page`](crate::pane::TerminalPane::scroll_page)) rather than writing the
 /// key to the pty.
+#[tracing::instrument(level = "debug", ret)]
 pub fn scroll_page_key(text: &str, shift: bool) -> Option<bool> {
     if !shift {
         return None;
@@ -179,6 +181,7 @@ pub fn scroll_page_key(text: &str, shift: bool) -> Option<bool> {
 /// for top, `Some(false)` for bottom, and `None` otherwise — including plain (un-shifted)
 /// Home/End, which still encode to their CSI sequences via [`encode_key`]. Matches the
 /// xterm/GNOME-Terminal convention (Shift+Home/End scroll to top/bottom).
+#[tracing::instrument(level = "debug", ret)]
 pub fn scroll_edge_key(text: &str, shift: bool) -> Option<bool> {
     if !shift {
         return None;
@@ -203,6 +206,7 @@ pub fn scroll_edge_key(text: &str, shift: bool) -> Option<bool> {
 /// (Ctrl+C interrupt, app chords, Alt-meta sequences) and navigation/special keys, so copying
 /// with a chord or arrow-scrolling history can't eat the highlight. The caller only clears the
 /// HIGHLIGHT — the key still goes to the shell unmodified (no speculative erase of off-row text).
+#[tracing::instrument(level = "debug", ret)]
 pub fn clears_selection(text: &str, ctrl: bool, alt: bool) -> bool {
     if ctrl || alt {
         return false;
@@ -221,6 +225,7 @@ pub fn clears_selection(text: &str, ctrl: bool, alt: bool) -> bool {
 /// DEL, and not a Slint private-use special key: `Key::*` map to U+F700-range codepoints inside
 /// the BMP private-use area). These are the keys that *replace* a prompt-line selection
 /// (type-over), a strict subset of [`clears_selection`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_printable(text: &str, ctrl: bool, alt: bool) -> bool {
     if ctrl || alt {
         return false;

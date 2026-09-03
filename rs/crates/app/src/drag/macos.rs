@@ -23,6 +23,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 
 /// Primary-screen metrics: `(height in points, backing scale)`. The flip axis + the
 /// points→physical-px factor for every coordinate this module reports.
+#[tracing::instrument(level = "debug", ret)]
 fn screen_metrics(mtm: MainThreadMarker) -> Option<(f64, f64)> {
     let screens = NSScreen::screens(mtm);
     let primary = screens.firstObject()?;
@@ -34,6 +35,7 @@ fn screen_metrics(mtm: MainThreadMarker) -> Option<(f64, f64)> {
 pub struct PlatformPointer;
 
 impl super::GlobalPointer for PlatformPointer {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn poll(&self) -> Option<(slint::PhysicalPosition, bool)> {
         let mtm = MainThreadMarker::new()?;
         let (height, scale) = screen_metrics(mtm)?;
@@ -48,6 +50,7 @@ impl super::GlobalPointer for PlatformPointer {
         crate::window::reassert_drag_cursor();
         Some((slint::PhysicalPosition::new(x, y), down))
     }
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn supports_cross_window(&self) -> bool {
         true
     }
@@ -56,6 +59,7 @@ impl super::GlobalPointer for PlatformPointer {
 /// A window's screen rect (physical px, top-left origin), `(left, top, right, bottom)`.
 /// `0`-rect when the native window isn't realized yet. With `fullSizeContentView` the
 /// content fills the whole frame, so the frame rect IS the Slint client area.
+#[tracing::instrument(level = "debug", ret)]
 pub fn window_rect(raw: isize) -> (i32, i32, i32, i32) {
     if raw == 0 {
         return (0, 0, 0, 0);
@@ -88,6 +92,7 @@ pub struct Ghost {
 }
 
 impl Ghost {
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Ghost {
         let Some(mtm) = MainThreadMarker::new() else {
             return Ghost { win: None };
@@ -129,6 +134,7 @@ impl Ghost {
 
     /// Move + show, offset a little below/right of the cursor hotspot. `p` is in the
     /// pump's physical-px top-left coords; convert back to cocoa points.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn follow(&self, p: (i32, i32)) {
         let Some(win) = &self.win else { return };
         let Some(mtm) = MainThreadMarker::new() else {
@@ -145,6 +151,7 @@ impl Ghost {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn hide(&self) {
         if let Some(win) = &self.win {
             unsafe {

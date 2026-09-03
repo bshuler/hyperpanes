@@ -68,6 +68,7 @@ pub struct SttSettings {
 
 /// Read settings from `path`, falling back to [`SttSettings::default`] on a missing or
 /// corrupt file.
+#[tracing::instrument(level = "debug", ret)]
 pub fn load(path: &Path) -> SttSettings {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return SttSettings::default();
@@ -76,6 +77,7 @@ pub fn load(path: &Path) -> SttSettings {
 }
 
 /// Persist `settings` to `path`, atomically.
+#[tracing::instrument(level = "debug", ret)]
 pub fn save(path: &Path, settings: &SttSettings) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;

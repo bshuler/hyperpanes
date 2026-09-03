@@ -70,6 +70,7 @@ static LINEAR_TO_SRGB: LazyLock<[u8; ENCODE_N + 1]> = LazyLock::new(|| {
 
 /// Mix `cov` of `fg_linear` into an sRGB destination byte, in linear light.
 #[inline]
+#[tracing::instrument(level = "debug", ret)]
 fn mix_channel(
     dst: u8,
     fg_linear: f32,
@@ -89,6 +90,7 @@ fn mix_channel(
 #[inline]
 // pre-existing; deferred per repo lint policy (test.yml)
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(level = "debug", ret, skip(g))]
 fn blit_glyph(
     px: &mut [Rgba8Pixel],
     w: u32,
@@ -150,12 +152,14 @@ pub struct SoftwareRenderer {
 }
 
 impl Default for SoftwareRenderer {
+    #[tracing::instrument(level = "debug")]
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl SoftwareRenderer {
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Self {
         SoftwareRenderer {
             bufs: Vec::new(),
@@ -167,10 +171,12 @@ impl SoftwareRenderer {
 }
 
 impl PaneRenderer for SoftwareRenderer {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn name(&self) -> &'static str {
         "software (swash → SharedPixelBuffer)"
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self, grid, font, opts))]
     fn render(&mut self, grid: &GridSnapshot, font: &mut Font, opts: &RenderOpts) -> Image {
         let cw = font.cell_w;
         let ch = font.cell_h;
@@ -384,6 +390,7 @@ pub struct GpuRenderer {
 }
 
 impl GpuRenderer {
+    #[tracing::instrument(level = "debug")]
     pub fn new(device: wgpu::Device, queue: wgpu::Queue) -> Self {
         let atlas_tex = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("glyph-atlas"),
@@ -606,6 +613,7 @@ impl GpuRenderer {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self, font, key))]
     fn ensure_glyph(&mut self, font: &mut Font, key: GlyphKey) -> bool {
         if self.atlas_map.contains_key(&key) {
             return true;
@@ -675,6 +683,7 @@ impl GpuRenderer {
 impl GpuRenderer {
     /// Do the GPU work (build instances, upload, draw into the per-pane target, submit).
     /// Separated from the Slint import so the benchmark can time pure render throughput.
+    #[tracing::instrument(level = "debug", ret, skip(self, grid, font, opts))]
     pub fn render_to_texture(&mut self, grid: &GridSnapshot, font: &mut Font, opts: &RenderOpts) {
         // Font/size reload? The glyph keys carry no font epoch, so old atlas entries would
         // bleed stale glyphs (and leak until "atlas full"). Drop them and start the packer
@@ -875,12 +884,14 @@ impl GpuRenderer {
     }
 
     /// Block until the most recent submission completes (benchmark timing only).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn wait_idle(&self) {
         let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
     }
 }
 
 impl PaneRenderer for GpuRenderer {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn name(&self) -> &'static str {
         "gpu (swash atlas → wgpu texture → slint Image)"
     }
@@ -895,6 +906,7 @@ impl PaneRenderer for GpuRenderer {
     // and an unverified format swap risks breaking the Slint texture import. Do it, and check
     // it against `partial_coverage_lands_in_light_not_in_srgb`, when this path is adopted.
 
+    #[tracing::instrument(level = "debug", ret, skip(self, grid, font, opts))]
     fn render(&mut self, grid: &GridSnapshot, font: &mut Font, opts: &RenderOpts) -> Image {
         self.render_to_texture(grid, font, opts);
         // Import the freshly-rendered texture as a Slint Image (shared device → zero copy).
@@ -919,6 +931,7 @@ const SHADER: &str = r#"
 struct U { screen: vec2<f32>, pad: vec2<f32> };
 @group(0) @binding(0) var<uniform> u: U;
 
+#[tracing::instrument(level = "debug", ret)]
 fn quad_corner(vi: u32) -> vec2<f32> {
     var c = array<vec2<f32>, 6>(
         vec2<f32>(0.0, 0.0), vec2<f32>(1.0, 0.0), vec2<f32>(0.0, 1.0),
@@ -926,6 +939,7 @@ fn quad_corner(vi: u32) -> vec2<f32> {
     );
     return c[vi];
 }
+#[tracing::instrument(level = "debug", ret)]
 fn to_ndc(px: vec2<f32>) -> vec4<f32> {
     let ndc = vec2<f32>(px.x / u.screen.x * 2.0 - 1.0, 1.0 - px.y / u.screen.y * 2.0);
     return vec4<f32>(ndc, 0.0, 1.0);

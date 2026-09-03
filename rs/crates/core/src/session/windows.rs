@@ -57,6 +57,7 @@ use crate::session_manager::{SessionEvent, SessionManager};
 // Re-use the same idle grace knob as the unix side (the env override is platform-agnostic).
 const DEFAULT_IDLE_GRACE_MS: u64 = 30_000;
 
+#[tracing::instrument(level = "debug", ret)]
 fn idle_grace() -> Duration {
     let ms = std::env::var("HYPERPANES_DAEMON_IDLE_MS")
         .ok()
@@ -67,6 +68,7 @@ fn idle_grace() -> Duration {
 
 /// FNV-1a (64-bit) — identical to the unix `daemon_names` hash (and the single-instance
 /// gate's), so a Windows daemon and client derive the same salted pipe.
+#[tracing::instrument(level = "debug", ret)]
 fn fnv1a64(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.bytes() {
@@ -78,6 +80,7 @@ fn fnv1a64(s: &str) -> u64 {
 
 /// The salted named-pipe path a daemon for `salt` binds — the Windows analog of the unix
 /// `socket_path_for`. One endpoint per salt; the client connects to the SAME name.
+#[tracing::instrument(level = "debug", ret)]
 pub fn pipe_name(salt: &str) -> String {
     let h = format!("{:016x}", fnv1a64(salt));
     format!(r"\\.\pipe\hyperpanesd.{h}")
@@ -97,11 +100,13 @@ pub fn pipe_name(salt: &str) -> String {
 const PTY_HOST_MARKER: &str = "\u{1}pty-host";
 
 /// The salt of the pty-host serving `salt`'s terminals.
+#[tracing::instrument(level = "debug", ret)]
 pub fn host_salt(salt: &str) -> String {
     format!("{salt}{PTY_HOST_MARKER}")
 }
 
 /// Whether `salt` names a pty-host rather than a user-facing daemon.
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_host_salt(salt: &str) -> bool {
     salt.ends_with(PTY_HOST_MARKER)
 }
@@ -115,24 +120,30 @@ struct Lifecycle {
 }
 
 impl Lifecycle {
+    #[tracing::instrument(level = "debug", ret)]
     fn new() -> Self {
         Lifecycle {
             active_conns: AtomicU64::new(0),
             shutting_down: AtomicBool::new(false),
         }
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn conn_opened(&self) {
         self.active_conns.fetch_add(1, Ordering::SeqCst);
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn conn_closed(&self) {
         self.active_conns.fetch_sub(1, Ordering::SeqCst);
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn conn_count(&self) -> u64 {
         self.active_conns.load(Ordering::SeqCst)
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn begin_shutdown(&self) -> bool {
         !self.shutting_down.swap(true, Ordering::SeqCst)
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn is_shutting_down(&self) -> bool {
         self.shutting_down.load(Ordering::SeqCst)
     }
@@ -146,6 +157,7 @@ impl Lifecycle {
 /// Binding happens BEFORE anything else so a losing race costs nothing: `AddrInUse` means an
 /// incumbent already serves this salt, and the caller (a client that spawned us) simply keeps
 /// connecting to whoever won.
+#[tracing::instrument(level = "debug", ret)]
 pub fn run(salt: &str) -> io::Result<()> {
     let pipe = pipe_name(salt);
     // A pty-host never takes another host's place: it owns live ConPTYs, so an incumbent host
@@ -187,6 +199,7 @@ const TAKEOVER_RECV_TIMEOUT: Duration = Duration::from_secs(5);
 /// a receipt (the incumbent's session list, for the log) proving the request was understood;
 /// an incumbent that closes without answering leaves the caller to fall back on the
 /// session-destroying tear-down, exactly as on unix.
+#[tracing::instrument(level = "debug", ret)]
 fn request_takeover(pipe: &str) -> io::Result<()> {
     use crate::session::transport::{self, Endpoint};
 
@@ -209,6 +222,7 @@ fn request_takeover(pipe: &str) -> io::Result<()> {
 /// Poll for the pipe name until it is ours or `budget` elapses — the peer of the unix
 /// `acquire_when_released`. The name frees when the incumbent's last handle closes, which is
 /// when it exits, so winning here is also the proof it is gone.
+#[tracing::instrument(level = "debug", ret)]
 fn bind_when_released(pipe: &str, budget: Duration) -> io::Result<NamedPipeServer> {
     let deadline = Instant::now() + budget;
     loop {
@@ -232,6 +246,7 @@ const ERROR_ACCESS_DENIED: i32 = 5;
 /// no cfg to tell "I lost the race" from "the bind genuinely failed".
 ///
 /// Must be called from inside a Tokio runtime context (the pipe registers with the reactor).
+#[tracing::instrument(level = "debug", ret)]
 fn bind_first_instance(pipe: &str) -> io::Result<NamedPipeServer> {
     match ServerOptions::new().first_pipe_instance(true).create(pipe) {
         Ok(server) => Ok(server),
@@ -245,6 +260,7 @@ fn bind_first_instance(pipe: &str) -> io::Result<NamedPipeServer> {
 
 /// Kill the running Windows daemon for `salt` (the `--kill-daemon` path): connect + send
 /// `Shutdown`. No-op if the pipe isn't there. Mirrors the unix `kill_daemon`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn kill_daemon(salt: &str) -> io::Result<bool> {
     let pipe = pipe_name(salt);
     let rt = tokio::runtime::Runtime::new()?;
@@ -305,6 +321,7 @@ impl Daemon {
     /// host is, by design, an older build than we are. That is the whole Windows answer to
     /// "upgrade without dropping terminals": an `HPCON` cannot cross a process boundary, so
     /// instead the process holding it never has to.
+    #[tracing::instrument(level = "debug", ret)]
     fn new(salt: &str) -> io::Result<Self> {
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let sessions = if is_host_salt(salt) {
@@ -358,12 +375,14 @@ impl Daemon {
 
     /// Push the whole claim table to every connection (M7). Full snapshots, never deltas:
     /// applying one is idempotent, so a dropped or reordered push cannot desync a client.
+    #[tracing::instrument(level = "debug", ret)]
     fn broadcast_claims(&self) {
         let _ = self.notices.send(DaemonMsg::Claims(self.claims.snapshot()));
     }
 
     /// Push the whole live-session list to every connection (M7) — the fix for a client
     /// shadow that would otherwise only learn about sessions created before it connected.
+    #[tracing::instrument(level = "debug", ret)]
     fn broadcast_sessions(&self) {
         let _ = self
             .notices
@@ -372,6 +391,7 @@ impl Daemon {
 
     /// Idle-exit monitor (mirror of the unix one): 0 sessions AND 0 clients through the grace
     /// → exit. On Windows we just `process::exit(0)` (no socket file to unlink).
+    #[tracing::instrument(level = "debug", ret)]
     fn start_idle_monitor(&self, grace: Duration) {
         let lifecycle = Arc::clone(&self.lifecycle);
         let sessions = self.sessions.clone();
@@ -409,6 +429,7 @@ impl Daemon {
     /// and re-arms the next instance before handing the current one off — the
     /// `single_instance::windows::run_server` pattern — so a connect arriving during a handoff
     /// is never refused.
+    #[tracing::instrument(level = "debug", ret)]
     async fn serve(&self, pipe: &str, mut server: NamedPipeServer) -> io::Result<()> {
         loop {
             if self.lifecycle.is_shutting_down() {
@@ -440,6 +461,7 @@ impl Daemon {
     /// for the uids this connection attached to. (Single-task simplification vs the unix
     /// two-thread split — the async pipe is full-duplex, so we can `tokio::select!` between the
     /// inbound frames and the bus on one task; the buffering shim feeds `read_frame`.)
+    #[tracing::instrument(level = "debug", ret)]
     async fn handle_connection(&self, conn: NamedPipeServer) {
         self.lifecycle.conn_opened();
         let mut pc = PipeConn::new(conn);
@@ -507,6 +529,7 @@ impl Daemon {
     }
 
     /// Dispatch one `ClientMsg` (mirror of the unix `dispatch`). Returns `false` to close.
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn dispatch(
         &self,
         msg: ClientMsg,
@@ -650,6 +673,7 @@ impl Daemon {
         true
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     fn list_sessions(&self) -> Vec<SessionMeta> {
         session_metas(&self.sessions, &self.cwds)
     }
@@ -657,6 +681,7 @@ impl Daemon {
 
 /// The live-session snapshot, as a free function so the event pump — which holds clones of
 /// the pieces, not a `Daemon` — can build exactly the same list the connection paths do.
+#[tracing::instrument(level = "debug", ret)]
 fn session_metas(
     sessions: &SessionManager,
     cwds: &Mutex<std::collections::HashMap<String, String>>,
@@ -689,6 +714,7 @@ fn session_metas(
         .collect()
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn event_uid(ev: &SessionEvent) -> &str {
     match ev {
         SessionEvent::Data { uid, .. }
@@ -715,6 +741,7 @@ struct PipeConn {
 }
 
 impl PipeConn {
+    #[tracing::instrument(level = "debug", ret)]
     fn new(pipe: NamedPipeServer) -> Self {
         PipeConn {
             pipe,
@@ -724,6 +751,7 @@ impl PipeConn {
 
     /// Read the next framed `ClientMsg`, accumulating bytes until a whole frame is buffered.
     /// `Ok(None)` on a clean EOF between frames.
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn read_msg(&mut self) -> io::Result<Option<ClientMsg>> {
         loop {
             // Do we already have a complete frame buffered?
@@ -751,6 +779,7 @@ impl PipeConn {
 
     /// Try to pull one complete frame out of `buf` (a `u32` LE length then that many JSON
     /// bytes). Returns `Ok(None)` if not enough is buffered yet.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn try_decode(&mut self) -> io::Result<Option<ClientMsg>> {
         if self.buf.len() < 4 {
             return Ok(None);
@@ -773,6 +802,7 @@ impl PipeConn {
     }
 
     /// Write one framed `DaemonMsg`.
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn write_msg(&mut self, msg: &DaemonMsg) -> io::Result<()> {
         let bytes = frame_bytes(msg)?;
         self.pipe.write_all(&bytes).await?;
@@ -782,6 +812,7 @@ impl PipeConn {
 
 /// Serialize a message into a length-prefixed frame (the same wire shape as
 /// `proto::write_frame`, materialized as bytes for the async writers here).
+#[tracing::instrument(level = "debug", ret)]
 fn frame_bytes(msg: &impl serde::Serialize) -> io::Result<Vec<u8>> {
     let body = serde_json::to_vec(msg).map_err(io::Error::other)?;
     let len: u32 = body

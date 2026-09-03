@@ -41,6 +41,7 @@ pub enum AgentLiveness {
 }
 
 impl AgentLiveness {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn as_str(self) -> &'static str {
         match self {
             AgentLiveness::Busy => "busy",
@@ -71,6 +72,7 @@ pub enum Marker {
 // Interpret one OSC payload (the bytes between `ESC]` and its terminator) as a marker.
 // Anything that is not a recognized prompt/agent marker (a title `0;…`, a cwd `7;…`,
 // `9;9;…`, a progress `9;4;…`, …) yields `None`.
+#[tracing::instrument(level = "debug", ret)]
 fn osc_data_to_marker(data: &str) -> Option<Marker> {
     if let Some(rest) = data.strip_prefix("133;") {
         // The sub-letter is the first char of `rest`; `D` may carry `;<code>`.
@@ -122,6 +124,7 @@ fn osc_data_to_marker(data: &str) -> Option<Marker> {
 /// Returning the full ordered list (not last-wins) matters: a single flush can contain
 /// `133;D;0` immediately followed by `133;A`, and the supervisor/liveness mirror want
 /// both edges.
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_osc_markers(carry: &str, chunk: &str) -> (Vec<Marker>, String) {
     // Fast reject: nothing pending and no ESC anywhere → impossible to hold an OSC.
     if carry.is_empty() && !chunk.contains('\u{1b}') {

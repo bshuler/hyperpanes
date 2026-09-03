@@ -74,6 +74,7 @@ pub const FRAME_PALETTES: [(&str, [(u8, u8, u8); 8]); 4] = [
 
 /// Clamp a (possibly stale) palette index to a real palette, returning its 8 slots
 /// (defaults to index 0 = Muted).
+#[tracing::instrument(level = "debug", ret)]
 pub fn frame_palette(idx: usize) -> &'static [(u8, u8, u8); 8] {
     &FRAME_PALETTES[idx.min(FRAME_PALETTES.len() - 1)].1
 }
@@ -175,11 +176,13 @@ pub const TERMINAL_THEMES: [(&str, [[u8; 3]; 16]); 4] = [
 
 /// Clamp a (possibly stale) theme index to a real theme, returning its 16 base colours
 /// (defaults to index 0 = Dark).
+#[tracing::instrument(level = "debug", ret)]
 pub fn terminal_theme(idx: usize) -> [[u8; 3]; 16] {
     TERMINAL_THEMES[idx.min(TERMINAL_THEMES.len() - 1)].1
 }
 
 /// A colour from a theme's base-16 slot, as a Slint `Color` (used by the preview).
+#[tracing::instrument(level = "debug", ret)]
 pub fn theme_color(idx: usize, slot: usize) -> Color {
     let c = terminal_theme(idx)[slot.min(15)];
     Color::from_rgb_u8(c[0], c[1], c[2])
@@ -331,11 +334,13 @@ pub const UI_PALETTES: [UiPalette; 5] = [
 
 /// Clamp a (possibly stale) shell-palette index to a real palette — a settings file written
 /// by a later build, or hand-edited, must not panic the startup path (defaults to Mocha).
+#[tracing::instrument(level = "debug", ret)]
 pub fn ui_palette(idx: usize) -> UiPalette {
     UI_PALETTES[idx.min(UI_PALETTES.len() - 1)]
 }
 
 /// The pane accent for creation index `i` under frame-palette `palette`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn accent_for(i: usize, palette: usize) -> Color {
     let slots = frame_palette(palette);
     let (r, g, b) = slots[i % slots.len()];
@@ -370,6 +375,7 @@ pub const LAYOUT_MENU: &[Layout] = &[
 /// would silently repaint every layout icon. Ids are never persisted — the
 /// workspace file stores the token from [`layout_name`] — so growing the menu
 /// costs nothing on disk.
+#[tracing::instrument(level = "debug", ret)]
 pub fn layout_id(l: Layout) -> i32 {
     if let Some(i) = menu_position(l) {
         return i;
@@ -383,11 +389,13 @@ pub fn layout_id(l: Layout) -> i32 {
     0
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn menu_position(l: Layout) -> Option<i32> {
     LAYOUT_MENU.iter().position(|x| *x == l).map(|i| i as i32)
 }
 
 /// Resolve a menu id back to a `Layout` (defaults to `Auto` on an out-of-range id).
+#[tracing::instrument(level = "debug", ret)]
 pub fn layout_from_id(id: i32) -> Layout {
     usize::try_from(id)
         .ok()
@@ -398,6 +406,7 @@ pub fn layout_from_id(id: i32) -> Layout {
 
 /// The serialization token for a layout — borrowed for every preset, owned only for the
 /// explicit `grid-CxR` shapes, which have no fixed string to point at.
+#[tracing::instrument(level = "debug", ret)]
 pub fn layout_name(l: Layout) -> Cow<'static, str> {
     l.token()
 }
@@ -438,6 +447,7 @@ pub mod menu_icon {
 /// as an outlined mini-frame with dividers by `IconLayout` in `ui/contextmenu.slint` —
 /// the vector replacement for the Electron `presets.ts` ⊞ □ ▥ ▤ ▦ ▧ chars, which the
 /// default UI font lacks. Used by the application + tab Layout submenus.
+#[tracing::instrument(level = "debug", ret)]
 pub fn layout_icon_kind(l: Layout) -> i32 {
     menu_icon::LAYOUT_BASE + layout_id(l)
 }
@@ -445,6 +455,7 @@ pub fn layout_icon_kind(l: Layout) -> i32 {
 /// The human display label for each layout, matching Electron's `LAYOUTS[].label` /
 /// `AUTO_LAYOUT.label` (Title Case). Used in the menus; the HUD/serialization keep the
 /// lowercase token from [`layout_name`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn layout_label(l: Layout) -> Cow<'static, str> {
     match l {
         Layout::Auto => Cow::Borrowed("Automatic"),
@@ -462,6 +473,7 @@ pub fn layout_label(l: Layout) -> Cow<'static, str> {
 
 /// Load a monospace font at the given UI scale (best-available Cascadia/Consolas on
 /// Windows; the platform default everywhere else).
+#[tracing::instrument(level = "debug")]
 pub fn load_font(scale: f32) -> Font {
     let candidates = [
         "C:/Windows/Fonts/CascadiaMono.ttf",
@@ -484,6 +496,7 @@ pub fn load_font(scale: f32) -> Font {
 /// A missing/unloadable `path` falls back to the platform default resolution, then the
 /// bundled OFL fonts (extracted at startup) — so font loading never panics over an
 /// uninstalled font on any OS.
+#[tracing::instrument(level = "debug")]
 pub fn load_font_at(path: &str, base_px: f32, scale: f32) -> Font {
     let px = (base_px * scale).round().max(8.0);
     if let Ok(f) = Font::from_path(path, px) {

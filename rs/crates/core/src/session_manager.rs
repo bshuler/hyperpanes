@@ -61,6 +61,7 @@ static NEXT_INPROC_UID: AtomicU64 = AtomicU64::new(0);
 /// `pane-0`, `pane-1`, … — the in-process uid scheme (PTYs die with the GUI, so per-run
 /// uniqueness suffices). The daemon scheme is a UUID for cross-run uniqueness; see
 /// [`SessionManager::fresh_uid`].
+#[tracing::instrument(level = "debug", ret)]
 fn next_inproc_uid() -> String {
     format!("pane-{}", NEXT_INPROC_UID.fetch_add(1, Ordering::Relaxed))
 }
@@ -121,6 +122,7 @@ pub enum AgentLiveness {
 }
 
 impl From<crate::session::osc133::AgentLiveness> for AgentLiveness {
+    #[tracing::instrument(level = "debug", ret)]
     fn from(a: crate::session::osc133::AgentLiveness) -> Self {
         use crate::session::osc133::AgentLiveness as P;
         match a {
@@ -256,6 +258,7 @@ pub struct Liveness {
 impl Shared {
     /// A blank read-state for a `cols`x`rows` grid — the starting point for both a freshly
     /// spawned session and an adopted one (which then seeds replay/cursor on top).
+    #[tracing::instrument(level = "debug")]
     fn fresh(cols: u16, rows: u16) -> Arc<Self> {
         Arc::new(Shared {
             replay: Mutex::new(Replay::new()),
@@ -274,6 +277,7 @@ impl Shared {
     /// Drain any buffered output into the screen mirror so a subsequent `screen.render()`
     /// reflects all flushed bytes. Cheap no-op when nothing is pending. Called on the
     /// read path (lazy) instead of on every flush (eager) — see `screen_pending`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn sync_screen(&self) {
         // Take the pending buffer under its own lock first to minimize contention with
         // the driver thread's appends, then parse it into the screen.
@@ -290,6 +294,7 @@ impl Shared {
     /// Fold one parsed [`Marker`](crate::session::osc133::Marker) into the liveness mirror.
     /// Every marker flips `marker_seen`, which is what hands authority from the silence
     /// heuristic to the precise state for this pane (gate in `control::server::activity_for`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn apply_marker(&self, m: &crate::session::osc133::Marker) {
         use crate::session::osc133::{AgentLiveness as A, Marker};
         self.marker_seen.store(true, Ordering::Relaxed);
@@ -330,6 +335,7 @@ impl Shared {
     }
 
     /// Snapshot the liveness mirror for the activity ticker.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn liveness(&self) -> Liveness {
         let raw = self.last_exit_code.load(Ordering::Relaxed);
         Liveness {
@@ -343,6 +349,7 @@ impl Shared {
     /// Input was just sent → optimistically clear `prompt_ready` so the busy edge is
     /// reported without waiting for the next marker (tightens latency, never lies for
     /// long — a real prompt re-asserts `prompt_ready` on its next `133;A`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn note_write(&self) {
         if self.marker_seen.load(Ordering::Relaxed) {
             self.prompt_ready.store(false, Ordering::Relaxed);
@@ -399,6 +406,7 @@ pub struct SessionRegistry {
 
 impl SessionRegistry {
     /// Create a registry that emits [`SessionEvent`]s on `events`.
+    #[tracing::instrument(level = "debug")]
     pub fn new(events: UnboundedSender<SessionEvent>) -> Self {
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
@@ -409,12 +417,14 @@ impl SessionRegistry {
 
     /// Allocate a fresh process-unique uid (`s1`, `s2`, …). The daemon calls this when a
     /// client did not pin a uid, making the daemon the authoritative uid source.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn mint_uid(&self) -> String {
         format!("s{}", self.next_uid.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Spawn a real pty session for `opts`. Returns once the pty is live and its driver
     /// task is running. Errors if the pty fails to spawn.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn create(&self, opts: SpawnOptions) -> io::Result<()> {
         let factory: SpawnFn = Box::new(|spec, sink| spawn_pty(spec, move |ev| sink(ev)));
         self.create_with(opts, factory)
@@ -422,6 +432,7 @@ impl SessionRegistry {
 
     /// Spawn a session using a custom pty `factory` (tests inject a mock). The resolved
     /// [`PtySpec`] is built from `opts` exactly as the production path does.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn create_with(&self, opts: SpawnOptions, factory: SpawnFn) -> io::Result<()> {
         let spec = build_spec(&opts);
 
@@ -445,6 +456,7 @@ impl SessionRegistry {
     /// Install `pty` under `uid` with the read-state `shared`, starting its driver task.
     /// The one place a session enters the map — [`create_with`](Self::create_with) and
     /// [`adopt`](Self::adopt) differ only in where the pty and the state come from.
+    #[tracing::instrument(level = "debug", ret, skip(self, shared, pty))]
     fn install(
         &self,
         uid: String,
@@ -477,6 +489,7 @@ impl SessionRegistry {
     /// What does NOT carry: the phase-4 liveness mirror (it re-learns itself from the next
     /// marker the shell emits) and `last_output_at` (nothing has been flushed *by us* yet;
     /// reporting a stale timestamp would misreport the pane as recently active).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn adopt(
         &self,
         snap: &SessionSnapshot,
@@ -539,6 +552,7 @@ impl SessionRegistry {
     /// never see — the same brief window nginx accepts across a live binary upgrade, and the
     /// reason the caller must exit immediately rather than linger.
     #[cfg(unix)]
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn hand_off(&self) -> Vec<(SessionSnapshot, std::os::fd::RawFd)> {
         let drained: Vec<(String, Session)> = {
             let mut map = self.sessions.lock().unwrap();
@@ -583,11 +597,13 @@ impl SessionRegistry {
     }
 
     /// Whether a session with `uid` is currently live.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn has(&self, uid: &str) -> bool {
         self.sessions.lock().unwrap().contains_key(uid)
     }
 
     /// The uids of all live sessions.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn uids(&self) -> Vec<String> {
         self.sessions.lock().unwrap().keys().cloned().collect()
     }
@@ -602,6 +618,7 @@ impl SessionRegistry {
     ///
     /// The descriptor is copied out and the map lock released before the syscalls, so a
     /// probe of one session never blocks writes to another.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn foreground_name(&self, uid: &str) -> Option<String> {
         #[cfg(unix)]
         {
@@ -627,6 +644,7 @@ impl SessionRegistry {
     /// ever arrives as a `SessionEvent::Cwd` parsed out of OSC 7, which a plain `zsh` never
     /// emits — so a pane spawned without an explicit directory had no cwd at all. `None`
     /// keeps the same meaning as its neighbour above: no answer, never "no directory".
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn foreground_cwd(&self, uid: &str) -> Option<String> {
         #[cfg(unix)]
         {
@@ -644,6 +662,7 @@ impl SessionRegistry {
     }
 
     /// Recent output for a re-attaching view (the rolling replay buffer).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn replay(&self, uid: &str) -> Option<String> {
         let map = self.sessions.lock().unwrap();
         map.get(uid)
@@ -652,6 +671,7 @@ impl SessionRegistry {
 
     /// Monotonic count of all output UTF-16 code units ever emitted (the `since`
     /// cursor; pair with `control::output::sliceSince`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn output_bytes(&self, uid: &str) -> Option<u64> {
         let map = self.sessions.lock().unwrap();
         map.get(uid)
@@ -660,6 +680,7 @@ impl SessionRegistry {
 
     /// Epoch-ms of the last output flush, or `None` if the pane has produced nothing
     /// yet (feeds `control::output::waitDecision`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn last_output_at(&self, uid: &str) -> Option<u64> {
         let map = self.sessions.lock().unwrap();
         map.get(uid)
@@ -671,6 +692,7 @@ impl SessionRegistry {
 
     /// Serialize the pane's current screen to clean text (for `mode:"screen"` reads).
     /// Brings the lazily-fed screen mirror fully up to date first (see `screen_pending`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn render_screen(&self, uid: &str) -> Option<String> {
         let map = self.sessions.lock().unwrap();
         map.get(uid).map(|s| {
@@ -680,6 +702,7 @@ impl SessionRegistry {
     }
 
     /// Current pty grid `(cols, rows)` — the width a remote client must emulate at.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn dims(&self, uid: &str) -> Option<(u16, u16)> {
         let map = self.sessions.lock().unwrap();
         map.get(uid).map(|s| s.shared.screen.lock().unwrap().dims())
@@ -689,6 +712,7 @@ impl SessionRegistry {
     /// replay lock, which `flush_into` also holds while bumping the cursor). Remote
     /// clients splice a live `output` frame stream onto this snapshot; a torn pair
     /// would drop or duplicate bytes at the seam.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn replay_with_cursor(&self, uid: &str) -> Option<(String, u64)> {
         let map = self.sessions.lock().unwrap();
         map.get(uid).map(|s| {
@@ -703,6 +727,7 @@ impl SessionRegistry {
     /// An unknown uid is an error, not a no-op: it is what a caller sees when the pane it
     /// was told about is gone, and answering nothing let the control API report success for
     /// input that reached no process at all.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn write(&self, uid: &str, data: &str) -> io::Result<()> {
         // Clone the handles out and drop the registry guard before the (possibly blocking)
         // pty write, so a wedged pty never stalls every other session behind the map lock.
@@ -719,6 +744,7 @@ impl SessionRegistry {
     }
 
     /// The pty handle and shared state for `uid`, cloned out from under the registry lock.
+    #[tracing::instrument(level = "debug", skip(self))]
     fn handles(&self, uid: &str) -> Option<(Arc<dyn Pty>, Arc<Shared>)> {
         let map = self.sessions.lock().unwrap();
         map.get(uid)
@@ -726,12 +752,14 @@ impl SessionRegistry {
     }
 
     /// Snapshot a session's phase-4 liveness mirror, or `None` if the uid is unknown.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn liveness(&self, uid: &str) -> Option<Liveness> {
         let map = self.sessions.lock().unwrap();
         map.get(uid).map(|s| s.shared.liveness())
     }
 
     /// Resize the pane (≥1×1) — both the pty grid and the live screen model.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn resize(&self, uid: &str, cols: u16, rows: u16) {
         let cols = cols.max(1);
         let rows = rows.max(1);
@@ -787,6 +815,7 @@ pub enum PaneLoad {
 
 impl PaneLoad {
     /// The uid the pane must be created/adopted under.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn uid(&self) -> &str {
         match self {
             PaneLoad::Reattach(u) | PaneLoad::Spawn(u) => u,
@@ -794,6 +823,7 @@ impl PaneLoad {
     }
 
     /// Whether this is a re-attach (as opposed to a fresh spawn).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_reattach(&self) -> bool {
         matches!(self, PaneLoad::Reattach(_))
     }
@@ -833,6 +863,7 @@ pub enum SessionManager {
 impl SessionManager {
     /// Create an **in-process** manager that emits [`SessionEvent`]s on `events` (the
     /// default backend — PTYs are children of this process, as before the daemon existed).
+    #[tracing::instrument(level = "debug")]
     pub fn new(events: UnboundedSender<SessionEvent>) -> Self {
         SessionManager::InProcess(SessionRegistry::new(events))
     }
@@ -842,6 +873,7 @@ impl SessionManager {
     /// can't be reached/spawned — `main` falls back to [`new`](Self::new) on `Err` so a
     /// daemon failure never blocks launch. `salt` is the user-data dir (same key the GUI's
     /// single-instance gate and the daemon's discovery use).
+    #[tracing::instrument(level = "debug")]
     pub fn new_daemon(events: UnboundedSender<SessionEvent>, salt: &str) -> io::Result<Self> {
         Ok(SessionManager::Daemon(Arc::new(
             crate::session::daemon_client::DaemonSessionManager::new(events, salt)?,
@@ -853,6 +885,7 @@ impl SessionManager {
     /// which owns the ConPTYs and is deliberately never upgraded under a running terminal. See
     /// [`VersionPolicy::Tolerant`](crate::session::daemon_client::VersionPolicy::Tolerant) for
     /// the frozen-surface contract that makes it safe.
+    #[tracing::instrument(level = "debug")]
     pub fn new_daemon_tolerant(
         events: UnboundedSender<SessionEvent>,
         salt: &str,
@@ -866,6 +899,7 @@ impl SessionManager {
     /// The underlying [`SessionRegistry`] for the in-process backend, or `None` when this
     /// manager is daemon-backed (the registry then lives in the daemon, not here). Unused by
     /// the GUI today; kept for in-process tooling that wants the registry directly.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn registry(&self) -> Option<&SessionRegistry> {
         match self {
             SessionManager::InProcess(r) => Some(r),
@@ -877,6 +911,7 @@ impl SessionManager {
     /// this to decide whether re-attach (M2) is even possible — only a daemon retains a
     /// session across a GUI restart, so the in-process backend always re-spawns from the
     /// recorded spawn command instead.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn is_daemon(&self) -> bool {
         matches!(self, SessionManager::Daemon(_))
     }
@@ -898,6 +933,7 @@ impl SessionManager {
     /// (The wire side already PINS whatever uid the GUI passes — see
     /// [`daemon_client`](crate::session::daemon_client) — so making the GUI's *minting* stable
     /// is the whole fix; the daemon honors it verbatim.)
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn fresh_uid(&self) -> String {
         match self {
             SessionManager::InProcess(_) => next_inproc_uid(),
@@ -908,6 +944,7 @@ impl SessionManager {
     /// Spawn a real pty session for `opts`. Returns once the pty is live and its driver
     /// task is running (in-process), or the create request is sent (daemon). Errors if the
     /// pty fails to spawn (in-process) / the request can't be sent (daemon).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn create(&self, opts: SpawnOptions) -> io::Result<()> {
         match self {
             SessionManager::InProcess(r) => r.create(opts),
@@ -918,6 +955,7 @@ impl SessionManager {
     /// Spawn a session using a custom pty `factory` (tests inject a mock). The daemon
     /// backend ignores the factory (a closure can't cross a socket; the daemon owns real
     /// PTYs) and spawns a normal session — no production caller uses `create_with`.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn create_with(&self, opts: SpawnOptions, factory: SpawnFn) -> io::Result<()> {
         match self {
             SessionManager::InProcess(r) => r.create_with(opts, factory),
@@ -926,6 +964,7 @@ impl SessionManager {
     }
 
     /// Whether a session with `uid` is currently live.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn has(&self, uid: &str) -> bool {
         match self {
             SessionManager::InProcess(r) => r.has(uid),
@@ -941,6 +980,7 @@ impl SessionManager {
     /// foreground process group, a daemon that predates the field) — never "nothing is
     /// running". Per `docs/tool-panes-plan.md` §D5 the answer may upgrade a pane's chrome
     /// and must never rewrite what the pane relaunches.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn foreground_name(&self, uid: &str) -> Option<String> {
         match self {
             SessionManager::InProcess(r) => r.foreground_name(uid),
@@ -953,6 +993,7 @@ impl SessionManager {
     ///
     /// This is the answer the left panel roots itself on when it follows the focused pane,
     /// and it is a live sample — a `cd` moves it without the shell having to cooperate.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn foreground_cwd(&self, uid: &str) -> Option<String> {
         match self {
             SessionManager::InProcess(r) => r.foreground_cwd(uid),
@@ -961,6 +1002,7 @@ impl SessionManager {
     }
 
     /// The uids of all live sessions.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn uids(&self) -> Vec<String> {
         match self {
             SessionManager::InProcess(r) => r.uids(),
@@ -982,6 +1024,7 @@ impl SessionManager {
     /// Otherwise [`PaneLoad::Spawn`]: mint a fresh uid and re-spawn from the spec. Callers
     /// must use the returned uid verbatim — re-attaching under any other uid would spawn a
     /// second session instead of adopting the survivor.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_load(&self, recorded_uid: Option<&str>) -> PaneLoad {
         match recorded_uid {
             Some(uid) if self.is_daemon() && self.has(uid) => PaneLoad::Reattach(uid.to_string()),
@@ -990,6 +1033,7 @@ impl SessionManager {
     }
 
     /// Recent output for a re-attaching view (the rolling replay buffer).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn replay(&self, uid: &str) -> Option<String> {
         match self {
             SessionManager::InProcess(r) => r.replay(uid),
@@ -999,6 +1043,7 @@ impl SessionManager {
 
     /// Monotonic count of all output UTF-16 code units ever emitted (the `since`
     /// cursor; pair with `control::output::sliceSince`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn output_bytes(&self, uid: &str) -> Option<u64> {
         match self {
             SessionManager::InProcess(r) => r.output_bytes(uid),
@@ -1008,6 +1053,7 @@ impl SessionManager {
 
     /// Epoch-ms of the last output flush, or `None` if the pane has produced nothing
     /// yet (feeds `control::output::waitDecision`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn last_output_at(&self, uid: &str) -> Option<u64> {
         match self {
             SessionManager::InProcess(r) => r.last_output_at(uid),
@@ -1018,6 +1064,7 @@ impl SessionManager {
     /// Serialize the pane's current screen to clean text (for `mode:"screen"` reads).
     /// Brings the lazily-fed screen mirror fully up to date first (see `screen_pending`);
     /// the daemon backend does a bounded `RenderScreen` round-trip.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn render_screen(&self, uid: &str) -> Option<String> {
         match self {
             SessionManager::InProcess(r) => r.render_screen(uid),
@@ -1033,6 +1080,7 @@ impl SessionManager {
     /// `POST /panes/{id}/input` came to answer `{"ok": true}` for keystrokes that landed
     /// nowhere. A caller that genuinely does not care can still say `let _ =`; the point is
     /// that it has to say so.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn write(&self, uid: &str, data: &str) -> io::Result<()> {
         match self {
             SessionManager::InProcess(r) => r.write(uid, data),
@@ -1047,6 +1095,7 @@ impl SessionManager {
     /// the client doesn't fold them into a shadow), so it returns `None` → the activity
     /// ticker keeps using the silence heuristic for daemon-backed panes. STUB: a later
     /// pass can mirror markers into `daemon_client::Shadow` like `last_output_at`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn liveness(&self, uid: &str) -> Option<Liveness> {
         match self {
             SessionManager::InProcess(r) => r.liveness(uid),
@@ -1055,6 +1104,7 @@ impl SessionManager {
     }
 
     /// Resize the pane (≥1×1) — both the pty grid and the live screen model.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn resize(&self, uid: &str, cols: u16, rows: u16) {
         match self {
             SessionManager::InProcess(r) => r.resize(uid, cols, rows),
@@ -1066,6 +1116,7 @@ impl SessionManager {
     /// is mirrored into the shadow from each `SessionMeta`, so it is one snapshot old
     /// rather than live — close enough for the two callers that want it (`/state`, and the
     /// re-attach seed, which needs the width the retained replay was written at).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn dims(&self, uid: &str) -> Option<(u16, u16)> {
         match self {
             SessionManager::InProcess(r) => r.dims(uid),
@@ -1075,6 +1126,7 @@ impl SessionManager {
 
     /// The replay buffer + byte cursor as an ATOMIC pair (see the in-process impl) —
     /// what remote clients seed from before splicing the live `output` frame stream.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn replay_with_cursor(&self, uid: &str) -> Option<(String, u64)> {
         match self {
             SessionManager::InProcess(r) => r.replay_with_cursor(uid),
@@ -1084,6 +1136,7 @@ impl SessionManager {
 
     /// Kill the pane's pty and forget it. The natural-exit `Exit` event is suppressed
     /// (mirrors TS `destroy()`), so a deliberate kill is silent.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn kill(&self, uid: &str) {
         match self {
             SessionManager::InProcess(r) => r.kill(uid),
@@ -1092,6 +1145,7 @@ impl SessionManager {
     }
 
     /// Kill every live pane and clear the map.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn kill_all(&self) {
         match self {
             SessionManager::InProcess(r) => r.kill_all(),
@@ -1105,6 +1159,7 @@ impl SessionManager {
     /// PTYs die with the GUI on exit anyway (the GUI's `main` already calls `kill_all` on the
     /// way out). Returns whether a daemon shutdown was actually requested, so a caller can
     /// distinguish "told the daemon to stop" from "nothing to do".
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn shutdown_daemon(&self) -> bool {
         match self {
             SessionManager::InProcess(_) => false,
@@ -1129,6 +1184,7 @@ impl SessionManager {
     ///
     /// See [`DaemonSessionManager::claim`](crate::session::daemon_client::DaemonSessionManager::claim)
     /// for the round-trip and the fail-closed policy.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn claim_session(&self, uid: &str) -> bool {
         match self {
             SessionManager::InProcess(_) => true,
@@ -1139,6 +1195,7 @@ impl SessionManager {
     /// Announce a claim on `uid` without blocking — for a pane this process already hosts
     /// (it created it, or it won the race to adopt it). Called from the GUI pump, so it must
     /// never wait on the daemon. Inert in-process.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn announce_claim(&self, uid: &str) {
         match self {
             SessionManager::InProcess(_) => {}
@@ -1149,6 +1206,7 @@ impl SessionManager {
     /// Give up this process's claim on `uid` (a pane that was closed but whose session
     /// stays alive). Inert in-process. Not needed for crash safety — the daemon releases
     /// every claim of a connection when that connection's socket closes.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn release_session(&self, uid: &str) {
         match self {
             SessionManager::InProcess(_) => {}
@@ -1159,6 +1217,7 @@ impl SessionManager {
     /// The uids some **other** hyperpanes process is currently hosting — what the left
     /// panel subtracts from its detached list so it never offers to adopt a pane that is
     /// visibly running in another window. Empty for the in-process backend.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn sessions_claimed_elsewhere(&self) -> std::collections::HashSet<String> {
         match self {
             SessionManager::InProcess(_) => std::collections::HashSet::new(),
@@ -1169,6 +1228,7 @@ impl SessionManager {
 
 // Build the resolved pty spec from spawn options — the port of the TS `Session`
 // constructor's resolution block (resolveSpawn → win-resolve → integration → env).
+#[tracing::instrument(level = "debug", skip_all)]
 fn build_spec(opts: &SpawnOptions) -> PtySpec {
     let shell = opts.shell.clone().unwrap_or_else(default_shell);
     let args = opts.args.as_deref();
@@ -1242,6 +1302,7 @@ fn build_spec(opts: &SpawnOptions) -> PtySpec {
 /// resolved env's `$HOME` if that exists, else the daemon/process cwd, else `/` (which
 /// always exists on unix). `None` only if even the process cwd is unreadable AND there
 /// is no usable `$HOME` — leaving the pty layer to apply its own fallback.
+#[tracing::instrument(level = "debug", skip_all)]
 fn resolve_spawn_cwd(requested: Option<&str>, env: &EnvMap) -> Option<String> {
     let is_dir = |p: &str| std::path::Path::new(p).is_dir();
     if let Some(c) = requested {
@@ -1265,6 +1326,7 @@ fn resolve_spawn_cwd(requested: Option<&str>, env: &EnvMap) -> Option<String> {
     None
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn epoch_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1274,6 +1336,7 @@ fn epoch_ms() -> u64 {
 
 // The async driver: pull pty events, run them through the pipeline, forward emitted
 // session events to the manager channel, and on terminal exit remove the session.
+#[tracing::instrument(level = "debug", ret, skip(pipeline, sessions))]
 async fn drive_session(
     mut pipeline: SessionPipeline,
     mut prx: UnboundedReceiver<PtyEvent>,
@@ -1343,6 +1406,7 @@ struct SessionPipeline {
 }
 
 impl SessionPipeline {
+    #[tracing::instrument(level = "debug", skip(shared))]
     fn new(uid: String, shared: Arc<Shared>) -> Self {
         Self {
             uid,
@@ -1359,12 +1423,14 @@ impl SessionPipeline {
     /// Streaming UTF-8 decode of a raw pty chunk, buffering an incomplete trailing
     /// sequence so a multibyte glyph split across reads isn't mangled (node-pty's
     /// `StringDecoder` does the same). Genuinely invalid bytes become U+FFFD.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn decode(&mut self, chunk: &[u8]) -> String {
         decode_utf8_streaming(&mut self.utf8_carry, chunk)
     }
 
     /// Handle a decoded raw chunk: sniff cwd (pre-batch), then feed the batcher. A
     /// size-triggered flush is processed inline.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn on_data(&mut self, raw: &str, now_mono_ms: u64, now_epoch_ms: u64) -> Vec<SessionEvent> {
         if self.ended {
             return Vec::new();
@@ -1404,6 +1470,7 @@ impl SessionPipeline {
     }
 
     /// A time-triggered flush from the driver's 16 ms timer.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn on_timer(&mut self, now_epoch_ms: u64) -> Vec<SessionEvent> {
         let mut out = Vec::new();
         if let Some(flushed) = self.batcher.flush() {
@@ -1414,6 +1481,7 @@ impl SessionPipeline {
 
     /// Terminal pty exit. On a *natural* exit, flush remaining output then emit `Exit`.
     /// On a manual kill (`shared.killed`), stay silent — mirrors TS `destroy()` gating.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn on_exit(&mut self, code: i32, now_epoch_ms: u64) -> Vec<SessionEvent> {
         if self.ended {
             return Vec::new();
@@ -1439,6 +1507,7 @@ impl SessionPipeline {
     // removes the per-flush second VTE parse (the GUI grid already parses the same bytes
     // via `SessionEvent::Data`), which was pure wasted CPU when no control client reads
     // the screen. See `Shared::screen_pending`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn flush_into(&mut self, data: String, now_epoch_ms: u64, out: &mut Vec<SessionEvent>) {
         let n = data.encode_utf16().count() as u64;
         // Bump the cursor while HOLDING the replay lock: `replay_with_cursor` reads the
@@ -1466,6 +1535,7 @@ impl SessionPipeline {
 }
 
 /// Map a parsed phase-4 [`Marker`](crate::session::osc133::Marker) to its `SessionEvent`.
+#[tracing::instrument(level = "debug", ret)]
 fn marker_to_event(uid: &str, m: &crate::session::osc133::Marker) -> SessionEvent {
     use crate::session::osc133::Marker;
     match m {
@@ -1491,6 +1561,7 @@ fn marker_to_event(uid: &str, m: &crate::session::osc133::Marker) -> SessionEven
 /// keep only an incomplete trailing sequence in `carry` for the next call. Invalid
 /// bytes are replaced with U+FFFD (matching `from_utf8_lossy`). Free function so it can
 /// be unit-tested directly.
+#[tracing::instrument(level = "debug", ret)]
 pub fn decode_utf8_streaming(carry: &mut Vec<u8>, chunk: &[u8]) -> String {
     carry.extend_from_slice(chunk);
     let mut decoded = String::new();

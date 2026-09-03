@@ -34,6 +34,7 @@ thread_local! {
 ///
 /// The first hook for a key installs the underlying Slint filter; later ones just join the
 /// list, so callers never have to know whether they are first.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn add(win: &slint::Window, key: isize, hook: Hook) {
     let first = HOOKS.with(|h| {
         let mut h = h.borrow_mut();
@@ -49,12 +50,14 @@ pub fn add(win: &slint::Window, key: isize, hook: Hook) {
 /// Forget every hook for a window (called when its native handle is retired, so a later
 /// window that reuses the address doesn't inherit them).
 #[allow(dead_code)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn clear(key: isize) {
     HOOKS.with(|h| {
         h.borrow_mut().remove(&key);
     });
 }
 
+#[tracing::instrument(level = "debug", skip(win))]
 fn dispatch(key: isize, win: &slint::Window, ev: &WindowEvent) -> EventResult {
     // Take the list out for the duration of the call. A hook is free to `add` another one
     // while it runs; holding the borrow across that would panic, and re-entering

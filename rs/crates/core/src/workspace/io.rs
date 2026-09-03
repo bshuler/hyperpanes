@@ -42,6 +42,7 @@ pub struct WorkspaceEnvelope {
 
 impl WorkspaceEnvelope {
     /// Wrap a workspace payload in the current-version envelope.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn wrap(workspace: WorkspaceFile) -> Self {
         Self {
             format: ENVELOPE_FORMAT.to_string(),
@@ -56,6 +57,7 @@ impl WorkspaceEnvelope {
 /// envelope with the wrong `format` or a `version` this build doesn't understand is an
 /// error (a bare object is never mistaken for an envelope — the legacy schema has no
 /// `format` field).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn parse_workspace_str(raw: &str) -> Result<WorkspaceFile, String> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
@@ -100,6 +102,7 @@ pub fn parse_workspace_str(raw: &str) -> Result<WorkspaceFile, String> {
 /// Node `path.isAbsolute` semantics for the current platform. On Windows a leading
 /// `/` or `\`, or a drive-rooted `C:\` / `C:/`, is absolute (a drive-relative `C:foo`
 /// is NOT); on POSIX, a leading `/`.
+#[tracing::instrument(level = "debug", ret)]
 fn node_is_absolute(p: &str) -> bool {
     let b = p.as_bytes();
     if b.is_empty() {
@@ -119,6 +122,7 @@ fn node_is_absolute(p: &str) -> bool {
 }
 
 /// Normalise away `.` / `..` components (like the tail of node `path.resolve`).
+#[tracing::instrument(level = "debug", ret)]
 fn normalize(path: PathBuf) -> PathBuf {
     let mut out = PathBuf::new();
     for comp in path.components() {
@@ -135,6 +139,7 @@ fn normalize(path: PathBuf) -> PathBuf {
 
 /// `path.resolve(base, p)` for a relative `p`: join onto `base`, make absolute against
 /// the process cwd if needed, then normalise.
+#[tracing::instrument(level = "debug", ret)]
 fn resolve_from(base: &str, p: &str) -> String {
     let mut combined = PathBuf::from(base);
     combined.push(p);
@@ -148,6 +153,7 @@ fn resolve_from(base: &str, p: &str) -> String {
     normalize(abs).to_string_lossy().into_owned()
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn fix_panes(panes: &mut [PaneSpec], base_dir: &str) {
     for p in panes.iter_mut() {
         if let Some(cwd) = &p.cwd {
@@ -161,6 +167,7 @@ fn fix_panes(panes: &mut [PaneSpec], base_dir: &str) {
 }
 
 /// Resolve relative pane cwds against `base_dir`, across all three nesting levels.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve_cwds(file: &WorkspaceFile, base_dir: &str) -> WorkspaceFile {
     let mut out = file.clone();
     if let Some(panes) = out.panes.as_mut() {
@@ -182,6 +189,7 @@ pub fn resolve_cwds(file: &WorkspaceFile, base_dir: &str) -> WorkspaceFile {
 }
 
 /// A file is loadable if it describes panes at any nesting level.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn has_panes(file: &WorkspaceFile) -> bool {
     file.panes.is_some() || file.groups.is_some() || file.windows.is_some()
 }
@@ -196,7 +204,9 @@ pub fn has_panes(file: &WorkspaceFile) -> bool {
 /// content-empty — and a shape check would let that empty shell outrank a real repo
 /// file forever. This is the *content* check; use it wherever "describes panes" is
 /// meant literally.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn describes_panes(file: &WorkspaceFile) -> bool {
+    #[tracing::instrument(level = "debug", ret)]
     fn any_group_has_panes(groups: &[GroupSpec]) -> bool {
         groups.iter().any(|g| !g.panes.is_empty())
     }
@@ -210,6 +220,7 @@ pub fn describes_panes(file: &WorkspaceFile) -> bool {
 
 /// Read + validate a workspace file, resolving relative cwds against its directory.
 /// Returns `None` on read/parse error or a contentless file.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn read_workspace<P: AsRef<Path>>(path: P) -> Option<WorkspaceFile> {
     let path = path.as_ref();
     let raw = std::fs::read_to_string(path).ok()?;
@@ -235,6 +246,7 @@ pub fn read_workspace<P: AsRef<Path>>(path: P) -> Option<WorkspaceFile> {
 /// form (`format`/`version`/`workspace`). Returns `false` on error (mirroring the TS
 /// `writeWorkspace` boolean). The reader stays tolerant of bare legacy files, so older
 /// `.json` workspaces keep loading even though saves are now always versioned.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn write_workspace<P: AsRef<Path>>(path: P, data: &WorkspaceFile) -> bool {
     let envelope = WorkspaceEnvelope::wrap(data.clone());
     let Ok(json) = serde_json::to_string_pretty(&envelope) else {
@@ -246,6 +258,7 @@ pub fn write_workspace<P: AsRef<Path>>(path: P, data: &WorkspaceFile) -> bool {
 /// Normalise any workspace file into a flat list of windows the launcher seeds from.
 /// Precedence: `windows` (verbatim, groupless dropped) → `groups` (one window) →
 /// `panes` (one window, one tab). `[]` for `None` / contentless input.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn windows_of(file: Option<&WorkspaceFile>) -> Vec<WindowSpec> {
     let Some(file) = file else {
         return Vec::new();

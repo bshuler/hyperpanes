@@ -124,6 +124,7 @@ impl Shared {
     /// `speech_settings_path` is `speech.json`'s path — a real embedder passes
     /// [`paths::speech_json`](crate::persistence::paths::speech_json); tests pass a scratch
     /// path so `cargo test` never touches the developer's real settings file.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn new(
         sessions: Arc<SessionManager>,
         allow_input: bool,
@@ -162,11 +163,13 @@ impl Shared {
     /// Set the requested bind address/port (from `control_settings`) BEFORE `run_server`.
     /// `address` must be a bare IP (the settings loader already validated it); `port` 0 =
     /// ephemeral.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn set_bind(&self, address: impl Into<String>, port: u16) {
         *self.bind.lock().unwrap() = (address.into(), port);
     }
 
     /// The requested `(address, port)` to bind.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn bind_config(&self) -> (String, u16) {
         self.bind.lock().unwrap().clone()
     }
@@ -174,6 +177,7 @@ impl Shared {
     /// The host to advertise in `control.json` / `POST /tokens` events URLs: the bind
     /// address itself, except unspecified (`0.0.0.0` / `::`) — which listens on loopback
     /// too — where the legacy `127.0.0.1` stays correct for local readers.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn advertised_host(&self) -> String {
         let (addr, _) = self.bind_config();
         match addr.parse::<std::net::IpAddr>() {
@@ -185,18 +189,21 @@ impl Shared {
 
     /// Flag that the project registry changed off-thread (a `/projects` write or a
     /// project-opening `newPane`), so the GUI host reloads the sidebar rail next tick.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn mark_projects_dirty(&self) {
         self.projects_dirty.store(true, Ordering::SeqCst);
     }
 
     /// Atomically read-and-clear the project-registry dirty flag. The GUI host calls this
     /// once per UI tick; returns `true` exactly once per batch of changes.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn take_projects_dirty(&self) -> bool {
         self.projects_dirty.swap(false, Ordering::SeqCst)
     }
 
     /// Bind background-task spawns (the `notify_state` coalescer) to an explicit runtime handle.
     /// Idempotent — only the first set takes effect.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn set_runtime(&self, handle: Handle) {
         let _ = self.runtime.set(handle);
     }
@@ -207,6 +214,7 @@ impl Shared {
     /// tests never do, so they keep the ephemeral in-memory queue. Failure is non-fatal — we
     /// log and keep the in-memory queue rather than take down the control plane over a queue
     /// that many sessions never touch.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn attach_durable_work_queue(&self) {
         let path = crate::persistence::paths::work_db();
         if let Some(dir) = path.parent() {
@@ -236,6 +244,7 @@ impl Shared {
     }
 
     /// Spawn a background task on the stored runtime handle if set, else the ambient runtime.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn spawn_task<F>(&self, fut: F)
     where
         F: Future<Output = ()> + Send + 'static,
@@ -250,10 +259,12 @@ impl Shared {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn port(&self) -> u16 {
         self.port.load(Ordering::SeqCst)
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn allow_input(&self) -> bool {
         self.allow_input.load(Ordering::SeqCst)
     }
@@ -262,6 +273,7 @@ impl Shared {
     /// that no longer exist. Called after every structural `/command` so a `setMeta` that
     /// flips `hp.supervise`, or a `newPane` with a `meta.hp.supervise`, takes effect. Cheap
     /// and idempotent — a disabled policy is recorded but yields `Decision::None`.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn reconcile_policies(&self) {
         use crate::control::supervisor::Policy;
         let panes: Vec<(String, std::collections::BTreeMap<String, String>)> = {
@@ -290,6 +302,7 @@ impl Shared {
     /// `status==='exited' ? 'exited' : idle ? 'idle' : 'busy'` with idle = "no output for the
     /// threshold"; a never-output pane reads `busy` (the renderer's `markActivity` only fires on
     /// output).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn compute_activity(&self, pane: &PaneInfo) -> Activity {
         activity_for(
             &self.sessions,
@@ -303,6 +316,7 @@ impl Shared {
 /// Free-function core of [`Shared::compute_activity`], factored out so `dispatch::recoverPane`
 /// (which has a `&SessionManager` but no `Shared`) reads liveness through the exact same
 /// source of truth as `/state`'s `activity` field, rather than a second, driftable copy.
+#[tracing::instrument(level = "debug", skip_all)]
 pub(crate) fn activity_for(
     sessions: &SessionManager,
     idle_threshold_ms: i64,
@@ -342,6 +356,7 @@ pub(crate) fn activity_for(
 /// Map a computed [`Activity`] + liveness snapshot into a `liveness` frame. The `state`
 /// string is `working | awaiting-input | done | exited`; `done` is used when the pane is
 /// awaiting input AND its last command exited cleanly (code 0), else `awaiting-input`.
+#[tracing::instrument(level = "debug", skip_all)]
 fn liveness_frame(
     pane_id: &str,
     act: Activity,
@@ -365,6 +380,7 @@ fn liveness_frame(
 }
 
 /// Current epoch-ms (the TS `Date.now()`).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -373,6 +389,7 @@ pub fn now_ms() -> i64 {
 }
 
 /// Coalesce structure changes into one "re-fetch /state" ping per ~100ms tick (TS `notifyState`).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn notify_state(shared: &Arc<Shared>) {
     if !shared.events.has_clients() {
         return;
@@ -408,10 +425,12 @@ struct Discovery<'a> {
 }
 
 /// Build the WS events URL for a host + port + token (also used by `POST /tokens`).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn events_url(host: &str, port: u16, token: &str) -> String {
     format!("ws://{host}:{port}/events?token={token}")
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn write_discovery(shared: &Arc<Shared>) -> io::Result<()> {
     let port = shared.port();
     let token = shared.tokens.lock().unwrap().master().map(str::to_string);
@@ -436,6 +455,7 @@ fn write_discovery(shared: &Arc<Shared>) -> io::Result<()> {
 /// Remove the discovery file (best-effort), so a stale `control.json` never points at a dead port.
 /// Owner-checked: only the instance whose pid the file records may delete it — a refused or
 /// hijacked instance stopping must not take the live owner's file down with it.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn remove_discovery(shared: &Arc<Shared>) {
     if crate::control::discovery_guard::recorded_pid(&shared.control_file) == Some(shared.pid) {
         let _ = std::fs::remove_file(&shared.control_file);
@@ -446,6 +466,7 @@ pub fn remove_discovery(shared: &Arc<Shared>) {
 /// until the process exits. Never returns under normal operation. The activity ticker is a
 /// SEPARATE task ([`run_activity_ticker`]) the embedder spawns alongside this one, so its
 /// lifetime can be torn down independently (the GUI host aborts it on stop — see `control_host`).
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn run_server(shared: Arc<Shared>) -> io::Result<()> {
     // A control file owned by a live, different-pid instance is not ours to claim — fail
     // loudly before binding anything (see control::discovery_guard).
@@ -491,6 +512,7 @@ pub async fn run_server(shared: Arc<Shared>) -> io::Result<()> {
 /// `control-token` file next to control.json instead — a paired phone must survive
 /// host restarts, or every reboot strands it until the user is back at the desk to
 /// re-scan a QR.
+#[tracing::instrument(level = "debug", skip_all)]
 fn master_token(shared: &Arc<Shared>) -> String {
     let (addr, _) = shared.bind_config();
     if addr == "127.0.0.1" {
@@ -543,6 +565,7 @@ const EXIT_CODE_UNOBSERVED: i32 = -1;
 ///
 /// Panes with no session uid (view panes, GUI-observed rows) are left alone: they have no
 /// session to have lost.
+#[tracing::instrument(level = "debug", skip_all)]
 fn reconcile_exits(shared: &Arc<Shared>) {
     let stale: Vec<PaneRef> = {
         let m = shared.model.lock().unwrap();
@@ -597,6 +620,7 @@ fn reconcile_exits(shared: &Arc<Shared>) {
 /// each flip of a KNOWN pane (a freshly-seen pane seeds its baseline silently — it rides the
 /// `state` ping). A pure busy⇄idle flip does NOT trigger a `state` ping (TS #13). Runs forever
 /// until its task is aborted (the GUI host holds its handle and aborts it on stop).
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn run_activity_ticker(shared: Arc<Shared>) {
     let mut interval = tokio::time::interval(Duration::from_millis(ACTIVITY_TICK_MS));
     let mut last: HashMap<String, Activity> = HashMap::new();
@@ -646,6 +670,7 @@ pub async fn run_activity_ticker(shared: Arc<Shared>) {
 /// spawns alongside [`run_activity_ticker`] and aborts on stop), it requeues every `claimed`
 /// task whose lease has expired — recovering a worker that died without a clean `Exit`, or one
 /// wedged past its lease. Exhausted tasks dead-letter. No-op (cheap indexed scan) when idle.
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn run_reaper_ticker(shared: Arc<Shared>) {
     let mut interval = tokio::time::interval(Duration::from_millis(REAPER_TICK_MS));
     loop {
@@ -663,6 +688,7 @@ pub async fn run_reaper_ticker(shared: Arc<Shared>) {
 /// Apply one live `SessionEvent` to the read-model and fan out the matching `/events` frame.
 /// `note_output` (byte cursor + last_output_at) is already done inside `SessionManager` BEFORE
 /// any subscriber guard, so `since`/`waitForIdle` work with zero clients (the ordering invariant).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn process_session_event(shared: &Arc<Shared>, ev: SessionEvent) {
     match ev {
         SessionEvent::Data { uid, data, cursor } => {
@@ -752,6 +778,7 @@ pub fn process_session_event(shared: &Arc<Shared>, ev: SessionEvent) {
 /// `exited_uid` is the session that just died. The scheduled restart carries it so that a
 /// pane the user restarted by hand during the backoff (a different, live uid by then) is
 /// left alone rather than respawned on top of — see [`do_restart`].
+#[tracing::instrument(level = "debug", skip_all)]
 fn supervise_exit(shared: &Arc<Shared>, pane_id: &str, exited_uid: &str, code: i32) {
     let decision = shared.supervisor.lock().unwrap().on_exit(pane_id, code);
     match decision {
@@ -807,6 +834,7 @@ fn supervise_exit(shared: &Arc<Shared>, pane_id: &str, exited_uid: &str, code: i
 /// `crashed` on a respawn error. STUB: this respawns from the read-model's recorded recipe (shell/args/command/
 /// cwd) rather than a full spawn ledger, so it does not yet re-attach `env`/`integration`
 /// (the same lossy set `restartPane` had pre-supervisor). A later pass adds the ledger.
+#[tracing::instrument(level = "debug", skip_all)]
 fn do_restart(
     shared: &Arc<Shared>,
     pane_id: &str,
@@ -890,6 +918,7 @@ fn do_restart(
 }
 
 /// Fan out a `supervisor` frame (scope-filtered to the pane).
+#[tracing::instrument(level = "debug", skip_all)]
 fn broadcast_supervisor(
     shared: &Arc<Shared>,
     pane_id: &str,
@@ -917,6 +946,7 @@ fn broadcast_supervisor(
 }
 
 /// Resolve a session uid to (pane_id, coords) under one model lock.
+#[tracing::instrument(level = "debug", skip_all)]
 fn pane_and_coords(
     shared: &Arc<Shared>,
     uid: &str,
@@ -928,6 +958,7 @@ fn pane_and_coords(
 }
 
 /// Emit a phase-4 `command` frame (scope-filtered) for a per-command edge.
+#[tracing::instrument(level = "debug", skip_all)]
 fn emit_command_frame(shared: &Arc<Shared>, uid: &str, phase: &str, code: Option<i32>) {
     if !shared.events.has_clients() {
         return;
@@ -946,6 +977,7 @@ fn emit_command_frame(shared: &Arc<Shared>, uid: &str, phase: &str, code: Option
 
 /// Emit a phase-4 `liveness` frame (scope-filtered) computed from the live mirror — the
 /// instant a marker arrives, before the ticker's next 500ms tick.
+#[tracing::instrument(level = "debug", skip_all)]
 fn emit_marker_liveness(shared: &Arc<Shared>, uid: &str) {
     if !shared.events.has_clients() {
         return;
@@ -978,6 +1010,7 @@ fn emit_marker_liveness(shared: &Arc<Shared>, uid: &str) {
 
 /// Drain the session-event channel forever, applying each event. (app.rs uses this when it has no
 /// extra taps; otherwise it runs its own loop calling [`process_session_event`].)
+#[tracing::instrument(level = "debug", skip_all)]
 pub async fn forward_session_events(shared: Arc<Shared>, mut rx: UnboundedReceiver<SessionEvent>) {
     while let Some(ev) = rx.recv().await {
         process_session_event(&shared, ev);
@@ -989,6 +1022,7 @@ pub async fn forward_session_events(shared: Arc<Shared>, mut rx: UnboundedReceiv
 /// the shared state (so the caller can seed the read-model) + the bound port. Session events are
 /// drained. Used by the std-only `tests/control_parity.rs` integration test and embedders that
 /// want a control server without driving the full `app::run` loop.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn serve_for_test(
     control_file: PathBuf,
     allow_input: bool,

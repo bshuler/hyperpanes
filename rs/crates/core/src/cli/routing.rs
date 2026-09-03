@@ -25,6 +25,7 @@ pub struct SecondInstance {
 
 /// Resolve a second `hyperpanes …` invocation (its `argv` + `cwd`) into windows +
 /// routing. No last-session fallback.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_second_instance_windows(argv: &[String], cwd: &str) -> SecondInstance {
     let parsed = parse_cli(argv);
 

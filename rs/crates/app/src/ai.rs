@@ -84,6 +84,7 @@ pub struct AiBridge {
 
 impl AiBridge {
     /// Spawn the engine thread (default-OFF) and return its UI-side handle.
+    #[tracing::instrument(level = "debug")]
     pub fn spawn() -> AiBridge {
         let (tx, rx) = unbounded_channel::<AiMsg>();
         let (data_tx, data_rx) = channel::<AiMsg>(DATA_CHANNEL_CAP);
@@ -126,11 +127,13 @@ impl AiBridge {
 
     /// Whether the engine is currently enabled (cached from the latest status). Gates the
     /// per-tick rendered-screen scan so the default-OFF path does no work.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn enabled(&self) -> bool {
         self.enabled.get()
     }
 
     /// Send a message to the engine thread (no-op if the thread has gone).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn send(&self, msg: AiMsg) {
         let _ = self.tx.send(msg);
     }
@@ -139,6 +142,7 @@ impl AiBridge {
     /// Bounded + `try_send`: if the engine is stalled (e.g. a slow Ollama job) the tap is
     /// dropped rather than queued unbounded — the next debounced `pump_ai` tick re-feeds the
     /// latest screen, so dropping is latest-wins, not data loss.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn feed_data(&self, uid: &str, data: &str) {
         if self.enabled.get() {
             let _ = self.data_tx.try_send(AiMsg::Data {
@@ -149,6 +153,7 @@ impl AiBridge {
     }
 
     /// Drain any produced subtitle pushes the UI pump should apply this tick.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn drain_meta(&self) -> Vec<MetaUpdate> {
         let mut out = Vec::new();
         let mut rx = self.meta_rx.borrow_mut();
@@ -160,6 +165,7 @@ impl AiBridge {
 
     /// Drain status transitions, updating the cached status + enabled flag. Returns `true`
     /// if anything changed (so the caller can refresh the Preferences projection).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn drain_status(&self) -> bool {
         let mut changed = false;
         let mut rx = self.status_rx.borrow_mut();
@@ -172,6 +178,7 @@ impl AiBridge {
     }
 
     /// The latest status (for the Preferences dialog).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn status(&self) -> AiStatus {
         self.status.borrow().clone()
     }
@@ -180,6 +187,7 @@ impl AiBridge {
 /// The engine's own event loop, running on its dedicated current-thread runtime. Mirrors
 /// `core::app::ai_loop`, extended with the pane-context publish + the enable/configure
 /// controls the GUI Preferences drives.
+#[tracing::instrument(level = "debug", ret)]
 async fn ai_loop(
     settings_path: PathBuf,
     memory_path: PathBuf,
@@ -274,6 +282,7 @@ async fn ai_loop(
 
 /// Spawn an off-loop reachability ping (up to 3s) so enable/configure never block the
 /// control loop; the result lands on `ping_tx` and is applied via `AiService::apply_ping`.
+#[tracing::instrument(level = "debug", ret, skip(ai))]
 fn spawn_ping(ai: &AiService<OllamaClient>, ping_tx: &UnboundedSender<bool>) {
     let client = ai.ping_client();
     let ping_tx = ping_tx.clone();

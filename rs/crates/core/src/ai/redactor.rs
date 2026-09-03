@@ -33,6 +33,7 @@
 const TOKEN: &[u8] = b"[REDACTED]";
 
 /// Strip likely secrets from `text`, replacing each with `[REDACTED]`.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn redact(text: &str) -> String {
     if text.is_empty() {
         return String::new();
@@ -53,23 +54,28 @@ pub fn redact(text: &str) -> String {
 
 // ---- character classes (ASCII) ----
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn is_word_dot_dash(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'-'
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn is_jwt_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn is_pem_header_char(b: u8) -> bool {
     b.is_ascii_uppercase() || b.is_ascii_digit() || b == b' '
 }
 
 // JS \s (the ASCII subset; the non-ASCII members never appear in our inputs).
+#[tracing::instrument(level = "debug", skip_all)]
 fn is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x0b)
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn find_sub(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() || from > hay.len() {
         return None;
@@ -80,6 +86,7 @@ fn find_sub(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
         .map(|p| p + from)
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn eq_ci(hay: &[u8], at: usize, lit: &[u8]) -> bool {
     at + lit.len() <= hay.len() && hay[at..at + lit.len()].eq_ignore_ascii_case(lit)
 }
@@ -93,6 +100,7 @@ fn eq_ci(hay: &[u8], at: usize, lit: &[u8]) -> bool {
 // Given `start` is the index immediately after a "-----BEGIN " / "-----END "
 // literal, returns the index just past the closing "-----" iff a valid
 // `(?:[A-Z0-9 ]+ )?PRIVATE KEY-----` follows.
+#[tracing::instrument(level = "debug", skip_all)]
 fn pem_header_end(b: &[u8], start: usize) -> Option<usize> {
     let mut p = start;
     while p < b.len() && is_pem_header_char(b[p]) {
@@ -107,6 +115,7 @@ fn pem_header_end(b: &[u8], start: usize) -> Option<usize> {
     }
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn redact_pem(b: &[u8]) -> Vec<u8> {
     const BEGIN: &[u8] = b"-----BEGIN ";
     const END: &[u8] = b"-----END ";
@@ -139,6 +148,7 @@ fn redact_pem(b: &[u8]) -> Vec<u8> {
 }
 
 // ---- JWT: eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+ ----
+#[tracing::instrument(level = "debug", skip_all)]
 fn redact_jwt(b: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -156,6 +166,7 @@ fn redact_jwt(b: &[u8]) -> Vec<u8> {
     out
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn jwt_match(b: &[u8], start: usize) -> Option<usize> {
     // "eyJ" then >=1 class, '.', >=1 class, '.', >=1 class.
     let mut p = start + 3; // past "eyJ"
@@ -193,6 +204,7 @@ fn jwt_match(b: &[u8], start: usize) -> Option<usize> {
 }
 
 // ---- AWS access key id: AKIA[0-9A-Z]{16} ----
+#[tracing::instrument(level = "debug", skip_all)]
 fn redact_aws(b: &[u8]) -> Vec<u8> {
     const PREFIX: &[u8] = b"AKIA";
     let mut out = Vec::with_capacity(b.len());
@@ -218,6 +230,7 @@ fn redact_aws(b: &[u8]) -> Vec<u8> {
 
 // ---- Authorization header: keep scheme, redact only the credential ----
 //   (Authorization:\s*(?:Bearer|Basic)\s+)(\S+)  [case-insensitive]
+#[tracing::instrument(level = "debug", skip_all)]
 fn redact_auth(b: &[u8]) -> Vec<u8> {
     const AUTH: &[u8] = b"Authorization:";
     let mut out = Vec::with_capacity(b.len());
@@ -240,6 +253,7 @@ fn redact_auth(b: &[u8]) -> Vec<u8> {
 
 // Returns (prefix_end, credential_end): prefix is everything up to and including
 // the `\s+` after the scheme; the credential is the following `\S+`.
+#[tracing::instrument(level = "debug", skip_all)]
 fn auth_match(b: &[u8], start: usize) -> Option<(usize, usize)> {
     let mut p = start + b"Authorization:".len();
     while p < b.len() && is_ws(b[p]) {
@@ -273,6 +287,7 @@ fn auth_match(b: &[u8], start: usize) -> Option<(usize, usize)> {
 // ---- secret-ish KEY=VALUE ----
 //   ([\w.-]*SECRET_KEY[\w.-]*)(\s*=\s*)(?:"([^"\r\n]*)"|'([^'\r\n]*)'|([^\s\r\n]*))
 // SECRET_KEY = SECRET|TOKEN|PASSWORD|PASSWD|API[_-]?KEY|PRIVATE[_-]?KEY|ACCESS[_-]?KEY|CREDENTIAL
+#[tracing::instrument(level = "debug", skip_all)]
 fn redact_kv(b: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -328,6 +343,7 @@ enum KvValue {
 
 // At `run_end` (just past the key), match `\s*=\s*` then a value. Returns the end
 // index of the `\s*=\s*` group and the parsed value.
+#[tracing::instrument(level = "debug", skip_all)]
 fn kv_value(b: &[u8], run_end: usize) -> Option<(usize, KvValue)> {
     let mut p = run_end;
     while p < b.len() && is_ws(b[p]) {
@@ -369,6 +385,7 @@ fn kv_value(b: &[u8], run_end: usize) -> Option<(usize, KvValue)> {
 }
 
 // Does `run` (a [\w.-] slice) contain a secret keyword as a substring?
+#[tracing::instrument(level = "debug", skip_all)]
 fn run_contains_secret_key(run: &[u8]) -> bool {
     let n = run.len();
     for start in 0..n {
@@ -379,6 +396,7 @@ fn run_contains_secret_key(run: &[u8]) -> bool {
     false
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn secret_key_at(run: &[u8], at: usize) -> bool {
     // simple alternatives
     for lit in [

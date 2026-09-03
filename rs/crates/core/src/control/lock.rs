@@ -35,6 +35,7 @@ pub struct PaneLocks {
 }
 
 impl PaneLocks {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -42,6 +43,7 @@ impl PaneLocks {
     /// Acquire/renew. Succeeds if the pane is free, the prior lock has expired, or
     /// the requester already holds it (renew). Fails (`ok:false`) if a *different*
     /// owner holds an unexpired lock — the result names the blocking holder.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn acquire(&mut self, pane_id: &str, owner: &str, now: i64, ttl_ms: i64) -> LockResult {
         if let Some(cur) = self.locks.get(pane_id) {
             if cur.expires_at > now && cur.owner != owner {
@@ -68,6 +70,7 @@ impl PaneLocks {
     }
 
     /// Release. Only the holder may release; an expired/absent lock counts as freed.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn release(&mut self, pane_id: &str, owner: &str, now: i64) -> bool {
         match self.locks.get(pane_id) {
             None => {
@@ -88,6 +91,7 @@ impl PaneLocks {
 
     /// The current unexpired holder, or `None` if the pane is free. `send_input`
     /// uses this: free → anyone writes; held → only that owner writes.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn holder(&self, pane_id: &str, now: i64) -> Option<String> {
         match self.locks.get(pane_id) {
             Some(cur) if cur.expires_at > now => Some(cur.owner.clone()),
@@ -96,6 +100,7 @@ impl PaneLocks {
     }
 
     /// Forget a pane's lock (on close).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn drop(&mut self, pane_id: &str) {
         self.locks.remove(pane_id);
     }

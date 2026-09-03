@@ -4,15 +4,18 @@
 
 use crate::control_cli;
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn wants_devices(argv: &[String]) -> bool {
     argv.get(1).map(|a| a == "devices").unwrap_or(false)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn wants_revoke(argv: &[String]) -> bool {
     argv.get(1).map(|a| a == "revoke").unwrap_or(false)
 }
 
 /// `hyperpanes devices` — print each paired device's label + expiry (tokens are never shown).
+#[tracing::instrument(level = "debug", ret)]
 pub fn run_list() -> std::io::Result<()> {
     let conn = control_cli::connect().unwrap_or_else(|e| {
         eprintln!("{e}");
@@ -57,6 +60,7 @@ pub fn run_list() -> std::io::Result<()> {
 }
 
 /// `hyperpanes revoke <label>` — revoke every device carrying that label.
+#[tracing::instrument(level = "debug", ret)]
 pub fn run_revoke(argv: &[String]) -> std::io::Result<()> {
     let Some(label) = argv.get(2).filter(|s| !s.is_empty()) else {
         eprintln!("usage: hyperpanes revoke <label>   (see `hyperpanes devices` for labels)");

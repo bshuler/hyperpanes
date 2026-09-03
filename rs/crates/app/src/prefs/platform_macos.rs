@@ -34,18 +34,21 @@ pub const FONT_OPTIONS: [(&str, &str); 7] = [
 ];
 
 /// The path the empty "System default" value resolves to: Monaco (always installed).
+#[tracing::instrument(level = "debug", ret)]
 pub fn default_font() -> String {
     super::resolve_font("Monaco.ttf").unwrap_or_else(|| FALLBACK_FONT.to_string())
 }
 
 /// Family-name resolution beyond the file-name join — not needed on macOS, where the
 /// picker values are real file names under the system font libraries.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_family(_family: &str) -> Option<String> {
     None
 }
 
 /// The shell to prefer when the user picked "System": the login shell from `$SHELL` when
 /// it's set and present, else `/bin/zsh` — the macOS default login shell, always present.
+#[tracing::instrument(level = "debug", ret)]
 pub fn preferred_shell() -> Option<String> {
     if let Ok(shell) = std::env::var("SHELL") {
         if !shell.is_empty() && std::path::Path::new(&shell).exists() {
@@ -58,6 +61,7 @@ pub fn preferred_shell() -> Option<String> {
 /// The directories scanned for the candidate font files: the per-user folder first (a
 /// user-installed font wins), the local and system font libraries, and the baked-in font
 /// dir last (so the shipped OFL fonts always resolve).
+#[tracing::instrument(level = "debug", ret)]
 pub fn font_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {

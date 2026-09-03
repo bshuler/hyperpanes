@@ -32,12 +32,14 @@ pub struct TokenInfo {
 
 /// 32 random bytes as lowercase hex — byte-identical to the TS
 /// `randomBytes(32).toString('hex')` master/scoped token shape (64 hex chars).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut bytes);
     to_hex(&bytes)
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn to_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut s = String::with_capacity(bytes.len() * 2);
@@ -76,16 +78,19 @@ pub struct TokenStore {
 }
 
 impl TokenStore {
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Install a freshly-minted master token (called on server start).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn set_master(&mut self, token: String) {
         self.master = Some(token);
     }
 
     /// The master token string (for writing `control.json`), or `None` before start.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn master(&self) -> Option<&str> {
         self.master.as_deref()
     }
@@ -93,6 +98,7 @@ impl TokenStore {
     /// Forget every token (server stop): the master is nulled and scoped tokens cleared. Device
     /// tokens are cleared from memory too — they live on in `device-tokens.json` and are reloaded
     /// on the next start via [`Self::add_device`].
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn clear(&mut self) {
         self.master = None;
         self.scoped.clear();
@@ -101,6 +107,7 @@ impl TokenStore {
 
     /// Constant-time master-token compare, length-guarded so `ct_eq` can't be fed mismatched
     /// slices (the TS `timingSafeEqual` guard). False if no master is set or `presented` empty.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn token_matches(&self, presented: &str) -> bool {
         match &self.master {
             Some(m) if !presented.is_empty() => {
@@ -115,6 +122,7 @@ impl TokenStore {
     /// Resolve a presented bearer to its authority: the master token (constant-time) →
     /// unscoped; a known, unexpired minted token → its scope; else `None`. Expired scoped
     /// tokens are pruned on access (`now` = ms epoch), exactly as TS `resolveToken` does.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn resolve(&mut self, presented: Option<&str>, now: i64) -> Option<TokenInfo> {
         let presented = presented?;
         if presented.is_empty() {
@@ -150,6 +158,7 @@ impl TokenStore {
 
     /// Mint + register a scoped token, optionally TTL'd. Returns the token and its expiry
     /// (`now + ttl_ms` when a positive TTL is given, else `None`).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn mint(&mut self, scope: Scope, ttl_ms: Option<i64>, now: i64) -> (String, Option<i64>) {
         let token = random_token();
         let expires_at = ttl_ms.filter(|&t| t > 0).map(|t| now + t);
@@ -169,6 +178,7 @@ impl TokenStore {
     ///
     /// `ssh_key`, when given, pairs the same device's SSH public key in the same record, so the
     /// embedded SSH server (M3) accepts it and `revoke_device` drops both credentials together.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn mint_device(
         &mut self,
         label: String,
@@ -190,6 +200,7 @@ impl TokenStore {
     }
 
     /// Register a device token loaded from `device-tokens.json` on start (mints nothing new).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn add_device(
         &mut self,
         token: String,
@@ -209,6 +220,7 @@ impl TokenStore {
 
     /// Revoke every device token carrying `label`. Returns how many were dropped (0 = no such
     /// label). Labels are not enforced-unique at mint, so all matches are removed together.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn revoke_device(&mut self, label: &str) -> usize {
         let before = self.devices.len();
         self.devices.retain(|_, d| d.label != label);
@@ -218,6 +230,7 @@ impl TokenStore {
     /// Snapshot of paired devices as `(token, info)`, for listing (`hyperpanes devices`) and for
     /// persisting the table to `device-tokens.json`. Every field of the record round-trips —
     /// dropping one here would silently un-pair whatever it held on the next rewrite.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn list_devices(&self) -> Vec<(String, DeviceInfo)> {
         self.devices
             .iter()

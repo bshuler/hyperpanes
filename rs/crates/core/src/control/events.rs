@@ -96,6 +96,7 @@ pub enum ControlEvent {
 
 impl ControlEvent {
     /// The exact wire bytes for this frame.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn to_json(&self) -> String {
         serde_json::to_string(self).expect("ControlEvent serializes")
     }
@@ -121,16 +122,19 @@ struct Inner {
 }
 
 impl EventHub {
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// True while ≥1 client is streaming — lets the hot output path bail when nobody listens.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn has_clients(&self) -> bool {
         !self.inner.lock().unwrap().clients.is_empty()
     }
 
     /// Register a client with its scope; returns its id + the channel its socket task drains.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn add_client(&self, scope: Option<Scope>) -> (u64, UnboundedReceiver<String>) {
         let (tx, rx) = unbounded_channel();
         let mut inner = self.inner.lock().unwrap();
@@ -140,17 +144,20 @@ impl EventHub {
         (id, rx)
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn remove_client(&self, id: u64) {
         self.inner.lock().unwrap().clients.retain(|c| c.id != id);
     }
 
     /// Drop every client's sender (server stop): each `handle_ws` `rx.recv()` then returns `None`
     /// and its socket task exits, so no WS task lingers holding an `Arc<Shared>` after a stop/toggle.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn clear_clients(&self) {
         self.inner.lock().unwrap().clients.clear();
     }
 
     /// Deliver one frame to a single client (the `hello` greeting on connect).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn send_to(&self, id: u64, event: &ControlEvent) {
         let json = event.to_json();
         let inner = self.inner.lock().unwrap();
@@ -160,6 +167,7 @@ impl EventHub {
     }
 
     /// Send to EVERY client (structure-only `state` ping). Serialized once.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn broadcast(&self, event: &ControlEvent) {
         let json = event.to_json();
         let inner = self.inner.lock().unwrap();
@@ -171,6 +179,7 @@ impl EventHub {
     /// Send a pane-addressed frame only to clients whose scope includes the pane. A master
     /// client (None scope) always receives it; an unknown pane (None coords) is master-only,
     /// so a scoped client never sees an unresolvable pane (TS `broadcastForPane`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn broadcast_for_pane(&self, coords: Option<&PaneCoords>, event: &ControlEvent) {
         let json = event.to_json();
         let inner = self.inner.lock().unwrap();

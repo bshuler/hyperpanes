@@ -39,6 +39,7 @@ pub enum Quoting {
 }
 
 /// The convention of the shell this build's panes run.
+#[tracing::instrument(level = "debug", ret)]
 pub fn native_quoting() -> Quoting {
     if cfg!(windows) {
         Quoting::Windows
@@ -66,6 +67,7 @@ thread_local! {
 
 /// Start listening for drops on the window identified by `key` (its native handle).
 /// Idempotent per window as long as the caller only calls it once the handle resolves.
+#[tracing::instrument(level = "debug", ret, skip(win))]
 pub fn install(win: &slint::Window, key: isize) {
     crate::winit_hooks::add(
         win,
@@ -80,6 +82,7 @@ pub fn install(win: &slint::Window, key: isize) {
 }
 
 /// Queue one dropped file, stamping it with where the pointer is *right now*.
+#[tracing::instrument(level = "debug", ret)]
 fn record(win: isize, path: PathBuf) {
     let at = crate::drag::global_pointer()
         .poll()
@@ -95,12 +98,14 @@ fn record(win: isize, path: PathBuf) {
 }
 
 /// Drain the queue if it has settled; otherwise leave it to grow for another tick.
+#[tracing::instrument(level = "debug", ret)]
 pub fn take_settled() -> Vec<Dropped> {
     QUEUE.with(|q| split_settled(&mut q.borrow_mut(), Instant::now(), SETTLE))
 }
 
 /// All-or-nothing: the batch is only released once its newest member is older than
 /// `settle`, so the files of one drag are never split across two insertions.
+#[tracing::instrument(level = "debug", ret)]
 fn split_settled(queue: &mut Vec<Dropped>, now: Instant, settle: Duration) -> Vec<Dropped> {
     let ready = queue
         .iter()
@@ -120,6 +125,7 @@ fn split_settled(queue: &mut Vec<Dropped>, now: Instant, settle: Duration) -> Ve
 /// pty: it *is* Enter, so a dropped file could run the half-typed line it was dropped into.
 /// Rather than mangle the name into something that no longer opens, such a path is refused
 /// and reported — the same call the transcript sanitizer makes, in the other direction.
+#[tracing::instrument(level = "debug", ret)]
 pub fn quote(path: &str, style: Quoting) -> Option<String> {
     if path.is_empty() || path.chars().any(|c| c.is_control() || c == '\u{7f}') {
         return None;
@@ -146,6 +152,7 @@ pub fn quote(path: &str, style: Quoting) -> Option<String> {
 /// rather than being wrapped in quotes it never needed. Deliberately conservative: `~`
 /// and `-` are bare only because they are not leading (a bare path always starts with `/`
 /// or a name), and everything non-ASCII is literal to `sh`.
+#[tracing::instrument(level = "debug", ret)]
 fn posix_bare(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || !c.is_ascii()
@@ -153,6 +160,7 @@ fn posix_bare(c: char) -> bool {
 }
 
 /// Same idea for `cmd`, which additionally treats `%` and `!` as expansion.
+#[tracing::instrument(level = "debug", ret)]
 fn windows_bare(c: char) -> bool {
     c.is_ascii_alphanumeric()
         || !c.is_ascii()
@@ -164,6 +172,7 @@ fn windows_bare(c: char) -> bool {
 
 /// Render a batch as the text to insert: quoted words, space separated, with a trailing
 /// space so whatever the user types next is a new word. Returns `(text, refused)`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn format_paths(paths: &[String], style: Quoting) -> (String, usize) {
     let mut out = String::new();
     let mut refused = 0usize;

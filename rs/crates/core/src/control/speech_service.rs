@@ -52,6 +52,7 @@ pub struct SpeechService {
 }
 
 impl SpeechService {
+    #[tracing::instrument(level = "debug")]
     pub fn new(settings_path: PathBuf) -> Self {
         let settings = speech::load(&settings_path);
         SpeechService {
@@ -62,6 +63,7 @@ impl SpeechService {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn settings_snapshot(&self) -> SpeechSettings {
         self.settings
             .lock()
@@ -69,6 +71,7 @@ impl SpeechService {
             .clone()
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_muted(&self, muted: bool) {
         let settings = {
             let mut s = self.settings.lock().expect("speech settings lock poisoned");
@@ -89,6 +92,7 @@ impl SpeechService {
     /// Kill any in-flight utterance and discard the queued backlog, without changing the
     /// persisted mute setting — a one-shot "shut up now" rather than a mode switch. A
     /// never-spawned engine has nothing to stop, so this is a no-op then.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn stop_all(&self) {
         if let Some(handle) = self
             .engine
@@ -100,6 +104,7 @@ impl SpeechService {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_focused_only(&self, focused_only: bool) {
         let settings = {
             let mut s = self.settings.lock().expect("speech settings lock poisoned");
@@ -109,6 +114,7 @@ impl SpeechService {
         let _ = speech::save(&self.settings_path, &settings);
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn status(&self) -> SpeechServiceStatus {
         let settings = self.settings_snapshot();
         let engine = self.engine.lock().expect("speech engine lock poisoned");
@@ -128,6 +134,7 @@ impl SpeechService {
     }
 
     /// Lazily spawn the engine on first use, returning a cheap clone of the handle.
+    #[tracing::instrument(level = "debug", skip(self))]
     fn ensure_engine(&self) -> SpeechHandle {
         let mut engine = self.engine.lock().expect("speech engine lock poisoned");
         if let Some(h) = engine.as_ref() {
@@ -143,6 +150,7 @@ impl SpeechService {
     /// (`(pane id, label)`) already read from the read-model. No talkers takes the
     /// fast path — clear any stale tails and return — without spawning the engine or
     /// touching the filesystem, so a default-off install costs nothing ongoing.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn tick(&self, talking: &[(String, String)], focused_pane: Option<&str>) {
         if talking.is_empty() {
             self.tails
@@ -168,6 +176,7 @@ impl SpeechService {
 /// Poll [`Shared::model`] for talking panes and [`SpeechService::tick`] once. Runs forever
 /// on [`POLL_INTERVAL`] until its task is aborted; the model lock is held only long enough
 /// to snapshot talking panes + the focused pane, never across the tail/engine I/O below.
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 pub async fn run_ticker(shared: Arc<Shared>) {
     let mut interval = tokio::time::interval(POLL_INTERVAL);
     loop {
@@ -186,6 +195,7 @@ pub async fn run_ticker(shared: Arc<Shared>) {
 ///
 /// `None` when the pane has no live marker (no agent running, the conversation already
 /// ended, or the tool has neither a hook nor a tailable log).
+#[tracing::instrument(level = "debug", ret)]
 fn resolve_transcript(pane_id: &str) -> Option<TranscriptRef> {
     if let Some(marker) = crate::claude_panes::read_pane_session(pane_id) {
         if let Some(path) = transcript_path(&marker) {
@@ -205,6 +215,7 @@ fn resolve_transcript(pane_id: &str) -> Option<TranscriptRef> {
 /// new assistant text, normalize, and enqueue. A pane no longer in `talking` (talk turned
 /// off, or the pane is gone) has its tail dropped. `label` is only attached to the
 /// utterance when more than one pane is talking, so a lone talker stays terse.
+#[tracing::instrument(level = "debug", skip_all)]
 fn poll_tick(
     talking: &[(String, String)],
     settings: &SpeechSettings,

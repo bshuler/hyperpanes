@@ -127,6 +127,7 @@ pub const DCS_CLOSE: &[u8] = b"\x1b\\";
 /// The two DCS wrapper strings do **not**: the live capture shows `\x1bP1000p` running
 /// straight into `%begin` with no separator, and the closing `\x1b\\` following `%exit\n`
 /// as the last bytes of the stream with nothing after it.
+#[tracing::instrument(level = "debug", ret)]
 pub fn needs_newline(line: &[u8]) -> bool {
     line != DCS_OPEN && line != DCS_CLOSE
 }
@@ -140,6 +141,7 @@ pub fn needs_newline(line: &[u8]) -> bool {
 /// `b < 0x20 || b == b'\\'` → `\NNN` (three-digit octal); every other byte passes through
 /// **unchanged**, DEL (`0x7F`) and the whole `0x80..=0xFF` range included. See the module
 /// docs for the source citation and the live-capture verification.
+#[tracing::instrument(level = "debug", ret)]
 pub fn escape_output(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     for &b in bytes {
@@ -158,6 +160,7 @@ pub fn escape_output(bytes: &[u8]) -> Vec<u8> {
 /// Inverse of [`escape_output`] — used by the round-trip tests and by anyone writing a
 /// control-mode *client* against this module. A malformed escape is passed through
 /// literally rather than dropped, because silently losing bytes is worse than showing them.
+#[tracing::instrument(level = "debug", ret)]
 pub fn unescape_output(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -187,6 +190,7 @@ pub fn unescape_output(bytes: &[u8]) -> Vec<u8> {
 
 /// tmux's layout checksum (`layout-custom.c:layout_checksum`): a 16-bit rotate-right-then-add
 /// over the layout body, rendered by the caller as `%04x`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn layout_checksum(body: &str) -> u16 {
     let mut csum: u16 = 0;
     for b in body.bytes() {
@@ -201,6 +205,7 @@ pub fn layout_checksum(body: &str) -> u16 {
 ///
 /// Body shape is `layout_append`'s `"%ux%u,%d,%d,%u"`; the checksum prefix is
 /// `layout_dump`'s `"%04hx,%s"`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn single_pane_layout(cols: u16, rows: u16, pane_id: u32) -> String {
     let body = format!("{cols}x{rows},0,0,{pane_id}");
     format!("{:04x},{}", layout_checksum(&body), body)
@@ -215,6 +220,7 @@ pub fn single_pane_layout(cols: u16, rows: u16, pane_id: u32) -> String {
 /// 31 rather than 32 bits because tmux ids are `u_int` on the wire but iTerm2 parses them
 /// with `intValue` (a signed 32-bit `int`) — `TmuxController.m` passes them around as `int`
 /// throughout — so an id with the top bit set would come back negative.
+#[tracing::instrument(level = "debug", ret)]
 fn hash31(domain: &str, uid: &str) -> u32 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in domain.bytes().chain(uid.bytes()) {
@@ -238,6 +244,7 @@ impl IdMap {
     /// Build the mapping for exactly this set of uids. A pure function of the *set* (order
     /// of the slice is irrelevant — it is sorted first), so two processes, or the same
     /// process before and after a reconnect, always agree.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn rebuild(uids: &[String]) -> Self {
         let mut sorted: Vec<&String> = uids.iter().collect();
         sorted.sort();
@@ -248,6 +255,7 @@ impl IdMap {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     fn assign(domain: &str, sorted: &[&String]) -> BTreeMap<String, u32> {
         let mut taken: HashSet<u32> = HashSet::new();
         let mut out = BTreeMap::new();
@@ -264,16 +272,19 @@ impl IdMap {
     }
 
     /// This uid's tmux pane id (the `n` in `%n`).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn pane_id(&self, uid: &str) -> Option<u32> {
         self.panes.get(uid).copied()
     }
 
     /// This uid's tmux window id (the `n` in `@n`).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn window_id(&self, uid: &str) -> Option<u32> {
         self.windows.get(uid).copied()
     }
 
     /// Reverse lookup for a `%n` target in a client command.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn uid_for_pane(&self, id: u32) -> Option<&str> {
         self.panes
             .iter()
@@ -282,6 +293,7 @@ impl IdMap {
     }
 
     /// Reverse lookup for an `@n` target in a client command.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn uid_for_window(&self, id: u32) -> Option<&str> {
         self.windows
             .iter()
@@ -315,6 +327,7 @@ pub struct PaneInfo {
 
 impl PaneInfo {
     /// A pane with nothing known but its uid.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn new(uid: impl Into<String>) -> Self {
         Self {
             uid: uid.into(),
@@ -327,17 +340,20 @@ impl PaneInfo {
     }
 
     /// Grid width with tmux's 80x24 fallback for an unknown grid.
+    #[tracing::instrument(level = "debug", ret)]
     fn width(&self) -> u16 {
         self.cols.unwrap_or(80).max(1)
     }
 
     /// Grid height with tmux's 80x24 fallback for an unknown grid.
+    #[tracing::instrument(level = "debug", ret)]
     fn height(&self) -> u16 {
         self.rows.unwrap_or(24).max(1)
     }
 
     /// The window name a client shows on the tab. The full `pane-<uuid>` is unreadable on a
     /// tab, so fall back to the uuid's first segment.
+    #[tracing::instrument(level = "debug", ret)]
     fn name(&self) -> String {
         if let Some(t) = self.title.as_deref().filter(|t| !t.trim().is_empty()) {
             return t.to_string();
@@ -384,6 +400,7 @@ pub enum Clock {
 }
 
 impl Clock {
+    #[tracing::instrument(level = "debug", ret)]
     fn now(&self) -> u64 {
         match self {
             Clock::System => SystemTime::now()
@@ -400,6 +417,7 @@ impl Clock {
 /// [`ControlServer::command`] is synchronous and pure, so it cannot go and ask the daemon
 /// for a pane's screen mid-dispatch. `capture-pane` is the only command that needs one, so
 /// the driver peeks with this and refreshes [`PaneInfo::screen`] first.
+#[tracing::instrument(level = "debug", ret)]
 pub fn wants_screen_refresh(line: &str) -> bool {
     let head = line.trim_start();
     let word = head.split(|c: char| c.is_whitespace()).next().unwrap_or("");
@@ -447,6 +465,7 @@ pub struct ControlServer {
 
 impl ControlServer {
     /// A server publishing `panes` as one tmux session named `session_name`.
+    #[tracing::instrument(level = "debug", skip(session_name))]
     pub fn new(session_name: impl Into<String>, panes: Vec<PaneInfo>) -> Self {
         let mut s = Self {
             session_name: session_name.into(),
@@ -491,11 +510,13 @@ impl ControlServer {
     }
 
     /// The current uid → tmux id mapping.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn ids(&self) -> &IdMap {
         &self.ids
     }
 
     /// Replace a pane's cached screen mirror, for `capture-pane -p`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_screen(&mut self, uid: &str, screen: Option<String>) {
         if let Some(p) = self.panes.get_mut(uid) {
             p.screen = screen;
@@ -505,6 +526,7 @@ impl ControlServer {
     /// Record a pane's sniffed cwd (`SessionEvent::Cwd`), reported to the client as
     /// `#{pane_current_path}`. Silent for an unknown uid, and emits nothing: tmux has no
     /// notification for a cwd change, clients poll it with a format.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_cwd(&mut self, uid: &str, cwd: Option<String>) {
         if let Some(p) = self.panes.get_mut(uid) {
             p.cwd = cwd;
@@ -512,15 +534,18 @@ impl ControlServer {
     }
 
     /// Whether this uid is one of the panes currently published.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn has_pane(&self, uid: &str) -> bool {
         self.panes.contains_key(uid)
     }
 
     /// Every published uid, in the id-assignment order (sorted).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn uids(&self) -> Vec<String> {
         self.panes.keys().cloned().collect()
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn reindex(&mut self) {
         let uids: Vec<String> = self.panes.keys().cloned().collect();
         self.ids = IdMap::rebuild(&uids);
@@ -533,6 +558,7 @@ impl ControlServer {
     /// `control.c:control_notify_write`: notifications must never land inside a command's
     /// guard block, because a client reads everything between `%begin` and `%end` as that
     /// command's output.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn notify(&mut self, out: &mut Vec<Line>, line: String) {
         if self.guard_depth == 0 {
             out.push(line.into_bytes());
@@ -543,6 +569,7 @@ impl ControlServer {
 
     /// Wrap `body` (already-formatted output lines) in a `%begin`/`%end`-or-`%error` block,
     /// then flush anything deferred while it was open.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn guarded(&mut self, out: &mut Vec<Line>, body: Vec<String>, is_error: bool) {
         let t = self.clock.now();
         let n = self.next_command;
@@ -567,6 +594,7 @@ impl ControlServer {
     /// Mirrors the captured `tmux -CC` transcript exactly: the DCS opener, tmux's own
     /// synthetic empty command block (note **flags 0** — it is not the client's command),
     /// a `%window-add` per window, `%sessions-changed`, then `%session-changed`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn greeting(&mut self) -> Vec<Line> {
         let mut out = Vec::new();
         if self.mode == ControlMode::Wrapped {
@@ -600,6 +628,7 @@ impl ControlServer {
     ///
     /// `client.c` prints `%exit <message>` when there is an exit reason and bare `%exit`
     /// otherwise, then the ST.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goodbye(&mut self, reason: Option<&str>) -> Vec<Line> {
         let mut out = Vec::new();
         out.push(match reason {
@@ -618,6 +647,7 @@ impl ControlServer {
     ///
     /// Returns nothing for an unknown uid or an empty chunk rather than emitting a bare
     /// `%output` a client would have to special-case.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn output(&mut self, uid: &str, data: &[u8]) -> Vec<Line> {
         if data.is_empty() {
             return Vec::new();
@@ -634,6 +664,7 @@ impl ControlServer {
     ///
     /// Re-deriving the whole [`IdMap`] here is deliberate: ids are a pure function of the
     /// uid set (module docs), so the map must be rebuilt, not appended to.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_added(&mut self, info: PaneInfo) -> Vec<Line> {
         let uid = info.uid.clone();
         if self.panes.contains_key(&uid) {
@@ -659,6 +690,7 @@ impl ControlServer {
 
     /// A pane exited → its window closes. The tmux **session stays**, because the
     /// hyperpanes daemon is still there and other panes may still be live.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_exited(&mut self, uid: &str) -> Vec<Line> {
         let Some(w) = self.ids.window_id(uid) else {
             return Vec::new();
@@ -675,6 +707,7 @@ impl ControlServer {
 
     /// A pane's grid changed → `%layout-change`, which is how a client learns to resize the
     /// native tab it is drawing.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_resized(&mut self, uid: &str, cols: u16, rows: u16) -> Vec<Line> {
         let Some(p) = self.panes.get_mut(uid) else {
             return Vec::new();
@@ -698,6 +731,7 @@ impl ControlServer {
     }
 
     /// A pane's title changed → `%window-renamed`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_renamed(&mut self, uid: &str, title: &str) -> Vec<Line> {
         let Some(p) = self.panes.get_mut(uid) else {
             return Vec::new();
@@ -717,6 +751,7 @@ impl ControlServer {
 
     // -- helpers -----------------------------------------------------------
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn layout_for(&self, uid: &str) -> String {
         let p = &self.panes[uid];
         let pane = self.ids.pane_id(uid).unwrap_or(0);
@@ -725,6 +760,7 @@ impl ControlServer {
 
     /// tmux's `#{window_flags}`: `*` marks the active window, `-` the previous one. We have
     /// no "previous window" concept, so only `*` is ever produced.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn window_flags(&self, uid: &str) -> String {
         if self.active.as_deref() == Some(uid) {
             "*".to_string()
@@ -733,12 +769,14 @@ impl ControlServer {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn window_index(&self, uid: &str) -> usize {
         self.panes.keys().position(|k| k == uid).unwrap_or(0)
     }
 
     /// Resolve a `-t` target to a uid. Accepts `%n` (pane), `@n` (window), `$n` (session →
     /// the active pane), a bare hyperpanes uid, and a window index.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn resolve_target(&self, target: &str) -> Option<String> {
         let t = target.trim().trim_matches('"').trim_matches('\'');
         if let Some(rest) = t.strip_prefix('%') {
@@ -789,6 +827,7 @@ impl ControlServer {
     /// **Anything else answers `%error`**, in tmux's exact shape — a `parse error: unknown
     /// command: <name>` body line closed by `%error` — rather than a silent `%end` that
     /// would make a client believe a destructive command had succeeded.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn command(&mut self, line: &str) -> Reaction {
         let line = line.strip_suffix('\n').unwrap_or(line);
         let line = line.strip_suffix('\r').unwrap_or(line);
@@ -819,6 +858,7 @@ impl ControlServer {
     }
 
     /// Run one parsed command. `Ok(body)` closes with `%end`, `Err(message)` with `%error`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn dispatch(
         &mut self,
         words: &[String],
@@ -870,6 +910,7 @@ impl ControlServer {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_list_sessions(&mut self, args: &[String]) -> Result<Vec<String>, String> {
         let a = Args::parse(args, "F:f:")?;
         let ctx = FmtCtx {
@@ -888,6 +929,7 @@ impl ControlServer {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_list_windows(&mut self, args: &[String]) -> Result<Vec<String>, String> {
         let a = Args::parse(args, "F:t:f:")?;
         let fmt = a.value('F');
@@ -922,6 +964,7 @@ impl ControlServer {
             .collect())
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_list_panes(&mut self, args: &[String]) -> Result<Vec<String>, String> {
         let a = Args::parse(args, "F:t:f:")?;
         let fmt = a.value('F');
@@ -953,6 +996,7 @@ impl ControlServer {
             .collect())
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_list_clients(&mut self, args: &[String]) -> Result<Vec<String>, String> {
         let a = Args::parse(args, "F:t:f:")?;
         let ctx = FmtCtx {
@@ -967,6 +1011,7 @@ impl ControlServer {
         }])
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_display_message(&mut self, args: &[String]) -> Result<Vec<String>, String> {
         // iTerm2's version probe is `display-message -p "#{version}"`; `-p` means "print to
         // stdout" which, in control mode, means "put it in the block body".
@@ -986,6 +1031,7 @@ impl ControlServer {
         Ok(vec![self.expand(&template, &ctx)])
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_send_keys(
         &mut self,
         args: &[String],
@@ -1039,6 +1085,7 @@ impl ControlServer {
         Ok(Vec::new())
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_refresh_client(
         &mut self,
         args: &[String],
@@ -1087,6 +1134,7 @@ impl ControlServer {
         Ok(Vec::new())
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_resize(
         &mut self,
         args: &[String],
@@ -1113,6 +1161,7 @@ impl ControlServer {
         Ok(Vec::new())
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_capture_pane(&mut self, args: &[String]) -> Result<Vec<String>, String> {
         // iTerm2 sends `capture-pane -p -P -C -t "%n"` (pending output) and
         // `capture-pane -peqJN -t "%n" -S -<n>` (scrollback). We answer both from the
@@ -1146,6 +1195,7 @@ impl ControlServer {
             .collect::<Vec<_>>())
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_select(&mut self, args: &[String]) -> Result<Vec<String>, String> {
         let a = Args::parse(args, "t:")?;
         let Some(uid) = a.value('t').and_then(|t| self.resolve_target(t)) else {
@@ -1171,6 +1221,7 @@ impl ControlServer {
     /// scope, and a real inheritance chain between them. We do not model the chain — we
     /// only need writes and reads of the *same* option to land in the same bucket, which
     /// is all iTerm2 does. So a scope is just a key string.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn option_scope(&self, a: &Args) -> String {
         if a.flag('s') {
             return "server".to_string();
@@ -1204,6 +1255,7 @@ impl ControlServer {
     /// option (`status`, `default-terminal`, `mouse`, …) errors instead: hyperpanes has no
     /// option store behind it, and a silent `%end` would tell the client a setting took
     /// effect when nothing changed. Same rule as the lifecycle commands above.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_set_option(
         &mut self,
         args: &[String],
@@ -1260,6 +1312,7 @@ impl ControlServer {
     /// block as a protocol failure. A bare `show <name>` on something unset errors, as
     /// tmux does. Note `-v` and `-q` are **booleans**, so they must stay out of the
     /// optstring or `show -v -q …` would eat `-q` as `-v`'s value.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_show_options(
         &mut self,
         args: &[String],
@@ -1294,6 +1347,7 @@ impl ControlServer {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cmd_has_session(&mut self, args: &[String]) -> Result<Vec<String>, String> {
         let a = Args::parse(args, "t:")?;
         match a.value('t') {
@@ -1316,6 +1370,7 @@ impl ControlServer {
     /// (`#{E:…}`, `#{T:…}`) and any variable we do not model expand to the empty string —
     /// which is what tmux does with an unknown variable, and is why an unrecognised probe
     /// degrades quietly instead of breaking the attach.
+    #[tracing::instrument(level = "debug", ret, skip(self, ctx))]
     fn expand(&self, template: &str, ctx: &FmtCtx) -> String {
         let b = template.as_bytes();
         let mut out = String::with_capacity(template.len());
@@ -1358,6 +1413,7 @@ impl ControlServer {
         out
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self, ctx))]
     fn expand_var(&self, inner: &str, ctx: &FmtCtx) -> String {
         if let Some(cond) = inner.strip_prefix('?') {
             let parts = split_top_level_commas(cond);
@@ -1385,6 +1441,7 @@ impl ControlServer {
     }
 
     /// One `#{...}` variable. Unknown → empty (tmux's behaviour).
+    #[tracing::instrument(level = "debug", ret, skip(self, ctx))]
     fn variable(&self, name: &str, ctx: &FmtCtx) -> String {
         let pane = ctx.uid.as_deref().and_then(|u| self.panes.get(u));
         let uid = ctx.uid.as_deref();
@@ -1470,6 +1527,7 @@ impl ControlServer {
 /// tmux quotes when the value is empty or holds anything the lexer would re-split
 /// (`options.c:options_to_string` → `args_escape`). Quoting only when it is needed keeps
 /// the common `@iterm2_id 1234` line byte-identical to real tmux.
+#[tracing::instrument(level = "debug", ret)]
 fn quote_option_value(v: &str) -> String {
     let needs = v.is_empty()
         || v.chars()
@@ -1490,6 +1548,7 @@ fn quote_option_value(v: &str) -> String {
 }
 
 /// tmux renders boolean formats as `1`/`0`.
+#[tracing::instrument(level = "debug", ret)]
 fn bool_fmt(b: bool) -> String {
     if b { "1" } else { "0" }.to_string()
 }
@@ -1500,6 +1559,7 @@ struct FmtCtx {
 }
 
 /// Index of the `}` matching the `{` at `open`, honouring nesting.
+#[tracing::instrument(level = "debug", ret)]
 fn matching_brace(b: &[u8], open: usize) -> Option<usize> {
     let mut depth = 0usize;
     for (i, &c) in b.iter().enumerate().skip(open) {
@@ -1518,6 +1578,7 @@ fn matching_brace(b: &[u8], open: usize) -> Option<usize> {
 }
 
 /// Split `#{?a,b,c}`'s body on commas that are not inside a nested `#{...}`.
+#[tracing::instrument(level = "debug", ret)]
 fn split_top_level_commas(s: &str) -> Vec<String> {
     let b = s.as_bytes();
     let mut parts = Vec::new();
@@ -1554,6 +1615,7 @@ fn split_top_level_commas(s: &str) -> Vec<String> {
 /// tmux's `;` command separator is **not** implemented: no client we target sends compound
 /// lines (iTerm2's `sendCommandList:` writes one command per line), and quietly running only
 /// the first half of a compound command would be worse than not seeing one at all.
+#[tracing::instrument(level = "debug", ret)]
 pub fn split_words(line: &str) -> Result<Vec<String>, String> {
     let mut words = Vec::new();
     let mut cur = String::new();
@@ -1638,6 +1700,7 @@ struct Args {
 }
 
 impl Args {
+    #[tracing::instrument(level = "debug", ret)]
     fn parse(words: &[String], optstring: &str) -> Result<Self, String> {
         let takes_value: HashSet<char> = {
             let cs: Vec<char> = optstring.chars().collect();
@@ -1682,10 +1745,12 @@ impl Args {
         Ok(out)
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     fn flag(&self, c: char) -> bool {
         self.flags.contains(&c)
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     fn value(&self, c: char) -> Option<&str> {
         self.values
             .iter()
@@ -1705,6 +1770,7 @@ impl Args {
 /// Anything else is sent as literal text, which is what tmux does with a name it does not
 /// recognise. The escape sequences are the xterm/`TERM=xterm-256color` ones, matching what
 /// the panes' `TERM` advertises.
+#[tracing::instrument(level = "debug", ret)]
 pub fn key_name_to_bytes(name: &str) -> Result<Vec<u8>, String> {
     if name.is_empty() {
         return Ok(Vec::new());

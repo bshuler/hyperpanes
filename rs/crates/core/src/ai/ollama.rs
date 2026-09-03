@@ -37,11 +37,13 @@ pub struct OllamaPatch {
 
 // Strip trailing slashes so `http://host:11434/` and `http://host:11434` behave
 // identically.
+#[tracing::instrument(level = "debug", ret)]
 fn normalize_endpoint(endpoint: &str) -> String {
     endpoint.trim_end_matches('/').to_string()
 }
 
 // Take the first non-empty line, collapse internal whitespace, clamp length.
+#[tracing::instrument(level = "debug", ret)]
 fn clean_line(raw: &str) -> String {
     let line = raw
         .split('\n')
@@ -66,6 +68,7 @@ pub struct OllamaClient {
 }
 
 impl OllamaClient {
+    #[tracing::instrument(level = "debug")]
     pub fn new(cfg: OllamaConfig) -> Self {
         Self {
             endpoint: normalize_endpoint(&cfg.endpoint),
@@ -76,6 +79,7 @@ impl OllamaClient {
     }
 
     /// Live-update endpoint/model/timeout. Untouched fields stay as-is.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn configure(&mut self, patch: OllamaPatch) {
         if let Some(endpoint) = patch.endpoint {
             self.endpoint = normalize_endpoint(&endpoint);
@@ -90,6 +94,7 @@ impl OllamaClient {
 
     /// POST `{endpoint}/api/generate` and reduce `.response` to a clean one-liner.
     /// Returns `Err` on network error, timeout, non-2xx, or missing/empty response.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub async fn summarize(&self, input: &SummarizeInput) -> Result<String, String> {
         let url = format!("{}/api/generate", self.endpoint);
         let body = json!({
@@ -122,6 +127,7 @@ impl OllamaClient {
     }
 
     /// GET `{endpoint}/api/tags` as a reachability check. Returns a bool; never errors.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub async fn ping(&self) -> bool {
         let url = format!("{}/api/tags", self.endpoint);
         match self

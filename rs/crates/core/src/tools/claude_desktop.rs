@@ -26,6 +26,7 @@ use std::path::{Path, PathBuf};
 /// Per-platform because the app follows each platform's own convention; a platform we have
 /// not confirmed returns `None` rather than a guess, and every caller degrades to "not in
 /// the desktop app", which is the same answer an empty store gives.
+#[tracing::instrument(level = "debug", ret)]
 pub fn store_dir() -> Option<PathBuf> {
     let rel = "Claude/claude-code-sessions";
     #[cfg(target_os = "macos")]
@@ -64,6 +65,7 @@ const SHARD_DEPTH: usize = 2;
 ///
 /// Archived records are dropped: the human removed the conversation from the app's list, so
 /// raising the app onto it is not what a click means any more — starting it in a pane is.
+#[tracing::instrument(level = "debug", ret)]
 pub fn scan() -> HashMap<String, String> {
     match store_dir() {
         Some(root) => scan_in(&root),
@@ -72,12 +74,14 @@ pub fn scan() -> HashMap<String, String> {
 }
 
 /// [`scan`] against an explicit root, so the mapping can be tested without a Claude install.
+#[tracing::instrument(level = "debug", ret)]
 pub fn scan_in(root: &Path) -> HashMap<String, String> {
     let mut out = HashMap::new();
     visit(root, 0, &mut out);
     out
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn visit(dir: &Path, depth: usize, out: &mut HashMap<String, String>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -112,6 +116,7 @@ fn visit(dir: &Path, depth: usize, out: &mut HashMap<String, String>) {
 
 /// One record's `cliSessionId -> sessionId`, or `None` when it is archived, unparseable, or
 /// carries an id we would not put in a URL.
+#[tracing::instrument(level = "debug", ret)]
 fn read_record(path: &Path) -> Option<(String, String)> {
     let raw = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -135,6 +140,7 @@ fn read_record(path: &Path) -> Option<(String, String)> {
 /// these ids come off disk, and a file in the store is a file anyone can write. Validating
 /// before the id reaches a URL is the same discipline `session_mark::valid_session_id`
 /// applies to a resume argument.
+#[tracing::instrument(level = "debug", ret)]
 pub fn valid_local_id(id: &str) -> bool {
     let Some(rest) = id.strip_prefix("local_") else {
         return false;
@@ -149,6 +155,7 @@ pub fn valid_local_id(id: &str) -> bool {
 /// `None` for an id that fails [`valid_local_id`] — a caller that cannot build a link has to
 /// fall back to opening the session in a pane, which is a better outcome than a URL built
 /// out of an id we did not vet.
+#[tracing::instrument(level = "debug", ret)]
 pub fn deep_link(local_id: &str) -> Option<String> {
     valid_local_id(local_id).then(|| format!("claude://code/continue?session={local_id}"))
 }

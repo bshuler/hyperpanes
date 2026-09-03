@@ -43,6 +43,7 @@ const TRAIL: &[char] = &[')', ']', '}', '>', '`', '"', '\'', ',', ';', '.', '!',
 
 /// True when a string looks path-shaped: has a separator, or ends in an extension. Mirrors
 /// `hasPathShape` (`/[\\/]/` OR `/\.[A-Za-z0-9]{1,12}$/`).
+#[tracing::instrument(level = "debug", ret)]
 pub fn has_path_shape(p: &str) -> bool {
     if p.contains('/') || p.contains('\\') {
         return true; // separator → covers ./ ../ ~/ and C:\ too
@@ -59,6 +60,7 @@ pub fn has_path_shape(p: &str) -> bool {
 
 /// Parse `^\d+(?::\d+)?$` — the whole string is `line` or `line:col`. Used for the unquoted
 /// trailing-suffix split.
+#[tracing::instrument(level = "debug", ret)]
 fn parse_loc(s: &str) -> Option<(u32, Option<u32>)> {
     let mut parts = s.splitn(2, ':');
     let a = parts.next()?;
@@ -81,6 +83,7 @@ fn parse_loc(s: &str) -> Option<(u32, Option<u32>)> {
 /// path-shaped (so `localhost:3000` isn't mistaken for a located path). Mirrors `splitSuffix`:
 /// the regex finds the *leftmost* colon whose tail is a pure location, then gates on
 /// `hasPathShape(head)` — failing that gate yields the whole token unsplit.
+#[tracing::instrument(level = "debug", ret)]
 fn split_suffix(core: &str) -> (String, Option<u32>, Option<u32>) {
     for (i, ch) in core.char_indices() {
         if ch != ':' || i == 0 {
@@ -102,6 +105,7 @@ fn split_suffix(core: &str) -> (String, Option<u32>, Option<u32>) {
 /// Parse a `:line[:col]` suffix appearing right after a closing quote. Returns the values plus
 /// the number of characters consumed. Mirrors the quoted-path branch's
 /// `/^:(\d+)(?::(\d+))?/`.
+#[tracing::instrument(level = "debug", ret)]
 fn parse_quote_suffix(rest: &[char]) -> Option<(u32, Option<u32>, usize)> {
     if rest.first() != Some(&':') {
         return None;
@@ -145,6 +149,7 @@ fn parse_quote_suffix(rest: &[char]) -> Option<(u32, Option<u32>, usize)> {
 /// One token: a double-/single-quoted string (incl. its quotes), or a run of non-space,
 /// non-quote characters. Returns `(token_chars, start_column)` pairs. Mirrors the TS
 /// `TOKEN_RE = /"[^"]*"|'[^']*'|[^\s"']+/g` (an unterminated quote is skipped, not a token).
+#[tracing::instrument(level = "debug", ret)]
 fn tokenize(chars: &[char]) -> Vec<(Vec<char>, usize)> {
     let mut out = Vec::new();
     let n = chars.len();
@@ -178,6 +183,7 @@ fn tokenize(chars: &[char]) -> Vec<(Vec<char>, usize)> {
 
 /// Extract every path-shaped candidate from one rendered terminal row. Mirrors
 /// `extractPathCandidates`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn extract_path_candidates(line: &str) -> Vec<PathCandidate> {
     let chars: Vec<char> = line.chars().collect();
     let mut out = Vec::new();
@@ -259,6 +265,7 @@ pub fn extract_path_candidates(line: &str) -> Vec<PathCandidate> {
 /// (`~/`), pointedly relative (`./`, `../`), or a Windows drive (`C:\\`, `C:/`). A bare
 /// `src/main.rs` is a path too, but it is not *rooted*, and this asks the narrower question:
 /// see the interior-delimiter split in [`extract_path_candidates`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_path_root(t: &[char]) -> bool {
     match t {
         [] => false,
@@ -275,6 +282,7 @@ pub fn is_path_root(t: &[char]) -> bool {
 /// `TRAIL` set [`extract_path_candidates`] trims from an unquoted token. Public because the
 /// space-widening pass in the pane has to do it to a word this module never tokenised on its
 /// own (see `Pane::widen_across_spaces`), and there must be exactly one such list.
+#[tracing::instrument(level = "debug", ret)]
 pub fn trim_trailing_punct(s: &str) -> &str {
     s.trim_end_matches(TRAIL)
 }
@@ -292,12 +300,14 @@ pub struct UrlCandidate {
 
 /// Characters that terminate a URL run. Whitespace plus delimiters that never appear raw in a
 /// URL: quotes/backticks and angle brackets (`<https://…>` autolink wrapping).
+#[tracing::instrument(level = "debug", ret)]
 fn url_stop(c: char) -> bool {
     c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>')
 }
 
 /// If `chars[i..]` starts with `http://` or `https://` (scheme case-insensitive), return the
 /// scheme length in chars; else `None`.
+#[tracing::instrument(level = "debug", ret)]
 fn url_scheme_len(chars: &[char], i: usize) -> Option<usize> {
     let mut j = i;
     for want in ['h', 't', 't', 'p'] {
@@ -325,6 +335,7 @@ fn url_scheme_len(chars: &[char], i: usize) -> Option<usize> {
 /// punctuation (`.`, `,`, `;`, `:`, `!`, `?`) is stripped, and trailing `)`/`]`/`}` only when
 /// unbalanced within the URL — so `(https://a.com)` drops the paren but a Wikipedia-style
 /// `…/Foo_(bar)` keeps it. No on-disk/network verification: shape alone linkifies.
+#[tracing::instrument(level = "debug", ret)]
 pub fn extract_url_candidates(line: &str) -> Vec<UrlCandidate> {
     let chars: Vec<char> = line.chars().collect();
     let n = chars.len();
@@ -394,6 +405,7 @@ pub fn extract_url_candidates(line: &str) -> Vec<UrlCandidate> {
 /// Assumes one column per character — exact for ASCII paths. Kept for parity with the TS
 /// `cellFromIndex` (the in-crate hit-tester works per single row, so it doesn't need the wrap
 /// math, but downstream/test parity does).
+#[tracing::instrument(level = "debug", ret)]
 pub fn cell_from_index(index: usize, start_row: usize, cols: usize) -> (usize, usize) {
     let cols = cols.max(1);
     ((index % cols) + 1, start_row + index / cols + 1)
@@ -424,6 +436,7 @@ pub struct CommitCandidate {
 ///
 /// Word boundaries are alphanumeric-or-`_`, so the `f1a` in `b99_price` and the tail of
 /// `deadbeefcafe.txt` are not offered — a hash git printed always stands alone.
+#[tracing::instrument(level = "debug", ret)]
 pub fn extract_commit_candidates(line: &str) -> Vec<CommitCandidate> {
     let chars: Vec<char> = line.chars().collect();
     let n = chars.len();

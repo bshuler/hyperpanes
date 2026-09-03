@@ -47,6 +47,7 @@ const MAX_URL: usize = 4096;
 // Interpret one OSC payload (the bytes between `ESC]` and its terminator) as an
 // open-URL request, applying the whole of the trust check: our key, a length a real
 // link never exceeds, and a scheme the OS handler is safe to be handed.
+#[tracing::instrument(level = "debug", ret)]
 fn osc_data_to_url(data: &str) -> Option<String> {
     let url = data.strip_prefix(KEY)?;
     if url.len() > MAX_URL {
@@ -67,6 +68,7 @@ fn osc_data_to_url(data: &str) -> Option<String> {
 ///
 /// A returned URL has already passed [`crate::open::is_openable_url`]; a caller still
 /// owns the *policy* question of whether this pane may open a link at all.
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_osc_open_url(carry: &str, chunk: &str) -> (Vec<String>, String) {
     // Fast reject: nothing pending and no ESC anywhere → impossible to hold an OSC.
     if carry.is_empty() && !chunk.contains('\u{1b}') {

@@ -49,6 +49,7 @@ struct ProjectsFile {
 }
 
 #[inline]
+#[tracing::instrument(level = "debug", ret)]
 fn is_win() -> bool {
     cfg!(windows)
 }
@@ -58,12 +59,14 @@ fn is_win() -> bool {
 /// case-insensitive), so `/Users/me/Repo` and `/users/me/repo` dedup to one project
 /// there; Linux filesystems are case-sensitive and keep the exact-case key.
 #[inline]
+#[tracing::instrument(level = "debug", ret)]
 fn case_insensitive_fs() -> bool {
     cfg!(any(windows, target_os = "macos"))
 }
 
 /// Canonical absolute path for storage. Strips trailing separators; on Windows
 /// normalises `/`→`\` and uppercases the drive letter.
+#[tracing::instrument(level = "debug", ret)]
 pub fn canonical_path(p: &str) -> String {
     // `p.replace(/[\\/]+$/, '')` — drop a run of trailing slashes/backslashes.
     let mut s: &str = p;
@@ -100,6 +103,7 @@ pub fn canonical_path(p: &str) -> String {
 /// Falls back to the lexical form whenever the path does not resolve — a project whose
 /// directory has been deleted or unmounted still keys the way it always did, so it keeps
 /// matching its stored entry instead of splitting off a duplicate.
+#[tracing::instrument(level = "debug", ret)]
 fn resolved_path(p: &str) -> String {
     let lexical = canonical_path(p);
     let Ok(real) = std::fs::canonicalize(&lexical) else {
@@ -124,6 +128,7 @@ fn resolved_path(p: &str) -> String {
 /// cwd's git root against a stored
 /// [`Project::path`] compare with the SAME key the store dedups by (e.g. the app's
 /// recolor-propagation).
+#[tracing::instrument(level = "debug", ret)]
 pub fn path_key(p: &str) -> String {
     let c = resolved_path(p);
     if case_insensitive_fs() {
@@ -135,6 +140,7 @@ pub fn path_key(p: &str) -> String {
 
 /// A stable per-repo color from the canonical key, via the JS `h = (h*31 + c) >>> 0`
 /// rolling hash over UTF-16 code units (so it matches `charCodeAt`).
+#[tracing::instrument(level = "debug", ret)]
 fn color_for_path(p: &str) -> String {
     let key = path_key(p);
     let mut h: u32 = 0;
@@ -148,6 +154,7 @@ fn color_for_path(p: &str) -> String {
 ///   `https://github.com/owner/my-repo.git` → `my-repo`
 ///   `git@github.com:owner/my-repo.git`     → `my-repo`
 ///   `ssh://git@github.com/owner/My.Repo.git` → `My.Repo`
+#[tracing::instrument(level = "debug", ret)]
 pub fn repo_name_from_url(url: &str) -> Option<String> {
     let trimmed = url.trim();
     // `.replace(/\.git$/i, '')` — strip a case-insensitive trailing `.git`.
@@ -178,6 +185,7 @@ pub fn repo_name_from_url(url: &str) -> Option<String> {
 /// The repo's name from its `origin` remote, read straight from `.git/config`.
 /// `None` when there's no plain `.git` directory (worktree/submodule pointer) or no
 /// origin url — the caller falls back to the folder name.
+#[tracing::instrument(level = "debug", ret)]
 fn git_repo_name(git_root: &str) -> Option<String> {
     let dot_git = Path::new(git_root).join(".git");
     if !dot_git.is_dir() {
@@ -190,6 +198,7 @@ fn git_repo_name(git_root: &str) -> Option<String> {
 /// Extract the `url = …` value under `[remote "origin"]`, mirroring the TS regex
 /// `/\[remote "origin"\][^[]*?\burl\s*=\s*(.+)/` (the url must appear before the next
 /// `[`-section; `.+` captures the rest of the line).
+#[tracing::instrument(level = "debug", ret)]
 fn parse_origin_url(cfg: &str) -> Option<String> {
     const HEADER: &str = "[remote \"origin\"]";
     let start = cfg.find(HEADER)?;
@@ -213,6 +222,7 @@ fn parse_origin_url(cfg: &str) -> Option<String> {
 }
 
 /// `path.basename` of a stored (canonical) path.
+#[tracing::instrument(level = "debug", ret)]
 fn basename(p: &str) -> String {
     Path::new(p)
         .file_name()
@@ -220,6 +230,7 @@ fn basename(p: &str) -> String {
         .unwrap_or_default()
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -230,6 +241,7 @@ fn now_ms() -> u64 {
 /// Collapse entries pointing at the same directory (keeping the most-recently-opened)
 /// and canonicalize each stored path — self-healing duplicates saved before paths were
 /// canonicalized. Preserves first-seen order (mirrors the JS `Map`).
+#[tracing::instrument(level = "debug", ret)]
 fn dedupe(list: Vec<Project>) -> Vec<Project> {
     let mut order: Vec<String> = Vec::new();
     let mut by_key: HashMap<String, Project> = HashMap::new();
@@ -258,6 +270,7 @@ fn dedupe(list: Vec<Project>) -> Vec<Project> {
 
 /// Load + dedup the project list from `store`, persisting the cleanup if dedup changed
 /// the count (the TS self-heal). Missing/corrupt files start empty.
+#[tracing::instrument(level = "debug", ret)]
 fn load_from(store: &Path) -> Vec<Project> {
     let Ok(raw) = std::fs::read_to_string(store) else {
         return Vec::new();
@@ -283,6 +296,7 @@ fn load_from(store: &Path) -> Vec<Project> {
 }
 
 /// Persist the project list to `store` (atomic) as `{ "projects": [ … ] }`.
+#[tracing::instrument(level = "debug", ret)]
 fn save_to(store: &Path, list: &[Project]) -> std::io::Result<()> {
     let file = ProjectsFile {
         projects: list.to_vec(),
@@ -293,6 +307,7 @@ fn save_to(store: &Path, list: &[Project]) -> std::io::Result<()> {
 }
 
 /// Remember a git root (or bump its recency if already known) in `store`.
+#[tracing::instrument(level = "debug", ret)]
 fn upsert_project_by_root_in(store: &Path, root: &str) -> Project {
     // Resolved, not merely lexical: the stored path is what every later comparison and the
     // colour hash are derived from, so an alias like `/tmp/x` must be recorded as the
@@ -332,6 +347,7 @@ fn upsert_project_by_root_in(store: &Path, root: &str) -> Project {
 /// Explicitly add a directory as a project (the sidebar's "+" on the PROJECTS header).
 /// Unlike [`upsert_project_by_root_in`] a duplicate is a strict no-op: the existing entry
 /// is returned untouched (no recency bump, no rewrite). Returns `(project, added)`.
+#[tracing::instrument(level = "debug", ret)]
 fn add_project_explicit_in(store: &Path, dir: &str) -> (Project, bool) {
     let path = canonical_path(dir);
     let key = path_key(&path);
@@ -356,6 +372,7 @@ fn add_project_explicit_in(store: &Path, dir: &str) -> (Project, bool) {
 // ---- public API over the canonical `projects.json` ----
 
 /// Newest-first by last-opened; the sidebar renders in this order.
+#[tracing::instrument(level = "debug", ret)]
 pub fn list_projects() -> Vec<Project> {
     let mut list = load_from(&paths::projects_json());
     list.sort_by_key(|b| std::cmp::Reverse(b.last_opened_at.unwrap_or(0)));
@@ -363,6 +380,7 @@ pub fn list_projects() -> Vec<Project> {
 }
 
 /// Remember a git root (or bump its recency); returns the project.
+#[tracing::instrument(level = "debug", ret)]
 pub fn upsert_project_by_root(root: &str) -> Project {
     upsert_project_by_root_in(&paths::projects_json(), root)
 }
@@ -371,6 +389,7 @@ pub fn upsert_project_by_root(root: &str) -> Project {
 /// `name` match (newest-opened wins on a name collision, since the list is sorted
 /// newest-first). Used by the control plane's `newPane { project }` to turn a project handle
 /// into its directory. `None` when nothing matches.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve(id_or_name: &str) -> Option<Project> {
     let mut list = load_from(&paths::projects_json());
     list.sort_by(|a, b| {
@@ -382,6 +401,7 @@ pub fn resolve(id_or_name: &str) -> Option<Project> {
 }
 
 /// Pure resolution over an already-loaded (newest-first) list — split out for tests.
+#[tracing::instrument(level = "debug", ret)]
 fn resolve_in(list: &[Project], id_or_name: &str) -> Option<Project> {
     list.iter()
         .find(|p| p.id == id_or_name)
@@ -391,11 +411,13 @@ fn resolve_in(list: &[Project], id_or_name: &str) -> Option<Project> {
 
 /// Explicitly add a directory as a project (git repo not required); duplicate adds are a
 /// strict no-op. Returns `(project, added)` — `added` is `false` for a known dir.
+#[tracing::instrument(level = "debug", ret)]
 pub fn add_project_explicit(dir: &str) -> (Project, bool) {
     add_project_explicit_in(&paths::projects_json(), dir)
 }
 
 /// Set a project's color by id.
+#[tracing::instrument(level = "debug", ret)]
 pub fn set_project_color(id: &str, color: &str) {
     let store = paths::projects_json();
     let mut list = load_from(&store);
@@ -406,6 +428,7 @@ pub fn set_project_color(id: &str, color: &str) {
 }
 
 /// Rename a project by id.
+#[tracing::instrument(level = "debug", ret)]
 pub fn rename_project(id: &str, name: &str) {
     let store = paths::projects_json();
     let mut list = load_from(&store);
@@ -416,6 +439,7 @@ pub fn rename_project(id: &str, name: &str) {
 }
 
 /// Forget a project by id.
+#[tracing::instrument(level = "debug", ret)]
 pub fn remove_project(id: &str) {
     let store = paths::projects_json();
     let list: Vec<Project> = load_from(&store)

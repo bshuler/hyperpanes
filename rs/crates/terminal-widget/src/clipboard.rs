@@ -19,6 +19,7 @@ impl Clipboard {
     /// Open a connection to the system clipboard. Never fails: if the platform clipboard is
     /// unavailable, the handle is inert (all reads return `None`, writes are dropped) so the
     /// caller's copy/paste paths stay infallible.
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Self {
         Clipboard {
             inner: arboard::Clipboard::new().ok(),
@@ -27,6 +28,7 @@ impl Clipboard {
 
     /// Copy `text` to the system clipboard. Returns `true` if it was written. A no-op (false)
     /// when the clipboard is unavailable or the write fails.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn copy(&mut self, text: &str) -> bool {
         match self.inner.as_mut() {
             Some(c) => c.set_text(text.to_owned()).is_ok(),
@@ -35,6 +37,7 @@ impl Clipboard {
     }
 
     /// Read the system clipboard as text. `None` when empty, non-text, or unavailable.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn paste(&mut self) -> Option<String> {
         let c = self.inner.as_mut()?;
         match c.get_text() {
@@ -49,12 +52,14 @@ impl Clipboard {
     /// Used by the paste path to decide whether a Ctrl+V should forward a literal 0x16 to an
     /// in-pane TUI (e.g. Claude Code) that reads the OS clipboard image itself, since the pty
     /// can't carry image bytes and this wrapper is text-only.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn has_image(&mut self) -> bool {
         self.inner.as_mut().is_some_and(|c| c.get_image().is_ok())
     }
 }
 
 impl Default for Clipboard {
+    #[tracing::instrument(level = "debug")]
     fn default() -> Self {
         Self::new()
     }

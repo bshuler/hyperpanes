@@ -86,6 +86,7 @@ impl ResumeCommand {
     /// The command as a shell line, for the paths that type into a live pane instead of
     /// spawning (`state.rs` has both shapes). Quoting is minimal on purpose: only the
     /// program path can contain a space, and session ids are validated before they get here.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn shell_line(&self) -> String {
         let mut out = quote_if_needed(&self.program.to_string_lossy());
         for a in &self.args {
@@ -97,6 +98,7 @@ impl ResumeCommand {
 }
 
 /// Single-quote `s` for a POSIX shell when it holds anything that would word-split.
+#[tracing::instrument(level = "debug", ret)]
 fn quote_if_needed(s: &str) -> String {
     let safe = !s.is_empty()
         && s.chars()
@@ -130,6 +132,7 @@ pub enum ResumeBlocked {
 
 impl ResumeBlocked {
     /// One sentence, for the row's tooltip.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn reason(&self) -> String {
         match self {
             ResumeBlocked::ToolNotInstalled { tool_id } => {
@@ -158,6 +161,7 @@ pub enum ResumePlan {
 
 impl ResumePlan {
     /// The command, when there is one.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn command(&self) -> Option<&ResumeCommand> {
         match self {
             ResumePlan::Ready(c) => Some(c),
@@ -166,6 +170,7 @@ impl ResumePlan {
     }
 
     /// Why not, when there isn't.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn blocked(&self) -> Option<&ResumeBlocked> {
         match self {
             ResumePlan::Blocked(b) => Some(b),
@@ -173,6 +178,7 @@ impl ResumePlan {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_ready(&self) -> bool {
         matches!(self, ResumePlan::Ready(_))
     }
@@ -198,6 +204,7 @@ pub trait SessionProvider {
 /// returned rows out of this order would draw the same project heading several times. Ties
 /// break on id so two sessions written in the same millisecond do not swap places between
 /// scans.
+#[tracing::instrument(level = "debug", ret)]
 pub fn sort_for_panel(sessions: &mut [ToolSession]) {
     sessions.sort_by(|a, b| {
         a.project
@@ -209,6 +216,7 @@ pub fn sort_for_panel(sessions: &mut [ToolSession]) {
 
 /// Resolve a tool's binary for a resume, mapping "not installed" onto the blocked variant.
 /// The shared half of every provider's [`SessionProvider::resume`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_program(
     tool_id: &'static str,
     overrides: &BTreeMap<String, String>,
@@ -222,6 +230,7 @@ pub fn resolve_program(
 }
 
 /// The project checks every provider owes: a path we verified, that still exists.
+#[tracing::instrument(level = "debug", ret)]
 pub fn check_project(session: &ToolSession) -> Result<PathBuf, ResumeBlocked> {
     if !session.project_origin.is_exact() {
         return Err(ResumeBlocked::ProjectUnverified {

@@ -184,17 +184,20 @@ impl TerminalPane {
     /// Create a pane of `cols`×`rows` cells driving the given renderer. Use
     /// [`crate::render::SoftwareRenderer`] (always available) or
     /// [`crate::render::GpuRenderer`] (when a wgpu device is in hand).
+    #[tracing::instrument(level = "debug", skip(renderer))]
     pub fn new(cols: usize, rows: usize, renderer: Box<dyn PaneRenderer>) -> Self {
         Self::with_scrollback(cols, rows, TermGrid::DEFAULT_SCROLLBACK, renderer)
     }
 
     /// Change how many lines of history the pane keeps (the app's `scrollback` preference
     /// applied live). Shrinking drops the oldest lines; a no-op when unchanged.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_scrollback(&mut self, scrollback: usize) {
         self.grid.set_scrollback(scrollback);
     }
 
     /// The scrollback depth the pane is configured with.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scrollback_capacity(&self) -> usize {
         self.grid.scrollback_capacity()
     }
@@ -202,6 +205,7 @@ impl TerminalPane {
     /// [`Self::new`] with an explicit scrollback depth (lines of history kept above the
     /// viewport) — the hook for the app's `scrollback` preference. Use
     /// [`Self::set_scrollback`] to change it on a live pane.
+    #[tracing::instrument(level = "debug", skip(renderer))]
     pub fn with_scrollback(
         cols: usize,
         rows: usize,
@@ -229,11 +233,13 @@ impl TerminalPane {
     }
 
     /// Feed a chunk of session output (the `data` of a `SessionEvent::Data`) into the grid.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn feed(&mut self, data: &str) {
         self.grid.feed(data.as_bytes());
     }
 
     /// Feed raw output bytes (when you have bytes rather than a decoded `String`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn feed_bytes(&mut self, bytes: &[u8]) {
         self.grid.feed(bytes);
     }
@@ -241,17 +247,20 @@ impl TerminalPane {
     /// Drain terminal-originated replies (DSR/DA/etc.) that must be written back to the
     /// session's pty. Empty when there is nothing to forward. **Must** be forwarded or a
     /// real conpty blocks at startup (see [`TermGrid::take_replies`]).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn take_replies(&mut self) -> Vec<u8> {
         self.grid.take_replies()
     }
 
     /// Resize the pane's grid. Returns `true` if the cell dimensions changed — in which
     /// case the caller should also `SessionManager::resize` the bound session.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn resize(&mut self, cols: usize, rows: usize) -> bool {
         self.grid.resize(cols, rows)
     }
 
     /// Take-and-clear the repaint flag. `true` means the grid changed since the last call.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn take_dirty(&mut self) -> bool {
         self.grid.take_dirty()
     }
@@ -260,12 +269,14 @@ impl TerminalPane {
     /// resolution (`cols*cell_w × rows*cell_h`). Cheap to call repeatedly — the renderer
     /// caches its buffers/atlas — but gate it on [`take_dirty`](Self::take_dirty) plus the
     /// cursor blink for minimal CPU.
+    #[tracing::instrument(level = "debug", ret, skip(self, font, opts))]
     pub fn render(&mut self, font: &mut Font, opts: &RenderOpts) -> Image {
         let snap = self.grid.snapshot();
         self.renderer.render(&snap, font, opts)
     }
 
     /// Current grid size in `(cols, rows)`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn grid_size(&self) -> (usize, usize) {
         let s = self.grid.size();
         (s.cols, s.rows)
@@ -276,6 +287,7 @@ impl TerminalPane {
     /// summariser the *rendered* screen (what the user actually sees) instead of the raw redraw
     /// byte stream, so a continuously-repainting TUI (e.g. an agent CLI) is captured cleanly
     /// rather than as redraw noise.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn screen_text(&self) -> String {
         let snap = self.grid.snapshot();
         let mut lines: Vec<String> = (0..snap.rows)
@@ -288,18 +300,21 @@ impl TerminalPane {
     }
 
     /// A human-readable name for the active renderer (e.g. for a HUD/debug overlay).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn renderer_name(&self) -> &'static str {
         self.renderer.name()
     }
 
     /// Apply a colour theme: override the 16 base ANSI colours (index 0 = default background,
     /// 7 = default foreground). See [`crate::grid::TermGrid::set_base16`].
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_palette(&mut self, base: [[u8; 3]; 16]) {
         self.grid.set_base16(base);
     }
 
     /// Swap the renderer at runtime (e.g. GPU↔software on a device-lost / RDP transition).
     /// The next [`render`](Self::render) rebuilds from the live grid, so the swap is seamless.
+    #[tracing::instrument(level = "debug", ret, skip(self, renderer))]
     pub fn set_renderer(&mut self, renderer: Box<dyn PaneRenderer>) {
         self.renderer = renderer;
     }
@@ -314,6 +329,7 @@ impl TerminalPane {
 
     /// Set this pane's working directory (the base for resolving relative path tokens). Clearing
     /// or changing it drops the verify cache, since the same token can resolve elsewhere.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_cwd(&mut self, cwd: Option<String>) {
         if cwd != self.cwd {
             self.cwd = cwd;
@@ -333,6 +349,7 @@ impl TerminalPane {
     /// a cell wider and a row taller. Passing the body divides that slack back into every cell,
     /// and because the error is multiplied by the column index it reaches a whole cell by the
     /// right-hand edge — the pointer selects one glyph left of the one under it.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cell_logical(&self, surf_w: f32, surf_h: f32) -> Option<(f32, f32, usize, usize)> {
         let (cols, rows) = self.grid_size();
         if cols == 0 || rows == 0 || surf_w <= 0.0 || surf_h <= 0.0 {
@@ -343,6 +360,7 @@ impl TerminalPane {
 
     /// Reconstruct one viewport row's text (one char per column; blanks as spaces) so the
     /// `links` extractor's column indices line up with cells. Exact for ASCII paths.
+    #[tracing::instrument(level = "debug", ret, skip(snap))]
     fn row_text(snap: &crate::grid::GridSnapshot, row: usize) -> String {
         (0..snap.cols)
             .map(|col| {
@@ -365,6 +383,7 @@ impl TerminalPane {
     /// `http://127.0.0.1:51551/row18` opened `http://127.0.0.1:51`. The extractor in
     /// [`crate::links`] was always written against a wrap-joined line (see `cell_from_index`);
     /// this is the join it was waiting for.
+    #[tracing::instrument(level = "debug", ret, skip(self, snap))]
     fn logical_line(
         &self,
         snap: &crate::grid::GridSnapshot,
@@ -392,6 +411,7 @@ impl TerminalPane {
     /// The part of a logical-line span `[start, end)` that falls on visual `row` of a wrap run
     /// beginning at `first`, as columns of that row. The underline is one rect per [`LinkHit`],
     /// so a token spanning two rows underlines the row the cursor is actually on.
+    #[tracing::instrument(level = "debug", ret)]
     fn row_segment(
         start: usize,
         end: usize,
@@ -406,6 +426,7 @@ impl TerminalPane {
         )
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     fn cache_key(&self, token: &str) -> String {
         format!("{}\u{1f}{}", self.cwd.as_deref().unwrap_or(""), token)
     }
@@ -418,6 +439,7 @@ impl TerminalPane {
     /// it is really there, because an underline is a promise. Copying makes no such promise, and
     /// the token a human most wants off their screen is often one that does *not* exist yet — a
     /// compiler naming the output it failed to write, a traceback from another machine.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn locate(
         &mut self,
         x: f32,
@@ -517,6 +539,7 @@ impl TerminalPane {
     /// `./`, `C:\`) — the shape a program prints when it announces a file, and one prose does
     /// not have. And a grown span is only ever accepted if it stats true, so the failure mode is
     /// "no link", never "wrong link".
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn widen_across_spaces(&self, text: &str, cand: &PathCandidate) -> Option<PathCandidate> {
         /// Four words each way covers `Application Support` and the deepest spaced name seen in
         /// the wild; past that the odds tilt towards swallowing the prose around the path.
@@ -600,6 +623,7 @@ impl TerminalPane {
     /// A coding session says `b99_price.py` and means a file it is not standing next to. The
     /// repository is the only corpus that makes that name an answer rather than a guess, and
     /// [`git::find_in_repo`] declines outright when more than one file could be meant.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn elsewhere(&mut self, token: &str) -> Option<ResolveResult> {
         let cwd = self.cwd.clone()?;
         let key = self.cache_key(token);
@@ -626,6 +650,7 @@ impl TerminalPane {
     /// Find an http/https URL under the (logical-px) point, returning the candidate, its row,
     /// and the cell metrics. URLs linkify on shape alone — no disk/network verification (so no
     /// cache either; extraction per hover is cheap, same as the path re-extract in `link_at`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn url_under(
         &self,
         x: f32,
@@ -659,6 +684,7 @@ impl TerminalPane {
     /// that name. That costs one subprocess the first time a given word is hovered in a given
     /// cwd, and nothing afterwards — both hits and misses are cached, because history does not
     /// un-write itself.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn commit_under(
         &mut self,
         x: f32,
@@ -703,6 +729,7 @@ impl TerminalPane {
     /// The candidate's `:line[:col]` is carried through (and shown in the tooltip), but only the
     /// resolved path is verified — mirroring the Electron link provider. URLs win when a token is
     /// both (a URL is path-shaped but never disk-verifies anyway).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn link_at(&mut self, x: f32, y: f32, surf_w: f32, surf_h: f32) -> Option<LinkHit> {
         if let Some((cand, start, end, row, cell_w, cell_h)) = self.url_under(x, y, surf_w, surf_h)
         {
@@ -728,6 +755,7 @@ impl TerminalPane {
     /// rather than merely hovered. Same geometry as [`link_at`](Self::link_at), minus the
     /// on-disk requirement: the returned [`LinkHit::exists`] says which kind it is, so a caller
     /// can copy any path-shaped token while still refusing to reveal one that isn't there.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn link_target_at(&mut self, x: f32, y: f32, surf_w: f32, surf_h: f32) -> Option<LinkHit> {
         if let Some((cand, start, end, row, cell_w, cell_h)) = self.url_under(x, y, surf_w, surf_h)
         {
@@ -752,6 +780,7 @@ impl TerminalPane {
     /// The commit half of both hit-tests. It is the same for either caller: a hash git cannot
     /// resolve is not a target anybody can copy or open, so there is no "missing but wanted"
     /// case the way there is for a path.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn commit_hit(&mut self, x: f32, y: f32, surf_w: f32, surf_h: f32) -> Option<LinkHit> {
         let (full, cwd, start, end, row, cell_w, cell_h) =
             self.commit_under(x, y, surf_w, surf_h)?;
@@ -771,6 +800,7 @@ impl TerminalPane {
     }
 
     /// The path half of both hit-tests, differing only in whether a missing file still counts.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn path_hit(
         &mut self,
         x: f32,
@@ -806,6 +836,7 @@ impl TerminalPane {
     /// absolute path — whether or not it exists — while a plain click asks the caller to reveal
     /// it, which only a path that is really there can satisfy. `None` when the click wasn't over
     /// a link at all.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn activate_link(
         &mut self,
         x: f32,
@@ -874,6 +905,7 @@ impl TerminalPane {
     /// The (clamped) viewport cell under a logical-px point. Unlike [`locate`](Self::locate),
     /// this never returns `None` for an in-pane drag that strays past an edge — it clamps to the
     /// nearest cell so a selection can run to the grid border.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cell_at_clamped(&self, x: f32, y: f32, surf_w: f32, surf_h: f32) -> Option<selection::Cell> {
         let (cell_w, cell_h, cols, rows) = self.cell_logical(surf_w, surf_h)?;
         let col = (x / cell_w).floor().clamp(0.0, (cols - 1) as f32) as usize;
@@ -887,6 +919,7 @@ impl TerminalPane {
     /// Begin a drag-selection anchored at the (logical-px) press point. Replaces any prior
     /// selection. The selection only starts *rendering* once the drag leaves the anchor cell, so
     /// a click that doesn't move still falls through to a link activation.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn selection_begin(&mut self, x: f32, y: f32, surf_w: f32, surf_h: f32) {
         self.selection = self
             .cell_at_clamped(x, y, surf_w, surf_h)
@@ -901,6 +934,7 @@ impl TerminalPane {
     /// the head stays pinned to the anchor (so the selection never becomes `dragged` and a click
     /// can't copy-on-select). This dead zone is what stops a stray click twitch — especially one
     /// that straddles a cell boundary — from clobbering the clipboard ahead of a paste.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn selection_update(&mut self, x: f32, y: f32, surf_w: f32, surf_h: f32) {
         // Track the live pointer for edge-autoscroll even below the drag threshold (autoscroll
         // itself only kicks in once the selection is actually dragged).
@@ -920,6 +954,7 @@ impl TerminalPane {
     }
 
     /// Drop the current selection (and its highlight).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn selection_clear(&mut self) {
         self.selection = None;
         self.select_origin = None;
@@ -928,6 +963,7 @@ impl TerminalPane {
 
     /// End the drag (button released) — stops edge-autoscroll while KEEPING any selection (the
     /// controller may still copy it). Call from the `selection-end` handler.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn end_selection_drag(&mut self) {
         self.drag_pointer = None;
         self.select_origin = None;
@@ -938,6 +974,7 @@ impl TerminalPane {
     /// edge row, so the selection grows into off-screen scrollback (the vim/iTerm/Claude drag
     /// behavior). Returns `true` if it scrolled — the pump uses that to keep ticking + repainting.
     /// No-op unless a real (dragged) selection is in flight with the pointer at an edge.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn selection_autoscroll_tick(&mut self) -> bool {
         let (x, y, sw, sh) = match self.drag_pointer {
             Some(d) => d,
@@ -977,6 +1014,7 @@ impl TerminalPane {
     /// copyable. This is the context menu's "Select All" — viewport-scoped (the region
     /// [`selection_text`](Self::selection_text) can reconstruct), mirroring xterm's `selectAll`
     /// over the on-screen buffer. A subsequent [`copy_selection`](Self::copy_selection) copies it.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn select_all(&mut self) {
         let (cols, rows) = self.grid_size();
         if cols == 0 || rows == 0 {
@@ -997,6 +1035,7 @@ impl TerminalPane {
     /// and pinning the viewport to the bottom. Feeds the ED escapes (erase display + erase
     /// scrollback) so it runs through the same parser path as live output — the native analog of
     /// xterm's `term.clear()`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn clear(&mut self) {
         self.selection = None;
         self.grid.feed(b"\x1b[H\x1b[2J\x1b[3J");
@@ -1005,6 +1044,7 @@ impl TerminalPane {
 
     /// True once the active selection has actually been dragged across cells (i.e. it's a real
     /// selection, not a stationary click). The caller uses this to choose copy-vs-click on release.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn selection_is_drag(&self) -> bool {
         self.selection.is_some_and(|s| s.dragged)
     }
@@ -1016,6 +1056,7 @@ impl TerminalPane {
     /// (scrollback / command output) isn't in the shell's buffer and is left untouched, so no
     /// speculative deletes are ever sent (no PTY corruption). False for no selection, a non-dragged
     /// click, a multi-row span, or when the cursor is scrolled out of view.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn selection_on_cursor_row(&self) -> bool {
         let sel = match &self.selection {
             Some(s) if s.dragged => s,
@@ -1049,6 +1090,7 @@ impl TerminalPane {
     ///
     /// Cell↔char caveat: counts are in grid cells, exact for ASCII (same wide-glyph caveat as
     /// [`selection_text`](Self::selection_text)).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn type_over_selection(&mut self) -> Option<Vec<u8>> {
         if self.grid.alt_screen() {
             return None;
@@ -1139,6 +1181,7 @@ impl TerminalPane {
     ///
     /// Cell↔char caveat: counts are in grid cells, exact for ASCII (same wide-glyph caveat as
     /// [`selection_text`](Self::selection_text)).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn click_move_cursor(&self) -> Option<Vec<u8>> {
         if self.grid.alt_screen() || self.grid.mouse_mode() {
             return None;
@@ -1197,6 +1240,7 @@ impl TerminalPane {
     /// the decoration, which is the marker row's own text column (continuation rows are indented
     /// under it). That margin, not each row's first non-blank cell, is the row's start, so a
     /// deliberately indented line keeps its leading spaces in the count.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn hard_input_rows(&self, lo: i32, hi: i32) -> Option<Vec<HardRow>> {
         let (cols, _) = self.grid_size();
         let mut rows = Vec::with_capacity((hi - lo + 1) as usize);
@@ -1228,6 +1272,7 @@ impl TerminalPane {
     /// Highlight rectangles (logical px) for the active *dragged* selection over a surface of
     /// `surf_w`×`surf_h`. Empty for no selection or a non-dragged click — so a plain click never
     /// leaves a stray one-cell highlight.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn selection_rects(&self, surf_w: f32, surf_h: f32) -> Vec<(f32, f32, f32, f32)> {
         let sel = match &self.selection {
             Some(s) if s.dragged => s,
@@ -1247,6 +1292,7 @@ impl TerminalPane {
     /// (one char per cell, blanks as spaces, each line right-trimmed, rows joined by `\n`).
     /// `None` when there's no real selection. Exact for ASCII (the same wide-glyph caveat as the
     /// link extractor).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn selection_text(&self) -> Option<String> {
         let sel = match &self.selection {
             Some(s) if s.dragged => s,
@@ -1291,6 +1337,7 @@ impl TerminalPane {
     /// Copy the current selection to the system clipboard and raise a "Copied …" indicator
     /// (the copy-on-select behavior, also bound to Ctrl+C / Ctrl+Shift+C). Returns the number of
     /// characters copied, or `None` if there was no selection or the clipboard was unavailable.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn copy_selection(&mut self) -> Option<usize> {
         let text = self.selection_text()?;
         let n = text.chars().count();
@@ -1311,6 +1358,7 @@ impl TerminalPane {
     /// [`copy_selection`](Self::copy_selection). Replaces the app's `clip.exe` shell-out, which
     /// blocked the UI thread on `child.wait()` for every Ctrl+click (a visible freeze) and
     /// showed no indicator.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn copy_text(&mut self, text: &str) -> bool {
         if self.clipboard.copy(text) {
             self.set_toast("Copied to clipboard");
@@ -1323,6 +1371,7 @@ impl TerminalPane {
     /// Read the system clipboard for a right-click / Ctrl+V paste, raising a "Pasted …"
     /// indicator. Returns the text the caller should write to this pane's session (the controller
     /// doesn't own the session transport), or `None` when the clipboard is empty/unavailable.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn paste_from_clipboard(&mut self) -> Option<String> {
         let text = self.clipboard.paste()?;
         let n = text.chars().count();
@@ -1341,6 +1390,7 @@ impl TerminalPane {
     /// drop). Sharing `prepare_paste` is the point: a TUI that distinguishes pasted content
     /// from typing must see a drop the same way it sees a paste, or a dropped path arrives
     /// as if it had been hand-typed one key at a time.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn prepare_insert(&self, text: &str) -> String {
         prepare_paste(text, self.grid.bracketed_paste())
     }
@@ -1348,18 +1398,21 @@ impl TerminalPane {
     /// Whether the OS clipboard holds an image (vs text). The controller uses this to decide
     /// whether a Ctrl+V with no clipboard text should forward a literal 0x16 to an in-pane TUI
     /// (Claude Code) that reads the clipboard image itself — see [`Clipboard::has_image`].
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn clipboard_has_image(&mut self) -> bool {
         self.clipboard.has_image()
     }
 
     /// Pin the viewport back to the live edge (display offset 0) so the cursor is visible at the
     /// end of whatever was just written — e.g. after a paste, regardless of scrollback position.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scroll_to_bottom(&mut self) {
         self.grid.scroll_to_bottom();
     }
 
     /// Scroll the scrollback viewport by `delta_lines` (positive = up into history, negative =
     /// toward the live edge), clamped to the history bounds. Stamps the scrollbar's show timer.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scroll_by(&mut self, delta_lines: i32) {
         self.grid.scroll_by(delta_lines);
         self.scroll_activity = Some(Instant::now());
@@ -1368,6 +1421,7 @@ impl TerminalPane {
     /// Scroll the scrollback viewport by one page (`up` = into history, else toward the live
     /// edge). A page is the visible row count less one row of overlap, so successive pages keep a
     /// line of context. Drives Shift+PageUp / Shift+PageDown.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scroll_page(&mut self, up: bool) {
         let (_, rows) = self.grid_size();
         let page = (rows as i32 - 1).max(1);
@@ -1375,6 +1429,7 @@ impl TerminalPane {
     }
 
     /// Jump the viewport to the very top of scrollback (Shift+Home). Stamps the scrollbar timer.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scroll_to_top(&mut self) {
         let (hist, _, off) = self.grid.scroll_metrics();
         if hist > off {
@@ -1395,6 +1450,7 @@ impl TerminalPane {
     /// Otherwise it scrolls our own scrollback viewport and returns `None`. This is the fix for
     /// "can't scroll Claude": in the alt screen there is no scrollback for `scroll_by` to move, so
     /// the wheel must be forwarded to the app.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn wheel(
         &mut self,
         delta_lines: i32,
@@ -1422,6 +1478,7 @@ impl TerminalPane {
     /// down; the position is the 1-based cell under the pointer.
     /// 1-based `(col, row)` of the pointer at logical px `(x, y)` over a `surf_w`×`surf_h` surface,
     /// clamped into the grid. Shared by every mouse report.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn cell_1based(&self, x: f32, y: f32, surf_w: f32, surf_h: f32) -> (usize, usize) {
         match self.cell_logical(surf_w, surf_h) {
             Some((cw, ch, cols, rows)) => {
@@ -1436,6 +1493,7 @@ impl TerminalPane {
     /// Encode ONE mouse report: `cb` is the button/event code (motion already includes the +32
     /// motion bit; wheel is 64/65), `release` picks SGR final `m`/X10 button-3. SGR (`ESC[<cb;c;r
     /// M|m`) when the app asked for it (DECSET 1006), else legacy X10 (`ESC[M` + 3 bytes, each +32).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn fmt_mouse(&self, cb: u32, col: usize, row: usize, release: bool) -> Vec<u8> {
         if self.grid.sgr_mouse() {
             let term = if release { 'm' } else { 'M' };
@@ -1453,6 +1511,7 @@ impl TerminalPane {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn mouse_wheel_report(
         &self,
         delta_lines: i32,
@@ -1476,6 +1535,7 @@ impl TerminalPane {
     /// of doing a local terminal selection — unless Shift is held (see [`mouse_report`]).
     ///
     /// [`mouse_report`]: Self::mouse_report
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn app_grabs_mouse(&self) -> bool {
         self.grid.mouse_mode()
     }
@@ -1485,6 +1545,7 @@ impl TerminalPane {
     /// middle, 2 = right, 3 = none (a bare move). Motion is only reported when the app asked for it
     /// (1002 = while a button is held, 1003 = always); press/release always report. Returns `None`
     /// if the app isn't grabbing the mouse.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn mouse_report(
         &self,
         kind: i32,
@@ -1520,6 +1581,7 @@ impl TerminalPane {
 
     /// How far the viewport is scrolled up from the live edge, in lines (0 = pinned to the bottom).
     /// Drives the jump-to-bottom HUD: shown whenever this is non-zero.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scroll_offset(&self) -> usize {
         self.grid.scroll_metrics().2
     }
@@ -1529,6 +1591,7 @@ impl TerminalPane {
     /// pane: the thumb height is proportional to the visible fraction of the buffer, its position to
     /// how far down the buffer the viewport sits, and the opacity ramps from 1 down to 0 over the
     /// show-then-fade window since the last scroll gesture (so the bar is invisible while idle).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scrollbar(&self, surf_h: f32) -> Option<(f32, f32, f32)> {
         let opacity = self.scrollbar_opacity()?;
         let (hist, rows, off) = self.grid.scroll_metrics();
@@ -1552,6 +1615,7 @@ impl TerminalPane {
 
     /// Current scrollbar opacity from the show-then-fade timer, or `None` once it has fully faded
     /// (so the projection can drop the bar entirely while idle).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn scrollbar_opacity(&self) -> Option<f32> {
         let e = self.scroll_activity?.elapsed().as_millis();
         if e < SCROLLBAR_SHOW_MS {
@@ -1567,12 +1631,14 @@ impl TerminalPane {
 
     /// Raise a transient indicator over the pane (e.g. "Copied 12 chars to clipboard"). It
     /// auto-expires after [`TOAST_MS`]; poll it each frame with [`toast_text`](Self::toast_text).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn set_toast(&mut self, msg: impl Into<String>) {
         self.toast = Some((msg.into(), Instant::now()));
     }
 
     /// The indicator text to display right now, or `None` once it has expired (which also clears
     /// it). Call this every frame and push the result to the pane's `toast` property.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn toast_text(&mut self) -> Option<String> {
         let expired = match &self.toast {
             Some((_, at)) => at.elapsed().as_millis() >= TOAST_MS,
@@ -1592,12 +1658,14 @@ impl TerminalPane {
     // xterm `@xterm/addon-search` wiring in the Electron `Terminal.tsx` / `SearchBox.tsx`.
 
     /// Open the search box (Ctrl+F). The query starts empty; type to search.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn search_open(&mut self) {
         self.search_shown = true;
     }
 
     /// Close the search box, dropping the query/matches and pinning the viewport back to the
     /// bottom (the live prompt).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn search_close(&mut self) {
         self.search_shown = false;
         self.search_query.clear();
@@ -1607,17 +1675,20 @@ impl TerminalPane {
     }
 
     /// Whether the search box is open.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn search_is_open(&self) -> bool {
         self.search_shown
     }
 
     /// The current query text.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn search_query(&self) -> &str {
         &self.search_query
     }
 
     /// Set the query (find-as-you-type): recompute matches across the grid + scrollback, pick the
     /// match nearest the current viewport, and scroll it into view.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn search_set_query(&mut self, query: &str) {
         self.search_query = query.to_string();
         self.search_recompute();
@@ -1625,6 +1696,7 @@ impl TerminalPane {
     }
 
     /// Step to the next (`forward`) / previous match, wrapping around, and reveal it.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn search_step(&mut self, forward: bool) {
         if self.search_matches.is_empty() {
             return;
@@ -1635,6 +1707,7 @@ impl TerminalPane {
     }
 
     /// `(current_1_based, total)` for the match counter — `(0, 0)` when there are no matches.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn search_count(&self) -> (usize, usize) {
         let total = self.search_matches.len();
         let cur = self.search_index.map(|i| i + 1).unwrap_or(0);
@@ -1646,6 +1719,7 @@ impl TerminalPane {
     /// of view are omitted.
     // pre-existing; deferred per repo lint policy (test.yml)
     #[allow(clippy::type_complexity)]
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn search_view_rects(
         &self,
         surf_w: f32,
@@ -1680,6 +1754,7 @@ impl TerminalPane {
 
     /// Recompute `search_matches` for the current query, choosing an initial active match nearest
     /// the viewport top. Clears everything for an empty query.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn search_recompute(&mut self) {
         if self.search_query.is_empty() {
             self.search_matches.clear();
@@ -1697,6 +1772,7 @@ impl TerminalPane {
     }
 
     /// Scroll the active match into view (no-op if already visible or there's none).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn search_reveal_active(&mut self) {
         if let Some(m) = self
             .search_index
@@ -1709,6 +1785,7 @@ impl TerminalPane {
     /// Recompute matches against the (possibly reflowed) grid — call after a [`resize`](Self::resize)
     /// so the highlight rects keep tracking the rewrapped text while the search box stays open. A
     /// no-op when search is closed; doesn't force-scroll (the viewport stays where the user left it).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn search_reflow(&mut self) {
         if self.search_shown {
             self.search_recompute();
@@ -1720,6 +1797,7 @@ impl TerminalPane {
 /// a font with `cell_w`×`cell_h` cells. Clamped to a sane minimum so a collapsed pane
 /// never produces a 0-sized grid. A small free helper the app-shell can reuse for the
 /// geometry→resize step.
+#[tracing::instrument(level = "debug", ret)]
 pub fn cells_for_px(width_px: f32, height_px: f32, cell_w: u32, cell_h: u32) -> (usize, usize) {
     let cols = ((width_px as u32) / cell_w.max(1)).max(2) as usize;
     let rows = ((height_px as u32) / cell_h.max(1)).max(1) as usize;
@@ -1730,6 +1808,7 @@ pub fn cells_for_px(width_px: f32, height_px: f32, cell_w: u32, cell_h: u32) -> 
 /// Up/Down per scrollback line in `delta_lines` (positive = up). Encoded as application cursor keys
 /// (`ESC O A/B`) when DECCKM is set, else normal (`ESC [ A/B`) — what xterm sends so pagers (less,
 /// man) scroll on the wheel. This is the no-mouse-grab leg of the "can't scroll Claude" fix.
+#[tracing::instrument(level = "debug", ret)]
 fn alt_scroll_arrows(delta_lines: i32, app_cursor: bool) -> Vec<u8> {
     let seq: &[u8] = match (delta_lines > 0, app_cursor) {
         (true, false) => b"\x1b[A",
@@ -1751,6 +1830,7 @@ fn alt_scroll_arrows(delta_lines: i32, app_cursor: bool) -> Vec<u8> {
 ///    mode (DECSET 2004 — modern PSReadLine / PowerShell 7). Then the shell inserts it as one
 ///    literal paste (caret at the end, no premature execution). Old shells (Windows PowerShell 5.1)
 ///    don't set the mode, so the CR-normalized text is sent bare — still the correct Enter handling.
+#[tracing::instrument(level = "debug", ret)]
 fn prepare_paste(text: &str, bracketed: bool) -> String {
     let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
     if bracketed {
@@ -1785,6 +1865,7 @@ struct HardRowShape {
 }
 
 impl HardRowShape {
+    #[tracing::instrument(level = "debug", ret)]
     fn of(text: &[char], cols: usize) -> Self {
         const BORDERS: [char; 2] = ['│', '║'];
         const MARKERS: [char; 2] = ['>', '❯'];
@@ -1832,6 +1913,7 @@ impl HardRowShape {
 /// the terminal's own (WRAPLINE), or the box's, which shows as text running to the row's
 /// right limit. `col` is clamped into the row's text so a click on the decoration or past the
 /// end lands at the nearest end of that row.
+#[tracing::instrument(level = "debug", ret)]
 fn hard_row_offset(rows: &[HardRow], lo: i32, line: i32, col: usize) -> i32 {
     let idx = (line - lo) as usize;
     let mut acc: i32 = 0;

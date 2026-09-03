@@ -82,6 +82,7 @@ pub struct SummaryScheduler {
 }
 
 impl SummaryScheduler {
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn new(
         cfg: SchedulerConfig,
         run_job: impl FnMut(&str) -> JobStart + 'static,
@@ -108,6 +109,7 @@ impl SummaryScheduler {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn start(&mut self) {
         if self.running {
             return;
@@ -118,6 +120,7 @@ impl SummaryScheduler {
 
     /// Stop scheduling and drop all pending timers/queue. In-flight jobs are left
     /// to settle on their own (their results are ignored once stopped).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn stop(&mut self) {
         self.running = false;
         self.settle_timers.clear();
@@ -129,11 +132,13 @@ impl SummaryScheduler {
         self.backoff_ms = 0;
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_config(&mut self, cfg: SchedulerConfig) {
         self.cfg = cfg;
     }
 
     /// A pane produced output: remember it and (re)arm its settle timer.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn note_output(&mut self, uid: &str) {
         if !self.running {
             return;
@@ -148,6 +153,7 @@ impl SummaryScheduler {
     }
 
     /// A pane is gone (session exit / no longer published): forget all state for it.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn forget(&mut self, uid: &str) {
         self.settle_timers.remove(uid);
         self.known.remove(uid);
@@ -159,18 +165,21 @@ impl SummaryScheduler {
     }
 
     /// Resolve a job previously reported [`JobStart::InFlight`].
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn complete(&mut self, uid: &str, result: JobResult) {
         self.finish(uid.to_string(), result);
         self.pump();
     }
 
     /// Number of jobs currently running (for tests / introspection).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn in_flight_count(&self) -> usize {
         self.in_flight.len()
     }
 
     /// Advance the virtual clock by `ms`, firing every timer that comes due, in
     /// chronological order (the deterministic equivalent of fake timers).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn advance(&mut self, ms: i64) {
         let target = self.now + ms;
         loop {
@@ -195,6 +204,7 @@ impl SummaryScheduler {
         self.now = target;
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn fire_at(&mut self, t: i64) {
         // Settle timers due now (sorted for deterministic enqueue order).
         let mut due: Vec<String> = self
@@ -223,6 +233,7 @@ impl SummaryScheduler {
         self.pump();
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn enqueue(&mut self, uid: String) {
         if !self.running {
             return;
@@ -238,6 +249,7 @@ impl SummaryScheduler {
         // Caller pumps (fire_at / complete do so after dispatch).
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn pump(&mut self) {
         loop {
             if self.running && self.backoff_timer.is_none() {
@@ -263,6 +275,7 @@ impl SummaryScheduler {
 
     // The tail of the TS async `execute`, after the job result is known. Does NOT
     // pump — the pump loop (or `complete`) drives the next round.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn finish(&mut self, uid: String, result: JobResult) {
         self.in_flight.remove(&uid);
         if !self.running {
@@ -289,6 +302,7 @@ impl SummaryScheduler {
 
     // Re-enqueue panes that haven't summarized within the staleness window. The
     // real runJob skips those with nothing new, so this is a cheap backstop.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn stale_tick(&mut self) {
         let cutoff = self.now - self.cfg.max_staleness_sec * 1000;
         let known: Vec<String> = self.known.iter().cloned().collect();
@@ -299,6 +313,7 @@ impl SummaryScheduler {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn schedule_backoff(&mut self, uid: String) {
         if !self.queued.contains(&uid) {
             self.queue.push_front(uid.clone()); // retry this one first
@@ -308,11 +323,13 @@ impl SummaryScheduler {
         self.backoff_timer = Some(self.now + self.backoff_ms);
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn reset_backoff(&mut self) {
         self.backoff_ms = 0;
         self.backoff_timer = None;
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn report(&mut self, online: bool, last_error: Option<&str>) {
         if self.last_online == Some(online) {
             return;

@@ -34,6 +34,7 @@ const TRUNCATED_SUFFIX: &str = " Truncated.";
 ///   the text it decorated
 /// - whitespace collapses to single spaces, and the result is capped at [`MAX_LEN`] chars
 ///   at the last sentence boundary before the cap, with `" Truncated."` appended
+#[tracing::instrument(level = "debug", ret)]
 pub fn normalize_for_speech(input: &str) -> String {
     let text = markup::strip_ansi(input);
     let text = markup::strip_decoration(&text);
@@ -65,6 +66,7 @@ pub fn normalize_for_speech(input: &str) -> String {
 /// two-column table, and flattening one is very nearly the identity — which is why the
 /// CSV guess is safe at all. But a Markdown *list* of such lines is not: reading it as a
 /// table would skip the list handling below and leave the emphasis markers in.
+#[tracing::instrument(level = "debug", ret)]
 fn looks_like_markdown(text: &str) -> bool {
     text.contains("**")
         || text.contains('`')
@@ -83,6 +85,7 @@ fn looks_like_markdown(text: &str) -> bool {
 /// The character filter is belt-and-suspenders for anything the structured passes missed —
 /// a stray emphasis marker, an unpaired bracket — which would otherwise be read out as a
 /// word.
+#[tracing::instrument(level = "debug", ret)]
 fn finish(text: &str) -> String {
     let stripped: String = text
         .chars()
@@ -92,6 +95,7 @@ fn finish(text: &str) -> String {
 }
 
 /// Remove Markdown markup, keeping the text it decorated.
+#[tracing::instrument(level = "debug", ret)]
 fn markdown_to_prose(input: &str) -> String {
     let lines: Vec<String> = input
         .lines()
@@ -122,6 +126,7 @@ fn markdown_to_prose(input: &str) -> String {
 /// Replace each fenced code block (``` ... ```) with the phrase "code block omitted." —
 /// hearing raw code read character-by-character is noise, not information; the listener
 /// can look at the pane for the code itself.
+#[tracing::instrument(level = "debug", ret)]
 fn strip_code_fences(input: &str) -> String {
     let mut out_lines = Vec::new();
     let mut in_fence = false;
@@ -142,6 +147,7 @@ fn strip_code_fences(input: &str) -> String {
 
 /// Is this line a thematic break (`---`, `***`, `___`) or a setext heading underline
 /// (`===`, `---`)? Both are runs of one character, and neither says anything.
+#[tracing::instrument(level = "debug", ret)]
 fn is_rule_line(line: &str) -> bool {
     let trimmed = line.trim();
     let Some(first) = trimmed.chars().next() else {
@@ -156,6 +162,7 @@ fn is_rule_line(line: &str) -> bool {
 
 /// Is this line a link reference definition (`[label]: https://…`)? The label is repaid
 /// where it is used; the line itself is bookkeeping.
+#[tracing::instrument(level = "debug", ret)]
 fn is_link_definition(line: &str) -> bool {
     let trimmed = line.trim_start();
     trimmed.starts_with('[')
@@ -166,6 +173,7 @@ fn is_link_definition(line: &str) -> bool {
 
 /// Strip blockquote markers (`> `, and `>> ` for a quote inside a quote), keeping the
 /// quoted text.
+#[tracing::instrument(level = "debug", ret)]
 fn strip_blockquote(line: &str) -> String {
     let mut rest = line.trim_start();
     let mut stripped = false;
@@ -182,6 +190,7 @@ fn strip_blockquote(line: &str) -> String {
 
 /// Strip a leading list marker (`- `, `* `, `+ `, or `1. `-style) from one line,
 /// keeping the item text.
+#[tracing::instrument(level = "debug", ret)]
 fn strip_list_marker(line: &str) -> String {
     let trimmed = line.trim_start();
     for m in ["- ", "* ", "+ "] {
@@ -203,6 +212,7 @@ fn strip_list_marker(line: &str) -> String {
 /// It is dropped rather than spoken as "done" or "to do": the marker is a glyph in a UI,
 /// and inventing a word for it puts a claim in the listener's ear that the author did not
 /// write.
+#[tracing::instrument(level = "debug", ret)]
 fn strip_task_box(line: &str) -> String {
     let trimmed = line.trim_start();
     for box_ in ["[ ] ", "[x] ", "[X] ", "[ ]", "[x]", "[X]"] {
@@ -215,6 +225,7 @@ fn strip_task_box(line: &str) -> String {
 
 /// Strip a leading ATX header marker (`#` through `######` followed by a space) from
 /// one line, leaving the heading text.
+#[tracing::instrument(level = "debug", ret)]
 fn strip_atx_header(line: &str) -> String {
     let trimmed = line.trim_start();
     let hashes = trimmed.chars().take_while(|&c| c == '#').count();
@@ -225,6 +236,7 @@ fn strip_atx_header(line: &str) -> String {
     line.to_string()
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn is_table_separator_row(trimmed: &str) -> bool {
     !trimmed.is_empty()
         && trimmed.contains('-')
@@ -235,6 +247,7 @@ fn is_table_separator_row(trimmed: &str) -> bool {
 
 /// If `line` looks like a `|`-delimited table row, flatten it to `", "`-joined cells
 /// (dropping a pure separator row entirely); otherwise return it unchanged.
+#[tracing::instrument(level = "debug", ret)]
 fn convert_table_row_or_pass(line: &str) -> String {
     let trimmed = line.trim();
     if !trimmed.contains('|') {
@@ -252,6 +265,7 @@ fn convert_table_row_or_pass(line: &str) -> String {
 }
 
 /// Replace `[text](url)` with `text`. Non-nested, single-line matches only.
+#[tracing::instrument(level = "debug", ret)]
 fn strip_markdown_links(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
@@ -282,6 +296,7 @@ fn strip_markdown_links(input: &str) -> String {
 
 /// Replace a reference link (`[text][label]`, or `[text][]`) with `text`. The label points
 /// at a definition line that [`is_link_definition`] has already dropped.
+#[tracing::instrument(level = "debug", ret)]
 fn strip_reference_links(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
@@ -310,6 +325,7 @@ fn strip_reference_links(input: &str) -> String {
 
 /// Remove Markdown autolinks (`<https://…>`, `<mailto:…>`), which [`strip_bare_urls`]
 /// cannot see because of the brackets around them.
+#[tracing::instrument(level = "debug", ret)]
 fn strip_autolinks(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
@@ -332,6 +348,7 @@ fn strip_autolinks(input: &str) -> String {
 }
 
 /// Remove bare `http://`/`https://` URLs (anything up to the next whitespace).
+#[tracing::instrument(level = "debug", ret)]
 fn strip_bare_urls(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut rest = input;
@@ -350,6 +367,7 @@ fn strip_bare_urls(input: &str) -> String {
 
 /// Collapse every run of whitespace (including newlines) to a single space, and trim
 /// the ends.
+#[tracing::instrument(level = "debug", ret)]
 fn collapse_whitespace(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut last_was_space = false;
@@ -370,6 +388,7 @@ fn collapse_whitespace(input: &str) -> String {
 /// Cap `input` at `max` chars, cutting at the last sentence-ending punctuation before
 /// the cap (inclusive) and appending [`TRUNCATED_SUFFIX`]. If no sentence boundary is
 /// found, hard-cuts at `max` chars instead.
+#[tracing::instrument(level = "debug", ret)]
 fn truncate_at_sentence(input: &str, max: usize) -> String {
     if input.chars().count() <= max {
         return input.to_string();

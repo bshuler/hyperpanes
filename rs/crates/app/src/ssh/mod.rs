@@ -68,6 +68,7 @@ pub mod server;
 
 /// True for `hyperpanes ssh …`. Only `argv[1]`, so `hyperpanes -c "ssh box"` still launches
 /// the GUI and runs ssh in a pane.
+#[tracing::instrument(level = "debug", ret)]
 pub fn wants_ssh(argv: &[String]) -> bool {
     argv.get(1).map(|a| a == "ssh").unwrap_or(false)
 }
@@ -100,6 +101,7 @@ NOTES:
 
 /// `hyperpanes ssh <subcommand>`.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn run(argv: &[String]) -> std::io::Result<()> {
     match run_inner(argv) {
         Ok(()) => Ok(()),
@@ -112,6 +114,7 @@ pub fn run(argv: &[String]) -> std::io::Result<()> {
 
 /// Windows: refuse with the real reason rather than pretending the feature is there.
 #[cfg(not(unix))]
+#[tracing::instrument(level = "debug", ret)]
 pub fn run(_argv: &[String]) -> std::io::Result<()> {
     eprintln!(
         "hyperpanes ssh is not available on Windows.\n\
@@ -123,6 +126,7 @@ pub fn run(_argv: &[String]) -> std::io::Result<()> {
 }
 
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn run_inner(argv: &[String]) -> Result<(), String> {
     use config::{SshPaths, SshSettings};
 
@@ -265,6 +269,7 @@ fn run_inner(argv: &[String]) -> Result<(), String> {
 }
 
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn status(paths: &config::SshPaths) -> Result<(), String> {
     let s = config::SshSettings::load(&paths.settings)?;
     println!("enabled:    {}", s.enabled);
@@ -307,6 +312,7 @@ fn status(paths: &config::SshPaths) -> Result<(), String> {
 /// so it is obvious which command takes each one away again. Takes a sink so the shape is
 /// testable without capturing stdout.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret, skip(out))]
 fn print_keys(set: &keys::Authorizer, mut out: impl FnMut(&str)) {
     let now = keys::now_ms();
     let live = set.live_len(now);
@@ -336,6 +342,7 @@ fn print_keys(set: &keys::Authorizer, mut out: impl FnMut(&str)) {
 /// immediately; every failure is logged and non-fatal, because an SSH misconfiguration must
 /// never stop the daemon that owns the user's live terminals from starting.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn spawn_with_daemon(salt: &str) {
     let paths = config::SshPaths::from_env();
     let settings = match config::SshSettings::load(&paths.settings) {
@@ -363,6 +370,7 @@ pub fn spawn_with_daemon(salt: &str) {
 
 /// No-op on Windows — see the module docs.
 #[cfg(not(unix))]
+#[tracing::instrument(level = "debug", ret)]
 pub fn spawn_with_daemon(_salt: &str) {}
 
 #[cfg(test)]

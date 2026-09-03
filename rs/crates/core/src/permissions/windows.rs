@@ -18,6 +18,7 @@ use std::process::{Command, Stdio};
 
 use super::{Grant, Right};
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn label(right: Right) -> &'static str {
     match right {
         Right::ScreenRecording => "Screen recording",
@@ -30,6 +31,7 @@ pub fn label(right: Right) -> &'static str {
 }
 
 /// `None` for the rights Windows does not gate.
+#[tracing::instrument(level = "debug", ret)]
 fn settings_url(right: Right) -> Option<&'static str> {
     match right {
         Right::Notifications => Some("ms-settings:notifications"),
@@ -42,6 +44,7 @@ fn settings_url(right: Right) -> Option<&'static str> {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn status(right: Right) -> Grant {
     match settings_url(right) {
         Some(_) => Grant::Undetermined,
@@ -51,10 +54,12 @@ pub fn status(right: Right) -> Grant {
 
 /// Nothing to raise: Windows shows its privacy consent dialogs to packaged apps, and a Win32
 /// desktop binary is simply allowed or not by the Settings switch.
+#[tracing::instrument(level = "debug", ret)]
 pub fn prompt(right: Right) -> Grant {
     status(right)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn request(right: Right) -> Result<(), String> {
     let url =
         settings_url(right).ok_or_else(|| format!("{} is not gated on Windows", right.id()))?;

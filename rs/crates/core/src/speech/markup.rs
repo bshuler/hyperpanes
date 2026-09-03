@@ -236,6 +236,7 @@ const LATIN1_ENTITIES: &[&str] = &[
 /// titles and hyperlinks; and the two-character sequences (`ESC ( B`, `ESC =`) that switch
 /// character sets. A lone `ESC` with nothing recognizable after it is dropped rather than
 /// spoken.
+#[tracing::instrument(level = "debug", ret)]
 pub fn strip_ansi(input: &str) -> String {
     let ch: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
@@ -281,6 +282,7 @@ pub fn strip_ansi(input: &str) -> String {
 }
 
 /// Is `c` a character that draws rather than says?
+#[tracing::instrument(level = "debug", ret)]
 fn is_decoration(c: char) -> bool {
     matches!(c,
         // C0 controls. Tab and newline survive: they are the structure the line-based
@@ -301,6 +303,7 @@ fn is_decoration(c: char) -> bool {
 ///
 /// Each one becomes a space rather than nothing: `a│b` is two things, and gluing them into
 /// `ab` invents a word. Whitespace is collapsed at the end of the pipeline anyway.
+#[tracing::instrument(level = "debug", ret)]
 pub fn strip_decoration(input: &str) -> String {
     input
         .chars()
@@ -314,6 +317,7 @@ pub fn strip_decoration(input: &str) -> String {
 /// brackets, or an HTML comment. Deliberately conservative: a false positive here deletes
 /// words from the middle of a sentence, while a false negative only leaves a stray bracket
 /// that the synthesizer will not read aloud anyway.
+#[tracing::instrument(level = "debug", ret)]
 pub fn looks_like_html(input: &str) -> bool {
     if input.contains("<!--") {
         return true;
@@ -348,6 +352,7 @@ struct Tag {
 /// Attribute scanning tracks quotes so a `>` inside `title="a > b"` does not end the tag
 /// early. An unterminated bracket returns `None` — the `<` is then literal text, which is
 /// what a lone `<` in prose is.
+#[tracing::instrument(level = "debug")]
 fn parse_tag(ch: &[char], at: usize) -> Option<Tag> {
     let mut i = at + 1;
     let closing = ch.get(i) == Some(&'/');
@@ -390,6 +395,7 @@ fn parse_tag(ch: &[char], at: usize) -> Option<Tag> {
 }
 
 /// Read one attribute's value out of a tag's raw attribute text.
+#[tracing::instrument(level = "debug", ret)]
 fn attr_value(attrs: &str, want: &str) -> Option<String> {
     let lower = attrs.to_ascii_lowercase();
     let mut from = 0;
@@ -425,6 +431,7 @@ fn attr_value(attrs: &str, want: &str) -> Option<String> {
 /// are decoded; `<script>`, `<style>` and `<svg>` bodies are dropped whole; an `<img>`
 /// contributes its `alt` text, which is the one place HTML puts words that are not between
 /// tags.
+#[tracing::instrument(level = "debug", ret)]
 pub fn html_to_text(input: &str) -> String {
     let ch: Vec<char> = input.chars().collect();
     let mut out = String::with_capacity(input.len());
@@ -479,6 +486,7 @@ pub fn html_to_text(input: &str) -> String {
 
 /// The whitespace a tag boundary stands for. Cell ends are the one case that needs a
 /// visible mark: two table cells run together are one wrong word, not two right ones.
+#[tracing::instrument(level = "debug", ret)]
 fn separator_for(name: &str, closing: bool) -> &'static str {
     if (name == "td" || name == "th") && closing {
         return ", ";
@@ -495,6 +503,7 @@ fn separator_for(name: &str, closing: bool) -> &'static str {
 }
 
 /// Drop the `", "` a final `</td>` leaves dangling at the end of its row.
+#[tracing::instrument(level = "debug", ret)]
 fn tidy_cells(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for (n, line) in input.split('\n').enumerate() {
@@ -506,11 +515,13 @@ fn tidy_cells(input: &str) -> String {
     out
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn find_seq(ch: &[char], from: usize, needle: &[char]) -> Option<usize> {
     (from..ch.len().saturating_sub(needle.len() - 1)).find(|&i| ch[i..i + needle.len()] == *needle)
 }
 
 /// Skip to just past `</name>`, or to the end if it never closes.
+#[tracing::instrument(level = "debug", ret)]
 fn skip_element(ch: &[char], from: usize, name: &str) -> usize {
     let mut i = from;
     while i < ch.len() {
@@ -531,6 +542,7 @@ fn skip_element(ch: &[char], from: usize, name: &str) -> usize {
 /// An unrecognized reference is left exactly as written. Guessing would be worse than
 /// useless: `&foo;` read as text is a small oddity, whereas silently deleting it removes
 /// content the listener has no way to recover.
+#[tracing::instrument(level = "debug", ret)]
 pub fn decode_entities(input: &str) -> String {
     if !input.contains('&') {
         return input.to_string();
@@ -561,6 +573,7 @@ pub fn decode_entities(input: &str) -> String {
     out
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn resolve_entity(body: &str) -> Option<char> {
     if let Some(num) = body.strip_prefix('#') {
         let code = match num.strip_prefix(['x', 'X']) {
@@ -589,6 +602,7 @@ fn resolve_entity(body: &str) -> Option<char> {
 /// alternative is hearing every brace, bracket and quotation mark. Keys are spoken because
 /// they are usually the only label a value has; `_` and `-` become spaces so `exit_code`
 /// is two words rather than one unpronounceable one.
+#[tracing::instrument(level = "debug", ret)]
 pub fn json_to_text(input: &str) -> Option<String> {
     let trimmed = input.trim();
     if !(trimmed.starts_with('{') || trimmed.starts_with('[')) {
@@ -600,6 +614,7 @@ pub fn json_to_text(input: &str) -> Option<String> {
     Some(parts.join(". "))
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn flatten_json(value: &serde_json::Value, out: &mut Vec<String>) {
     match value {
         serde_json::Value::Null => {}
@@ -653,6 +668,7 @@ const CSV_MAX_WORDS: usize = 12;
 /// rejected on any of four counts: fewer than two lines, rows that disagree about how many
 /// fields they have, a single field, or a field long enough to be a sentence. Prose fails
 /// the second test almost always and the fourth immediately.
+#[tracing::instrument(level = "debug", ret)]
 pub fn csv_to_text(input: &str) -> Option<String> {
     let lines: Vec<&str> = input.lines().filter(|l| !l.trim().is_empty()).collect();
     if lines.len() < 2 {
@@ -699,6 +715,7 @@ pub fn csv_to_text(input: &str) -> Option<String> {
 }
 
 /// Does this row read like a sentence someone wrote rather than a row of values?
+#[tracing::instrument(level = "debug", ret)]
 fn is_prose_row(fields: &[String]) -> bool {
     if fields.iter().any(|f| f.contains(". ")) {
         return true;
@@ -717,6 +734,7 @@ fn is_prose_row(fields: &[String]) -> bool {
 
 /// Split one delimited line into fields, honouring RFC 4180 quoting: a delimiter inside
 /// `"…"` is data, and `""` inside a quoted field is one literal quote.
+#[tracing::instrument(level = "debug", ret)]
 fn csv_fields(line: &str, delim: char) -> Vec<String> {
     let mut fields = Vec::new();
     let mut cur = String::new();

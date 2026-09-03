@@ -67,6 +67,7 @@ pub enum DispatchError {
 }
 
 impl DispatchError {
+    #[tracing::instrument(level = "debug", ret)]
     fn status(&self) -> u16 {
         match self {
             DispatchError::BadRequest(_) => 400,
@@ -74,32 +75,38 @@ impl DispatchError {
             DispatchError::Internal(_) => 500,
         }
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn message(&self) -> &str {
         match self {
             DispatchError::BadRequest(m) | DispatchError::NotFound(m) | DispatchError::Internal(m) => m,
         }
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn no_such_pane(pane_id: &str) -> Self {
         DispatchError::NotFound(format!("no such pane: {pane_id}"))
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn window_not_found(window_id: i64) -> Self {
         DispatchError::NotFound(format!("window not found: {window_id}"))
     }
 }
 
 impl From<String> for DispatchError {
+    #[tracing::instrument(level = "debug", ret)]
     fn from(m: String) -> Self {
         DispatchError::Internal(m)
     }
 }
 
 impl From<&str> for DispatchError {
+    #[tracing::instrument(level = "debug", ret)]
     fn from(m: &str) -> Self {
         DispatchError::Internal(m.to_string())
     }
 }
 
 impl DispatchResult {
+    #[tracing::instrument(level = "debug")]
     fn err(status: u16, message: &str) -> Self {
         DispatchResult {
             status,
@@ -108,6 +115,7 @@ impl DispatchResult {
             projects_dirty: false,
         }
     }
+    #[tracing::instrument(level = "debug")]
     fn ok(result: Option<Value>, notify_state: bool) -> Self {
         let body = match result {
             Some(r) => json!({ "ok": true, "result": r }),
@@ -126,6 +134,7 @@ impl DispatchResult {
 /// `control_file` is the discovery path injected into spawned panes' env (suppressed by
 /// `build_env` when a scoped token rides in the spec's env). `speech` is the shared
 /// per-pane "talk" service (settings + engine) for the `setSpeech*` commands below.
+#[tracing::instrument(level = "debug", skip(sessions, speech))]
 pub fn handle_command(
     model: &mut ReadModel,
     sessions: &SessionManager,
@@ -147,6 +156,7 @@ pub fn handle_command(
     r
 }
 
+#[tracing::instrument(level = "debug", skip(sessions, speech))]
 fn handle_command_inner(
     model: &mut ReadModel,
     sessions: &SessionManager,
@@ -260,6 +270,7 @@ fn handle_command_inner(
 
 /// Run one command against the live model. Returns (command result, structural?) or a
 /// [`DispatchError`] carrying its status. Result `None` ⇒ a result-less command (`{ ok: true }`).
+#[tracing::instrument(level = "debug", ret, skip(sessions))]
 fn exec(
     ty: &str,
     cmd: &Value,
@@ -518,6 +529,7 @@ const RECOVER_TAIL_BYTES: usize = 8 * 1024;
 /// Read a pane's live output, ANSI-strip it (same helper `GET /panes/:id/output?strip=1`
 /// uses), and keep only the last [`RECOVER_TAIL_BYTES`] bytes — the pane-tail text
 /// [`crate::claude_recovery::detect_api_error`] scans.
+#[tracing::instrument(level = "debug", ret, skip(sessions))]
 fn pane_tail(sessions: &SessionManager, uid: &str) -> String {
     let (raw, _) = sessions.replay_with_cursor(uid).unwrap_or_default();
     let stripped = crate::ansi_strip::strip_ansi(&raw);
@@ -526,6 +538,7 @@ fn pane_tail(sessions: &SessionManager, uid: &str) -> String {
 
 /// Keep the last `max` bytes of `s`, walking forward to the nearest char boundary so the
 /// slice is always valid UTF-8 (never splits a multi-byte character).
+#[tracing::instrument(level = "debug", ret)]
 fn tail_bytes(s: &str, max: usize) -> &str {
     if s.len() <= max {
         return s;
@@ -537,6 +550,7 @@ fn tail_bytes(s: &str, max: usize) -> &str {
     &s[start..]
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn error_class_str(c: ErrorClass) -> &'static str {
     match c {
         ErrorClass::Transient => "transient",
@@ -550,6 +564,7 @@ fn error_class_str(c: ErrorClass) -> &'static str {
 /// any) and its class, and the best session this pane could be resumed/repaired against
 /// (a live marker, or every same-cwd scan candidate when there's no marker). Never mutates
 /// anything, so it's always safe to call speculatively before `repair`/`resume`.
+#[tracing::instrument(level = "debug", ret, skip(sessions))]
 fn recover_inspect(sessions: &SessionManager, pane: &PaneInfo) -> Result<Value, String> {
     let activity = crate::control::server::activity_for(
         sessions,
@@ -611,6 +626,7 @@ struct RecoverTarget {
     config_dir: Option<String>,
 }
 
+#[tracing::instrument(level = "debug")]
 fn resolve_recover_target(pane: &PaneInfo, cmd: &Value) -> Result<RecoverTarget, String> {
     let cwd = pane
         .cwd
@@ -672,6 +688,7 @@ fn resolve_recover_target(pane: &PaneInfo, cmd: &Value) -> Result<RecoverTarget,
 /// masking a real, unrelated problem. A healthy/already-repaired transcript is a no-op
 /// (`dropped: []`, no backup written); repairing one is byte-preserving except for the
 /// dropped lines, and always backed up first.
+#[tracing::instrument(level = "debug", ret, skip(sessions))]
 fn recover_repair(
     sessions: &SessionManager,
     pane: &PaneInfo,
@@ -707,6 +724,7 @@ fn recover_repair(
 /// contract (byte-preserving repair, timestamped backup, idempotency) is testable against
 /// a plain temp file, independent of [`resolve_recover_target`]'s session resolution
 /// (which, in production, reads real per-account transcript stores).
+#[tracing::instrument(level = "debug", ret)]
 fn apply_repair_to_disk(path: &Path) -> Result<(Vec<usize>, Option<String>), String> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("reading transcript {}: {e}", path.display()))?;
@@ -735,6 +753,7 @@ fn apply_repair_to_disk(path: &Path) -> Result<(Vec<usize>, Option<String>), Str
 /// doesn't second-guess that — it only hard-refuses the one class recovery can't reason
 /// about at all), then shares its respawn mechanics with `restartPane { resume: true }` via
 /// [`respawn_resuming`].
+#[tracing::instrument(level = "debug", ret, skip(sessions))]
 fn recover_resume(
     model: &mut ReadModel,
     sessions: &SessionManager,
@@ -780,6 +799,7 @@ struct ResumeTarget {
 }
 
 impl ResumeTarget {
+    #[tracing::instrument(level = "debug")]
     fn from_marker(m: &crate::claude_panes::PaneClaudeSession) -> Self {
         ResumeTarget {
             session_id: m.session_id.clone(),
@@ -793,6 +813,7 @@ impl ResumeTarget {
 /// mechanics shared by `restartPane { resume: true }` (marker-sourced target) and
 /// `recoverPane { action: "resume" }` (marker-or-scan-fallback target), factored out so
 /// there's exactly one place that knows how to rebuild a resumed launch.
+#[tracing::instrument(level = "debug", skip_all)]
 fn respawn_resuming(
     model: &mut ReadModel,
     sessions: &SessionManager,
@@ -902,6 +923,7 @@ fn respawn_resuming(
 
 /// Build + spawn a pane session from a `{ label?, command?, args?, cwd?, shell?, color?, meta?,
 /// env? }` spec, returning the read-model `PaneInfo` (not yet inserted).
+#[tracing::instrument(level = "debug", ret, skip(sessions))]
 fn spawn_pane(
     sessions: &SessionManager,
     control_file: Option<&str>,
@@ -1032,6 +1054,7 @@ fn spawn_pane(
 /// reorders the sidebar rail exactly like the GUI's "open project". An unknown handle is an
 /// error (the `newPane` fails rather than spawning a homeless pane). A spec with no `project`
 /// field is left untouched.
+#[tracing::instrument(level = "debug", ret)]
 fn resolve_project_into_spec(spec: &mut Value) -> Result<(), String> {
     let handle = match spec.get("project").and_then(Value::as_str) {
         Some(h) => h.to_string(),
@@ -1053,6 +1076,7 @@ fn resolve_project_into_spec(spec: &mut Value) -> Result<(), String> {
 
 /// Whether a scoped token may run `cmd` against its target (pane > tab > window). Mirrors TS
 /// `commandScopeError` exactly, including the active-tab exception for window-targeted spawns.
+#[tracing::instrument(level = "debug", ret)]
 pub fn command_scope_error(
     scope: Option<&Scope>,
     cmd: &Value,
@@ -1099,6 +1123,7 @@ pub fn command_scope_error(
     Some("a scoped token needs a paneId, tabId, or windowId on the command".to_string())
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn str_field(cmd: &Value, key: &str) -> Result<String, DispatchError> {
     cmd.get(key)
         .and_then(Value::as_str)
@@ -1109,6 +1134,7 @@ fn str_field(cmd: &Value, key: &str) -> Result<String, DispatchError> {
 /// Read `windowId` from a command, accepting either a JSON number OR a numeric string. Clients
 /// that build the request by hand (e.g. `jq -r '.windows[0].windowId'` → the string `"0"`) would
 /// otherwise fail the strict `as_i64` and hit the misleading "needs a paneId or windowId".
+#[tracing::instrument(level = "debug", ret)]
 fn window_id_field(cmd: &Value) -> Option<i64> {
     cmd.get("windowId").and_then(|v| {
         v.as_i64()
@@ -1126,6 +1152,7 @@ fn window_id_field(cmd: &Value) -> Option<i64> {
 /// it needs no shell-quoting here. `respawn_pane` never bakes the resume flag back into
 /// the stored command, so `base` is always the pristine original — but we still guard
 /// against a pre-existing `--resume` to stay idempotent if that ever changes.
+#[tracing::instrument(level = "debug", ret)]
 fn resume_command(base: Option<&str>, session_id: &str) -> Option<String> {
     let base = base?.trim();
     // Only rewrite a direct claude invocation; never append flags to a plain shell.
@@ -1138,6 +1165,7 @@ fn resume_command(base: Option<&str>, session_id: &str) -> Option<String> {
     Some(format!("{base} --resume {session_id}"))
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }

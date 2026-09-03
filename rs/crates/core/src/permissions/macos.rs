@@ -40,6 +40,7 @@ extern "C" {
     fn AXIsProcessTrusted() -> bool;
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn label(right: Right) -> &'static str {
     // Apple's own wording in System Settings › Privacy & Security.
     match right {
@@ -53,6 +54,7 @@ pub fn label(right: Right) -> &'static str {
 }
 
 /// The Settings deep link for each right.
+#[tracing::instrument(level = "debug", ret)]
 fn settings_url(right: Right) -> &'static str {
     const SEC: &str = "x-apple.systempreferences:com.apple.preference.security";
     match right {
@@ -101,6 +103,7 @@ const FULL_DISK_PROBES: &[&str] = &[
 /// `open(2)`. So we open and immediately drop the handle: no read, nothing to leak. The
 /// contents are never touched, which matters because these files hold the user's entire
 /// consent history and browsing bookmarks.
+#[tracing::instrument(level = "debug", ret)]
 fn full_disk_access() -> Grant {
     let Ok(home) = std::env::var("HOME") else {
         return Grant::Undetermined;
@@ -116,6 +119,7 @@ fn full_disk_access() -> Grant {
     Grant::Undetermined
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn status(right: Right) -> Grant {
     match right {
         // Preflight true is unambiguous. Preflight false is *not* "denied": before the app
@@ -158,6 +162,7 @@ pub fn status(right: Right) -> Grant {
 /// Call this from the feature at the moment it needs the right — never from a settings list.
 /// The dialog appears at most once in the app's lifetime on this machine; spending it
 /// somewhere the user cannot see what it is for spends it badly.
+#[tracing::instrument(level = "debug", ret)]
 pub fn prompt(right: Right) -> Grant {
     match right {
         // Returns the post-answer state directly. Already-denied is a no-op: the OS will not
@@ -174,6 +179,7 @@ pub fn prompt(right: Right) -> Grant {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn request(right: Right) -> Result<(), String> {
     Command::new("/usr/bin/open")
         .arg(settings_url(right))

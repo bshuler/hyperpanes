@@ -51,11 +51,13 @@ impl PaneKind {
     /// session uid for a non-PTY pane would put a phantom entry in front of
     /// `pane_load`, `has()`, and the multi-window `claim_session` arbitration. Every
     /// `mgr.*` call is gated on this.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_pty(&self) -> bool {
         matches!(self, PaneKind::Terminal | PaneKind::Tool(_))
     }
 
     /// The registry entry, when this is a tool we know about.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn tool(&self) -> Option<&'static ToolDef> {
         match self {
             PaneKind::Tool(id) => registry::by_id(id),
@@ -64,6 +66,7 @@ impl PaneKind {
     }
 
     /// The tool id, whether or not this build knows the tool.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn tool_id(&self) -> Option<&str> {
         match self {
             PaneKind::Tool(id) => Some(id.as_str()),
@@ -74,6 +77,7 @@ impl PaneKind {
     /// The value written to `meta["pane.kind"]`. `Terminal` returns `None` so the
     /// default is never written — a file from a build with this feature and one from
     /// a build without it stay byte-identical for ordinary panes.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn as_meta_value(&self) -> Option<String> {
         match self {
             PaneKind::Terminal => None,
@@ -88,6 +92,7 @@ impl PaneKind {
     /// Decode a `meta["pane.kind"]` value. Anything unrecognised in the `view:`
     /// namespace falls back to `Terminal` — a view we cannot render is better shown
     /// as a shell than as a broken pane.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn from_meta_value(v: &str) -> PaneKind {
         let v = v.trim();
         if v.is_empty() || v == "terminal" {
@@ -108,6 +113,7 @@ impl PaneKind {
     /// The int the Slint side switches on. Tool panes are `1`; *which* tool comes
     /// through the separate `tool-icon` property, so the UI never needs a per-tool
     /// enum arm.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn ui_kind(&self) -> i32 {
         match self {
             PaneKind::Terminal => 0,
@@ -121,11 +127,13 @@ impl PaneKind {
 
     /// Icon kind for the pane header, or `0` when there is nothing tool-specific to
     /// show. An unknown tool id has no icon, which is the honest rendering.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn ui_icon(&self) -> i32 {
         self.tool().map(|t| t.icon as i32).unwrap_or(0)
     }
 
     /// Display name for the pane header badge; empty when the pane is a plain shell.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn ui_name(&self) -> String {
         match self {
             PaneKind::Terminal => String::new(),
@@ -149,6 +157,7 @@ impl PaneKind {
     /// This is the *deterministic* half of tool detection: what the user explicitly asked
     /// to run. The runtime half — noticing that a plain shell pane has started `claude` —
     /// reads the OSC title instead, and only ever upgrades a [`PaneKind::Terminal`].
+    #[tracing::instrument(level = "debug", ret)]
     pub fn for_command(command: &str) -> PaneKind {
         let Some(program) = command.split_whitespace().next() else {
             return PaneKind::Terminal;

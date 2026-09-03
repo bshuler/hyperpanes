@@ -39,6 +39,7 @@ pub const FONT_OPTIONS: [(&str, &str); 7] = [
 /// The path the empty "System default" value resolves to: whatever fontconfig aliases
 /// `monospace` to (the distro/user default — the same font every other terminal shows),
 /// else the bundled JetBrains Mono, else the conventional DejaVu path.
+#[tracing::instrument(level = "debug", ret)]
 pub fn default_font() -> String {
     if let Some(p) = fc_query("fc-match", "monospace") {
         return p;
@@ -49,12 +50,14 @@ pub fn default_font() -> String {
 /// Resolve a fontconfig family name to an installed font file. `fc-list` (unlike
 /// `fc-match`) returns only *actually installed* faces of the family — an uninstalled
 /// pick must return `None` so the caller falls back, not silently substitute.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_family(family: &str) -> Option<String> {
     fc_query("fc-list", family)
 }
 
 /// Shared fontconfig shell-out: the file of the best face for `pattern`. For `fc-list`
 /// the Regular face is preferred over the (alphabetically first) Bold/Italic siblings.
+#[tracing::instrument(level = "debug", ret)]
 fn fc_query(cmd: &str, pattern: &str) -> Option<String> {
     let out = std::process::Command::new(cmd)
         .args(["--format", "%{file}\\n", pattern])
@@ -80,6 +83,7 @@ fn fc_query(cmd: &str, pattern: &str) -> Option<String> {
 
 /// The shell to prefer when the user picked "System": the login shell from `$SHELL` when
 /// it's set and actually present on disk, else `None` to let core pick the OS default.
+#[tracing::instrument(level = "debug", ret)]
 pub fn preferred_shell() -> Option<String> {
     let shell = std::env::var("SHELL").ok()?;
     (!shell.is_empty() && std::path::Path::new(&shell).exists()).then_some(shell)
@@ -90,6 +94,7 @@ pub fn preferred_shell() -> Option<String> {
 /// baked-in font dir last (so the shipped OFL fonts always resolve). The shared
 /// `resolve_font` joins `dir/file` without recursing, so the common monospace subdirs
 /// (Debian/Ubuntu `truetype/dejavu`, Arch `TTF`) are listed explicitly.
+#[tracing::instrument(level = "debug", ret)]
 pub fn font_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("HOME") {

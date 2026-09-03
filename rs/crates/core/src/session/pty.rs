@@ -92,6 +92,7 @@ pub trait Pty: Send + Sync {
     /// existing implementations — notably the test mocks — are unaffected; a session whose
     /// pty answers `None` is simply not carried across a live upgrade.
     #[cfg(unix)]
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn handoff_info(&self) -> Option<HandoffInfo> {
         None
     }
@@ -111,6 +112,7 @@ pub trait Pty: Send + Sync {
     /// the correct move for a process that is about to exit, and this must only be called on
     /// that path — anywhere else it is a genuine fd leak.
     #[cfg(unix)]
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn relinquish(self: Box<Self>) {
         std::mem::forget(self);
     }
@@ -125,12 +127,14 @@ struct PortablePty {
 }
 
 impl Pty for PortablePty {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn write(&self, data: &[u8]) -> io::Result<()> {
         let mut w = self.writer.lock().unwrap();
         w.write_all(data)?;
         w.flush()
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         self.master
             .lock()
@@ -144,12 +148,14 @@ impl Pty for PortablePty {
             .map_err(|e| io::Error::other(e.to_string()))
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn kill(&self) -> io::Result<()> {
         self.killer.lock().unwrap().kill()
     }
 
     /// `portable-pty` exposes both halves on unix, so a real session is always handoff-able.
     #[cfg(unix)]
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn handoff_info(&self) -> Option<HandoffInfo> {
         let master = self.master.lock().unwrap();
         Some(HandoffInfo {
@@ -163,6 +169,7 @@ impl Pty for PortablePty {
 /// startup queries (`ESC[6n` / `ESC[c`) — bytes the handshake scanner must carry to the
 /// next read so a query split across chunk boundaries is still matched.
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 fn query_prefix_suffix_len(data: &[u8]) -> usize {
     for keep in (1..=3usize.min(data.len())).rev() {
         let tail = &data[data.len() - keep..];
@@ -199,6 +206,7 @@ struct StartupQueryFilter {
 
 #[cfg(windows)]
 impl StartupQueryFilter {
+    #[tracing::instrument(level = "debug", ret)]
     fn new(writer: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
         StartupQueryFilter {
             writer,
@@ -211,6 +219,7 @@ impl StartupQueryFilter {
 
     /// Process one read chunk, returning the bytes to forward to the sink now (a
     /// possible split-query suffix is held back in `carry` until the next chunk).
+    #[tracing::instrument(level = "debug", ret)]
     fn process(&mut self, chunk: &[u8]) -> Vec<u8> {
         if !self.want_dsr && !self.want_da {
             return chunk.to_vec();
@@ -255,6 +264,7 @@ impl StartupQueryFilter {
     }
 
     /// Any held-back bytes at EOF (a query prefix that never completed).
+    #[tracing::instrument(level = "debug", ret)]
     fn flush(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.carry)
     }
@@ -267,14 +277,17 @@ struct StartupQueryFilter;
 
 #[cfg(not(windows))]
 impl StartupQueryFilter {
+    #[tracing::instrument(level = "debug", skip_all)]
     fn new(_writer: Arc<Mutex<Box<dyn Write + Send>>>) -> Self {
         StartupQueryFilter
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn process(&mut self, chunk: &[u8]) -> Vec<u8> {
         chunk.to_vec()
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn flush(&mut self) -> Vec<u8> {
         Vec::new()
     }
@@ -283,6 +296,7 @@ impl StartupQueryFilter {
 /// Spawn a pty running `spec`, delivering output and exit via `on_event`. The returned
 /// handle drives write/resize/kill; output flows on a background thread until the
 /// child exits (then a single [`PtyEvent::Exit`] is sent and the thread ends).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn spawn_pty(
     spec: &PtySpec,
     on_event: impl Fn(PtyEvent) + Send + 'static,

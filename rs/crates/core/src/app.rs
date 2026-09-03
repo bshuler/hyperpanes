@@ -41,6 +41,7 @@ struct MetaUpdate {
 
 /// Run the headless daemon: wire the engine + control server + AI + single-instance gate, seed the
 /// launch workspace, and serve the loopback control API until the process exits.
+#[tracing::instrument(level = "debug", ret)]
 pub async fn run(version: &str) -> io::Result<()> {
     let control_file = std::env::var_os("HYPERPANES_CONTROL_FILE")
         .map(PathBuf::from)
@@ -142,6 +143,7 @@ pub async fn run(version: &str) -> io::Result<()> {
     server::run_server(shared).await
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn env_truthy(name: &str) -> bool {
     matches!(
         std::env::var(name).ok().as_deref(),
@@ -153,6 +155,7 @@ fn env_truthy(name: &str) -> bool {
 
 /// Seed the read-model with the given windows, spawning a pty per pane. If `windows` is empty,
 /// seeds a single empty window so the daemon always has a target for `open_pane`.
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 fn seed_windows(shared: &Arc<Shared>, windows: Vec<WindowSpec>, start_id: i64) {
     let control_file = shared.control_file.to_str().map(str::to_string);
     let mut model = shared.model.lock().unwrap();
@@ -214,6 +217,7 @@ fn seed_windows(shared: &Arc<Shared>, windows: Vec<WindowSpec>, start_id: i64) {
 }
 
 /// Spawn a pty for a workspace `PaneSpec` and return its `PaneInfo` (not yet inserted).
+#[tracing::instrument(level = "debug", ret, skip(sessions))]
 fn spawn_seed_pane(
     sessions: &SessionManager,
     control_file: Option<&str>,
@@ -276,6 +280,7 @@ fn spawn_seed_pane(
 }
 
 /// A second headless invocation: open its windows alongside the existing ones.
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 fn handle_handoff(shared: &Arc<Shared>, msg: HandoffMessage) {
     let si = crate::cli::routing::resolve_second_instance_windows(&msg.argv, &msg.cwd);
     let next_id = {
@@ -289,6 +294,7 @@ fn handle_handoff(shared: &Arc<Shared>, msg: HandoffMessage) {
     notify_state(shared);
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn max_window_id(model: &ReadModel) -> i64 {
     model
         .panes()
@@ -300,6 +306,7 @@ fn max_window_id(model: &ReadModel) -> i64 {
 
 // ---- live event plumbing ------------------------------------------------------------------
 
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 async fn forward_loop(
     shared: Arc<Shared>,
     mut erx: UnboundedReceiver<SessionEvent>,
@@ -311,6 +318,7 @@ async fn forward_loop(
     }
 }
 
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 async fn apply_meta_updates(shared: Arc<Shared>, mut rx: UnboundedReceiver<MetaUpdate>) {
     while let Some(u) = rx.recv().await {
         let mut patch: BTreeMap<String, Option<String>> = BTreeMap::new();
@@ -331,6 +339,7 @@ async fn apply_meta_updates(shared: Arc<Shared>, mut rx: UnboundedReceiver<MetaU
 
 // ---- ambient AI thread (!Send, so it owns its own current-thread runtime) ------------------
 
+#[tracing::instrument(level = "debug", ret)]
 fn spawn_ai_thread(
     settings_path: PathBuf,
     memory_path: PathBuf,
@@ -354,6 +363,7 @@ fn spawn_ai_thread(
         .ok();
 }
 
+#[tracing::instrument(level = "debug", ret)]
 async fn ai_loop(
     settings_path: PathBuf,
     memory_path: PathBuf,
@@ -401,6 +411,7 @@ async fn ai_loop(
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }

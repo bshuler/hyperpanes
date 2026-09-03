@@ -66,6 +66,7 @@ const LEFT_PANEL_W: f32 = 300.0;
 /// session" a bare relaunch restores via core's `resolve_launch_workspace` fallback (#14:
 /// this is what carries per-pane zoom, layout, focus and cwds across a plain relaunch).
 /// Best-effort: a failed write must never block quit.
+#[tracing::instrument(level = "debug", skip_all)]
 fn persist_last_session(file: &hyperpanes_core::workspace::model::WorkspaceFile) {
     use hyperpanes_core::persistence::paths;
     match serde_json::to_string_pretty(file) {
@@ -91,6 +92,7 @@ fn persist_last_session(file: &hyperpanes_core::workspace::model::WorkspaceFile)
 /// attic — exec'ing it would relaunch the build the user just replaced, which is exactly the
 /// case this menu item exists to serve. Prefer the installed bundle whenever ours has been
 /// retired out from under us.
+#[tracing::instrument(level = "debug", ret)]
 fn relaunch_command() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
     #[cfg(target_os = "macos")]
@@ -116,6 +118,7 @@ fn relaunch_command() -> Option<String> {
 /// Absolute path to `systemd-run` if this is a systemd host, else `None`. Used to launch
 /// the self-restart relauncher in its OWN cgroup so our scope's teardown can't kill it.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn which_systemd_run() -> Option<std::path::PathBuf> {
     for dir in ["/usr/bin", "/bin", "/usr/local/bin"] {
         let p = std::path::Path::new(dir).join("systemd-run");
@@ -127,6 +130,7 @@ fn which_systemd_run() -> Option<std::path::PathBuf> {
 }
 
 #[cfg(not(unix))]
+#[tracing::instrument(level = "debug", ret)]
 fn which_systemd_run() -> Option<std::path::PathBuf> {
     None
 }
@@ -297,6 +301,7 @@ const AI_FEED_INTERVAL: Duration = Duration::from_millis(400);
 const SPRING_DELAY: std::time::Duration = std::time::Duration::from_millis(450);
 
 impl App {
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn new(mgr: Arc<SessionManager>, erx: UnboundedReceiver<SessionEvent>) -> Rc<Self> {
         let control = crate::control_host::ControlHost::new(&mgr);
         // Register the SessionStart/SessionEnd hooks for the tools that have them, next to
@@ -344,6 +349,7 @@ impl App {
     /// itself did not survive. The hook's marker files are keyed by the pane's external id
     /// (`HYPERPANES_PANE_ID`): the control host's alias for a control-spawned pane, the
     /// session uid itself for a GUI-native one — hence the lookup lives here, above both.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn embed_claude_sessions(&self, file: &mut hyperpanes_core::workspace::model::WorkspaceFile) {
         use hyperpanes_core::claude_panes;
         let groups = match file.groups.as_mut() {
@@ -395,6 +401,7 @@ impl App {
     ///
     /// Chrome only — nothing here writes `spawn_command` / `spawn_args` or the persisted
     /// [`PaneKind`](hyperpanes_core::tools::PaneKind).
+    #[tracing::instrument(level = "debug", ret, skip(self, windows))]
     fn sniff_foreground(&self, windows: &[Rc<Window>]) {
         const EVERY: Duration = Duration::from_millis(750);
         let now = std::time::Instant::now();
@@ -484,6 +491,7 @@ impl App {
     ///
     /// Throttled well off the pump: source 1 is a `stat` per unidentified pane, and source 2
     /// paces itself on its own scan interval regardless of how often it is polled.
+    #[tracing::instrument(level = "debug", ret, skip(self, windows))]
     fn adopt_tool_sessions(&self, windows: &[Rc<Window>]) {
         const EVERY: Duration = Duration::from_secs(2);
         let now = std::time::Instant::now();
@@ -578,6 +586,7 @@ impl App {
     /// live Claude marker whose session has queued messages, type them into the owning pane.
     /// Readiness = the marker is a few seconds old (SessionStart fires early in boot; the
     /// TUI needs a beat before it accepts input). Deliver-once: `take_for` removes them.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn deliver_queued_prompts(&self) {
         use hyperpanes_core::resume_queue;
         const EVERY: Duration = Duration::from_secs(2);
@@ -673,6 +682,7 @@ impl App {
     /// until the form clears. Delivery reuses the resume-queue cadence — type text, gap, CR,
     /// insurance CR — then best-effort re-pastes any attached images via the OS clipboard (their
     /// paths are already in the text, which is the guaranteed delivery).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn deliver_pending_goals(&self) {
         const READY_AGE_SECS: u64 = 4;
         const FALLBACK_SECS: u64 = 12;
@@ -756,6 +766,7 @@ impl App {
     /// The two Hyperpane scheduler loops (see [`crate::loops`]): ask the persisted schedule
     /// which are due at the configured intervals, and do their work. A throttled clock
     /// compare in the common case.
+    #[tracing::instrument(level = "debug", ret, skip(self, windows))]
     fn service_loops(&self, windows: &[Rc<Window>]) {
         let Some(first) = windows.first() else {
             return;
@@ -794,6 +805,7 @@ impl App {
     /// delivery pass already waits out option forms and paces the submitting Enter — and
     /// typed straight into the pane otherwise (the same cadence), unless a form is up, in
     /// which case this round is skipped and logged rather than swallowed by the form.
+    #[tracing::instrument(level = "debug", ret, skip(self, w))]
     fn fire_status_loop(&self, w: &Window, prompt: &str) {
         let prompt = if prompt.trim().is_empty() {
             crate::loops::DEFAULT_STATUS_PROMPT
@@ -843,6 +855,7 @@ impl App {
     /// The restart loop: respawn every monitored agent pane — each tool pane outside the
     /// system tab — into the same conversation. Each restart mints a new session uid, so the
     /// control plane's stable pane id follows it, exactly as after an exit-and-respawn.
+    #[tracing::instrument(level = "debug", ret, skip(self, w))]
     fn fire_restart_loop(&self, w: &Window) {
         let targets = w.state.borrow().monitored_panes();
         if targets.is_empty() {
@@ -889,6 +902,7 @@ impl App {
     /// window only, so at least the Hyperpane window comes back from a bare relaunch; the
     /// second-instance hand-off spawns a window per spec and restores all of them. A single
     /// window writes no `windows` list, keeping that file byte-identical to before.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn session_snapshot(
         &self,
         wins: &[Rc<Window>],
@@ -926,6 +940,7 @@ impl App {
         Some(first)
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn service_restart_request(&self) {
         let scope = self.control.take_restart_request();
         if scope == 0 {
@@ -997,6 +1012,7 @@ impl App {
     /// and skipped when nothing changed. Snapshots the primary (first) window, matching the
     /// single-window clean-close/restore behaviour. Cheap: the snapshot is structural (layout +
     /// cwd + labels + zoom), never scrollback. Called every tick; early-returns most of them.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn autosave_session(&self) {
         const EVERY: Duration = Duration::from_secs(4);
         let now = std::time::Instant::now();
@@ -1025,6 +1041,7 @@ impl App {
 
     /// Install the second-instance hand-off receiver (primary instance only). Called once
     /// from `main` after the single-instance gate resolves to Primary.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_handoff_rx(
         &self,
         rx: std::sync::mpsc::Receiver<hyperpanes_core::single_instance::HandoffMessage>,
@@ -1034,6 +1051,7 @@ impl App {
 
     /// Hand the shared pump timer to the app so the adaptive cadence (#3) can re-interval it.
     /// Called once from `main` after the timer is started at the fast cadence.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn set_timer(&self, timer: slint::Timer) {
         *self.timer.borrow_mut() = Some(timer);
     }
@@ -1041,6 +1059,7 @@ impl App {
     /// Switch the pump cadence (no-op when already there, so we never churn the timer). Safe
     /// to call from inside the timer callback — Slint releases the timer-registry borrow
     /// before invoking the callback — and from input callbacks on the UI thread.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn set_cadence(&self, slow: bool) {
         if self.cadence_slow.get() == slow {
             return;
@@ -1055,6 +1074,7 @@ impl App {
     /// Wake the pump to the fast cadence immediately and reset the idle counter. Called from
     /// the input paths (keystrokes, command dispatch) so a keystroke's echo renders without
     /// the idle-cadence delay. ⚠ This is what keeps adaptive cadence input-latency-safe.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn wake(&self) {
         self.idle_ticks.set(0);
         self.set_cadence(false);
@@ -1062,6 +1082,7 @@ impl App {
 
     /// Realize a new OS window, wire its callbacks to act on its own state, show it, and
     /// register it. `seed` decides its first pane (empty shell, or a re-hosted session).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn spawn_window(self: &Rc<Self>, seed: PendingSeed) {
         let id = self.next_id.get();
         self.next_id.set(id + 1);
@@ -1165,11 +1186,13 @@ impl App {
 
     /// Look a window up by id (clones the `Rc`, releasing the registry borrow so the
     /// caller can freely borrow the window's state / spawn / reap).
+    #[tracing::instrument(level = "debug", skip(self))]
     fn window_by_id(&self, id: usize) -> Option<Rc<Window>> {
         self.windows.borrow().iter().find(|w| w.id == id).cloned()
     }
 
     /// Run `cmd` against `win`'s state and apply any window-level [`Effect`].
+    #[tracing::instrument(level = "debug", skip_all)]
     fn run_command(self: &Rc<Self>, win: &Rc<Window>, cmd: Command) {
         // Any command is user activity — snap the pump back to the fast cadence (#3) so the
         // result renders immediately even if we'd dropped to the idle cadence.
@@ -1237,6 +1260,7 @@ impl App {
     }
 
     /// Apply OS fullscreen to `win` (mirrors the single-window controller's handling).
+    #[tracing::instrument(level = "debug", ret, skip(self, win))]
     fn set_fullscreen(&self, win: &Rc<Window>, on: bool) {
         let raw = win.hwnd.get();
         if on {
@@ -1257,6 +1281,7 @@ impl App {
 
     /// Flag `win` for reaping (its sessions are killed + the window dropped on the next
     /// tick — never mid-callback, so we don't drop a component while it's dispatching).
+    #[tracing::instrument(level = "debug", ret, skip(self, win))]
     fn close_window(&self, win: &Rc<Window>) {
         win.closing.set(true);
     }
@@ -1265,6 +1290,7 @@ impl App {
 
     /// One UI-thread tick across all windows: realize HWNDs, drain the shared session
     /// stream into the owning windows, render each window, then reap any that closed.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn tick(self: &Rc<Self>) {
         // Second-instance hand-offs first (they may add tabs/windows this very tick).
         self.drain_handoffs();
@@ -1593,6 +1619,7 @@ impl App {
     /// Route one session event to the window hosting its `uid`. Returns the number of output
     /// bytes fed into a pane (0 for non-`Data` events / no owning pane) so the pump can report
     /// feed throughput in the perf log (#1).
+    #[tracing::instrument(level = "debug", ret, skip(self, windows))]
     fn route_event(&self, windows: &[Rc<Window>], ev: SessionEvent) -> usize {
         match ev {
             SessionEvent::Data { uid, data, .. } => {
@@ -1738,6 +1765,7 @@ impl App {
     /// Ambient-AI pump (UI thread): apply produced subtitles to pane state, (re)publish each
     /// window's pane context to the engine when it changed, and mirror the latest engine
     /// status into every window's Preferences props. Cheap when the engine is off/idle.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn pump_ai(self: &Rc<Self>, windows: &[Rc<Window>]) {
         // Apply each produced `ai.subtitle` to the owning pane (kicks its typewriter reveal).
         for u in self.ai.drain_meta() {
@@ -1816,6 +1844,7 @@ impl App {
     /// `RemindersAdapter` global. The push is gated by a signature over (open, uid, fired)
     /// — labels/tints are fixed at park time — because Slint property writes dirty the
     /// render tree unconditionally (the same idle-render guard as the maximized flag).
+    #[tracing::instrument(level = "debug", ret, skip(self, windows))]
     fn pump_reminders(&self, windows: &[Rc<Window>]) {
         let now_ms = crate::glow::now_epoch_ms();
         for w in windows {
@@ -1888,6 +1917,7 @@ impl App {
     /// `ClosedAdapter` global. Signature-gated exactly like [`Self::pump_reminders`], with
     /// the age bucket folded in so the "2m ago" line ticks over without re-pushing every
     /// frame — the rows are otherwise frozen at close time.
+    #[tracing::instrument(level = "debug", ret, skip(self, windows))]
     fn pump_closed(&self, windows: &[Rc<Window>]) {
         let now_ms = crate::glow::now_epoch_ms();
         for w in windows {
@@ -1944,6 +1974,7 @@ impl App {
     /// known, because [`State::make_pane`] sizes the pty at a fixed 80×24 and the first render
     /// pump relayouts it to the real area. Seeding here (before the heavy `AppWindow::new`)
     /// overlaps the shell's process startup with wgpu/device init instead of running it after.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn apply_seed(self: &Rc<Self>, st: &mut State, seed: PendingSeed) {
         match seed {
             PendingSeed::EmptyTab => {
@@ -2075,6 +2106,7 @@ impl App {
     /// on what was restored: a workspace that already carries it (the tab persists, see
     /// `Tab::system`) needs nothing, and only a session that has none anywhere gets a fresh
     /// one. `hyperpane_done` then latches, so later windows never grow a second copy.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn ensure_hyperpane_tab(self: &Rc<Self>, st: &mut State) {
         // A restored workspace can carry the tab anywhere in the strip (it was appended, not
         // pinned, before the pin existed — and a saved reorder outlives the rule that now
@@ -2110,6 +2142,7 @@ impl App {
     /// Render one window. Returns its [`paneview::PumpResult`] (panes repainted + whether the
     /// pass was active) for the perf log + adaptive cadence. The first pane is seeded eagerly
     /// in `spawn_window`, so this only renders once the pane area is known.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn pump_window(self: &Rc<Self>, win: &Rc<Window>) -> paneview::PumpResult {
         let scale = win.app.window().scale_factor().max(1.0);
         let (aw, ah) = win.area.get();
@@ -2146,6 +2179,7 @@ impl App {
 
     /// Drain pending `{argv, cwd}` hand-offs and route each (the native port of Electron's
     /// `second-instance` event → `resolveSecondInstanceWindows` + routing).
+    #[tracing::instrument(level = "debug", skip_all)]
     fn drain_handoffs(self: &Rc<Self>) {
         loop {
             let msg = match &*self.handoffs.borrow() {
@@ -2159,6 +2193,7 @@ impl App {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     fn apply_handoff(self: &Rc<Self>, msg: hyperpanes_core::single_instance::HandoffMessage) {
         use hyperpanes_core::cli::parse::{AttachAs, LaunchRouting};
         use hyperpanes_core::workspace::model::WorkspaceFile;
@@ -2215,6 +2250,7 @@ impl App {
 
     // ---- key routing for one window (app chords first, else encode to the pane) ----
 
+    #[tracing::instrument(level = "debug", skip_all)]
     fn on_key(self: &Rc<Self>, win: &Rc<Window>, idx: usize, msg: KeyMsg) {
         // A keystroke is the latency-critical input: wake the pump to the fast cadence now so
         // the echo renders without the idle-cadence delay (#3). Commands go through
@@ -2395,6 +2431,7 @@ impl App {
     /// A pane header was pressed: snapshot the pane (uid + chrome) and arm a drag from the
     /// current global cursor. Until the cursor moves past the threshold this is just a
     /// pending click (the header's own `clicked` still focuses the pane).
+    #[tracing::instrument(level = "debug", skip_all)]
     fn begin_pane_drag(self: &Rc<Self>, win: &Rc<Window>, pane_idx: usize) {
         let uid = win
             .state
@@ -2422,6 +2459,7 @@ impl App {
     }
 
     /// A tab was pressed: arm an in-window tab-reorder drag from the global cursor.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn begin_tab_drag(self: &Rc<Self>, win: &Rc<Window>, tab_idx: usize) {
         if tab_idx >= win.state.borrow().tabs.len() {
             return;
@@ -2445,6 +2483,7 @@ impl App {
     /// here so the insertion happens on the pump, holding `state` exactly once, like every
     /// other mutation. A batch is regrouped by target pane: one drag reports one event per
     /// file, and the pane each file belongs to is only knowable here.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn pump_file_drops(self: &Rc<Self>, windows: &[Rc<Window>]) {
         let drops = filedrop::take_settled();
         if drops.is_empty() {
@@ -2480,6 +2519,7 @@ impl App {
     /// specific window, and that is true even if the pointer sample raced past it. The
     /// cursor only picks the pane inside it, and where there is no global cursor to read
     /// (Wayland) the window's focused pane is the only honest answer.
+    #[tracing::instrument(level = "debug", ret, skip(self, windows))]
     fn drop_target(&self, windows: &[Rc<Window>], d: &filedrop::Dropped) -> Option<(usize, usize)> {
         let w = windows.iter().find(|w| w.hwnd.get() == d.win)?;
         let pane =
@@ -2493,6 +2533,7 @@ impl App {
     /// Drive an in-flight drag from the global cursor: promote past the threshold, follow
     /// with the ghost once the cursor leaves the source window, paint drop previews, and
     /// resolve the drop on button release. No-op when nothing is being dragged.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn pump_drag(self: &Rc<Self>, windows: &[Rc<Window>]) {
         if self.drag.borrow().is_none() {
             if self.preview_on.replace(false) {
@@ -2677,6 +2718,7 @@ impl App {
     /// Hit-test the global `cursor` against every window's live geometry, resolving it into
     /// a [`Hover`] (which window / tab strip / pane slot it is over). `win == None` means
     /// empty desktop space (→ a tear-off drop makes a new window).
+    #[tracing::instrument(level = "debug", ret, skip(self, windows))]
     fn compute_hover(&self, windows: &[Rc<Window>], cursor: (i32, i32)) -> Hover {
         for w in windows {
             let raw = w.hwnd.get();
@@ -2753,6 +2795,7 @@ impl App {
     /// chip directly under the cursor)`. The slot counts tabs whose centre the cursor has
     /// passed (for the reorder/dock caret); the chip is the tab whose extent contains the
     /// cursor (for spring-load / dock-into-tab). Uses the UI-reported [`Window::tab_geom`].
+    #[tracing::instrument(level = "debug", ret, skip(self, w))]
     fn tab_hit(&self, w: &Rc<Window>, lx: f32) -> (usize, Option<usize>) {
         let g = w.tab_geom.borrow();
         let n = w.state.borrow().tabs.len().min(g.len());
@@ -2782,6 +2825,7 @@ impl App {
     /// Borrow discipline (the #18 fix): every geometry read is bound to a LOCAL and the shared
     /// `state` borrow is dropped *before* `run_command` takes `borrow_mut()`. Never hold a
     /// `state.borrow()` across the reopen.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn reopen_context_at_cursor(self: &Rc<Self>, win: &Rc<Window>) {
         let Some((pos, _down)) = drag::global_pointer().poll() else {
             return; // no global cursor on this platform → no chain target
@@ -2859,6 +2903,7 @@ impl App {
     /// Resolve a completed drop: reorder in-window, stitch / dock cross-window, or spawn a
     /// new window for an empty-space drop. Re-host uses detach→adopt (replay-primed, no PTY
     /// restart); `State` was untouched until this moment.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn apply_drop(
         self: &Rc<Self>,
         _windows: &[Rc<Window>],
@@ -3032,6 +3077,7 @@ impl App {
     /// Paint the drop previews for the current `hover` onto every window: a window-level
     /// glow on the target of a cross-window pane tear, a tab-strip highlight + insertion
     /// caret, and a slot highlight on the hovered pane tile.
+    #[tracing::instrument(level = "debug", ret, skip(self, windows))]
     fn set_previews(&self, windows: &[Rc<Window>], is_pane: bool, hover: &Hover, source_id: usize) {
         for w in windows {
             let is_target = hover.win == Some(w.id);
@@ -3103,6 +3149,7 @@ impl App {
     }
 
     /// Clear all drop-preview props on every window (drag ended / cancelled).
+    #[tracing::instrument(level = "debug", ret, skip(self, windows))]
     fn clear_previews(&self, windows: &[Rc<Window>]) {
         for w in windows {
             w.app.set_drop_win_active(false);
@@ -3120,6 +3167,7 @@ impl App {
     /// Wire every Slint callback of `win` to operate on *that* window's state. Each
     /// closure captures the app + the window id and resolves the window per-call, so a
     /// reaped window's stale closures simply no-op.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn wire(self: &Rc<Self>, win: &Rc<Window>) {
         let app = self;
 
@@ -4899,6 +4947,7 @@ fn find_window<'a>(windows: &'a [Rc<Window>], uid: &str) -> Option<&'a Rc<Window
 /// anything typed while one is up lands in the form and is swallowed on the user's next pick,
 /// so goal delivery holds while this returns true. The ordinary Claude input box (`>` prompt)
 /// has no `❯` pointer, so it never matches.
+#[tracing::instrument(level = "debug", ret)]
 fn screen_shows_option_form(screen: &str) -> bool {
     let mut pointer = false;
     let mut numbered = 0;
@@ -4927,6 +4976,7 @@ fn screen_shows_option_form(screen: &str) -> bool {
 /// clipboard, so a following Ctrl+V into a Claude pane pastes the actual image. Returns `false`
 /// (a no-op) on a read/decode/clipboard error — the goal's text already carries the file path,
 /// which is the guaranteed delivery, so a failure here is non-fatal.
+#[tracing::instrument(level = "debug", ret)]
 fn set_clipboard_image_from_file(path: &std::path::Path) -> bool {
     let Ok(img) = image::open(path) else {
         return false;
@@ -4945,6 +4995,7 @@ fn set_clipboard_image_from_file(path: &std::path::Path) -> bool {
 
 /// Cheap FNV-1a hash of a string — used to detect when a pane's rendered screen text
 /// changed (so the ambient-AI feed only sends on a real change).
+#[tracing::instrument(level = "debug", ret)]
 fn fnv1a(s: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in s.as_bytes() {
@@ -4956,6 +5007,7 @@ fn fnv1a(s: &str) -> u64 {
 
 /// Mirror the ambient-AI engine status into a window's Preferences props: the enabled
 /// toggle, the host/model field seeds, and a human-readable status line.
+#[tracing::instrument(level = "debug", ret, skip(app))]
 fn apply_ai_status_props(app: &AppWindow, st: &hyperpanes_core::ai::service::AiStatus) {
     app.set_pref_ai_enabled(st.enabled);
     app.set_pref_ai_host(st.endpoint.clone().into());
@@ -4974,6 +5026,7 @@ fn apply_ai_status_props(app: &AppWindow, st: &hyperpanes_core::ai::service::AiS
 
 /// The human-readable Control-API status line for the Preferences section: off, or running
 /// with its loopback port + whether input is allowed.
+#[tracing::instrument(level = "debug", ret)]
 fn control_status_line(enabled: bool, allow_input: bool, port: Option<u16>) -> String {
     if !enabled {
         return "Off".to_string();

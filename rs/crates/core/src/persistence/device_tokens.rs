@@ -37,6 +37,7 @@ pub struct DeviceRecord {
 impl DeviceRecord {
     /// Whether this pairing has lapsed at `now_ms` (ms epoch). A record with no expiry never
     /// lapses — the same guarantee the master token has.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn is_expired(&self, now_ms: i64) -> bool {
         matches!(self.expires_at, Some(exp) if exp <= now_ms)
     }
@@ -50,11 +51,13 @@ struct DeviceFile {
 }
 
 /// Read the device table from the canonical `device-tokens.json` (empty on any error).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn load() -> Vec<DeviceRecord> {
     load_from(&paths::device_tokens_json())
 }
 
 /// Read the device table from `path`, returning an empty vec on any read/parse error.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn load_from(path: &std::path::Path) -> Vec<DeviceRecord> {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return Vec::new();
@@ -65,12 +68,14 @@ pub fn load_from(path: &std::path::Path) -> Vec<DeviceRecord> {
 }
 
 /// Persist the device table to the canonical `device-tokens.json` (atomic, `0600`).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn save(devices: &[DeviceRecord]) -> std::io::Result<()> {
     save_to(&paths::device_tokens_json(), devices)
 }
 
 /// Persist the device table to `path` (atomic), then tighten to `0600` on Unix — the file holds
 /// full-authority tokens, so it gets the same permissions as the master `control-token` file.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn save_to(path: &std::path::Path, devices: &[DeviceRecord]) -> std::io::Result<()> {
     let file = DeviceFile {
         devices: devices.to_vec(),

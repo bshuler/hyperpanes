@@ -85,6 +85,7 @@ impl PaneSpec {
     /// is every pane written before tool panes existed, and every pane that is still
     /// just a shell. See `tools::kind` for why the discriminator rides in `meta`
     /// instead of becoming a field of its own.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn pane_kind(&self) -> PaneKind {
         self.meta
             .as_ref()
@@ -96,6 +97,7 @@ impl PaneSpec {
     /// Record this pane's kind. `Terminal` *removes* the key rather than writing
     /// `"terminal"`, so an ordinary pane's file stays byte-identical to what a build
     /// without this feature would write, and an empty `meta` map is dropped entirely.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn set_pane_kind(&mut self, kind: &PaneKind) {
         match kind.as_meta_value() {
             Some(v) => {

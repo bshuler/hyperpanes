@@ -118,6 +118,7 @@ pub struct ViewRow {
 }
 
 impl Default for ViewRow {
+    #[tracing::instrument(level = "debug", ret)]
     fn default() -> Self {
         Self::inert(role::LINE, "")
     }
@@ -125,6 +126,7 @@ impl Default for ViewRow {
 
 impl ViewRow {
     /// A row with nothing to open.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn inert(role: i32, text: impl Into<String>) -> Self {
         Self {
             role,
@@ -140,6 +142,7 @@ impl ViewRow {
     }
 
     /// Whether clicking this row does anything (drives the pointer cursor).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn activatable(&self) -> bool {
         !self.path.as_os_str().is_empty()
     }
@@ -153,6 +156,7 @@ impl ViewRow {
     /// re-spelled the plain-text way, because a paste has no other way to carry
     /// it. A file viewer's line is the one exception and is copied byte for byte:
     /// there the pane was never rendering markup in the first place.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn copy_text(&self) -> String {
         match self.role {
             // Listing rows and the plain viewer: the text is already what was drawn.
@@ -220,6 +224,7 @@ pub const MAX_ENTRIES: usize = 2_000;
 ///
 /// Returns a single [`role::NOTICE`] row rather than an empty model on every
 /// failure path — an empty pane looks broken, a pane that says *why* does not.
+#[tracing::instrument(level = "debug", ret)]
 pub fn rows_for(kind: &PaneKind, target: Option<&str>) -> Vec<ViewRow> {
     let Some(t) = target.filter(|t| !t.is_empty()) else {
         return vec![ViewRow::inert(role::NOTICE, "No path set for this pane")];
@@ -242,6 +247,7 @@ pub fn rows_for(kind: &PaneKind, target: Option<&str>) -> Vec<ViewRow> {
 /// means everywhere else. Fragments and queries are dropped — `design.md#rationale` names a
 /// file we can show. Nothing that does not exist resolves, which is what keeps a
 /// `javascript:` or a link into a directory that is not there from becoming an action.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_local_href(target: &Path, href: &str) -> Option<PathBuf> {
     let bare = href.split(['#', '?']).next().unwrap_or(href);
     if bare.is_empty() {
@@ -257,6 +263,7 @@ pub fn resolve_local_href(target: &Path, href: &str) -> Option<PathBuf> {
 
 /// The header line for a view pane: the target's own name, which is all the
 /// header has room for. "" when there is no target.
+#[tracing::instrument(level = "debug", ret)]
 pub fn view_title(kind: &PaneKind, target: Option<&str>) -> String {
     if !matches!(
         kind,
@@ -274,6 +281,7 @@ pub fn view_title(kind: &PaneKind, target: Option<&str>) -> String {
 
 /// The last two path components ("hyperpanes/src"), or the whole path when it is
 /// already that short. Never empty for a non-empty path — a bare "/" returns "/".
+#[tracing::instrument(level = "debug", ret)]
 fn tail_two(p: &Path) -> String {
     let comps: Vec<String> = p
         .components()
@@ -301,6 +309,7 @@ fn tail_two(p: &Path) -> String {
 ///
 /// Sorting is case-insensitive so `README` does not sort above `apps` the way a
 /// raw byte comparison would.
+#[tracing::instrument(level = "debug", ret)]
 pub fn list_dir(dir: &Path) -> Vec<ViewRow> {
     let rd = match fs::read_dir(dir) {
         Ok(rd) => rd,
@@ -394,6 +403,7 @@ pub fn list_dir(dir: &Path) -> Vec<ViewRow> {
 }
 
 /// A file's lines, numbered, bounded by [`MAX_LINES`] / [`MAX_LINE_CHARS`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn read_lines(file: &Path) -> Vec<ViewRow> {
     let text = match read_text(file) {
         Ok(t) => t,
@@ -439,6 +449,7 @@ pub fn read_lines(file: &Path) -> Vec<ViewRow> {
 ///
 /// Fences win over every other rule while open, so a `# comment` inside a shell
 /// snippet stays code.
+#[tracing::instrument(level = "debug", ret)]
 pub fn markdown_blocks(file: &Path) -> Vec<ViewRow> {
     let text = match read_text(file) {
         Ok(t) => t,
@@ -622,6 +633,7 @@ pub fn markdown_blocks(file: &Path) -> Vec<ViewRow> {
 
 /// Whether a fence's info string opens a mermaid block. Mermaid is only ever the
 /// first word — ```` ```mermaid {init: …} ```` is legal and still a diagram.
+#[tracing::instrument(level = "debug", ret)]
 fn is_mermaid(info: &str) -> bool {
     info.trim()
         .split(|c: char| c.is_whitespace() || c == '{')
@@ -632,6 +644,7 @@ fn is_mermaid(info: &str) -> bool {
 /// The opening line of a fenced block → its marker character and info string.
 /// A backtick fence's info string may not itself contain a backtick, which is
 /// what stops ``` `` `code` `` ``` from opening a block.
+#[tracing::instrument(level = "debug", ret)]
 fn fence_open(trimmed: &str) -> Option<(char, &str)> {
     for mark in ['`', '~'] {
         let run = trimmed.chars().take_while(|c| *c == mark).count();
@@ -648,6 +661,7 @@ fn fence_open(trimmed: &str) -> Option<(char, &str)> {
 
 /// Whether `line` closes a fence opened with `mark`: the same character, three or
 /// more, and nothing else.
+#[tracing::instrument(level = "debug", ret)]
 fn fence_closes(line: &str, mark: char) -> bool {
     let t = line.trim();
     t.chars().take_while(|c| *c == mark).count() >= 3
@@ -660,6 +674,7 @@ fn fence_closes(line: &str, mark: char) -> bool {
 /// dialects and this renders some of them, so the unsupported case is a normal
 /// outcome, not an error path. The reader gets the source plus a line saying why —
 /// which is strictly more than the preview showed before diagrams existed.
+#[tracing::instrument(level = "debug", ret)]
 fn diagram_rows(src: &[String]) -> Vec<ViewRow> {
     match crate::mermaid::render(&src.join("\n")) {
         Ok(d) => vec![ViewRow {
@@ -687,6 +702,7 @@ fn diagram_rows(src: &[String]) -> Vec<ViewRow> {
 /// A heading's inline markers are stripped rather than kept, because a heading is
 /// drawn with a plain `Text`: it needs a font weight, and `StyledText` has no
 /// property for one.
+#[tracing::instrument(level = "debug", ret)]
 fn heading(trimmed: &str) -> Option<ViewRow> {
     let hashes = trimmed.chars().take_while(|c| *c == '#').count();
     if hashes == 0 || hashes > 6 {
@@ -715,6 +731,7 @@ fn heading(trimmed: &str) -> Option<ViewRow> {
 
 /// A setext underline → the level it makes the paragraph above it. `=` is H1 and
 /// `-` is H2; two dashes are required so a lone `-` stays a list item.
+#[tracing::instrument(level = "debug", ret)]
 fn setext(trimmed: &str) -> Option<i32> {
     let t = trimmed.trim_end();
     if t.len() >= 1 && t.chars().all(|c| c == '=') {
@@ -737,6 +754,7 @@ struct Item<'a> {
 }
 
 /// `- x` / `* x` / `+ x` / `1. x` / `- [x] x` → the item, or `None`.
+#[tracing::instrument(level = "debug")]
 fn list_item(trimmed: &str) -> Option<Item<'_>> {
     let mut marker = String::new();
     let rest = match ["- ", "* ", "+ "]
@@ -779,6 +797,7 @@ fn list_item(trimmed: &str) -> Option<Item<'_>> {
 /// The nesting depth an item at column `lead` sits at, updating the open stack.
 /// Capped, because past six levels the text column is narrower than the indent
 /// leading to it.
+#[tracing::instrument(level = "debug", ret)]
 fn nest(lead: usize, stack: &mut Vec<usize>) -> i32 {
     while stack.last().is_some_and(|&top| lead < top) {
         stack.pop();
@@ -792,6 +811,7 @@ fn nest(lead: usize, stack: &mut Vec<usize>) -> i32 {
 }
 
 /// The column a line's text starts at, tabs expanded to the next multiple of four.
+#[tracing::instrument(level = "debug", ret)]
 fn column_of(raw: &str) -> usize {
     let mut n = 0;
     for c in raw.chars() {
@@ -806,6 +826,7 @@ fn column_of(raw: &str) -> usize {
 
 /// Whether the line asked for a break rather than for the next line to flow into
 /// it: markdown's two trailing spaces, or a trailing backslash.
+#[tracing::instrument(level = "debug", ret)]
 fn hard_break(raw: &str) -> bool {
     raw.ends_with("  ") || raw.ends_with('\\')
 }
@@ -813,6 +834,7 @@ fn hard_break(raw: &str) -> bool {
 /// Append a continuation line to an open block. Joined with a space, not a
 /// newline, because the row is one wrapped paragraph and the renderer decides
 /// where it breaks.
+#[tracing::instrument(level = "debug", ret)]
 fn flow_into(row: &mut ViewRow, more: &str) {
     if row.text.chars().count() >= MAX_LINE_CHARS {
         return;
@@ -830,6 +852,7 @@ fn flow_into(row: &mut ViewRow, more: &str) {
 ///
 /// Both lines have to agree on the column count. That is what stops a paragraph
 /// that happens to contain a pipe from eating the line under it.
+#[tracing::instrument(level = "debug", ret)]
 fn table_at(head: &str, delim: &str) -> Option<Vec<i32>> {
     let delim = delim.strip_suffix('\r').unwrap_or(delim);
     if !head.contains('|') || !delim.contains('|') {
@@ -858,6 +881,7 @@ fn table_at(head: &str, delim: &str) -> Option<Vec<i32>> {
 
 /// The cells of one table line: split on `|`, with the optional leading and
 /// trailing fence dropped. An escaped `\|` stays inside its cell.
+#[tracing::instrument(level = "debug", ret)]
 fn split_cells(line: &str) -> Vec<String> {
     let mut cells = vec![String::new()];
     let mut esc = false;
@@ -888,6 +912,7 @@ fn split_cells(line: &str) -> Vec<String> {
 
 /// One table line as a row. Short lines are padded and long ones truncated to the
 /// header's column count, so every row in a table has the same shape.
+#[tracing::instrument(level = "debug", ret)]
 fn table_row(role: i32, cells: &[String], aligns: &[i32]) -> ViewRow {
     let mut row = ViewRow::inert(role, "");
     row.cells = aligns
@@ -904,6 +929,7 @@ fn table_row(role: i32, cells: &[String], aligns: &[i32]) -> ViewRow {
 /// Inline markdown reduced to the words it was wrapping. Used only where the row
 /// is drawn with a plain `Text` instead of Slint's `StyledText` — headings, which
 /// need the font weight `StyledText` has no property for.
+#[tracing::instrument(level = "debug", ret)]
 fn strip_inline(src: &str) -> String {
     let ch: Vec<char> = src.chars().collect();
     let mut out = String::with_capacity(src.len());
@@ -951,6 +977,7 @@ fn strip_inline(src: &str) -> String {
 }
 
 /// `---`, `***`, `___` (three or more, nothing else on the line).
+#[tracing::instrument(level = "debug", ret)]
 fn is_rule(trimmed: &str) -> bool {
     let t = trimmed.trim_end();
     for c in ['-', '*', '_'] {
@@ -964,6 +991,7 @@ fn is_rule(trimmed: &str) -> bool {
 /// Read a file as text, refusing what a preview has no business loading. The error
 /// arm is a ready-made [`role::NOTICE`] row so every caller reports failure the
 /// same way.
+#[tracing::instrument(level = "debug", ret)]
 fn read_text(file: &Path) -> Result<String, ViewRow> {
     let md = fs::metadata(file)
         .map_err(|e| ViewRow::inert(role::NOTICE, format!("Cannot read: {e}")))?;
@@ -989,6 +1017,7 @@ fn read_text(file: &Path) -> Result<String, ViewRow> {
 
 /// Truncate to [`MAX_LINE_CHARS`] *chars* (never bytes — a byte slice can split a
 /// UTF-8 sequence) and drop the trailing `\r` a CRLF file leaves on every line.
+#[tracing::instrument(level = "debug", ret)]
 fn clip(s: &str) -> String {
     let s = s.strip_suffix('\r').unwrap_or(s);
     if s.chars().count() <= MAX_LINE_CHARS {
@@ -1000,6 +1029,7 @@ fn clip(s: &str) -> String {
 }
 
 /// "1.2 KB" — binary units, one decimal past KB, so a listing column stays narrow.
+#[tracing::instrument(level = "debug", ret)]
 fn size_label(bytes: u64) -> String {
     const K: f64 = 1024.0;
     let b = bytes as f64;
@@ -1017,6 +1047,7 @@ fn size_label(bytes: u64) -> String {
 
 /// "3m", "5h", "2d", "Aug 30" — the same shape the left panel's session rows use,
 /// so the two lists read as one product.
+#[tracing::instrument(level = "debug", ret)]
 fn age_label(t: SystemTime, now: u64) -> String {
     let then = t
         .duration_since(UNIX_EPOCH)
@@ -1034,6 +1065,7 @@ fn age_label(t: SystemTime, now: u64) -> String {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1057,6 +1089,7 @@ struct Fingerprint {
     len: u64,
 }
 
+#[tracing::instrument(level = "debug")]
 fn fingerprint(kind: &PaneKind, target: Option<&str>) -> Fingerprint {
     let target = target.unwrap_or_default().to_string();
     let (mtime, len) = fs::metadata(&target)
@@ -1115,6 +1148,7 @@ thread_local! {
 /// `stat` and a refcount bump.
 /// The "no diagram" value. `w == 0` is what the view tests, so a blank one is
 /// inert without needing a second flag.
+#[tracing::instrument(level = "debug", ret)]
 fn blank_diagram() -> PaneDiagram {
     PaneDiagram {
         w: 0.0,
@@ -1131,6 +1165,7 @@ fn blank_diagram() -> PaneDiagram {
 
 /// Hand a laid-out diagram to Slint. A straight field-for-field copy: the layout
 /// is finished before it gets here, and this side adds no geometry of its own.
+#[tracing::instrument(level = "debug", ret)]
 fn diagram_model(d: &crate::mermaid::Diagram) -> PaneDiagram {
     PaneDiagram {
         w: d.w,
@@ -1170,17 +1205,20 @@ fn diagram_model(d: &crate::mermaid::Diagram) -> PaneDiagram {
 /// Whether a role's text is a wrapping run of inline markdown. These are the
 /// rows the view hands to `StyledText`; every other role is either verbatim
 /// (a viewer line, a code line) or drawn (a rule, a diagram, air).
+#[tracing::instrument(level = "debug", ret)]
 fn flows(role: i32) -> bool {
     matches!(role, role::PROSE | role::BULLET | role::QUOTE)
 }
 
 /// Inline markdown for the view. A source that will not parse still has to be
 /// readable, so it falls back to itself as plain text rather than vanishing.
+#[tracing::instrument(level = "debug", ret)]
 fn markdown_text(src: &str) -> slint::StyledText {
     slint::StyledText::from_markdown(src)
         .unwrap_or_else(|_| slint::StyledText::from_plain_text(src))
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn model_for(uid: &str, kind: &PaneKind, target: Option<&str>) -> ModelRc<PaneViewRow> {
     let fp = fingerprint(kind, target);
     VIEW_CACHE.with(|c| {
@@ -1266,12 +1304,14 @@ pub fn generation(uid: &str) -> Option<u64> {
 /// safe here (unlike the session list, which is keyed by id) because the model and
 /// the rows are stored together and replaced together — a stale index can only
 /// miss, never resolve to a different row's path.
+#[tracing::instrument(level = "debug", ret)]
 pub fn row_at(uid: &str, index: usize) -> Option<ViewRow> {
     VIEW_CACHE.with(|c| c.borrow().get(uid).and_then(|e| e.rows.get(index).cloned()))
 }
 
 /// Pane `uid`'s selection as (anchor, focus) — unordered, in the order the human
 /// made it. `None` when nothing is selected or the pane has no projection.
+#[tracing::instrument(level = "debug", ret)]
 pub fn selection(uid: &str) -> Option<(usize, usize)> {
     VIEW_CACHE.with(|c| c.borrow().get(uid).and_then(|e| e.sel))
 }
@@ -1279,6 +1319,7 @@ pub fn selection(uid: &str) -> Option<(usize, usize)> {
 /// The selected range as (lo, hi), or `None`. What the view and the clipboard both
 /// want; [`selection`] is for the code that has to know which end the human is
 /// dragging.
+#[tracing::instrument(level = "debug", ret)]
 pub fn selected_range(uid: &str) -> Option<(usize, usize)> {
     selection(uid).map(|(a, b)| if a <= b { (a, b) } else { (b, a) })
 }
@@ -1286,6 +1327,7 @@ pub fn selected_range(uid: &str) -> Option<(usize, usize)> {
 /// Move pane `uid`'s selection to `row`, either replacing it (`extend` false) or
 /// stretching the existing anchor to reach it (`extend` true). A shift-click with
 /// nothing selected yet has no anchor to stretch, so it starts one.
+#[tracing::instrument(level = "debug", ret)]
 pub fn select_row(uid: &str, row: usize, extend: bool) {
     VIEW_CACHE.with(|c| {
         let mut c = c.borrow_mut();
@@ -1301,6 +1343,7 @@ pub fn select_row(uid: &str, row: usize, extend: bool) {
 }
 
 /// Select every row of pane `uid`. A no-op on a pane with no projection.
+#[tracing::instrument(level = "debug", ret)]
 pub fn select_all(uid: &str) {
     VIEW_CACHE.with(|c| {
         let mut c = c.borrow_mut();
@@ -1337,6 +1380,7 @@ pub fn row_count(uid: &str) -> usize {
 /// needs (a heading's level, a table's cells, a bullet's nesting). The range is
 /// clamped and order-normalised here so callers may hand over a selection anchor
 /// and focus in whichever order the human dragged them.
+#[tracing::instrument(level = "debug", ret)]
 pub fn copy_range(uid: &str, a: usize, b: usize) -> String {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
     VIEW_CACHE.with(|c| {
@@ -1357,6 +1401,7 @@ pub fn copy_range(uid: &str, a: usize, b: usize) -> String {
 
 /// Drop a pane's projection. Called when the pane closes so a long-lived window
 /// does not accumulate the row vectors of every view pane it ever had.
+#[tracing::instrument(level = "debug", ret)]
 pub fn forget(uid: &str) {
     VIEW_CACHE.with(|c| {
         c.borrow_mut().remove(uid);
@@ -1367,6 +1412,7 @@ pub fn forget(uid: &str) {
 /// markdown file gets the preview, everything else the plain viewer. Deterministic
 /// and extension-driven — the alternative (sniffing content) would make the same
 /// click do different things on different days.
+#[tracing::instrument(level = "debug", ret)]
 pub fn kind_for_file(path: &Path) -> PaneKind {
     let ext = path
         .extension()

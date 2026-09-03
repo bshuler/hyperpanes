@@ -34,6 +34,7 @@ pub struct Resolution {
 
 /// The user's home directory. Cross-platform, unlike the private helper in
 /// `persistence::paths` which is `#[cfg(not(windows))]`.
+#[tracing::instrument(level = "debug", ret)]
 fn home_dir() -> Option<PathBuf> {
     #[cfg(windows)]
     let var = std::env::var_os("USERPROFILE");
@@ -51,6 +52,7 @@ fn home_dir() -> Option<PathBuf> {
 /// `claude.cmd` (an npm shim) or `claude.exe`, so `PATHEXT` has to be honoured or the
 /// walk finds nothing at all.
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 fn exe_suffixes() -> Vec<String> {
     let raw = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
     let mut v = vec![String::new()]; // an explicit `foo.exe` argument still resolves
@@ -63,12 +65,14 @@ fn exe_suffixes() -> Vec<String> {
 }
 
 #[cfg(not(windows))]
+#[tracing::instrument(level = "debug", ret)]
 fn exe_suffixes() -> Vec<String> {
     vec![String::new()]
 }
 
 /// Whether `p` is a file we could actually launch. On Unix that means the execute bit
 /// is set — a non-executable file with the right name is not the tool.
+#[tracing::instrument(level = "debug", ret)]
 fn is_executable(p: &Path) -> bool {
     let Ok(md) = std::fs::metadata(p) else {
         return false;
@@ -88,6 +92,7 @@ fn is_executable(p: &Path) -> bool {
 }
 
 /// Look for `cmd` in `dir`, trying each executable suffix.
+#[tracing::instrument(level = "debug", ret)]
 fn in_dir(dir: &Path, cmd: &str) -> Option<PathBuf> {
     for suffix in exe_suffixes() {
         let candidate = if suffix.is_empty() {
@@ -103,6 +108,7 @@ fn in_dir(dir: &Path, cmd: &str) -> Option<PathBuf> {
 }
 
 /// The first directory on `PATH` holding an executable named `cmd`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn on_path(cmd: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
     std::env::split_paths(&path).find_map(|dir| in_dir(&dir, cmd))
@@ -111,6 +117,7 @@ pub fn on_path(cmd: &str) -> Option<PathBuf> {
 /// Install locations these tools commonly land in that are *not* always on `PATH` —
 /// notably a GUI app's environment, which does not inherit a login shell's `PATH` on
 /// macOS and so routinely misses `~/.local/bin` and Homebrew.
+#[tracing::instrument(level = "debug", ret)]
 fn well_known_dirs() -> Vec<PathBuf> {
     #[allow(unused_mut)]
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -148,6 +155,7 @@ fn well_known_dirs() -> Vec<PathBuf> {
 /// not overrule them because the file happens to be missing right now (a network
 /// mount, a version manager mid-switch). Callers that care can check whether
 /// [`Resolution::path`] exists.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve(tool: &ToolDef, overrides: &BTreeMap<String, String>) -> Option<Resolution> {
     if let Some(p) = overrides.get(tool.id) {
         if !p.is_empty() {
@@ -180,6 +188,7 @@ pub fn resolve(tool: &ToolDef, overrides: &BTreeMap<String, String>) -> Option<R
 
 /// Resolve every tool in the registry, keyed by tool id. Tools that are not installed
 /// are simply absent from the map.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_all(overrides: &BTreeMap<String, String>) -> BTreeMap<&'static str, Resolution> {
     super::registry::TOOLS
         .iter()

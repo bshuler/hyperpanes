@@ -78,11 +78,13 @@ impl WindowGeometry {
     /// The remembered inner size, or `None` when the file never recorded one. Both halves
     /// are required: a width with no height cannot be applied, and applying half of it
     /// would produce a window shape nobody ever chose.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn size(&self) -> Option<(i64, i64)> {
         Some((self.width?, self.height?))
     }
 
     /// The remembered outer position, or `None` when the file never recorded one.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn position(&self) -> Option<(i64, i64)> {
         Some((self.x?, self.y?))
     }
@@ -104,6 +106,7 @@ impl WindowGeometry {
     ///
     /// The chosen display is the one the frame overlaps most; with no overlap at all it is
     /// the first (primary) one.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn clamp_to_displays(&self, displays: &[DisplayRect]) -> WindowGeometry {
         let (Some((w, h)), Some((x, y))) = (self.size(), self.position()) else {
             // Nothing to clamp — a size-only or empty geometry is applied (or not) as-is.
@@ -149,6 +152,7 @@ impl WindowGeometry {
 }
 
 /// Area of the intersection between a frame and a display, `0` when they do not touch.
+#[tracing::instrument(level = "debug", ret)]
 fn overlap_area(x: i64, y: i64, w: i64, h: i64, d: &DisplayRect) -> i64 {
     let ox = (x + w).min(d.x + d.width) - x.max(d.x);
     let oy = (y + h).min(d.y + d.height) - y.max(d.y);
@@ -156,12 +160,14 @@ fn overlap_area(x: i64, y: i64, w: i64, h: i64, d: &DisplayRect) -> i64 {
 }
 
 /// Does enough of the frame's TOP edge (the drag handle) land on this display?
+#[tracing::instrument(level = "debug", ret)]
 fn top_edge_visible(x: i64, y: i64, w: i64, d: &DisplayRect) -> bool {
     let ox = (x + w).min(d.x + d.width) - x.max(d.x);
     ox >= MIN_VISIBLE && y >= d.y && y < d.y + d.height
 }
 
 /// Read the remembered frame from the canonical `window-geometry.json`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn load() -> WindowGeometry {
     load_from(&paths::window_geometry_json())
 }
@@ -173,6 +179,7 @@ pub fn load() -> WindowGeometry {
 /// or hand-edited file must cost a default-sized window, never a failed launch. A field
 /// that is not a whole number (a `null`, a string, a float from some other writer) is
 /// treated as absent rather than poisoning the whole frame.
+#[tracing::instrument(level = "debug", ret)]
 pub fn load_from(path: &std::path::Path) -> WindowGeometry {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return WindowGeometry::default();
@@ -193,12 +200,14 @@ pub fn load_from(path: &std::path::Path) -> WindowGeometry {
 }
 
 /// Persist the frame to the canonical `window-geometry.json` (atomic).
+#[tracing::instrument(level = "debug", ret)]
 pub fn save(geometry: &WindowGeometry) -> std::io::Result<()> {
     save_to(&paths::window_geometry_json(), geometry)
 }
 
 /// Persist the frame to `path`, atomically, 2-space pretty-printed like every other file
 /// under the userData dir. Unset fields are omitted rather than written as `null`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn save_to(path: &std::path::Path, geometry: &WindowGeometry) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;

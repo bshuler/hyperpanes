@@ -62,6 +62,7 @@ pub enum Recorder {
 }
 
 impl Recorder {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn name(&self) -> &'static str {
         match self {
             Recorder::Native => "native",
@@ -75,6 +76,7 @@ impl Recorder {
 
     /// Only meaningful for the variants that spawn a process; [`Recorder::Native`] is
     /// stopped over a channel, not a signal, so its answer here is never consulted.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn stop_kind(&self) -> StopKind {
         match self {
             Recorder::Ffmpeg { .. } => StopKind::FfmpegQuit,
@@ -86,6 +88,7 @@ impl Recorder {
     /// The command to spawn, writing its capture to `wav`. `None` for the variants that
     /// spawn nothing: [`Recorder::Native`], [`Recorder::None`], and an empty custom
     /// template.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn build_command(&self, wav: &Path) -> Option<Command> {
         let wav_s = wav.to_string_lossy().to_string();
         match self {
@@ -130,6 +133,7 @@ impl Recorder {
 
 /// Pick a recorder: the configured template if there is one, else in-process capture,
 /// else the first thing on `PATH` that can capture on this platform.
+#[tracing::instrument(level = "debug", ret)]
 pub fn detect_recorder(settings: &SttSettings) -> Recorder {
     if let Some(argv) = settings.record_template.as_ref() {
         if !argv.is_empty() {
@@ -161,6 +165,7 @@ pub fn detect_recorder(settings: &SttSettings) -> Recorder {
 /// macOS and Linux both name a default device, so the pair is a constant. Windows does
 /// not: dshow has no "default microphone" spelling, so the device has to be enumerated
 /// before the first recording, and a machine with no capture device yields `None`.
+#[tracing::instrument(level = "debug", ret)]
 fn ffmpeg_input() -> Option<(String, &'static str)> {
     #[cfg(target_os = "macos")]
     {
@@ -201,6 +206,7 @@ fn ffmpeg_input() -> Option<(String, &'static str)> {
 /// Every entry is followed by an `Alternative name "@device_cm_{…}"` line — the GUID
 /// spelling, which works but is unreadable in a settings file the user may want to
 /// override, so friendly names win.
+#[tracing::instrument(level = "debug", ret)]
 pub fn first_dshow_audio_device(stderr: &str) -> Option<String> {
     let mut in_audio = false;
     for line in stderr.lines() {
@@ -223,6 +229,7 @@ pub fn first_dshow_audio_device(stderr: &str) -> Option<String> {
 }
 
 /// The contents of the first `"…"` pair in `line`.
+#[tracing::instrument(level = "debug", ret)]
 fn quoted(line: &str) -> Option<String> {
     let start = line.find('"')? + 1;
     let rest = &line[start..];
@@ -252,6 +259,7 @@ pub enum Transcriber {
 }
 
 impl Transcriber {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn name(&self) -> &'static str {
         match self {
             Transcriber::Custom(_) => "custom",
@@ -262,6 +270,7 @@ impl Transcriber {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn build_command(&self, wav: &Path) -> Option<Command> {
         let wav_s = wav.to_string_lossy().to_string();
         match self {
@@ -299,6 +308,7 @@ impl Transcriber {
 /// `whisper` deliberately should not be made to wait on a 142 MB download they have no
 /// use for. Both arms are cheap and synchronous: neither touches the network, so `/state`
 /// can ask this on every poll.
+#[tracing::instrument(level = "debug", ret)]
 pub fn detect_transcriber(settings: &SttSettings) -> Transcriber {
     if let Some(argv) = settings.transcribe_template.as_ref() {
         if !argv.is_empty() {
@@ -326,6 +336,7 @@ pub fn detect_transcriber(settings: &SttSettings) -> Transcriber {
 /// Whisper prints `[00:00.000 --> 00:02.000]  text` per segment, and both builds emit
 /// bracketed non-speech markers (`[BLANK_AUDIO]`, `[Music]`) that must never be typed
 /// into a pane as if the human had said them.
+#[tracing::instrument(level = "debug", ret)]
 pub fn clean_transcript(stdout: &str) -> String {
     let mut words: Vec<&str> = Vec::new();
     for line in stdout.lines() {
@@ -339,6 +350,7 @@ pub fn clean_transcript(stdout: &str) -> String {
 }
 
 /// Drop a leading `[… --> …]` segment stamp, if present.
+#[tracing::instrument(level = "debug", ret)]
 fn strip_timestamp(line: &str) -> &str {
     let Some(rest) = line.strip_prefix('[') else {
         return line;
@@ -353,6 +365,7 @@ fn strip_timestamp(line: &str) -> &str {
 }
 
 /// Is the whole line a single `[…]` or `(…)` non-speech marker?
+#[tracing::instrument(level = "debug", ret)]
 fn is_bracketed_marker(line: &str) -> bool {
     let inner = match (line.starts_with('['), line.starts_with('(')) {
         (true, _) => line.strip_prefix('[').and_then(|s| s.strip_suffix(']')),
@@ -365,6 +378,7 @@ fn is_bracketed_marker(line: &str) -> bool {
 // =========================== shared ===========================
 
 /// Build a command from a user template, substituting `placeholder` in every argument.
+#[tracing::instrument(level = "debug", ret)]
 fn custom_command(argv: &[String], placeholder: &str, value: &str) -> Option<Command> {
     let (prog, rest) = argv.split_first()?;
     let mut c = command_for(&prog.replace(placeholder, value));
@@ -376,6 +390,7 @@ fn custom_command(argv: &[String], placeholder: &str, value: &str) -> Option<Com
 
 /// Is `cmd` an executable somewhere on `PATH`? Shares [`crate::speech::engine`]'s
 /// `PATHEXT`-aware probe so a Windows box resolves `ffmpeg.EXE` from a bare name.
+#[tracing::instrument(level = "debug", ret)]
 fn on_path(cmd: &str) -> bool {
     crate::speech::engine::on_path(cmd)
 }
@@ -383,6 +398,7 @@ fn on_path(cmd: &str) -> bool {
 /// Spawn a tool through its resolved absolute path — see
 /// [`crate::speech::engine::command_for`]. A GUI launched from the Dock has no Homebrew
 /// on `PATH`, so a bare `Command::new("ffmpeg")` fails on a machine that plainly has it.
+#[tracing::instrument(level = "debug", ret)]
 fn command_for(cmd: &str) -> Command {
     crate::speech::engine::command_for(cmd)
 }

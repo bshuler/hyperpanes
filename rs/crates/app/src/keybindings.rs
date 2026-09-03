@@ -42,6 +42,7 @@ impl KeyTok {
     /// The persisted/normalized token string (mirrors the renderer's `e.key`): a single
     /// lowercase character, or `arrowleft`/`arrowright`/`arrowup`/`arrowdown`/`f11`/`tab`/
     /// `enter`/`space`/`escape`.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn token(self) -> String {
         match self {
             KeyTok::Char(c) => c.to_ascii_lowercase().to_string(),
@@ -59,6 +60,7 @@ impl KeyTok {
 
     /// Parse a normalized token back into a [`KeyTok`] (the inverse of [`Self::token`]).
     /// Unknown multi-char tokens return `None`.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn from_token(s: &str) -> Option<KeyTok> {
         match s {
             "arrowleft" => Some(KeyTok::Left),
@@ -85,6 +87,7 @@ impl KeyTok {
     /// The display chip for this key (`P`, `←`, `F11`, `Tab`) — the native port of the
     /// renderer's `keyLabel`: arrows show glyphs, named keys are spelled out, a single
     /// character is upper-cased.
+    #[tracing::instrument(level = "debug", ret)]
     fn label(self) -> String {
         match self {
             KeyTok::Char(c) => c.to_ascii_uppercase().to_string(),
@@ -102,6 +105,7 @@ impl KeyTok {
 }
 
 /// Whether `c` is a single printable (non-control) character a chord can target.
+#[tracing::instrument(level = "debug", ret)]
 fn is_printable(c: char) -> bool {
     let u = c as u32;
     u >= 0x20 && u != 0x7f && !(0xe000..=0xf8ff).contains(&u)
@@ -135,12 +139,14 @@ impl Chord {
             key,
         }
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn matches(&self, ctrl: bool, alt: bool, shift: bool, key: KeyTok) -> bool {
         self.ctrl == ctrl && self.alt == alt && self.shift == shift && self.key == key
     }
 
     /// The chord's pieces in display order, e.g. `["Ctrl", "Shift", "P"]` — the native port
     /// of the renderer's `comboParts`, rendered as `<kbd>` chips in the keybindings list.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn parts(&self) -> Vec<String> {
         let mut parts: Vec<String> = Vec::new();
         if self.ctrl {
@@ -159,6 +165,7 @@ impl Chord {
     /// Human chord label, e.g. `Ctrl+Shift+P` or `Alt+←` (the joined [`Self::parts`]). Used
     /// by tests + available for diagnostics; the editor renders [`Self::parts`] as chips.
     #[allow(dead_code)]
+    #[tracing::instrument(level = "debug", ret)]
     pub fn label(&self) -> String {
         self.parts().join("+")
     }
@@ -179,6 +186,7 @@ struct ChordRepr {
 }
 
 impl ChordRepr {
+    #[tracing::instrument(level = "debug", ret)]
     fn to_chord(&self) -> Option<Chord> {
         KeyTok::from_token(&self.key).map(|key| Chord {
             ctrl: self.ctrl,
@@ -190,6 +198,7 @@ impl ChordRepr {
 }
 
 impl From<Chord> for ChordRepr {
+    #[tracing::instrument(level = "debug", ret)]
     fn from(c: Chord) -> Self {
         ChordRepr {
             ctrl: c.ctrl,
@@ -221,6 +230,7 @@ pub const CATEGORY_ORDER: [&str; 4] = ["General", "Tabs", "Panes", "Zoom"];
 /// is the display order within each category. (The non-rebindable "Focus pane by number →
 /// Alt 1…9" documentation row is rendered by the editor, not a binding here.) Native-only
 /// addition: `pane.paste` (Ctrl+V → app-side paste, #9) has no renderer counterpart.
+#[tracing::instrument(level = "debug")]
 pub fn default_bindings() -> Vec<Binding> {
     use KeyTok::*;
     let b = |id, ctrl, alt, shift, key, category, label, command| Binding {
@@ -447,6 +457,7 @@ pub fn default_bindings() -> Vec<Binding> {
 /// owned `Command`s; the key router consults this table on **every** key event
 /// ([`Keymap::match_chord`]) and the menus on every render ([`Keymap::label_for`]), so caching
 /// it behind a [`OnceLock`] avoids rebuilding the whole table each time.
+#[tracing::instrument(level = "debug")]
 fn bindings() -> &'static [Binding] {
     static BINDINGS: OnceLock<Vec<Binding>> = OnceLock::new();
     BINDINGS.get_or_init(default_bindings)
@@ -487,6 +498,7 @@ impl Keymap {
     /// Load the persisted overrides (an empty map on a missing/corrupt file). Unknown ids are
     /// dropped and un-parseable chords fall back to the default, so an older blob never breaks
     /// the editor. A `null` value is an explicit unbind.
+    #[tracing::instrument(level = "debug")]
     pub fn load() -> Self {
         let mut overrides = BTreeMap::new();
         let path = paths::user_data_dir().join("native-keybindings.json");
@@ -518,6 +530,7 @@ impl Keymap {
 
     /// Persist the overrides atomically (best-effort; a write failure is logged, never fatal).
     /// An unbound binding serializes as `null`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn save(&self) {
         let path = paths::user_data_dir().join("native-keybindings.json");
         let map: BTreeMap<&String, Option<ChordRepr>> = self
@@ -537,6 +550,7 @@ impl Keymap {
 
     /// The effective chord for `id`: the user override if set (which may be `None` = unbound),
     /// else `default`. `None` means nothing fires this binding.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn effective(&self, id: &str, default: Chord) -> Option<Chord> {
         match self.overrides.get(id) {
             Some(opt) => *opt,
@@ -545,6 +559,7 @@ impl Keymap {
     }
 
     /// Whether `id` currently has a user override (a rebind *or* an explicit unbind).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn is_overridden(&self, id: &str) -> bool {
         self.overrides.contains_key(id)
     }
@@ -552,6 +567,7 @@ impl Keymap {
     /// The effective chord label (e.g. `Ctrl+Shift+Z`) for binding `id` — the native port of the
     /// renderer's `comboLabel(combos[id])`, used to annotate context-menu rows. `None` for an
     /// unknown *or* unbound binding (so the menu shows no shortcut).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn label_for(&self, id: &str) -> Option<String> {
         bindings()
             .iter()
@@ -563,6 +579,7 @@ impl Keymap {
     /// Find the command bound to a live modifier+key combo, consulting each binding's
     /// **effective** chord (override wins over default; an unbound binding never matches),
     /// first match in table order.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn match_chord(&self, ctrl: bool, alt: bool, shift: bool, key: KeyTok) -> Option<Command> {
         if let Some(cmd) = self.match_exact(ctrl, alt, shift, key) {
             return Some(cmd);
@@ -579,6 +596,7 @@ impl Keymap {
 
     /// The command whose **effective** chord equals this exact combo (override-first, first match
     /// in table order). The exact half of [`Self::match_chord`].
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn match_exact(&self, ctrl: bool, alt: bool, shift: bool, key: KeyTok) -> Option<Command> {
         bindings()
             .iter()
@@ -592,6 +610,7 @@ impl Keymap {
     /// The id of a *different* binding whose **effective** chord already equals `chord` (the
     /// current owner of that combo), or `None` when the combo is free. Used to "steal" a chord:
     /// rebinding to an in-use combo unbinds its previous owner.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn owner_of(&self, chord: Chord, except: &str) -> Option<&'static str> {
         bindings()
             .iter()
@@ -605,6 +624,7 @@ impl Keymap {
     }
 
     /// Override binding `id` with `chord`, persisting. Unknown ids are ignored.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set(&mut self, id: &str, chord: Chord) {
         if bindings().iter().any(|b| b.id == id) {
             self.overrides.insert(id.to_string(), Some(chord));
@@ -613,6 +633,7 @@ impl Keymap {
     }
 
     /// Explicitly unbind `id` (no chord fires it), persisting. Unknown ids are ignored.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn unbind(&mut self, id: &str) {
         if bindings().iter().any(|b| b.id == id) {
             self.overrides.insert(id.to_string(), None);
@@ -621,6 +642,7 @@ impl Keymap {
     }
 
     /// Reset binding `id` to its default chord (drop any override/unbind), persisting.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn reset(&mut self, id: &str) {
         if self.overrides.remove(id).is_some() {
             self.save();
@@ -628,6 +650,7 @@ impl Keymap {
     }
 
     /// Reset *every* binding to its default (clear all overrides), persisting.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn reset_all(&mut self) {
         if !self.overrides.is_empty() {
             self.overrides.clear();
@@ -636,6 +659,7 @@ impl Keymap {
     }
 
     /// Whether any binding is overridden (drives the "Reset all" affordance).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn any_overridden(&self) -> bool {
         !self.overrides.is_empty()
     }
@@ -643,6 +667,7 @@ impl Keymap {
     /// The bindings grouped by [`CATEGORY_ORDER`] (category order, then table order) — the
     /// editor's row model, with each row's **effective** chord chips, overridden flag, and
     /// unbound flag. Each category's rows are contiguous so the view can draw a heading per group.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn rows(&self) -> Vec<BindingRow> {
         let bindings = bindings();
         let mut rows = Vec::with_capacity(bindings.len());

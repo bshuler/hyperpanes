@@ -139,6 +139,7 @@ pub struct Ui {
 
 impl Ui {
     /// A fresh, empty model set for one window.
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Rc<Ui> {
         Rc::new(Ui {
             panes: Rc::new(VecModel::default()),
@@ -188,6 +189,7 @@ impl Ui {
     }
 
     /// Bind this window's models to its `AppWindow` instance.
+    #[tracing::instrument(level = "debug", ret, skip(self, app))]
     pub fn attach(&self, app: &AppWindow) {
         app.set_panes(ModelRc::from(self.panes.clone()));
         app.set_tabs(ModelRc::from(self.tabs.clone()));
@@ -242,6 +244,7 @@ impl Ui {
 ///
 /// `from_argb_encoded` rather than `from_rgb_u8`: `scrim` and `veil` are translucent, and
 /// the alpha is part of the palette (a light theme wants a lighter shadow).
+#[tracing::instrument(level = "debug", ret, skip(app))]
 fn push_ui_palette(app: &AppWindow, p: crate::theme::UiPalette) {
     use slint::ComponentHandle as _;
     let t = app.global::<crate::Theme>();
@@ -267,6 +270,7 @@ fn push_ui_palette(app: &AppWindow, p: crate::theme::UiPalette) {
 /// unchanged (`set_row_data`) and only rebuilding (`set_vec`) when it differs.
 /// Reuse is essential: `set_vec` destroys + recreates the repeated Slint elements,
 /// which would drop a divider's pointer grab mid-drag and reset pane focus.
+#[tracing::instrument(level = "debug", skip_all)]
 fn sync_model<T: Clone + 'static>(model: &VecModel<T>, items: Vec<T>) {
     // Grow/shrink at the tail and update the rest in place, rather than `set_vec`. `set_vec`
     // replaces the whole model, which makes a Repeater DESTROY and re-create every element —
@@ -299,6 +303,7 @@ fn sync_model<T: Clone + 'static>(model: &VecModel<T>, items: Vec<T>) {
 /// converges (verified live: one 1px move corrects it). No-op when the cursor is outside the
 /// window.
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 fn replay_cursor_pos(app: &AppWindow, link_active: bool) {
     use slint::ComponentHandle;
     use windows::Win32::Foundation::POINT;
@@ -325,11 +330,13 @@ fn replay_cursor_pos(app: &AppWindow, link_active: bool) {
 }
 
 #[cfg(not(windows))]
+#[tracing::instrument(level = "debug", ret, skip(_app))]
 fn replay_cursor_pos(_app: &AppWindow, _link_active: bool) {}
 
 /// Build a model row for pane `i`. `editing` flags the pane whose label is being renamed
 /// inline; `show_frame`/`show_dot` are the GLOBAL Appearance prefs, folded here over each
 /// pane's per-pane override (a clean new pane resolves OFF, a git-project pane ON).
+#[tracing::instrument(level = "debug", ret, skip(ps))]
 fn pane_item(
     ps: &PaneState,
     focused: bool,
@@ -499,6 +506,7 @@ fn pane_item(
 
 /// Recompute the active tab's pane rects (and reflow any pane whose pixel size
 /// changed). Honors zoom (solo the zoomed pane full-area).
+#[tracing::instrument(level = "debug", ret, skip(state))]
 fn relayout_active(state: &mut State, area: (f32, f32), scale: f32) {
     let (aw, ah) = area;
     let active = state.active;
@@ -592,6 +600,7 @@ fn relayout_active(state: &mut State, area: (f32, f32), scale: f32) {
 }
 
 /// Pixel rects for the active tab's draggable dividers.
+#[tracing::instrument(level = "debug", ret, skip(state))]
 fn build_dividers(state: &State, area: (f32, f32)) -> Vec<DividerItem> {
     let (aw, ah) = area;
     state
@@ -661,6 +670,7 @@ const PTY_RESIZE_SETTLE: Duration = Duration::from_millis(300);
 ///
 /// Runs every tick — NOT from [`resync`], which only runs on a dirty state and would leave a
 /// settled size pending indefinitely on an idle app.
+#[tracing::instrument(level = "debug", skip_all)]
 fn flush_pty_resizes(state: &mut State, mgr: &SessionManager, now: Instant) {
     for tab in &mut state.tabs {
         for p in &mut tab.panes {
@@ -676,6 +686,7 @@ fn flush_pty_resizes(state: &mut State, mgr: &SessionManager, now: Instant) {
     }
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resync(
     state: &mut State,
     app: &AppWindow,
@@ -1761,6 +1772,7 @@ pub struct PumpResult {
 /// preview is animating). A bare cursor-blink repaint is deliberately NOT "active", so an
 /// otherwise-idle window lets the pump settle to the slow cadence (the blink still toggles
 /// fine at the ~31 Hz idle rate).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn pump(
     app: &AppWindow,
     state: &mut State,

@@ -34,6 +34,7 @@ pub const PRODUCT_NAME: &str = "hyperpanes";
 /// Electron prefers the `APPDATA` env var and falls back to the known folder; we do the
 /// same (the `directories` crate resolves the Roaming known folder as the fallback).
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 fn app_data_dir() -> PathBuf {
     if let Some(v) = std::env::var_os("APPDATA") {
         if !v.is_empty() {
@@ -49,6 +50,7 @@ fn app_data_dir() -> PathBuf {
 
 /// The user's home directory: `$HOME`, falling back to the OS-resolved home.
 #[cfg(not(windows))]
+#[tracing::instrument(level = "debug", ret)]
 fn home_dir() -> PathBuf {
     if let Some(v) = std::env::var_os("HOME") {
         if !v.is_empty() {
@@ -64,6 +66,7 @@ fn home_dir() -> PathBuf {
 /// Resolve an XDG base dir: the env var if set to an absolute path (the spec says a
 /// relative value must be ignored), else `home/<rel>`. Pure core is [`pick_base`].
 #[cfg(not(any(windows, target_os = "macos")))]
+#[tracing::instrument(level = "debug", ret)]
 fn xdg_dir(var: &str, home_rel: &str) -> PathBuf {
     pick_base(
         std::env::var_os(var).map(PathBuf::from),
@@ -75,6 +78,7 @@ fn xdg_dir(var: &str, home_rel: &str) -> PathBuf {
 /// Pure XDG base-dir rule, split out for tests: an absolute, non-empty `env_value`
 /// wins; anything else falls back to `home/<rel>`.
 #[cfg(not(any(windows, target_os = "macos")))]
+#[tracing::instrument(level = "debug", ret)]
 fn pick_base(env_value: Option<PathBuf>, home: &Path, rel: &str) -> PathBuf {
     if let Some(p) = env_value {
         if !p.as_os_str().is_empty() && p.is_absolute() {
@@ -88,6 +92,7 @@ fn pick_base(env_value: Option<PathBuf>, home: &Path, rel: &str) -> PathBuf {
 /// for the production build on every platform:
 /// Windows `%APPDATA%\hyperpanes`, macOS `~/Library/Application Support/hyperpanes`,
 /// Linux `$XDG_CONFIG_HOME/hyperpanes` (default `~/.config/hyperpanes`).
+#[tracing::instrument(level = "debug", ret)]
 pub fn user_data_dir() -> PathBuf {
     #[cfg(windows)]
     {
@@ -108,12 +113,14 @@ pub fn user_data_dir() -> PathBuf {
 
 /// Where user-edited settings live. Same as [`user_data_dir`] on every platform
 /// (on Linux that already IS the XDG config dir).
+#[tracing::instrument(level = "debug", ret)]
 pub fn config_dir() -> PathBuf {
     user_data_dir()
 }
 
 /// Where durable user data lives: [`user_data_dir`] on Windows/macOS;
 /// `$XDG_DATA_HOME/hyperpanes` (default `~/.local/share/hyperpanes`) on Linux.
+#[tracing::instrument(level = "debug", ret)]
 pub fn data_dir() -> PathBuf {
     #[cfg(any(windows, target_os = "macos"))]
     {
@@ -127,6 +134,7 @@ pub fn data_dir() -> PathBuf {
 
 /// Where session/runtime state lives: [`user_data_dir`] on Windows/macOS;
 /// `$XDG_STATE_HOME/hyperpanes` (default `~/.local/state/hyperpanes`) on Linux.
+#[tracing::instrument(level = "debug", ret)]
 pub fn state_dir() -> PathBuf {
     #[cfg(any(windows, target_os = "macos"))]
     {
@@ -140,11 +148,13 @@ pub fn state_dir() -> PathBuf {
 
 /// Discovery file the control server writes (port/token/pid/version/events URL).
 /// Runtime state → [`state_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn control_json() -> PathBuf {
     state_dir().join("control.json")
 }
 
 /// `{ enabled, allowInput }` control-server settings. User setting → [`config_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn control_settings_json() -> PathBuf {
     config_dir().join("control-settings.json")
 }
@@ -152,22 +162,26 @@ pub fn control_settings_json() -> PathBuf {
 /// Persisted paired-device tokens (mobile clients). Lives beside `control.json` in the state
 /// dir — the running server reads it on start and `hyperpanes pair`/`devices`/`revoke` drive it
 /// through the control API, so the two always agree.
+#[tracing::instrument(level = "debug", ret)]
 pub fn device_tokens_json() -> PathBuf {
     state_dir().join("device-tokens.json")
 }
 
 /// The last saved session (restored on launch). Session state → [`state_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn last_workspace_json() -> PathBuf {
     state_dir().join("last-workspace.json")
 }
 
 /// The main window's remembered frame (position, size, maximized). Restored before the
 /// window is first shown, so it is session state, not durable user data → [`state_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn window_geometry_json() -> PathBuf {
     state_dir().join("window-geometry.json")
 }
 
 /// Remembered git-project history. Durable user data → [`data_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn projects_json() -> PathBuf {
     data_dir().join("projects.json")
 }
@@ -175,6 +189,7 @@ pub fn projects_json() -> PathBuf {
 /// The durable work-queue DB (SQLite/WAL) backing the `/queues` + `/tasks` routes. A
 /// real embedder opens this via `WorkQueue::open` (tests stay in-memory). Durable user
 /// data → [`data_dir`], alongside `projects.json`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn work_db() -> PathBuf {
     data_dir().join("work.db")
 }
@@ -182,22 +197,26 @@ pub fn work_db() -> PathBuf {
 /// The Claude-account registry (goals system account rotation): the list of `CLAUDE_CONFIG_DIR`s
 /// to rotate agents across. Optional — absent falls back to discovery (see
 /// [`crate::claude_accounts::load`]). Durable user data → [`data_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn claude_accounts_json() -> PathBuf {
     data_dir().join("claude-accounts.json")
 }
 
 /// Ambient-AI settings. User setting → [`config_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn ai_settings_json() -> PathBuf {
     config_dir().join("ai-settings.json")
 }
 
 /// Per-pane "talk" (local TTS) settings. User setting → [`config_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn speech_json() -> PathBuf {
     config_dir().join("speech.json")
 }
 
 /// Per-pane dictation (local STT) settings. User setting → [`config_dir`]. Kept beside
 /// `speech.json`, which is also how the control server derives it.
+#[tracing::instrument(level = "debug", ret)]
 pub fn stt_json() -> PathBuf {
     config_dir().join("stt.json")
 }
@@ -205,11 +224,13 @@ pub fn stt_json() -> PathBuf {
 /// Where downloaded speech-recognition models are cached. Durable user data →
 /// [`data_dir`]: a 142 MB model is expensive to re-fetch and survives restarts, which is
 /// exactly what `data_dir` means and exactly what `state_dir` does not.
+#[tracing::instrument(level = "debug", ret)]
 pub fn stt_models_dir() -> PathBuf {
     data_dir().join("models")
 }
 
 /// Ambient-AI per-pane memory. Durable user data → [`data_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn ai_memory_json() -> PathBuf {
     data_dir().join("ai-memory.json")
 }
@@ -219,6 +240,7 @@ pub fn ai_memory_json() -> PathBuf {
 /// resolve a re-attached control-spawned pane's `HYPERPANES_PANE_ID` (which is baked into
 /// the pane's environment at spawn and keys the Claude session markers below).
 /// Runtime state → [`state_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn control_pane_ids_json() -> PathBuf {
     state_dir().join("control-pane-ids.json")
 }
@@ -226,6 +248,7 @@ pub fn control_pane_ids_json() -> PathBuf {
 /// Durable session→prompt queue (see [`crate::resume_queue`]): messages waiting for a
 /// Claude conversation to (re)appear — typed into its pane on the next SessionStart
 /// marker. Runtime state → [`state_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn resume_prompts_json() -> PathBuf {
     state_dir().join("resume-prompts.json")
 }
@@ -235,6 +258,7 @@ pub fn resume_prompts_json() -> PathBuf {
 /// and read by the relaunch snapshot so a restored pane can `claude --resume` its
 /// conversation. Runtime state → [`state_dir`]: a marker only describes a live pane,
 /// so it must not survive into backups/dotfile syncs as durable data.
+#[tracing::instrument(level = "debug", ret)]
 pub fn claude_sessions_dir() -> PathBuf {
     state_dir().join("claude-sessions")
 }
@@ -246,6 +270,7 @@ pub fn claude_sessions_dir() -> PathBuf {
 /// keeping workspaces elsewhere — a set references them by path either way.
 ///
 /// Set members deliberately do NOT live here — see [`set_members_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn workspaces_dir() -> PathBuf {
     data_dir().join("workspaces")
 }
@@ -253,6 +278,7 @@ pub fn workspaces_dir() -> PathBuf {
 /// Where the per-process log files live (`hyperpanes-app.log`, `hyperpanes-daemon.log`,
 /// `hyperpanes-cli.log` and their `.1`…`.N` rolled predecessors — see `crate::logging`).
 /// Runtime state, not user data: [`state_dir`], so on Linux it lands in `$XDG_STATE_HOME`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn logs_dir() -> PathBuf {
     state_dir().join("logs")
 }
@@ -264,6 +290,7 @@ pub fn logs_dir() -> PathBuf {
 /// works in — the agent keeps notes there and the user can drop files in — not a runtime scratch
 /// file the app may delete. The app refreshes only the files it ships (see
 /// `crate::hyperpane::materialize`) and never removes anything else.
+#[tracing::instrument(level = "debug", ret)]
 pub fn hyperpane_dir() -> PathBuf {
     data_dir().join("hyperpane")
 }
@@ -271,6 +298,7 @@ pub fn hyperpane_dir() -> PathBuf {
 /// Saved **workspace sets** (`sets/*.json`): a name plus references to member workspaces —
 /// see [`crate::workspace::sets`]. Durable user data → [`data_dir`], beside
 /// [`workspaces_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn sets_dir() -> PathBuf {
     data_dir().join("sets")
 }
@@ -286,6 +314,7 @@ pub fn sets_dir() -> PathBuf {
 ///
 /// Sets written before this directory existed keep working untouched: their members are
 /// recorded as absolute paths, which `resolve_members` passes through verbatim.
+#[tracing::instrument(level = "debug", ret)]
 pub fn set_members_dir() -> PathBuf {
     sets_dir().join("members")
 }
@@ -293,6 +322,7 @@ pub fn set_members_dir() -> PathBuf {
 /// Write `contents` to `path` atomically: create the parent dir, write to a sibling
 /// temp file, then rename over the target (a single filesystem op — readers never see
 /// a half-written file). `std::fs::rename` replaces the destination on Windows.
+#[tracing::instrument(level = "debug", ret)]
 pub fn write_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)?;

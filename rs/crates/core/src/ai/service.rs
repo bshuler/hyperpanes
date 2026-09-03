@@ -50,6 +50,7 @@ pub trait Summarizer {
 }
 
 impl Summarizer for OllamaClient {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn run_summary(&self, system: &str, prompt: &str) -> Result<String, String> {
         self.summarize(&SummarizeInput {
             system: system.to_string(),
@@ -57,9 +58,11 @@ impl Summarizer for OllamaClient {
         })
         .await
     }
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn check_alive(&self) -> bool {
         self.ping().await
     }
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn configure(&mut self, endpoint: &str, model: &str) {
         OllamaClient::configure(
             self,
@@ -85,6 +88,7 @@ pub struct AiSettings {
 }
 
 impl Default for AiSettings {
+    #[tracing::instrument(level = "debug", ret)]
     fn default() -> Self {
         Self {
             enabled: false,
@@ -159,6 +163,7 @@ pub type PushMeta = Box<dyn FnMut(i64, &str, Vec<(String, String)>)>;
 pub type OnStatus = Box<dyn FnMut(&AiStatus)>;
 
 // Cheap, stable content fingerprint so we don't re-summarize unchanged output.
+#[tracing::instrument(level = "debug", ret)]
 fn fingerprint(text: &str) -> String {
     let mut h: i32 = 5381;
     let mut len = 0usize;
@@ -169,6 +174,7 @@ fn fingerprint(text: &str) -> String {
     format!("{len}:{h}")
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn basename(path: &str) -> &str {
     match path.rfind(['/', '\\']) {
         Some(i) => &path[i + 1..],
@@ -201,6 +207,7 @@ pub struct PreparedJob<S: Summarizer> {
 impl<S: Summarizer> PreparedJob<S> {
     /// Run the (single) Ollama summary call, consuming the job and yielding an
     /// opaque [`JobOutcome`] to feed back to [`AiService::finish_job`].
+    #[tracing::instrument(level = "debug", skip(self))]
     pub async fn run(self) -> JobOutcome {
         let result = self.client.run_summary(SYSTEM_PROMPT, &self.prompt).await;
         JobOutcome {
@@ -247,6 +254,7 @@ pub struct AiService<S: Summarizer> {
 }
 
 impl<S: Summarizer> AiService<S> {
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn new(
         settings_path: PathBuf,
         memory_path: PathBuf,
@@ -298,6 +306,7 @@ impl<S: Summarizer> AiService<S> {
     }
 
     /// Load persisted settings + memory and start if it was left enabled.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn init(&mut self) {
         self.settings = self.load_settings();
         self.store.load();
@@ -309,10 +318,12 @@ impl<S: Summarizer> AiService<S> {
         self.emit_status();
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn enabled(&self) -> bool {
         self.settings.enabled
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn status(&self) -> AiStatus {
         AiStatus {
             enabled: self.settings.enabled,
@@ -323,6 +334,7 @@ impl<S: Summarizer> AiService<S> {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_enabled(&mut self, enabled: bool) {
         if self.settings.enabled == enabled {
             return;
@@ -339,6 +351,7 @@ impl<S: Summarizer> AiService<S> {
     }
 
     /// Live-update endpoint/model/cadence from Preferences.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn configure(&mut self, patch: AiSettingsPatch) {
         if let Some(endpoint) = patch.endpoint {
             self.settings.endpoint = endpoint;
@@ -362,6 +375,7 @@ impl<S: Summarizer> AiService<S> {
     }
 
     // ---- taps from the session output ----
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn on_data(&mut self, uid: &str, data: &str) {
         if !self.settings.enabled {
             return;
@@ -374,6 +388,7 @@ impl<S: Summarizer> AiService<S> {
         self.scheduler.note_output(uid);
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn on_cwd(&mut self, uid: &str, cwd: &str, project: Option<AiProjectRef>) {
         let Some(ctx) = self.ctx_by_uid.get_mut(uid) else {
             return;
@@ -385,6 +400,7 @@ impl<S: Summarizer> AiService<S> {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn on_session_exit(&mut self, uid: &str) {
         self.buffer.clear(uid);
         self.scheduler.forget(uid);
@@ -395,6 +411,7 @@ impl<S: Summarizer> AiService<S> {
     /// A window publishes its live set of watched panes. We reconcile our context
     /// map for THAT window only, then prune the store against the union of all
     /// windows' published panes.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn on_pane_context(&mut self, window_id: i64, panes: &[AiPanePublish]) {
         let mut seen = HashSet::new();
         for p in panes {
@@ -459,6 +476,7 @@ impl<S: Summarizer> AiService<S> {
     }
 
     /// A window closed — forget its panes and re-prune.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn drop_window(&mut self, window_id: i64) {
         self.published_by_window.remove(&window_id);
         let to_remove: Vec<String> = self
@@ -479,6 +497,7 @@ impl<S: Summarizer> AiService<S> {
     // Prune store pane records to the union of all windows' published panes. Only
     // prunes once at least one window has published, so an early/empty state can't
     // wipe persisted memory.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn prune_panes(&mut self) {
         let mut all: Vec<String> = Vec::new();
         for set in self.published_by_window.values() {
@@ -491,6 +510,7 @@ impl<S: Summarizer> AiService<S> {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn shutdown(&mut self) {
         self.scheduler.stop();
         self.store.flush();
@@ -499,23 +519,27 @@ impl<S: Summarizer> AiService<S> {
     // ---- scheduler <-> live-driver bridge ----
 
     /// Advance the scheduler's virtual clock (the live driver ticks real elapsed ms).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn tick(&mut self, ms: i64) {
         self.scheduler.advance(ms);
         self.drain_status_signal();
     }
 
     /// Pop the next uid the scheduler has dispatched, if any.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn next_due(&mut self) -> Option<String> {
         self.ready.borrow_mut().pop_front()
     }
 
     /// Report a finished [`run_job`] back to the scheduler (online/offline tracking,
     /// backoff, re-queue), forwarding any status transition to `on_status`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn complete_job(&mut self, uid: &str, result: JobResult) {
         self.scheduler.complete(uid, result);
         self.drain_status_signal();
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn drain_status_signal(&mut self) {
         let signal = self.status_signal.borrow_mut().take();
         if let Some((online, err)) = signal {
@@ -536,6 +560,7 @@ impl<S: Summarizer> AiService<S> {
     /// self-contained [`PreparedJob`] (an owned prompt + a cloned client) that
     /// can run the Ollama call off the engine loop via [`PreparedJob::run`].
     /// Apply the result with [`finish_job`].
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn prepare_job(&mut self, uid: &str) -> JobStep<S>
     where
         S: Clone,
@@ -580,6 +605,7 @@ impl<S: Summarizer> AiService<S> {
     /// returning the [`JobResult`] to hand to the scheduler. Does NOT call
     /// [`complete_job`] (the in-loop driver does that); [`finish_job`] bundles
     /// both for the live path.
+    #[tracing::instrument(level = "debug", ret, skip(self, outcome))]
     fn apply_outcome(&mut self, outcome: &JobOutcome) -> JobResult {
         let line = match &outcome.result {
             Ok(line) => redact(line),
@@ -621,6 +647,7 @@ impl<S: Summarizer> AiService<S> {
 
     /// Apply an off-loop job's outcome AND report it to the scheduler. The live
     /// GUI driver calls this when a spawned [`PreparedJob::run`] lands.
+    #[tracing::instrument(level = "debug", ret, skip(self, outcome))]
     pub fn finish_job(&mut self, outcome: JobOutcome) {
         let result = self.apply_outcome(&outcome);
         self.complete_job(&outcome.uid, result);
@@ -630,6 +657,7 @@ impl<S: Summarizer> AiService<S> {
     /// apply). Kept for the synchronous/headless driver and the unit tests; the
     /// GUI loop instead uses `prepare_job` + `spawn_local` + `finish_job` so a
     /// slow Ollama call never blocks its `select!`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub async fn run_job(&mut self, uid: &str) -> JobResult
     where
         S: Clone,
@@ -646,6 +674,7 @@ impl<S: Summarizer> AiService<S> {
     /// A cheap clone of the summarizer client, for an off-loop reachability
     /// ping (see [`apply_ping`]). Lets the GUI driver `spawn_local` the ping so
     /// `refresh_status`'s up-to-3s await never blocks its control loop.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn ping_client(&self) -> S
     where
         S: Clone,
@@ -654,6 +683,7 @@ impl<S: Summarizer> AiService<S> {
     }
 
     /// Apply the result of an off-loop reachability ping to online state.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn apply_ping(&mut self, online: bool) {
         self.online = online;
         if online {
@@ -664,11 +694,13 @@ impl<S: Summarizer> AiService<S> {
 
     /// Ping the server and update online state (the live layer calls this on
     /// enable / configure). Mirrors TS `refreshStatus`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub async fn refresh_status(&mut self) {
         let ok = self.client.check_alive().await;
         self.apply_ping(ok);
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn sched_config(&self) -> SchedulerConfig {
         SchedulerConfig {
             settle_ms: self.settings.settle_ms,
@@ -677,17 +709,20 @@ impl<S: Summarizer> AiService<S> {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn client_configure(&mut self) {
         let endpoint = self.settings.endpoint.clone();
         let model = self.settings.model.clone();
         self.client.configure(&endpoint, &model);
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn emit_status(&mut self) {
         let st = self.status();
         (self.on_status)(&st);
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn load_settings(&self) -> AiSettings {
         let mut settings = AiSettings::default();
         if let Ok(text) = std::fs::read_to_string(&self.settings_path) {
@@ -715,6 +750,7 @@ impl<S: Summarizer> AiService<S> {
         settings
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn save_settings(&self) {
         if let Ok(json) = serde_json::to_string_pretty(&self.settings) {
             if let Err(err) =
@@ -729,6 +765,7 @@ impl<S: Summarizer> AiService<S> {
 /// The concurrency cap a caller asked for, made usable. `0` would mean "run no jobs at all":
 /// the scheduler's dispatch loop admits a job only while `in_flight < concurrency`, so a zero
 /// parks every pane in the queue forever with no error anywhere. Clamp it to 1 and say so.
+#[tracing::instrument(level = "debug", ret)]
 fn valid_concurrency(requested: usize) -> usize {
     if requested == 0 {
         tracing::warn!("ai concurrency 0 would stall summarization; using 1");
@@ -738,6 +775,7 @@ fn valid_concurrency(requested: usize) -> usize {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn build_prompt(ctx: &PaneCtx, prior: &str, redacted_tail: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     if !ctx.label.is_empty() {

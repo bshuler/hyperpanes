@@ -18,6 +18,7 @@ pub struct Conn {
     pub client: reqwest::blocking::Client,
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn io_err(msg: impl Into<String>) -> io::Error {
     io::Error::other(msg.into())
 }
@@ -25,6 +26,7 @@ fn io_err(msg: impl Into<String>) -> io::Error {
 /// Read `{ port, token }` from `control.json` (honouring `HYPERPANES_CONTROL_FILE`, treating an
 /// empty value as unset like the rest of the CLI), resolve the reachable base URL, and build the
 /// client. Errors when no control API is running / the file is unreadable.
+#[tracing::instrument(level = "debug")]
 pub fn connect() -> io::Result<Conn> {
     let control_file = std::env::var_os("HYPERPANES_CONTROL_FILE")
         .filter(|v| !v.is_empty())
@@ -65,6 +67,7 @@ pub fn connect() -> io::Result<Conn> {
 /// Base URL for LOCAL calls to the control server. A configured, specific `bindAddress` is the
 /// only address the server listens on (single-socket bind), so loopback would refuse — dial it
 /// directly. An unspecified bind (`0.0.0.0`/`::`) or none means loopback works.
+#[tracing::instrument(level = "debug", ret)]
 pub fn base_url(port: u16, bind_address: Option<&str>) -> String {
     let host = match bind_address.and_then(|a| a.parse::<IpAddr>().ok()) {
         Some(ip) if !ip.is_unspecified() => bracket(&ip.to_string()),
@@ -73,6 +76,7 @@ pub fn base_url(port: u16, bind_address: Option<&str>) -> String {
     format!("http://{host}:{port}")
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn bracket(host: &str) -> String {
     if host.contains(':') {
         format!("[{host}]")
@@ -83,6 +87,7 @@ fn bracket(host: &str) -> String {
 
 /// A sensible default label for a freshly-paired device: the machine's hostname (so `hyperpanes
 /// devices` reads meaningfully), falling back to `device` when it can't be determined.
+#[tracing::instrument(level = "debug", ret)]
 pub fn default_device_label() -> String {
     std::env::var("HOSTNAME")
         .ok()
@@ -95,6 +100,7 @@ pub fn default_device_label() -> String {
 /// Parse a TTL spec into milliseconds: a bare integer is milliseconds; a `s`/`m`/`h`/`d` suffix is
 /// seconds/minutes/hours/days. Returns `Err` on anything unparseable so a typo can't silently mint
 /// a never-expiring token.
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_ttl_ms(spec: &str) -> Result<i64, String> {
     let spec = spec.trim();
     let (num, mult) = match spec.chars().last() {

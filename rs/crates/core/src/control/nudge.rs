@@ -47,6 +47,7 @@ pub const POLL_MS: u64 = 2_000;
 
 /// Whether a pane with this meta wants inbox nudges. Explicit `hp.nudge` wins; otherwise the
 /// org roles in [`NUDGED_ROLES`] opt in and everything else stays pull-only (frozen behaviour).
+#[tracing::instrument(level = "debug", ret)]
 pub fn wants_nudge(meta: Option<&BTreeMap<String, String>>) -> bool {
     let Some(meta) = meta else { return false };
     match meta.get(NUDGE_META_KEY).map(String::as_str) {
@@ -60,6 +61,7 @@ pub fn wants_nudge(meta: Option<&BTreeMap<String, String>>) -> bool {
 
 /// The line typed into a nudged pane. One line, no shell metacharacters, and it names the exact
 /// cursor to read from so the agent doesn't re-ingest its whole backlog.
+#[tracing::instrument(level = "debug", ret)]
 pub fn nudge_text(pane_id: &str, pending: usize, first_seq: u64) -> String {
     let plural = if pending == 1 { "" } else { "s" };
     format!(
@@ -105,12 +107,14 @@ pub struct NudgeLedger {
 }
 
 impl NudgeLedger {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Record a message for `pane_id`. Returns `true` if the caller should spawn a waiter task
     /// (no other waiter is in flight for this pane).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn arm(&mut self, pane_id: &str, seq: u64, now_ms: i64) -> bool {
         let e = self.panes.entry(pane_id.to_string()).or_default();
         if e.pending == 0 {
@@ -127,6 +131,7 @@ impl NudgeLedger {
 
     /// One waiter poll. `busy` is the pane's live activity (true ⇒ mid-turn, never type).
     /// On [`Step::Send`] the pending batch is consumed and the waiter retires.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn poll(&mut self, pane_id: &str, busy: bool, now_ms: i64) -> Step {
         let Some(e) = self.panes.get_mut(pane_id) else {
             return Step::Stop;
@@ -153,6 +158,7 @@ impl NudgeLedger {
     }
 
     /// Forget a pane (on close), so a closed pane's counters don't leak.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn drop_pane(&mut self, pane_id: &str) {
         self.panes.remove(pane_id);
     }

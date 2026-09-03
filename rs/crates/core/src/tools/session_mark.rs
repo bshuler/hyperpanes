@@ -65,6 +65,7 @@ impl ToolSessionMark {
     /// Build a mark, or `None` when either half would not survive landing on a command
     /// line. Both gates are the ones `claude_panes` already applies to hook-written
     /// markers: this value comes back out of `workspace.json`, which a human edits.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new(id: &str, cwd: &str) -> Option<Self> {
         (valid_session_id(id) && valid_resume_cwd(cwd)).then(|| ToolSessionMark {
             id: id.to_string(),
@@ -81,6 +82,7 @@ impl ToolSessionMark {
     /// resolves it in [`crate::tools::registry`] to get a program name, so an unresolvable
     /// id is a value that can never be spent, and keeping it would only invite a later
     /// reader to spend it unchecked.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn with_tool(mut self, tool_id: &str) -> Self {
         self.tool = crate::tools::registry::by_id(tool_id).map(|t| t.id.to_string());
         self
@@ -88,6 +90,7 @@ impl ToolSessionMark {
 
     /// Read a pane's mark back out of its `meta`. Re-validated rather than trusted: the
     /// file it came from is user-editable and the id lands on a command line.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn read(meta: Option<&BTreeMap<String, String>>) -> Option<Self> {
         let m = meta?;
         let mark = Self::new(m.get(META_SESSION_KEY)?, m.get(META_SESSION_CWD_KEY)?)?;
@@ -98,6 +101,7 @@ impl ToolSessionMark {
     }
 
     /// Record the mark in a pane's `meta`.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn write_into(&self, meta: &mut BTreeMap<String, String>) {
         meta.insert(META_SESSION_KEY.to_string(), self.id.clone());
         meta.insert(META_SESSION_CWD_KEY.to_string(), self.cwd.clone());
@@ -109,6 +113,7 @@ impl ToolSessionMark {
     /// The program to run to re-enter this conversation when the pane's kind is silent:
     /// the registry's binary name for the recorded tool. `'static`, so nothing a human
     /// typed into `workspace.json` reaches a command line through here.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn tool_bin(&self) -> Option<&'static str> {
         crate::tools::registry::by_id(self.tool.as_deref()?).map(|t| t.bin)
     }
@@ -121,6 +126,7 @@ impl ToolSessionMark {
 /// their `ResumeCommand` from this, and so does the relaunch path in the app, which has no
 /// provider to ask (a cold start has scanned nothing yet). A tool missing here degrades to
 /// "starts fresh", which is what it does today — never to a guessed flag.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resume_args(tool_id: &str, id: &str) -> Option<Vec<String>> {
     match tool_id {
         // `claude --resume <id>`.

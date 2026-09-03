@@ -34,6 +34,7 @@ pub struct Selection {
 
 impl Selection {
     /// Begin a selection anchored at `anchor` (head starts coincident, not yet dragged).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new(anchor: Cell) -> Self {
         Self {
             anchor,
@@ -43,6 +44,7 @@ impl Selection {
     }
 
     /// Move the head to `head`; marks the selection `dragged` once it leaves the anchor cell.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn update(&mut self, head: Cell) {
         self.head = head;
         if head != self.anchor {
@@ -51,6 +53,7 @@ impl Selection {
     }
 
     /// `(start, end)` in reading order (top→bottom by line, then left→right), both inclusive.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn ordered(&self) -> (Cell, Cell) {
         let (a, b) = (self.anchor, self.head);
         if (a.line, a.col) <= (b.line, b.col) {
@@ -68,6 +71,7 @@ impl Selection {
 /// row-inclusive and the head cell is included, so a single-cell selection still paints one cell
 /// wide. Multi-line selections split into: the first line from its start column to the line end, a
 /// full-width block for any whole middle lines, and the last line from column 0 to its end column.
+#[tracing::instrument(level = "debug", ret)]
 pub fn selection_rects(
     sel: &Selection,
     cols: usize,

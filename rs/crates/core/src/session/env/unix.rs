@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(3);
 
 impl FreshEnvProvider for PlatformEnv {
+    #[tracing::instrument(level = "debug", skip_all)]
     fn fresh_env_with_process(&self, process: EnvMap) -> EnvMap {
         let shell = process
             .get("SHELL")
@@ -60,6 +61,7 @@ impl EnvCache {
         Self(Mutex::new(None))
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     fn get_or_capture(
         &self,
         shell: &str,
@@ -80,6 +82,7 @@ impl EnvCache {
 }
 
 /// Run `shell -l -c "env -0 || env"` and parse its stdout. `None` on any failure.
+#[tracing::instrument(level = "debug", skip_all)]
 fn login_shell_env(shell: &str, timeout: Duration) -> Option<EnvMap> {
     // `command env -0` for NUL-delimited output (newline-safe values); a shell whose
     // env lacks -0 fails to stderr and the plain `env` fallback runs instead.
@@ -124,6 +127,7 @@ fn login_shell_env(shell: &str, timeout: Duration) -> Option<EnvMap> {
 /// newlines); otherwise newline-delimited, where a line that does not start a valid
 /// `NAME=` is treated as the continuation of the previous value. Entries without a
 /// valid name (rc-file noise before the dump) are skipped.
+#[tracing::instrument(level = "debug", skip_all)]
 fn parse_env_dump(buf: &[u8]) -> EnvMap {
     let text = String::from_utf8_lossy(buf);
     let mut env = EnvMap::new();
@@ -165,6 +169,7 @@ fn parse_env_dump(buf: &[u8]) -> EnvMap {
 }
 
 /// `NAME=value` where NAME is a valid POSIX name (`[A-Za-z_][A-Za-z0-9_]*`).
+#[tracing::instrument(level = "debug", ret)]
 fn split_env_entry(entry: &str) -> Option<(&str, &str)> {
     let (name, value) = entry.split_once('=')?;
     let mut chars = name.chars();
@@ -181,6 +186,7 @@ fn split_env_entry(entry: &str) -> Option<(&str, &str)> {
 /// Layer process-only vars over the fresh login env: for a name present in both, the
 /// FRESH login value wins; names only the process knows (session-only `HYPERPANES_*`
 /// injections etc.) are added. Case-sensitive — POSIX env semantics.
+#[tracing::instrument(level = "debug", skip_all)]
 fn layer_process_only(mut fresh: EnvMap, process: EnvMap) -> EnvMap {
     for (k, v) in process {
         fresh.entry(k).or_insert(v);

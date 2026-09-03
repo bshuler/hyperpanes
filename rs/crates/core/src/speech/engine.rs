@@ -39,6 +39,7 @@ pub enum Backend {
 }
 
 impl Backend {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn name(&self) -> &'static str {
         match self {
             Backend::Custom(_) => "custom",
@@ -63,6 +64,7 @@ impl Backend {
 ///
 /// Windows is absent deliberately: its installers write to the machine `PATH`, which a
 /// GUI process does inherit, so there is no equivalent blind spot to paper over.
+#[tracing::instrument(level = "debug", ret)]
 fn extra_dirs() -> Vec<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     #[allow(unused_mut)]
@@ -109,6 +111,7 @@ fn extra_dirs() -> Vec<PathBuf> {
 /// On Windows a bare name is not enough: the shell appends each suffix in `PATHEXT`
 /// (`powershell` is really `powershell.EXE`), so try the bare name first and then
 /// every configured extension.
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn resolve(cmd: &str) -> Option<PathBuf> {
     // An explicit path is already an answer — don't go looking for a different one.
     if cmd.contains(std::path::MAIN_SEPARATOR) {
@@ -128,6 +131,7 @@ pub(crate) fn resolve(cmd: &str) -> Option<PathBuf> {
 }
 
 /// Is `cmd` an executable this process can actually spawn?
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn on_path(cmd: &str) -> bool {
     resolve(cmd).is_some()
 }
@@ -135,6 +139,7 @@ pub(crate) fn on_path(cmd: &str) -> bool {
 /// `Command::new` for a tool named by bare name, spawned through its resolved absolute
 /// path so it survives the GUI's stripped `PATH`. Falls back to the bare name, which
 /// keeps the failure a normal "not found" from the OS rather than a panic here.
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn command_for(cmd: &str) -> Command {
     match resolve(cmd) {
         Some(p) => Command::new(p),
@@ -143,11 +148,13 @@ pub(crate) fn command_for(cmd: &str) -> Command {
 }
 
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn path_candidates(cmd: &str) -> Vec<String> {
     vec![cmd.to_string()]
 }
 
 #[cfg(not(unix))]
+#[tracing::instrument(level = "debug", ret)]
 fn path_candidates(cmd: &str) -> Vec<String> {
     let mut out = vec![cmd.to_string()];
     let pathext = std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
@@ -162,6 +169,7 @@ fn path_candidates(cmd: &str) -> Vec<String> {
 
 /// Pick a backend: the configured custom command if present, else the first backend
 /// found on `PATH` for the current platform, else [`Backend::None`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn detect(settings: &SpeechSettings) -> Backend {
     if let Some(cmd) = &settings.command_template {
         if !cmd.is_empty() {
@@ -192,6 +200,7 @@ pub fn detect(settings: &SpeechSettings) -> Backend {
     Backend::None
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn build_command(backend: &Backend, text: &str) -> Option<Command> {
     match backend {
         Backend::None => None,
@@ -243,6 +252,7 @@ pub struct Utterance {
 }
 
 impl Utterance {
+    #[tracing::instrument(level = "debug", ret)]
     fn spoken_text(&self) -> String {
         if self.label.is_empty() {
             self.text.clone()
@@ -273,6 +283,7 @@ struct Shared {
 }
 
 /// Push `item` onto `queue`, dropping the oldest entry first if already at `cap`.
+#[tracing::instrument(level = "debug", ret)]
 fn push_bounded(queue: &mut VecDeque<Utterance>, cap: usize, item: Utterance) {
     if queue.len() >= cap {
         queue.pop_front();
@@ -284,12 +295,14 @@ pub struct SpeechEngine;
 
 impl SpeechEngine {
     /// Detect a backend from `settings` and start the engine thread.
+    #[tracing::instrument(level = "debug")]
     pub fn spawn(settings: SpeechSettings) -> SpeechHandle {
         let backend = detect(&settings);
         spawn_with_backend(backend, settings.muted)
     }
 }
 
+#[tracing::instrument(level = "debug")]
 fn spawn_with_backend(backend: Backend, muted: bool) -> SpeechHandle {
     let shared = Arc::new(Shared {
         queue: Mutex::new(VecDeque::new()),
@@ -315,6 +328,7 @@ pub struct SpeechHandle {
 impl SpeechHandle {
     /// Enqueue an utterance to be spoken once prior ones finish. Drops the oldest
     /// queued (not-yet-spoken) utterance if the queue is already at capacity.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn enqueue(&self, utterance: Utterance) {
         {
             let mut q = self
@@ -329,6 +343,7 @@ impl SpeechHandle {
 
     /// Discard the queue and kill whatever is currently speaking. Returns as soon as
     /// the in-flight process has been killed, without waiting out its own duration.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn stop_all(&self) {
         self.generation_bump();
         self.shared
@@ -339,10 +354,12 @@ impl SpeechHandle {
         self.kill_current_child();
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn generation_bump(&self) {
         self.shared.generation.fetch_add(1, Ordering::SeqCst);
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn kill_current_child(&self) {
         let taken = self
             .shared
@@ -356,12 +373,14 @@ impl SpeechHandle {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_muted(&self, muted: bool) {
         self.shared.muted.store(muted, Ordering::SeqCst);
     }
 
     /// Re-detect the backend for a new custom command template (`None` re-runs
     /// platform auto-detection).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_template(&self, template: Option<Vec<String>>) {
         let settings = SpeechSettings {
             command_template: template,
@@ -375,6 +394,7 @@ impl SpeechHandle {
         *backend = detect(&settings);
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn status(&self) -> SpeechStatus {
         SpeechStatus {
             backend: self
@@ -401,6 +421,7 @@ impl SpeechHandle {
     }
 }
 
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 fn run(shared: Arc<Shared>, wake_rx: mpsc::Receiver<()>) {
     while wake_rx.recv().is_ok() {
         loop {
@@ -430,6 +451,7 @@ fn run(shared: Arc<Shared>, wake_rx: mpsc::Receiver<()>) {
 /// Run one utterance's backend command to completion, polling (rather than
 /// blocking) so a concurrent `stop_all` can kill the child without waiting on this
 /// thread's lock.
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 fn speak(shared: &Arc<Shared>, utterance: &Utterance, generation: u64) {
     let backend = shared
         .backend

@@ -42,6 +42,7 @@ pub struct Tetris {
 }
 
 impl Tetris {
+    #[tracing::instrument(level = "debug")]
     pub fn new(seed: u64) -> Self {
         let mut t = Tetris {
             board: [[0; W as usize]; H as usize],
@@ -60,25 +61,31 @@ impl Tetris {
         t
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn score(&self) -> u32 {
         self.score
     }
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn lines(&self) -> u32 {
         self.lines
     }
     /// Level rises every 10 cleared lines (1-based), like classic Tetris.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn level(&self) -> u32 {
         self.lines / 10 + 1
     }
     /// The upcoming piece's kind (for the HUD's NEXT swatch).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn next_kind(&self) -> usize {
         self.next
     }
     /// The upcoming piece's tetromino letter (I/O/T/S/Z/J/L), for the HUD's NEXT.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn next_letter(&self) -> char {
         ['I', 'O', 'T', 'S', 'Z', 'J', 'L'][self.next]
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn rand(&mut self) -> u64 {
         let mut x = self.rng;
         x ^= x << 13;
@@ -88,6 +95,7 @@ impl Tetris {
         x
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     fn rotate(cells: &[(i32, i32); 4]) -> [(i32, i32); 4] {
         let mut r = *cells;
         for c in r.iter_mut() {
@@ -98,6 +106,7 @@ impl Tetris {
 
     /// Whether `cells` at box offset `(ox, oy)` would overlap a wall, the floor, or a
     /// locked cell. (Above the top — `y < 0` — is allowed so a piece can spawn off-screen.)
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn collides(&self, cells: &[(i32, i32); 4], ox: i32, oy: i32) -> bool {
         for (cx, cy) in cells {
             let x = ox + cx;
@@ -112,6 +121,7 @@ impl Tetris {
         false
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn spawn(&mut self) {
         self.kind = self.next;
         self.next = (self.rand() % 7) as usize;
@@ -131,6 +141,7 @@ impl Tetris {
 
     /// The lowest box offset `oy` at which `cells` rests at column `ox` (a hard drop), or
     /// `None` if the piece can't sit in that column at all.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn drop_y(&self, cells: &[(i32, i32); 4], ox: i32) -> Option<i32> {
         let mut y = -3;
         if self.collides(cells, ox, y) {
@@ -143,6 +154,7 @@ impl Tetris {
     }
 
     /// The board that would result from locking `cells` at `(ox, oy)`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn with_locked(
         &self,
         cells: &[(i32, i32); 4],
@@ -163,6 +175,7 @@ impl Tetris {
     /// Greedy one-piece placement (El-Tetris weights): try every rotation × column, hard-drop
     /// each, and score the resulting board by aggregate height / completed lines / holes /
     /// bumpiness. Returns the chosen rotated cells + target column.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn best_placement(&self) -> ([(i32, i32); 4], i32) {
         let mut rot = PIECES[self.kind];
         let mut best_score = f64::MIN;
@@ -183,6 +196,7 @@ impl Tetris {
     }
 
     /// Score a board for the placement AI: reward completed lines, punish height/holes/bumps.
+    #[tracing::instrument(level = "debug", ret)]
     fn evaluate(board: &[[u8; W as usize]; H as usize]) -> f64 {
         let mut heights = [0i32; W as usize];
         for x in 0..W as usize {
@@ -215,6 +229,7 @@ impl Tetris {
         -0.51 * agg as f64 + 0.76 * lines as f64 - 0.36 * holes as f64 - 0.18 * bump as f64
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn lock(&mut self) {
         let color = (self.kind + 1) as u8;
         for (cx, cy) in self.cells {
@@ -232,6 +247,7 @@ impl Tetris {
     }
 
     /// Remove full rows, compacting the rest down. Returns how many were cleared.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn clear_lines(&mut self) -> usize {
         let mut write = H - 1;
         let mut kept = 0;
@@ -253,6 +269,7 @@ impl Tetris {
 
     /// Advance one frame: nudge the piece a column toward its target, then apply gravity —
     /// locking (and spawning the next piece) when it can fall no further.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn step(&mut self) {
         if self.x < self.target_x && !self.collides(&self.cells, self.x + 1, self.y) {
             self.x += 1;
@@ -275,6 +292,7 @@ impl Tetris {
     /// falling piece overlaid. Filled cells use truecolor `██` from `colors` (the active
     /// frame palette, indexed by piece kind); empty cells are spaces so the terminal theme's
     /// background shows through. The caller frames it with the HUD + cursor-home.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn render(&self, colors: &[(u8, u8, u8)]) -> String {
         let mut disp = self.board;
         let color = (self.kind + 1) as u8;

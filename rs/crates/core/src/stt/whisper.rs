@@ -71,11 +71,13 @@ pub const MODELS: &[Model] = &[
 ];
 
 impl Model {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn url(&self) -> String {
         format!("{HOST}/ggml-{}.bin", self.name)
     }
 
     /// Where this model lives once fetched.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn path(&self) -> PathBuf {
         crate::persistence::paths::stt_models_dir().join(format!("ggml-{}.bin", self.name))
     }
@@ -83,12 +85,14 @@ impl Model {
     /// Is the cached copy present and the right length? The full digest is not re-checked
     /// on every dictation — that is seconds of hashing per recording for a file this
     /// process itself verified before it named it.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_cached(&self) -> bool {
         std::fs::metadata(self.path()).is_ok_and(|m| m.len() == self.bytes)
     }
 }
 
 /// A built-in model by whisper.cpp's name (`base.en`), or `None` if it is not one.
+#[tracing::instrument(level = "debug", ret)]
 pub fn by_name(name: &str) -> Option<&'static Model> {
     MODELS.iter().find(|m| m.name == name)
 }
@@ -107,6 +111,7 @@ pub enum Choice {
 /// Order matters. A bare `base.en` is a name, not a relative path, and someone who typed
 /// it meant the model — not a file called `base.en` that happens to be in the working
 /// directory of whatever launched the GUI.
+#[tracing::instrument(level = "debug", ret)]
 pub fn choose(settings: &super::SttSettings) -> Choice {
     let configured = settings.model.as_deref().unwrap_or("").trim();
     if !configured.is_empty() {
@@ -124,6 +129,7 @@ pub fn choose(settings: &super::SttSettings) -> Choice {
 }
 
 /// Is a model ready to use right now, with no network?
+#[tracing::instrument(level = "debug", ret)]
 pub fn ready(settings: &super::SttSettings) -> bool {
     match choose(settings) {
         Choice::File(p) => p.is_file(),
@@ -142,12 +148,14 @@ static FETCH_TOTAL: AtomicU64 = AtomicU64::new(0);
 static FETCHING: Mutex<()> = Mutex::new(());
 
 /// `(bytes so far, total)` while a model download is running, else `None`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn progress() -> Option<(u64, u64)> {
     let total = FETCH_TOTAL.load(Ordering::Relaxed);
     (total > 0).then(|| (FETCHED.load(Ordering::Relaxed).min(total), total))
 }
 
 /// Human-readable tail for an error raised while a download is still going.
+#[tracing::instrument(level = "debug", ret)]
 fn progress_note() -> String {
     match progress() {
         Some((done, total)) => format!(
@@ -164,6 +172,7 @@ fn progress_note() -> String {
 /// Fire-and-forget on purpose: this is called when the mic opens, and a download that
 /// fails there must not stop the recording — the same fetch is retried, this time with
 /// its error reported, when the recording is transcribed.
+#[tracing::instrument(level = "debug", ret)]
 pub fn prefetch(settings: &super::SttSettings) {
     let Choice::Builtin(model) = choose(settings) else {
         return;
@@ -179,6 +188,7 @@ pub fn prefetch(settings: &super::SttSettings) {
 }
 
 /// The model file, downloading and verifying it first if it is not cached. Blocking.
+#[tracing::instrument(level = "debug", ret)]
 pub fn ensure(model: &Model) -> Result<PathBuf, String> {
     let dest = model.path();
     if model.is_cached() {
@@ -213,6 +223,7 @@ pub fn ensure(model: &Model) -> Result<PathBuf, String> {
 /// (the dictation state machine, and `prefetch`'s thread), and one of them is itself
 /// already inside a `spawn_blocking` on the control server's runtime — borrowing that
 /// runtime from a blocking context is exactly the deadlock this avoids.
+#[tracing::instrument(level = "debug", ret)]
 fn download(url: &str, dest: &Path, expect: u64) -> Result<(), String> {
     let (url, dest) = (url.to_string(), dest.to_path_buf());
     let handle = std::thread::Builder::new()
@@ -233,6 +244,7 @@ fn download(url: &str, dest: &Path, expect: u64) -> Result<(), String> {
     r
 }
 
+#[tracing::instrument(level = "debug", ret)]
 async fn stream_to_file(url: &str, dest: &Path, expect: u64) -> Result<(), String> {
     use futures_util::StreamExt;
     use std::io::Write;
@@ -280,6 +292,7 @@ async fn stream_to_file(url: &str, dest: &Path, expect: u64) -> Result<(), Strin
 
 /// Hash `path` and compare with the pin. Streamed, so hashing a 500 MB model does not
 /// hold 500 MB.
+#[tracing::instrument(level = "debug", ret)]
 fn verify(path: &Path, model: &Model) -> Result<(), String> {
     let mut f = std::fs::File::open(path).map_err(|e| format!("verifying the model: {e}"))?;
     let mut hasher = Sha256::new();
@@ -296,6 +309,7 @@ fn verify(path: &Path, model: &Model) -> Result<(), String> {
     Ok(())
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
@@ -307,6 +321,7 @@ fn hex(bytes: &[u8]) -> String {
 /// Returns whisper's raw segments joined by newlines — deliberately the same shape the
 /// command-line transcribers print, so `clean_transcript` is the single place that knows
 /// what to strip.
+#[tracing::instrument(level = "debug", ret)]
 pub fn transcribe(wav: &Path, settings: &super::SttSettings) -> Result<String, String> {
     let model = match choose(settings) {
         Choice::File(p) => p,
@@ -319,6 +334,7 @@ pub fn transcribe(wav: &Path, settings: &super::SttSettings) -> Result<String, S
     run(&model, &audio)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn run(model: &Path, audio: &[f32]) -> Result<String, String> {
     // whisper.cpp writes its model-load banner straight to stderr. Route it into the
     // (unconfigured, hence silent) logging hooks so a dictation does not spray the app's
@@ -363,6 +379,7 @@ fn run(model: &Path, audio: &[f32]) -> Result<String, String> {
 /// How many threads to give the inference. whisper.cpp's own default is 4; more than the
 /// machine has is slower, not faster, and dictation must not monopolize a laptop that is
 /// also running the panes.
+#[tracing::instrument(level = "debug", ret)]
 fn threads() -> std::ffi::c_int {
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -375,6 +392,7 @@ fn threads() -> std::ffi::c_int {
 /// [`super::native`] already writes exactly that, so this is a no-op conversion for the
 /// built-in recorder — it exists for the other three, and for a `recordTemplate` that
 /// captures at whatever its tool felt like.
+#[tracing::instrument(level = "debug", ret)]
 fn read_wav(path: &Path) -> Result<Vec<f32>, String> {
     let mut reader =
         hound::WavReader::open(path).map_err(|e| format!("reading the recording: {e}"))?;
@@ -399,6 +417,7 @@ fn read_wav(path: &Path) -> Result<Vec<f32>, String> {
 
 /// Average the channels together. Averaging, not "take channel 0": a two-input interface
 /// with one dead channel is common, and picking that one transcribes to nothing.
+#[tracing::instrument(level = "debug", ret)]
 fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
     if channels <= 1 {
         return interleaved.to_vec();
@@ -412,6 +431,7 @@ fn downmix(interleaved: &[f32], channels: usize) -> Vec<f32> {
 /// Nearest-neighbour rate conversion to [`MODEL_RATE`], by the same phase accumulator the
 /// recorder uses. Crude, and adequate: the alternative is a resampling dependency for a
 /// path that only runs when someone overrode the recorder.
+#[tracing::instrument(level = "debug", ret)]
 fn resample(mono: &[f32], rate: u32) -> Vec<f32> {
     if rate == MODEL_RATE || rate == 0 {
         return mono.to_vec();

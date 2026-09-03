@@ -61,6 +61,7 @@ pub struct CtxEntry {
 }
 
 impl CtxEntry {
+    #[tracing::instrument(level = "debug")]
     fn sep() -> Self {
         CtxEntry {
             label: SharedString::new(),
@@ -98,6 +99,7 @@ struct Build {
 }
 
 impl Build {
+    #[tracing::instrument(level = "debug", skip_all)]
     fn new() -> Self {
         Build {
             entries: Vec::new(),
@@ -165,6 +167,7 @@ impl Build {
         self.openwith.push(label.into());
         self.extra(cmd)
     }
+    #[tracing::instrument(level = "debug", skip_all)]
     fn finish(self, kind: CtxKind, target: usize, x: f32, y: f32) -> CtxMenu {
         CtxMenu {
             kind,
@@ -184,6 +187,7 @@ impl Build {
 /// **Show** row is prepended (left-click already shows the pane, but it's offered as the
 /// default row) and the **Maximize/Restore** row is dropped (maximize is meaningless when
 /// the single preset already fills the area).
+#[tracing::instrument(level = "debug", skip(state))]
 pub fn pane_menu(state: &State, idx: usize, x: f32, y: f32, in_taskbar: bool) -> CtxMenu {
     let mut b = Build::new();
     let t = state.active_tab();
@@ -465,6 +469,7 @@ pub fn pane_menu(state: &State, idx: usize, x: f32, y: f32, in_taskbar: bool) ->
 /// Each row carries its own fully-formed [`Command`] with the path baked in, so unlike the
 /// pane and tab menus this one needs no target index — which is what lets the row list be
 /// rebuilt from disk by the very click that dispatches from it.
+#[tracing::instrument(level = "debug", skip(state))]
 pub fn file_menu(state: &State, path: &std::path::Path, x: f32, y: f32) -> CtxMenu {
     let mut b = Build::new();
     let p = path.display().to_string();
@@ -575,6 +580,7 @@ pub fn file_menu(state: &State, path: &std::path::Path, x: f32, y: f32) -> CtxMe
 
 /// Whether "Run" is worth offering: the file says how to run itself (a shebang or a kind we
 /// know an interpreter for), or the filesystem says it is a program.
+#[tracing::instrument(level = "debug", ret)]
 fn is_runnable(path: &std::path::Path) -> bool {
     if crate::command::run_prefix(path).is_some() {
         return true;
@@ -591,6 +597,7 @@ fn is_runnable(path: &std::path::Path) -> bool {
 }
 
 /// What the OS calls "show me this file in the file manager".
+#[tracing::instrument(level = "debug", ret)]
 fn reveal_label() -> &'static str {
     if cfg!(target_os = "macos") {
         "Reveal in Finder"
@@ -601,6 +608,7 @@ fn reveal_label() -> &'static str {
     }
 }
 
+#[tracing::instrument(level = "debug", skip(state))]
 pub fn tab_menu(state: &State, idx: usize, x: f32, y: f32) -> CtxMenu {
     let mut b = Build::new();
     let only = state.tabs.len() < 2;
@@ -693,6 +701,7 @@ pub fn tab_menu(state: &State, idx: usize, x: f32, y: f32) -> CtxMenu {
 /// submenu rows come from the [`crate::theme::LAYOUT_MENU`] model the
 /// resync pushes into `ctx_layouts` (with the live checkmark + the Automatic "— <resolved>"
 /// hint), exactly like the tab menu's Layout submenu.
+#[tracing::instrument(level = "debug", skip(state))]
 pub fn app_menu(state: &State, x: f32, y: f32) -> CtxMenu {
     let mut b = Build::new();
     let cur = state.active_tab().layout;
@@ -858,6 +867,7 @@ pub fn app_menu(state: &State, x: f32, y: f32) -> CtxMenu {
 ///
 /// `None` for anything else (empty, zero, malformed, past the 24 h cap — the cap keeps the
 /// due label's "tomorrow HH:MM" arithmetic in `state::due_for` honest).
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_custom_duration(s: &str, now_secs_since_midnight: u64) -> Option<u32> {
     const DAY_MIN: u32 = 24 * 60;
     let s = s.trim().to_ascii_lowercase();
@@ -902,6 +912,7 @@ pub fn parse_custom_duration(s: &str, now_secs_since_midnight: u64) -> Option<u3
 
 /// [`parse_custom_duration`] against the live local clock — the pure bridge app.rs wires
 /// into the `ReminderCustom` Slint global's `parse-minutes` callback.
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_custom_minutes_now(s: &str) -> Option<u32> {
     parse_custom_duration(s, crate::state::local_secs_since_midnight())
 }

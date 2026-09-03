@@ -26,6 +26,7 @@ pub struct Entry {
 }
 
 impl Entry {
+    #[tracing::instrument(level = "debug")]
     fn new(title: &str, subtitle: &str, keywords: &str, command: Command) -> Self {
         Entry {
             title: title.into(),
@@ -39,6 +40,7 @@ impl Entry {
 /// Lightweight subsequence fuzzy matcher — a 1:1 port of `fuzzyScore`. Returns a
 /// score (higher is better) or `None` when `query` isn't a subsequence of `text`.
 /// Rewards consecutive matches and word-boundary hits so "lg" ranks "Layout: Grid".
+#[tracing::instrument(level = "debug", ret)]
 pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
     let q: Vec<char> = query.to_lowercase().chars().collect();
     let t: Vec<char> = text.to_lowercase().chars().collect();
@@ -75,6 +77,7 @@ pub fn fuzzy_score(query: &str, text: &str) -> Option<i32> {
 
 /// Build the command list from current state. Rebuilt each open so the pane-focus
 /// entries + the active-layout `current` marker stay fresh (mirrors `buildCommands`).
+#[tracing::instrument(level = "debug", skip(state))]
 pub fn build(state: &State) -> Vec<Entry> {
     let mut cmds: Vec<Entry> = Vec::new();
 
@@ -253,6 +256,7 @@ pub fn build(state: &State) -> Vec<Entry> {
 
 /// Filter + rank `entries` against `query`, returning the surviving indices in best-
 /// first order. An empty query keeps the natural order (mirrors the TS palette).
+#[tracing::instrument(level = "debug", ret, skip(entries))]
 pub fn filter(entries: &[Entry], query: &str) -> Vec<usize> {
     if query.is_empty() {
         return (0..entries.len()).collect();

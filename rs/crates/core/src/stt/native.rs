@@ -39,6 +39,7 @@ type SharedWriter = Arc<Mutex<Option<Writer>>>;
 /// Deliberately more than "a device exists": a device whose default config cannot be read
 /// is one whose stream would fail to build, and finding that out during detection means
 /// falling through to `ffmpeg` rather than failing at the moment the user clicks the mic.
+#[tracing::instrument(level = "debug", ret)]
 pub fn available() -> bool {
     cpal::default_host()
         .default_input_device()
@@ -59,6 +60,7 @@ impl NativeCapture {
     /// Blocking, and it must be: the header carries the data length, so a caller that
     /// returned before this finished would hand a transcriber a file whose header says
     /// zero samples.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn finish(mut self) -> Result<(), String> {
         let _ = self.stop.send(());
         match self.join.take() {
@@ -71,6 +73,7 @@ impl NativeCapture {
 }
 
 impl Drop for NativeCapture {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn drop(&mut self) {
         // Only reached when `finish` was never called — a cancelled recording, or a
         // panic on the way out. Stop the device anyway; a mic left open outlives the
@@ -87,6 +90,7 @@ impl Drop for NativeCapture {
 /// Returns once the stream is actually running, so a caller that gets `Ok` knows the
 /// microphone is live — a device that is busy or refused by the OS is an error here, not
 /// a silent empty file discovered a minute later.
+#[tracing::instrument(level = "debug")]
 pub fn start(wav: &Path, max: Duration) -> Result<NativeCapture, String> {
     let wav: PathBuf = wav.to_path_buf();
     let (stop_tx, stop_rx) = mpsc::channel::<()>();
@@ -123,6 +127,7 @@ pub fn start(wav: &Path, max: Duration) -> Result<NativeCapture, String> {
 }
 
 /// The whole life of one capture, on the recorder thread.
+#[tracing::instrument(level = "debug", ret)]
 fn capture(
     wav: &Path,
     max: Duration,
@@ -173,6 +178,7 @@ fn capture(
 /// Devices offer wildly different formats — f32 on CoreAudio, i16 on most of ALSA, u8 on
 /// some cheap USB mics — and the conversion to the i16 the WAV wants is `dasp`'s job, not
 /// ours. The exhaustive-looking arm list is one line per format cpal knows.
+#[tracing::instrument(level = "debug", skip_all)]
 fn build_stream(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -203,6 +209,7 @@ fn build_stream(
     }
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn input_stream<T>(
     device: &cpal::Device,
     config: &StreamConfig,
@@ -249,6 +256,7 @@ where
 
 /// Average a frame's channels into one sample. A stereo mic that has one dead channel
 /// still transcribes; picking channel 0 would have made it silence.
+#[tracing::instrument(level = "debug", ret, skip(frame))]
 fn downmix<T>(frame: &[T]) -> i16
 where
     T: SizedSample,

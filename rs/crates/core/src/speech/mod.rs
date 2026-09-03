@@ -29,6 +29,7 @@ pub struct SpeechSettings {
 
 /// Read settings from `path`, falling back to [`SpeechSettings::default`] on a
 /// missing or corrupt file.
+#[tracing::instrument(level = "debug", ret)]
 pub fn load(path: &Path) -> SpeechSettings {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return SpeechSettings::default();
@@ -37,6 +38,7 @@ pub fn load(path: &Path) -> SpeechSettings {
 }
 
 /// Persist `settings` to `path`, atomically.
+#[tracing::instrument(level = "debug", ret)]
 pub fn save(path: &Path, settings: &SpeechSettings) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;

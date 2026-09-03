@@ -48,6 +48,7 @@ use hyperpanes_core::session::control_mode::ControlMode;
 ///
 /// `-CC` is accepted as an alias because that is what a user copying a tmux invocation into
 /// a mobile client's "custom command" box will type.
+#[tracing::instrument(level = "debug", ret)]
 pub fn wants_control_mode(argv: &[String]) -> bool {
     argv.get(1)
         .map(|a| a == "control-mode" || a == "-CC")
@@ -66,6 +67,7 @@ pub struct ControlOpts {
 }
 
 impl Default for ControlOpts {
+    #[tracing::instrument(level = "debug", ret)]
     fn default() -> Self {
         Self {
             session_name: "hyperpanes".to_string(),
@@ -81,6 +83,7 @@ impl ControlOpts {
     /// Unknown flags are rejected rather than ignored: this process's stdout is a protocol
     /// stream, so a typo that silently changed behaviour would surface as an unexplainable
     /// client bug much later.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn parse(argv: &[String]) -> Result<Self, String> {
         let mut out = Self::default();
         let mut it = argv.iter().skip(2); // argv[0]=exe, argv[1]="control-mode"
@@ -130,6 +133,7 @@ Point a client at it over SSH, e.g.:
 /// The salt every hyperpanes client keys its daemon by: this install's user-data dir.
 /// Identical to `attach`'s, so both find the same daemon.
 #[cfg_attr(not(unix), allow(dead_code))]
+#[tracing::instrument(level = "debug", ret)]
 fn salt() -> String {
     hyperpanes_core::persistence::paths::user_data_dir()
         .to_string_lossy()
@@ -154,6 +158,7 @@ const SCREEN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(150
 /// protocol core itself is platform-independent and compiles here — only this transport is
 /// unix-only.
 #[cfg(not(unix))]
+#[tracing::instrument(level = "debug", ret)]
 pub fn run(_argv: &[String]) -> Result<(), String> {
     Err(
         "hyperpanes control-mode is not available on Windows yet (the GUI binary has no \
@@ -176,6 +181,7 @@ enum Msg {
 }
 
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn run(argv: &[String]) -> Result<(), String> {
     use hyperpanes_core::session::attach;
     use hyperpanes_core::session::control_mode::{
@@ -445,6 +451,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
 /// Anything else that arrives meanwhile is pushed onto `pending` for the main loop rather
 /// than dropped — losing a `%output` here would leave a permanent hole in the pane.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret, skip_all)]
 fn refresh_screens(
     server: &mut hyperpanes_core::session::control_mode::ControlServer,
     sock: &mut hyperpanes_core::session::transport::Conn,
@@ -484,6 +491,7 @@ fn refresh_screens(
 /// whose grid moved. Attaches to newly-discovered panes as a side effect, so their output
 /// starts flowing on this same connection.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret, skip(server))]
 fn diff_sessions(
     server: &mut hyperpanes_core::session::control_mode::ControlServer,
     seen: &mut std::collections::BTreeMap<String, (Option<u16>, Option<u16>)>,

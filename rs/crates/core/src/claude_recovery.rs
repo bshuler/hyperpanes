@@ -40,6 +40,7 @@ pub struct ApiErrorSighting {
 /// Scan `tail` for the LAST line containing `"API Error"` and parse it into an
 /// [`ApiErrorSighting`]. Returns `None` when no such line exists (including the
 /// common healthy-but-quiet case: normal Claude/compile output with no error).
+#[tracing::instrument(level = "debug", ret)]
 pub fn detect_api_error(tail: &str) -> Option<ApiErrorSighting> {
     let line = tail.lines().rev().find(|l| l.contains("API Error"))?;
 
@@ -108,6 +109,7 @@ const TRANSIENT_WORDS: [&str; 8] = [
 /// Classify an [`ApiErrorSighting`]. Wording is checked before falling back to
 /// the status code, since a wording match (e.g. a 429 with usage-limit wording)
 /// is more specific than the code's usual bucket.
+#[tracing::instrument(level = "debug", ret)]
 pub fn classify_error(sighting: &ApiErrorSighting) -> ErrorClass {
     let detail_lc = sighting.detail.to_lowercase();
     let code = sighting.code;
@@ -136,6 +138,7 @@ pub fn classify_error(sighting: &ApiErrorSighting) -> ErrorClass {
 /// Does `detail` complain about message/content-block *structure* (as opposed to,
 /// say, an invalid parameter value)? `detail_lc` is `detail.to_lowercase()`,
 /// passed in to avoid re-lowering per caller.
+#[tracing::instrument(level = "debug", ret)]
 fn looks_structurally_poisoned(detail: &str, detail_lc: &str) -> bool {
     detail.contains("tool_use_id")
         || (detail_lc.contains("tool_result") && detail_lc.contains("tool_use"))
@@ -146,6 +149,7 @@ fn looks_structurally_poisoned(detail: &str, detail_lc: &str) -> bool {
 
 /// Does `detail` contain a `messages.<digits>.content` path fragment anywhere
 /// (Anthropic's per-message error path, e.g. `messages.1.content.0: …`)?
+#[tracing::instrument(level = "debug", ret)]
 fn contains_messages_dot_n_dot_content(detail: &str) -> bool {
     const PREFIX: &str = "messages.";
     for (idx, _) in detail.match_indices(PREFIX) {
@@ -182,6 +186,7 @@ pub struct RepairResult {
 /// Pure and byte-preserving: records that don't need to change are copied
 /// verbatim (not re-parsed-and-reserialized), so running this on an already-
 /// healthy transcript is a no-op, and running it twice is idempotent.
+#[tracing::instrument(level = "debug", ret)]
 pub fn repair_poisoned_transcript(jsonl: &str) -> RepairResult {
     let mut producer_ids: HashSet<String> = HashSet::new();
     let mut dropped = Vec::new();
@@ -214,6 +219,7 @@ pub fn repair_poisoned_transcript(jsonl: &str) -> RepairResult {
 /// Split `s` into `(line, terminator)` pairs where `terminator` is `"\n"` for
 /// every line but a final one with no trailing newline (terminator `""`).
 /// Concatenating every `line` + `terminator` reproduces `s` exactly.
+#[tracing::instrument(level = "debug", ret)]
 fn split_lines_with_terminators(s: &str) -> Vec<(&str, &str)> {
     let mut out = Vec::new();
     let bytes = s.as_bytes();
@@ -230,6 +236,7 @@ fn split_lines_with_terminators(s: &str) -> Vec<(&str, &str)> {
     out
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn message_content_blocks(v: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
     v.get("message")?.get("content")?.as_array()
 }
@@ -237,6 +244,7 @@ fn message_content_blocks(v: &serde_json::Value) -> Option<&Vec<serde_json::Valu
 /// Does every `tool_result`/`tool_search_tool_result` block in `v`'s content
 /// reference a `tool_use_id` that's already known — either from an earlier
 /// record (`producer_ids`) or an earlier block in this same record?
+#[tracing::instrument(level = "debug", ret)]
 fn record_is_healthy(v: &serde_json::Value, producer_ids: &HashSet<String>) -> bool {
     let Some(blocks) = message_content_blocks(v) else {
         return true;
@@ -263,6 +271,7 @@ fn record_is_healthy(v: &serde_json::Value, producer_ids: &HashSet<String>) -> b
     true
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn collect_producer_ids(v: &serde_json::Value, out: &mut HashSet<String>) {
     let Some(blocks) = message_content_blocks(v) else {
         return;
@@ -310,6 +319,7 @@ pub struct SessionCandidate {
 
 /// Resolve resume candidates for `project_root` across every account's default
 /// transcript store, newest-first.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_session_candidates(project_root: &Path) -> Vec<SessionCandidate> {
     let mut stores = Vec::new();
     if let Some(root) = crate::claude_history::claude_projects_root() {
@@ -331,6 +341,7 @@ pub fn resolve_session_candidates(project_root: &Path) -> Vec<SessionCandidate> 
 /// test seam). Searches `store.projects_root.join(encode_project_dir(project_root))`
 /// in each store, merges, and sorts newest-first (ties broken by `session_id`
 /// descending so ordering is deterministic even with equal/missing mtimes).
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_session_candidates_in(
     stores: &[SessionStore],
     project_root: &Path,

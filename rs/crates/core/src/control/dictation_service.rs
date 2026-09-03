@@ -35,6 +35,7 @@ impl DictationService {
     /// `settings_path` is `stt.json`'s path. Recordings are scratch and go to a
     /// pid-scoped temp directory — never beside the settings, and never anywhere a
     /// backup or a dotfile sync would pick up raw audio of the user.
+    #[tracing::instrument(level = "debug")]
     pub fn new(settings_path: PathBuf) -> Self {
         let settings = stt::load(&settings_path);
         let wav_dir =
@@ -46,6 +47,7 @@ impl DictationService {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn settings_snapshot(&self) -> SttSettings {
         self.settings
             .lock()
@@ -55,24 +57,29 @@ impl DictationService {
 
     /// Re-read `stt.json` — the settings routes call this after a user edits it, so a new
     /// `transcribeTemplate` takes effect without a restart.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn reload(&self) {
         let fresh = stt::load(&self.settings_path);
         *self.settings.lock().expect("stt settings lock poisoned") = fresh;
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn recording_panes(&self) -> Vec<String> {
         self.dictation.recording_panes()
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn is_recording(&self, pane_id: &str) -> bool {
         self.dictation.is_recording(pane_id)
     }
 
     /// Whether a finished transcript should be submitted (Enter) as well as typed.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn submit_after_insert(&self) -> bool {
         self.settings_snapshot().submit
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn start(&self, pane_id: &str) -> Result<&'static str, String> {
         // Raise the OS's own consent dialog from the feature that needs it, at the moment it
         // needs it — macOS shows each one once ever, so a mic prompt spent on a settings list
@@ -92,24 +99,29 @@ impl DictationService {
     /// than a broken recorder — and [`permissions::status`] there is `Undetermined`, since
     /// reading the real answer means loading AVFoundation. Offering the door is honest;
     /// asserting a grant we cannot read would not be.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_microphone_settings(&self) -> Result<(), String> {
         permissions::request(Right::Microphone)
     }
 
     /// Stop and transcribe. **Blocking** — seconds, on a cold model — so the HTTP layer
     /// runs it on a blocking task rather than the async executor.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn stop(&self, pane_id: &str) -> Result<Transcript, String> {
         self.dictation.stop(pane_id, &self.settings_snapshot())
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn cancel(&self, pane_id: &str) {
         self.dictation.cancel(pane_id);
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn cancel_all(&self) {
         self.dictation.cancel_all();
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn status(&self) -> DictationStatus {
         let s = self.settings_snapshot();
         DictationStatus {
@@ -135,6 +147,7 @@ pub struct Delivered {
 /// the control route on `spawn_blocking`, the GUI's mic button on a worker, which is also
 /// why the submit delay here is a plain sleep rather than a timer. They share this function
 /// so a transcript can never reach a pane by two subtly different routes.
+#[tracing::instrument(level = "debug", skip(shared))]
 pub fn stop_and_deliver(shared: &Shared, pane_id: &str, uid: &str) -> Result<Delivered, String> {
     let transcript = shared.dictation.stop(pane_id)?;
     let text = sanitize_for_pane(&transcript.text);
@@ -169,6 +182,7 @@ pub fn stop_and_deliver(shared: &Shared, pane_id: &str, uid: &str) -> Result<Del
 /// transcript is therefore untrusted input on its way to a shell: a stray control
 /// character could execute a line the user never finished dictating, and an embedded
 /// newline could submit it. Both are flattened to spaces — the human presses Enter.
+#[tracing::instrument(level = "debug", ret)]
 pub fn sanitize_for_pane(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut last_space = false;

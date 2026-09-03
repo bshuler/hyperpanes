@@ -17,23 +17,27 @@ use hyperpanes_core::persistence::paths;
 const REPO_NEW_ISSUE: &str = "https://github.com/Eyalm321/hyperpanes/issues/new";
 
 /// The crash-log path the panic hook writes to (must match `main`'s hook).
+#[tracing::instrument(level = "debug", ret)]
 pub fn default_log_path() -> PathBuf {
     std::env::temp_dir().join("hyperpanes-crash.log")
 }
 
 /// The "unhandled crash" marker. Its presence means a crash hasn't been surfaced to the user yet;
 /// its contents are the crash-log path to read.
+#[tracing::instrument(level = "debug", ret)]
 fn marker_path() -> PathBuf {
     paths::state_dir().join("crash-pending")
 }
 
 /// Record an unacknowledged crash (best-effort — called from the panic hook).
+#[tracing::instrument(level = "debug", ret)]
 pub fn write_marker(log_path: &Path) {
     let _ = std::fs::create_dir_all(paths::state_dir());
     let _ = paths::write_atomic(&marker_path(), log_path.to_string_lossy().as_bytes());
 }
 
 /// The pending crash-log path, if a crash is still unacknowledged.
+#[tracing::instrument(level = "debug", ret)]
 pub fn pending() -> Option<PathBuf> {
     let s = std::fs::read_to_string(marker_path()).ok()?;
     let s = s.trim();
@@ -41,6 +45,7 @@ pub fn pending() -> Option<PathBuf> {
 }
 
 /// Mark the pending crash as handled (the reporter calls this once shown).
+#[tracing::instrument(level = "debug", ret)]
 pub fn clear_marker() {
     let _ = std::fs::remove_file(marker_path());
 }
@@ -52,6 +57,7 @@ pub enum Outcome {
 }
 
 /// Read the crash log and assemble the full diagnostics report (latest panic block + environment).
+#[tracing::instrument(level = "debug", ret)]
 pub fn gather(log_path: &Path) -> String {
     let raw =
         std::fs::read_to_string(log_path).unwrap_or_else(|_| "(crash log not found)".to_string());
@@ -65,6 +71,7 @@ pub fn gather(log_path: &Path) -> String {
 }
 
 /// The crash log is append-only across runs; keep only the most recent panic block.
+#[tracing::instrument(level = "debug", ret)]
 fn last_panic_block(log: &str) -> &str {
     match log.rfind("PANIC:") {
         Some(i) => &log[i..],
@@ -74,6 +81,7 @@ fn last_panic_block(log: &str) -> &str {
 
 /// A short body for the dialog: the version line + the panic message, stopping before the
 /// backtrace frames (which look like `0: symbol`, `12: symbol`).
+#[tracing::instrument(level = "debug", ret)]
 pub fn summary(report: &str) -> String {
     let mut lines: Vec<&str> = Vec::new();
     for line in report.lines() {
@@ -94,6 +102,7 @@ pub fn summary(report: &str) -> String {
 }
 
 /// First panic line, trimmed, for the issue title.
+#[tracing::instrument(level = "debug", ret)]
 fn panic_headline(report: &str) -> String {
     report
         .lines()
@@ -112,6 +121,7 @@ fn panic_headline(report: &str) -> String {
 
 /// Prefilled GitHub "new issue" URL. The body is short (URLs cap out); the full report goes to the
 /// clipboard.
+#[tracing::instrument(level = "debug", ret)]
 pub fn github_issue_url(report: &str) -> String {
     let title = format!("Crash: {}", panic_headline(report));
     let body = format!(
@@ -125,6 +135,7 @@ pub fn github_issue_url(report: &str) -> String {
     )
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn truncate(s: &str, max: usize) -> String {
     match s.char_indices().nth(max) {
         Some((i, _)) => format!("{}\n…(truncated — full report on clipboard)", &s[..i]),
@@ -133,6 +144,7 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 /// Minimal percent-encoding for URL query values (RFC 3986 unreserved kept).
+#[tracing::instrument(level = "debug", ret)]
 fn pct(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 2);
     for b in s.bytes() {
@@ -149,6 +161,7 @@ fn pct(s: &str) -> String {
 /// Show the crash dialog (native rfd) and act on the buttons. Needs a Tokio runtime entered for
 /// rfd's portal backend — `main`'s `--crash-report` arm enters one first. Loops so "Send" can be
 /// followed by Relaunch/Close.
+#[tracing::instrument(level = "debug")]
 pub fn run_report(log_path: &Path) -> Outcome {
     let report = gather(log_path);
     let body = summary(&report);
@@ -187,6 +200,7 @@ pub fn run_report(log_path: &Path) -> Outcome {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn copy_to_clipboard(text: &str) {
     if let Ok(mut cb) = arboard::Clipboard::new() {
         let _ = cb.set_text(text.to_owned());
@@ -197,6 +211,7 @@ fn copy_to_clipboard(text: &str) {
 /// reporter's own env markers so the relaunched app is a normal instance: without clearing
 /// `HYPERPANES_CRASH_CHILD` a recovered app couldn't report a *future* crash, and clearing
 /// `HYPERPANES_TEST_PANIC` stops the simulated-crash test from looping after recovery.
+#[tracing::instrument(level = "debug", ret)]
 pub fn relaunch() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(exe)

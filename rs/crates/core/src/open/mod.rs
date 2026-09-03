@@ -47,6 +47,7 @@ pub const ALLOWED_SCHEMES: &[&str] = &["http", "https", "mailto"];
 /// True when `url` is safe to pass to the OS handler: an allowed scheme, no control
 /// characters or whitespace (which could split a command line), and no `"` (which would
 /// break out of the quoting `windows.rs` relies on — a legal URL never contains one).
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_openable_url(url: &str) -> bool {
     if url.is_empty() || url.len() > 8192 {
         return false;
@@ -70,6 +71,7 @@ pub fn is_openable_url(url: &str) -> bool {
 /// Open a URL in the user's default browser. `Err` carries the spawn failure; a refused
 /// URL reports as `Err` too, naming the reason, so callers can surface it rather than
 /// silently doing nothing.
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_url(url: &str) -> Result<(), String> {
     if !is_openable_url(url) {
         return Err(format!(
@@ -81,6 +83,7 @@ pub fn open_url(url: &str) -> Result<(), String> {
 
 /// Open a URL in one specific browser (the `launcher` from a [`BrowserApp`]), rather
 /// than the OS default. Same refusal rules as [`open_url`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_url_with(launcher: &str, url: &str) -> Result<(), String> {
     if !is_openable_url(url) {
         return Err(format!(
@@ -99,6 +102,7 @@ pub fn open_url_with(launcher: &str, url: &str) -> Result<(), String> {
 /// Note this does *not* screen executable extensions; `paths::open_os_default` still owns
 /// that policy for clicked terminal tokens, because it is the caller that knows the path
 /// came from untrusted output.
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_path(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("empty path".to_string());
@@ -108,6 +112,7 @@ pub fn open_path(path: &Path) -> Result<(), String> {
 
 /// Show a path in the file manager — selected inside its parent when it is a file,
 /// opened when it is a folder.
+#[tracing::instrument(level = "debug", ret)]
 pub fn reveal_path(path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("empty path".to_string());
@@ -117,6 +122,7 @@ pub fn reveal_path(path: &Path) -> Result<(), String> {
 
 /// Every browser we can find installed, in a stable order (the OS's own default handler
 /// is not included — that is [`open_url`], and it is offered separately in the UI).
+#[tracing::instrument(level = "debug", ret)]
 pub fn list_browsers() -> Vec<BrowserApp> {
     platform::list_browsers()
 }
@@ -137,6 +143,7 @@ pub struct HandlerApp {
 /// nothing else. It gets spliced into an OS query (a plist scan, a registry key, a mime
 /// lookup) and it arrives from a path the user clicked in terminal output, so it is
 /// screened here rather than in each platform half.
+#[tracing::instrument(level = "debug", ret)]
 fn is_plain_ext(ext: &str) -> bool {
     !ext.is_empty() && ext.len() <= 16 && ext.chars().all(|c| c.is_ascii_alphanumeric())
 }
@@ -148,6 +155,7 @@ fn is_plain_ext(ext: &str) -> bool {
 /// and a menu that says so helps nobody. The OS's own default handler is not marked and
 /// not excluded; it is offered separately as [`open_path`], the same split
 /// [`list_browsers`] makes for URLs.
+#[tracing::instrument(level = "debug", ret)]
 pub fn handlers_for(path: &Path) -> Vec<HandlerApp> {
     let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
         return Vec::new();
@@ -166,12 +174,14 @@ pub fn handlers_for(path: &Path) -> Vec<HandlerApp> {
 /// is cached for the life of the process, so this call is the whole cost and every later
 /// one is free. On the other two it only warms the OS's file cache, which is cheap enough
 /// not to be worth a second mechanism.
+#[tracing::instrument(level = "debug", ret)]
 pub fn warm_handlers() {
     let _ = handlers_for(Path::new("warm.txt"));
 }
 
 /// Open a file in one specific application (the `launcher` from a [`HandlerApp`]) rather
 /// than in whatever owns its type.
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_path_with(launcher: &str, path: &Path) -> Result<(), String> {
     if path.as_os_str().is_empty() {
         return Err("empty path".to_string());
@@ -227,6 +237,7 @@ goto loop\r\n";
 /// Where the generated `BROWSER` shim lives. A fixed path inside the app's own data
 /// directory: stable across launches, so a pane spawned by an older run still names a
 /// script that exists, and free of spaces on every platform we support.
+#[tracing::instrument(level = "debug", ret)]
 pub fn browser_shim_path() -> PathBuf {
     let bin = crate::persistence::paths::user_data_dir().join("bin");
     #[cfg(windows)]
@@ -244,6 +255,7 @@ pub fn browser_shim_path() -> PathBuf {
 /// Rewritten on every call rather than skipped when present: the shim is part of the
 /// binary's contract with [`crate::session::openurl`], and an upgraded build that kept
 /// running a stale script would emit a sequence this build no longer parses.
+#[tracing::instrument(level = "debug", ret)]
 pub fn ensure_browser_shim() -> std::io::Result<PathBuf> {
     let path = browser_shim_path();
 
@@ -285,6 +297,7 @@ pub fn ensure_browser_shim() -> std::io::Result<PathBuf> {
 ///
 /// Best-effort by design — if the shim cannot be written, the pane still spawns and
 /// links simply take the OS default, which is what would have happened anyway.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn with_browser_shim(
     env: Option<crate::session::spawn::EnvMap>,
 ) -> Option<crate::session::spawn::EnvMap> {

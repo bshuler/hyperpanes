@@ -67,6 +67,7 @@ pub struct SetEnvelope {
 
 impl SetEnvelope {
     /// Wrap a set payload in the current-version envelope.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn wrap(set: WorkspaceSet) -> Self {
         Self {
             format: SET_FORMAT.to_string(),
@@ -78,6 +79,7 @@ impl SetEnvelope {
 
 /// Filesystem-safe stem for a set name: lowercase, non-alphanumerics collapsed to `-`,
 /// trimmed. An empty/entirely-punctuation name yields `"set"` so a path is always valid.
+#[tracing::instrument(level = "debug", ret)]
 pub fn slug(name: &str) -> String {
     let mut out = String::new();
     let mut pending_dash = false;
@@ -102,6 +104,7 @@ pub fn slug(name: &str) -> String {
 /// Parse set-file text, accepting both shapes: the versioned envelope (a top-level object
 /// with a `format` key) and a bare legacy [`WorkspaceSet`] ("version 0"). Mirrors
 /// [`io::parse_workspace_str`] one-for-one.
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_set_str(raw: &str) -> Result<WorkspaceSet, String> {
     let value: serde_json::Value =
         serde_json::from_str(raw).map_err(|e| format!("invalid JSON: {e}"))?;
@@ -147,6 +150,7 @@ pub fn parse_set_str(raw: &str) -> Result<WorkspaceSet, String> {
 
 /// Resolve every relative member `path` against `base_dir` (absolute paths kept verbatim),
 /// so a set file and the workspaces beside it move together.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_members(set: &WorkspaceSet, base_dir: &Path) -> WorkspaceSet {
     let mut out = set.clone();
     for m in out.members.iter_mut() {
@@ -161,6 +165,7 @@ pub fn resolve_members(set: &WorkspaceSet, base_dir: &Path) -> WorkspaceSet {
 /// Read + validate a set file, resolving relative member paths against its own directory.
 /// `None` on read/parse error (parse failures are reported on stderr, exactly like
 /// [`io::read_workspace`]).
+#[tracing::instrument(level = "debug", ret, skip(path))]
 pub fn read_set<P: AsRef<Path>>(path: P) -> Option<WorkspaceSet> {
     let path = path.as_ref();
     let raw = std::fs::read_to_string(path).ok()?;
@@ -178,6 +183,7 @@ pub fn read_set<P: AsRef<Path>>(path: P) -> Option<WorkspaceSet> {
 /// Write a set file (pretty, 2-space) in the versioned container form, atomically through
 /// [`paths::write_atomic`] (creating `sets/` if needed). Returns `false` on error, matching
 /// [`io::write_workspace`]'s boolean.
+#[tracing::instrument(level = "debug", ret, skip(path))]
 pub fn write_set<P: AsRef<Path>>(path: P, set: &WorkspaceSet) -> bool {
     let Ok(json) = serde_json::to_string_pretty(&SetEnvelope::wrap(set.clone())) else {
         return false;
@@ -186,12 +192,14 @@ pub fn write_set<P: AsRef<Path>>(path: P, set: &WorkspaceSet) -> bool {
 }
 
 /// The canonical path a set with this name is saved to: `sets/<slug>.json`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn path_for(name: &str) -> PathBuf {
     paths::sets_dir().join(format!("{}.json", slug(name)))
 }
 
 /// Every readable set in `dir`, sorted by file name. Unreadable/invalid files are skipped
 /// (a corrupt file must not hide the rest of the library).
+#[tracing::instrument(level = "debug", ret)]
 pub fn list_sets_in(dir: &Path) -> Vec<(PathBuf, WorkspaceSet)> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
@@ -213,6 +221,7 @@ pub fn list_sets_in(dir: &Path) -> Vec<(PathBuf, WorkspaceSet)> {
 }
 
 /// Every readable set in the canonical [`paths::sets_dir`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn list_sets() -> Vec<(PathBuf, WorkspaceSet)> {
     list_sets_in(&paths::sets_dir())
 }
@@ -220,6 +229,7 @@ pub fn list_sets() -> Vec<(PathBuf, WorkspaceSet)> {
 /// Read each member workspace of `set`, in order. Members that don't resolve to a valid
 /// workspace are skipped (with a stderr note) rather than failing the whole open — a set is
 /// a loose index and one stale reference must not cost the user the other tabs.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn load_members(set: &WorkspaceSet) -> Vec<WorkspaceFile> {
     set.members
         .iter()

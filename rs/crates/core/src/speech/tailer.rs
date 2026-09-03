@@ -42,6 +42,7 @@ const MAX_LINE_BYTES: usize = 1024 * 1024;
 /// Resolve `marker`'s live session to its transcript path: `<config_dir, or ~/.claude>/
 /// projects/<encoded cwd>/<session_id>.jsonl`. `None` when the marker has no cwd (nothing
 /// to encode) or no home directory is known for the default-account fallback.
+#[tracing::instrument(level = "debug", ret)]
 pub fn transcript_path(marker: &PaneClaudeSession) -> Option<PathBuf> {
     if marker.cwd.is_empty() {
         return None;
@@ -99,6 +100,7 @@ pub enum TranscriptFormat {
 /// `tool_id` is a [`crate::tools::registry`] id and `session_id`/`cwd` come from that
 /// tool's session-hook marker. `None` for a tool with no tailable log — the caller falls
 /// back to the pane's terminal output rather than going silent.
+#[tracing::instrument(level = "debug", ret)]
 pub fn tool_transcript(tool_id: &str, session_id: &str, cwd: &str) -> Option<TranscriptRef> {
     match tool_id {
         "cursor-agent" => {
@@ -179,6 +181,7 @@ impl TranscriptTail {
     /// Start tailing `path` from its current end — pre-existing content (all prior history)
     /// is never returned by [`poll`](Self::poll). A missing file starts at offset 0, so it
     /// picks up everything once the file (and any assistant replies) appear.
+    #[tracing::instrument(level = "debug")]
     pub fn start_at_end(path: PathBuf, format: TranscriptFormat) -> TranscriptTail {
         let cursor = fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         TranscriptTail {
@@ -192,10 +195,12 @@ impl TranscriptTail {
 
     /// The transcript path this tail is following.
     /// The record shape this tail is parsing.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn format(&self) -> TranscriptFormat {
         self.format
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -207,6 +212,7 @@ impl TranscriptTail {
     /// simply not exist yet. If the file shrank (rotated/truncated) since the last poll, the
     /// cursor resets to the new length and the buffered partial is dropped, since whatever
     /// was appended after our old cursor is no longer there.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn poll(&mut self) -> Vec<String> {
         let mut texts = Vec::new();
         let Ok(mut file) = fs::File::open(&self.path) else {
@@ -274,6 +280,7 @@ impl TranscriptTail {
 ///
 /// Malformed JSON, non-assistant records, and assistant records carrying no text (a
 /// tool-only turn) all yield `None` — the tailer speaks nothing rather than guessing.
+#[tracing::instrument(level = "debug", ret)]
 pub fn extract_assistant_text(line: &str, format: TranscriptFormat) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
     match format {
@@ -340,6 +347,7 @@ pub fn extract_assistant_text(line: &str, format: TranscriptFormat) -> Option<St
 
 /// Space-join the `{"type":"text"}` blocks of a `message.content` array. `tool_use` /
 /// `tool_result` blocks are silently skipped — they are not speech.
+#[tracing::instrument(level = "debug", ret)]
 fn content_block_text(v: &serde_json::Value) -> Option<String> {
     let blocks = v.get("message")?.get("content")?.as_array()?;
     let mut out = String::new();
@@ -364,6 +372,7 @@ fn content_block_text(v: &serde_json::Value) -> Option<String> {
 /// array — the sibling of [`content_block_text`] for a payload that holds its blocks
 /// directly rather than under `message`. Refusal blocks and any future non-text block kind
 /// are skipped for the same reason `tool_use` is above: they are not speech.
+#[tracing::instrument(level = "debug", ret)]
 fn output_text(payload: &serde_json::Value) -> Option<String> {
     let blocks = payload.get("content")?.as_array()?;
     let mut out = String::new();

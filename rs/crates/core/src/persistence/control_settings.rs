@@ -37,12 +37,14 @@ pub struct ControlSettings {
 }
 
 /// Read the settings from the canonical `control-settings.json`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn load() -> ControlSettings {
     load_from(&paths::control_settings_json())
 }
 
 /// Read the settings from `path`, returning the defaults on any error — exactly the
 /// TS `try { … } catch { return { ...DEFAULT_SETTINGS } }` behaviour.
+#[tracing::instrument(level = "debug", ret)]
 pub fn load_from(path: &std::path::Path) -> ControlSettings {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return ControlSettings::default();
@@ -69,6 +71,7 @@ pub fn load_from(path: &std::path::Path) -> ControlSettings {
 }
 
 /// Persist the settings to the canonical `control-settings.json` (atomic).
+#[tracing::instrument(level = "debug", ret)]
 pub fn save(settings: &ControlSettings) -> std::io::Result<()> {
     save_to(&paths::control_settings_json(), settings)
 }
@@ -76,6 +79,7 @@ pub fn save(settings: &ControlSettings) -> std::io::Result<()> {
 /// Persist the settings to `path`, atomically. The on-disk shape matches
 /// `JSON.stringify(this.settings, null, 2)`: `{ "enabled": …, "allowInput": … }`,
 /// pretty-printed with 2-space indent.
+#[tracing::instrument(level = "debug", ret)]
 pub fn save_to(path: &std::path::Path, settings: &ControlSettings) -> std::io::Result<()> {
     let json = serde_json::to_string_pretty(settings)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;

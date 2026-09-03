@@ -46,11 +46,13 @@ pub struct MessageInbox {
 }
 
 impl MessageInbox {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Enqueue a message for `to`. Returns the stored message (with its seq).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn post(&mut self, to: &str, from: &str, body: &str, ts: i64) -> PaneMessage {
         self.seq += 1;
         let msg = PaneMessage {
@@ -72,6 +74,7 @@ impl MessageInbox {
 
     /// Messages for `paneId` with seq > afterSeq (afterSeq=0 ⇒ all retained). The
     /// returned vec is a copy, ordered by seq ascending.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn read(&self, pane_id: &str, after_seq: u64) -> Vec<PaneMessage> {
         let list = match self.by_pane.get(pane_id) {
             None => return Vec::new(),
@@ -85,12 +88,14 @@ impl MessageInbox {
     }
 
     /// How many messages were evicted for `paneId` by the cap (for "you missed N").
+    #[tracing::instrument(level = "debug", ret)]
     pub fn dropped_count(&self, pane_id: &str) -> usize {
         self.dropped.get(pane_id).copied().unwrap_or(0)
     }
 
     /// The highest seq currently retained for `paneId` (0 if empty) — a fresh
     /// reader can start its cursor here to skip backlog.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn latest_seq(&self, pane_id: &str) -> u64 {
         self.by_pane
             .get(pane_id)
@@ -99,6 +104,7 @@ impl MessageInbox {
     }
 
     /// Forget a pane's inbox (on close). Keeps the dropped counter cleared too.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn drop(&mut self, pane_id: &str) {
         self.by_pane.remove(pane_id);
         self.dropped.remove(pane_id);

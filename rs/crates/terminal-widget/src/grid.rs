@@ -38,6 +38,7 @@ pub struct RenderCell {
 }
 
 impl Default for RenderCell {
+    #[tracing::instrument(level = "debug")]
     fn default() -> Self {
         RenderCell {
             ch: ' ',
@@ -66,6 +67,7 @@ pub struct GridSnapshot {
 
 impl GridSnapshot {
     #[inline]
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn cell(&self, col: usize, row: usize) -> &RenderCell {
         &self.cells[row * self.cols + col]
     }
@@ -78,12 +80,15 @@ pub struct TermSize {
     pub rows: usize,
 }
 impl alacritty_terminal::grid::Dimensions for TermSize {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn total_lines(&self) -> usize {
         self.rows
     }
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn screen_lines(&self) -> usize {
         self.rows
     }
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn columns(&self) -> usize {
         self.cols
     }
@@ -96,6 +101,7 @@ struct ProxyListener {
     tx: Sender<Vec<u8>>,
 }
 impl EventListener for ProxyListener {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn send_event(&self, event: Event) {
         if let Event::PtyWrite(text) = event {
             let _ = self.tx.send(text.into_bytes());
@@ -123,6 +129,7 @@ impl TermGrid {
 
     /// A fresh grid sized to `cols`×`rows` (each clamped to ≥1) with
     /// [`Self::DEFAULT_SCROLLBACK`] lines of history.
+    #[tracing::instrument(level = "debug")]
     pub fn new(cols: usize, rows: usize) -> Self {
         Self::with_scrollback(cols, rows, Self::DEFAULT_SCROLLBACK)
     }
@@ -130,6 +137,7 @@ impl TermGrid {
     /// A fresh grid sized to `cols`×`rows` (each clamped to ≥1) keeping up to `scrollback`
     /// lines of history above the live viewport. This is where the app's `scrollback`
     /// preference lands; alacritty clamps the value to its own ceiling.
+    #[tracing::instrument(level = "debug")]
     pub fn with_scrollback(cols: usize, rows: usize, scrollback: usize) -> Self {
         let size = TermSize {
             cols: cols.max(1),
@@ -155,6 +163,7 @@ impl TermGrid {
     /// Change the scrollback depth of a live grid. Shrinking drops the oldest history;
     /// growing keeps everything. A no-op when the depth is unchanged, so it is safe to call
     /// on every settings apply.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_scrollback(&mut self, scrollback: usize) {
         if self.scrollback == scrollback {
             return;
@@ -169,6 +178,7 @@ impl TermGrid {
     }
 
     /// The configured scrollback depth (lines of history the grid will keep).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scrollback_capacity(&self) -> usize {
         self.scrollback
     }
@@ -176,6 +186,7 @@ impl TermGrid {
     /// Apply a colour theme by overriding the 16 base ANSI colours (indices 0–15; index 0 is
     /// the default background, index 7 the default foreground). The 6×6×6 colour cube and the
     /// grayscale ramp (indices 16–255) are kept. Marks the grid dirty so it repaints.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_base16(&mut self, base: [[u8; 3]; 16]) {
         for (i, c) in base.iter().enumerate() {
             self.palette[i] = Rgb {
@@ -188,6 +199,7 @@ impl TermGrid {
     }
 
     /// Advance the VTE parser with a chunk of raw session output. Marks the grid dirty.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn feed(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
@@ -200,6 +212,7 @@ impl TermGrid {
     /// processing the last [`feed`](Self::feed). The controller must write these back to
     /// the session's pty (`SessionManager::write`) or the shell can hang at startup.
     /// Returns an empty vec when there is nothing to forward.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn take_replies(&mut self) -> Vec<u8> {
         let mut out = Vec::new();
         while let Ok(chunk) = self.resp_rx.try_recv() {
@@ -210,6 +223,7 @@ impl TermGrid {
 
     /// Reflow the grid to `cols`×`rows`. Returns `true` if the size actually changed (the
     /// caller should then also resize the *session* via `SessionManager::resize`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn resize(&mut self, cols: usize, rows: usize) -> bool {
         let cols = cols.max(1);
         let rows = rows.max(1);
@@ -225,6 +239,7 @@ impl TermGrid {
     /// Take-and-clear the dirty flag. Also clears alacritty's accumulated damage so it
     /// doesn't grow unbounded (the renderers repaint the whole pane texture per dirty
     /// frame — partial-damage repaint is a noted future refinement).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn take_dirty(&mut self) -> bool {
         let d = self.dirty;
         self.dirty = false;
@@ -232,6 +247,7 @@ impl TermGrid {
         d
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn size(&self) -> TermSize {
         self.size
     }
@@ -241,6 +257,7 @@ impl TermGrid {
     /// treats it as one literal insertion instead of replaying each embedded newline as Enter —
     /// which is what fragments a multi-line paste across `>>` continuation prompts and strands the
     /// caret. See [`TerminalPane::paste_from_clipboard`](crate::pane::TerminalPane).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn bracketed_paste(&self) -> bool {
         self.term
             .mode()
@@ -251,12 +268,14 @@ impl TermGrid {
 
     /// How far the viewport is scrolled up into history, in lines (0 = pinned to the bottom /
     /// live prompt). Viewport row `r` shows absolute grid line `r - display_offset`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn display_offset(&self) -> usize {
         self.term.grid().display_offset()
     }
 
     /// The cursor's column (0-based grid cell). Pairs with [`cursor_row`](Self::cursor_row) to
     /// compute the type-over-selection edit sequence (how far the selection sits from the caret).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn cursor_col(&self) -> usize {
         self.term.grid().cursor.point.column.0
     }
@@ -266,6 +285,7 @@ impl TermGrid {
     /// type-over-selection treat a long shell input that soft-wrapped across visual rows as the
     /// single editable line it is (the line editor's arrows/backspace walk straight through the
     /// wrap, so linear cell distances stay valid).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn row_wraps(&self, row: usize) -> bool {
         if row >= self.size.rows || self.size.cols == 0 {
             return false;
@@ -279,6 +299,7 @@ impl TermGrid {
     /// Whether the application has switched to the **alternate screen** (vim, htop, full-screen
     /// TUIs). Type-over-selection must not fire there: its arrow/backspace bytes would be app
     /// commands (vim motions), not line edits.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn alt_screen(&self) -> bool {
         self.term
             .mode()
@@ -289,6 +310,7 @@ impl TermGrid {
     /// click / drag / motion tracking). When on, a wheel notch should be forwarded to the pty as a
     /// mouse event so the app (Claude Code, vim, less, htop) scrolls its own view, rather than the
     /// terminal moving a scrollback viewport the app doesn't have. See [`crate::pane`]'s wheel path.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn mouse_mode(&self) -> bool {
         self.term
             .mode()
@@ -297,6 +319,7 @@ impl TermGrid {
 
     /// Whether the application requested **SGR** (1006) mouse encoding. Picks the wheel-report
     /// wire format: SGR (`ESC[<Cb;Cx;Cy M`) when on, else legacy X10 (`ESC[M` + 3 bytes).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn sgr_mouse(&self) -> bool {
         self.term
             .mode()
@@ -305,6 +328,7 @@ impl TermGrid {
 
     /// Whether **application cursor keys** (DECCKM) are active. Selects the arrow-key encoding used
     /// for alternate-scroll (alt-screen, no mouse mode): `ESC O A/B` when on, else `ESC [ A/B`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn app_cursor(&self) -> bool {
         self.term
             .mode()
@@ -313,6 +337,7 @@ impl TermGrid {
 
     /// Whether the app requested **button-event (drag) tracking** (DECSET 1002): report pointer
     /// motion only while a button is held. Gates motion-event forwarding for mouse-grab apps.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn mouse_drag(&self) -> bool {
         self.term
             .mode()
@@ -321,6 +346,7 @@ impl TermGrid {
 
     /// Whether the app requested **any-event motion tracking** (DECSET 1003): report all pointer
     /// motion, button held or not.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn mouse_any_motion(&self) -> bool {
         self.term
             .mode()
@@ -332,6 +358,7 @@ impl TermGrid {
     /// viewport; `display_offset` is how far the viewport is scrolled up into it (0 = pinned to the
     /// live edge). Total buffer height = `history_lines + viewport_rows`. In the alternate screen
     /// history is 0, so the overlays naturally vanish.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scroll_metrics(&self) -> (usize, usize, usize) {
         let g = self.term.grid();
         (g.history_size(), self.size.rows, g.display_offset())
@@ -341,6 +368,7 @@ impl TermGrid {
     /// char per cell with blanks as spaces and no right-trim, or `None` when the line is outside
     /// the buffer. Lets selection text-extraction reach scrollback rows the viewport snapshot
     /// can't (a selection anchored in history while scrolled).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn line_text(&self, line: i32) -> Option<String> {
         let grid = self.term.grid();
         if line < grid.topmost_line().0 || line > grid.bottommost_line().0 {
@@ -359,6 +387,7 @@ impl TermGrid {
     /// Whether absolute grid `line` CONTINUES onto the next line (alacritty's `WRAPLINE` on its
     /// last cell) — the absolute-line analogue of [`row_wraps`](Self::row_wraps), for type-over
     /// across a soft-wrapped prompt regardless of scroll position.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn line_wraps(&self, line: i32) -> bool {
         let grid = self.term.grid();
         if self.size.cols == 0 || line < grid.topmost_line().0 || line > grid.bottommost_line().0 {
@@ -371,6 +400,7 @@ impl TermGrid {
     /// The cursor's row within the current viewport (display offset applied), or `None` when the
     /// cursor is scrolled out of view. Cheap — reads the grid cursor directly, no snapshot. Used
     /// to scope type-over-selection to the live prompt line (the cursor's own row).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn cursor_row(&self) -> Option<usize> {
         let grid = self.term.grid();
         let row = grid.cursor.point.line.0 + grid.display_offset() as i32;
@@ -385,6 +415,7 @@ impl TermGrid {
     /// Absolute lines are negative for scrollback and `0..rows` for the live viewport (the same
     /// numbering the snapshot/cursor use). One char per cell, blanks as spaces. Used by the
     /// search model; O(history) so call it on query change, not per frame.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn history_lines(&self) -> Vec<(i32, String)> {
         let grid = self.term.grid();
         let cols = grid.columns();
@@ -405,6 +436,7 @@ impl TermGrid {
 
     /// Scroll so absolute grid `line` is visible (roughly centered), unless it already is. Marks
     /// the grid dirty when the offset actually moves. Used to reveal the active search match.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scroll_to_visible(&mut self, line: i32) {
         let (cur, hist, rows) = {
             let g = self.term.grid();
@@ -427,6 +459,7 @@ impl TermGrid {
     }
 
     /// Pin the viewport back to the bottom (the live prompt), e.g. when search closes.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scroll_to_bottom(&mut self) {
         if self.term.grid().display_offset() != 0 {
             self.term.scroll_display(Scroll::Bottom);
@@ -439,6 +472,7 @@ impl TermGrid {
     /// scrollback bounds, so an over-scroll past the top/bottom is a no-op. Marks the grid dirty
     /// only when the offset actually moved (so a clamped no-op doesn't force a repaint). Drives
     /// mouse-wheel + Shift-PageUp/Down scrollback.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scroll_by(&mut self, delta_lines: i32) {
         if delta_lines == 0 {
             return;
@@ -450,6 +484,7 @@ impl TermGrid {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn resolve(&self, c: AnsiColor, default_fg: bool) -> [u8; 4] {
         let rgb = match c {
             AnsiColor::Spec(rgb) => rgb,
@@ -473,6 +508,7 @@ impl TermGrid {
     }
 
     /// Produce a flat, resolved-RGBA snapshot of the current viewport for a renderer.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn snapshot(&self) -> GridSnapshot {
         let cols = self.size.cols;
         let rows = self.size.rows;
@@ -574,6 +610,7 @@ impl TermGrid {
 /// (a heavier blend than 50% so dim text reads clearly quieter than normal text while
 /// staying legible). Alpha is kept opaque; only the hue moves toward the background.
 #[inline]
+#[tracing::instrument(level = "debug", ret)]
 fn dim_blend(fg: [u8; 4], bg: [u8; 4]) -> [u8; 4] {
     const KEEP_NUM: u32 = 45; // keep 45% of fg → 55% toward bg
     const DEN: u32 = 100;
@@ -588,6 +625,7 @@ fn dim_blend(fg: [u8; 4], bg: [u8; 4]) -> [u8; 4] {
 }
 
 /// Tokyo-Night-ish default 16 + the standard xterm 256-colour cube/grayscale.
+#[tracing::instrument(level = "debug", ret)]
 fn default_palette() -> [Rgb; 256] {
     let mut p = [Rgb { r: 0, g: 0, b: 0 }; 256];
     let base: [[u8; 3]; 16] = [

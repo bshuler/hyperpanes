@@ -16,6 +16,7 @@ use super::BrowserApp;
 /// Don't flash a console window (same constant as `paths::NoWindow`).
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+#[tracing::instrument(level = "debug", ret)]
 fn detached(cmd: &mut Command) -> Result<(), String> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -28,6 +29,7 @@ fn detached(cmd: &mut Command) -> Result<(), String> {
 
 /// `cmd /C start "" "<target>"` — the empty string is the window-title argument, without
 /// which `start` would consume our quoted target as the title and open nothing.
+#[tracing::instrument(level = "debug", ret)]
 fn shell_start(target: &str) -> Result<(), String> {
     if target.contains('"') {
         return Err(format!("refusing to open {target:?}: contains a quote"));
@@ -40,10 +42,12 @@ fn shell_start(target: &str) -> Result<(), String> {
     detached(&mut c)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_url(url: &str) -> Result<(), String> {
     shell_start(url)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_url_with(launcher: &str, url: &str) -> Result<(), String> {
     // The launcher is an absolute .exe path we found ourselves (or the user chose), so it
     // is spawned directly — no shell, nothing to re-parse.
@@ -52,10 +56,12 @@ pub fn open_url_with(launcher: &str, url: &str) -> Result<(), String> {
     detached(&mut c)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_path(path: &Path) -> Result<(), String> {
     shell_start(&path.to_string_lossy())
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn reveal_path(path: &Path) -> Result<(), String> {
     let p = path.to_string_lossy().to_string();
     if p.contains('"') {
@@ -72,6 +78,7 @@ pub fn reveal_path(path: &Path) -> Result<(), String> {
     detached(&mut c)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_path_with(launcher: &str, path: &Path) -> Result<(), String> {
     // The launcher is an absolute .exe path we read out of the registry ourselves, so it
     // is spawned directly — no shell, nothing to re-parse.
@@ -85,6 +92,7 @@ pub fn open_path_with(launcher: &str, path: &Path) -> Result<(), String> {
 /// `reg query <key>`, as lines. `reg` is the supported command-line reader for the
 /// registry and ships with every Windows; going through it keeps this crate free of a
 /// registry binding it would otherwise need on one platform only.
+#[tracing::instrument(level = "debug", ret)]
 fn reg(args: &[&str]) -> Option<String> {
     let out = Command::new("reg")
         .arg("query")
@@ -101,6 +109,7 @@ fn reg(args: &[&str]) -> Option<String> {
 }
 
 /// A value line is `<indent><name><spaces><TYPE><spaces><data>`. Returns (name, data).
+#[tracing::instrument(level = "debug", ret)]
 fn reg_value(line: &str) -> Option<(String, String)> {
     let mut parts = line.trim().splitn(3, "    ").map(str::trim);
     let name = parts.next()?.to_string();
@@ -114,6 +123,7 @@ fn reg_value(line: &str) -> Option<(String, String)> {
 /// The executable out of a `shell\open\command` template: `"C:\...\x.exe" "%1"` or
 /// `C:\...\x.exe %1`. Everything after it is the argument template, which we replace with
 /// the real path rather than substituting into.
+#[tracing::instrument(level = "debug", ret)]
 fn exe_of(command: &str) -> Option<String> {
     let c = command.trim();
     let exe = if let Some(rest) = c.strip_prefix('"') {
@@ -125,6 +135,7 @@ fn exe_of(command: &str) -> Option<String> {
 }
 
 /// The friendly name a progid publishes, falling back to the executable's own file name.
+#[tracing::instrument(level = "debug", ret)]
 fn progid_name(progid: &str, exe: &str) -> String {
     let key = format!(r"HKCR\{progid}");
     let named = reg(&[&key]).and_then(|body| {
@@ -141,6 +152,7 @@ fn progid_name(progid: &str, exe: &str) -> String {
     })
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn handlers_for_ext(ext: &str) -> Vec<super::HandlerApp> {
     // The progids registered for the extension: the ones the user has picked from the
     // Open With dialog (per-user) and the ones installers declared (per-machine).
@@ -266,6 +278,7 @@ const KNOWN: &[(&str, &str, &[(&str, &str)])] = &[
     ),
 ];
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn list_browsers() -> Vec<BrowserApp> {
     let mut out = Vec::new();
     for (id, name, candidates) in KNOWN {

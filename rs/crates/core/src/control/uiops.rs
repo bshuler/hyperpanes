@@ -41,6 +41,7 @@ type PatchSender = oneshot::Sender<Result<(), String>>;
 
 impl PatchReply {
     /// A fresh channel: the handle to queue with the op, and the receiver the route awaits.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new() -> (Self, oneshot::Receiver<Result<(), String>>) {
         let (tx, rx) = oneshot::channel();
         (PatchReply(Arc::new(Mutex::new(Some(tx)))), rx)
@@ -48,6 +49,7 @@ impl PatchReply {
 
     /// Answer the waiting route. Only the first call delivers; later calls are no-ops, and a
     /// receiver that already gave up (timed out) is ignored rather than an error.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn send(&self, result: Result<(), String>) {
         if let Some(tx) = self.0.lock().unwrap().take() {
             let _ = tx.send(result);
@@ -56,6 +58,7 @@ impl PatchReply {
 }
 
 impl PartialEq for PatchReply {
+    #[tracing::instrument(level = "debug", ret)]
     fn eq(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
@@ -103,6 +106,7 @@ impl UiOpQueue {
     /// headless embedder — where nothing ever drains — stays bounded.
     pub const MAX_PENDING: usize = 256;
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new() -> Self {
         UiOpQueue {
             pending: VecDeque::new(),
@@ -111,6 +115,7 @@ impl UiOpQueue {
 
     /// Queue an op. Returns `false` (and drops it) when the queue is full — the caller turns
     /// that into a 503 rather than silently losing the edit.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn push(&mut self, op: UiOp) -> bool {
         if self.pending.len() >= Self::MAX_PENDING {
             return false;
@@ -120,14 +125,17 @@ impl UiOpQueue {
     }
 
     /// Take everything pending, in submission order.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn drain(&mut self) -> Vec<UiOp> {
         self.pending.drain(..).collect()
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn len(&self) -> usize {
         self.pending.len()
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_empty(&self) -> bool {
         self.pending.is_empty()
     }

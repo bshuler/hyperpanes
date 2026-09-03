@@ -48,16 +48,19 @@ pub struct PaneTailBuffer {
 }
 
 impl Default for PaneTailBuffer {
+    #[tracing::instrument(level = "debug")]
     fn default() -> Self {
         Self::new()
     }
 }
 
 impl PaneTailBuffer {
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Self {
         Self::with_opts(DEFAULT_MAX_LINES, DEFAULT_MAX_CHARS)
     }
 
+    #[tracing::instrument(level = "debug")]
     pub fn with_opts(max_lines: usize, max_chars: usize) -> Self {
         Self {
             max_lines,
@@ -66,6 +69,7 @@ impl PaneTailBuffer {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn append(&mut self, uid: &str, raw_chunk: &str) {
         if raw_chunk.is_empty() {
             return; // tolerate empty chunks: nothing changed
@@ -113,6 +117,7 @@ impl PaneTailBuffer {
         state.dirty = true;
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn snapshot(&self, uid: &str) -> TailSnapshot {
         let Some(state) = self.panes.get(uid) else {
             return TailSnapshot {
@@ -134,12 +139,14 @@ impl PaneTailBuffer {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn mark_clean(&mut self, uid: &str) {
         if let Some(state) = self.panes.get_mut(uid) {
             state.dirty = false;
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn clear(&mut self, uid: &str) {
         self.panes.remove(uid);
     }
@@ -147,6 +154,7 @@ impl PaneTailBuffer {
 
 // A lone `\r` redraws the current line in place; the visible result is whatever
 // follows the last carriage return.
+#[tracing::instrument(level = "debug", ret)]
 fn apply_carriage_returns(line: &str) -> &str {
     match line.rfind(CR) {
         Some(i) => &line[i + 1..],
@@ -154,11 +162,13 @@ fn apply_carriage_returns(line: &str) -> &str {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn char_len(s: &str) -> usize {
     s.chars().count()
 }
 
 // Equivalent of JS `s.slice(-n)` — keep the last `n` characters.
+#[tracing::instrument(level = "debug", ret)]
 fn slice_last_chars(s: &str, n: usize) -> String {
     let total = char_len(s);
     if total <= n {
@@ -169,6 +179,7 @@ fn slice_last_chars(s: &str, n: usize) -> String {
 
 // Trim oldest lines until the retained text is under the char cap. If a single
 // line is itself over the cap, truncate it to its last `max_chars`.
+#[tracing::instrument(level = "debug", ret, skip(state))]
 fn enforce_char_cap(state: &mut PaneState, max_chars: usize) {
     let mut total = char_count(&state.lines);
     while state.lines.len() > 1 && total > max_chars {
@@ -180,6 +191,7 @@ fn enforce_char_cap(state: &mut PaneState, max_chars: usize) {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn char_count(lines: &[String]) -> usize {
     if lines.is_empty() {
         return 0;
@@ -194,6 +206,7 @@ fn char_count(lines: &[String]) -> usize {
 // Alt-screen toggle: ESC [ ? (1049|47) (h|l). h enters, l leaves. The last toggle
 // in the chunk wins; returns Some(true) for enter, Some(false) for leave, None if
 // no toggle is present.
+#[tracing::instrument(level = "debug", ret)]
 fn last_alt_toggle(s: &str) -> Option<bool> {
     let b = s.as_bytes();
     let mut result = None;

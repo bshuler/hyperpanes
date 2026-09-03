@@ -42,6 +42,7 @@ pub const LIVE_WINDOW_MS: u64 = 30_000;
 /// `now_ms`. `1.0` = output this instant, falling linearly to `0.0` a [`LIVE_WINDOW_MS`]
 /// later; a session that has never produced output (or whose clock reads in the future)
 /// is `0.0`. The UI floors the dot's opacity so a quiet pane still shows its color chip.
+#[tracing::instrument(level = "debug", ret)]
 pub fn liveness(last: Option<u64>, now_ms: u64) -> f32 {
     let Some(last) = last else {
         return 0.0;
@@ -58,6 +59,7 @@ pub fn liveness(last: Option<u64>, now_ms: u64) -> f32 {
 /// past the threshold). Reproduced here rather than read off `PaneState::glow` because the
 /// pump only advances the glow for the ACTIVE tab's panes — the tree shows every tab, and
 /// a background tab's stale `glow.alpha` would lie.
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_idle(
     shell_title: &str,
     last: Option<u64>,
@@ -105,6 +107,7 @@ pub mod pane_mark {
 /// Takes the pane's EFFECTIVE kind (`State::effective_kind`), not `PaneState::kind`, so a
 /// plain terminal that the title sniff caught running an agent is branded in the tree for
 /// the same reason — and at the same moment — as it is in its header.
+#[tracing::instrument(level = "debug", ret)]
 pub fn pane_mark_kind(kind: &PaneKind) -> i32 {
     match kind {
         PaneKind::FileBrowser => pane_mark::FILE_BROWSER,
@@ -124,6 +127,7 @@ pub fn pane_mark_kind(kind: &PaneKind) -> i32 {
 /// the identical colour the header tints its mark with, so the two readings of the same
 /// pane never disagree — and the pane's accent otherwise, which is the header's own
 /// fallback and is never invisible against the panel.
+#[tracing::instrument(level = "debug", ret)]
 pub fn pane_mark_ink(kind: &PaneKind, accent: slint::Color) -> slint::Color {
     match kind.tool() {
         Some(t) => slint::Color::from_rgb_u8(t.brand.0, t.brand.1, t.brand.2),
@@ -143,6 +147,7 @@ const HEARTBEAT: std::time::Duration = std::time::Duration::from_millis(1000);
 /// per window, so a single shared stamp would be consumed by whichever window the app
 /// happens to pump first and every other window's dots would freeze at their last
 /// projected brightness.
+#[tracing::instrument(level = "debug", ret)]
 pub fn heartbeat_due(last: &mut Option<std::time::Instant>, now: std::time::Instant) -> bool {
     match *last {
         Some(t) if now.duration_since(t) < HEARTBEAT => false,
@@ -159,6 +164,7 @@ pub fn heartbeat_due(last: &mut Option<std::time::Instant>, now: std::time::Inst
 /// "Save workspace…" file dialog (which writes wherever the user points it) — the library
 /// is the zero-friction drawer the panel lists, and it is app-owned on purpose so this
 /// milestone doesn't reach into `core::persistence`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn library_dir() -> PathBuf {
     data_dir().join("workspaces")
 }
@@ -191,6 +197,7 @@ thread_local! {
 /// disagreeing about the panel (one open, one shut) would flip a shared flag every tick and
 /// rescan the directory on every single frame — the exact per-tick disk hit the cache exists
 /// to avoid.
+#[tracing::instrument(level = "debug", ret)]
 pub fn note_panel_open(seen: &mut bool, open: bool) {
     if rescan_due(seen, open) {
         refresh_library();
@@ -200,6 +207,7 @@ pub fn note_panel_open(seen: &mut bool, open: bool) {
 
 /// The edge test behind [`note_panel_open`], split from the disk scan so it can be tested
 /// without reaching for the user's real data directory: true exactly on closed→open.
+#[tracing::instrument(level = "debug", ret)]
 fn rescan_due(seen: &mut bool, open: bool) -> bool {
     let edge = open && !*seen;
     *seen = open;
@@ -208,12 +216,14 @@ fn rescan_due(seen: &mut bool, open: bool) -> bool {
 
 /// Rescan [`library_dir`] into the cache. Cheap (one `read_dir` over a directory that
 /// holds a handful of small files) and only ever called on an edge, never per tick.
+#[tracing::instrument(level = "debug", ret)]
 pub fn refresh_library() {
     let rows = scan_library(&library_dir());
     LIB_CACHE.with(|c| *c.borrow_mut() = rows);
 }
 
 /// The cached library rows, in display order (newest first).
+#[tracing::instrument(level = "debug", ret)]
 pub fn library() -> Vec<LibraryEntry> {
     LIB_CACHE.with(|c| c.borrow().clone())
 }
@@ -221,6 +231,7 @@ pub fn library() -> Vec<LibraryEntry> {
 /// Scan `dir` for `*.hyperpanes` / `*.json` workspaces, newest first. Unreadable or
 /// malformed files are skipped rather than shown as broken rows. Split out from
 /// [`refresh_library`] so it can be tested against a temp directory.
+#[tracing::instrument(level = "debug", ret)]
 pub fn scan_library(dir: &Path) -> Vec<LibraryEntry> {
     let now = crate::glow::now_epoch_ms();
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -273,6 +284,7 @@ pub fn scan_library(dir: &Path) -> Vec<LibraryEntry> {
 /// The library row's second line: "3 panes · 2 tabs · 5m ago" (the time part is dropped
 /// when the file's mtime is unknown). Reuses the sidebar's relative-time buckets rather
 /// than growing a second wording of the same idea.
+#[tracing::instrument(level = "debug", skip_all)]
 fn describe_workspace(
     file: &hyperpanes_core::workspace::model::WorkspaceFile,
     mtime: u64,
@@ -304,6 +316,7 @@ fn describe_workspace(
 /// the directory if needed, and refresh the cache. Returns the path written, or `None` if
 /// the directory or the file could not be written. A name that collides gets `-2`, `-3`, …
 /// appended, so saving twice never silently overwrites the earlier snapshot.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn save_to_library(
     name: &str,
     file: &hyperpanes_core::workspace::model::WorkspaceFile,
@@ -331,6 +344,7 @@ pub fn save_to_library(
 
 /// Reduce a tab title to a safe file stem: path separators and the Windows-reserved
 /// punctuation become `-`, runs collapse, and an empty result falls back to "workspace".
+#[tracing::instrument(level = "debug", ret)]
 fn sanitize_name(name: &str) -> String {
     let mut out = String::new();
     let mut last_dash = false;
@@ -377,12 +391,14 @@ thread_local! {
 }
 
 /// Rescan the canonical sets directory into the cache.
+#[tracing::instrument(level = "debug", ret)]
 pub fn refresh_sets() {
     let rows = scan_sets(&paths::sets_dir());
     SET_CACHE.with(|c| *c.borrow_mut() = rows);
 }
 
 /// The cached set rows, in display order (newest first).
+#[tracing::instrument(level = "debug", ret)]
 pub fn sets_rows() -> Vec<SetEntry> {
     SET_CACHE.with(|c| c.borrow().clone())
 }
@@ -393,6 +409,7 @@ pub fn sets_rows() -> Vec<SetEntry> {
 /// Ordering differs from [`sets::list_sets_in`] on purpose: that returns file-name order (a
 /// stable index for programmatic use), while this panel section is a *recency* drawer, like
 /// [`scan_library`] beside it — the set you just saved belongs at the top.
+#[tracing::instrument(level = "debug", ret)]
 pub fn scan_sets(dir: &Path) -> Vec<SetEntry> {
     let now = crate::glow::now_epoch_ms();
     let mut rows: Vec<(u64, SetEntry)> = Vec::new();
@@ -426,6 +443,7 @@ pub fn scan_sets(dir: &Path) -> Vec<SetEntry> {
 /// The set row's second line: "4 workspaces · 5m ago". Counts the set's OWN member list
 /// rather than reading each member file — a set is an index of references, and a stale
 /// reference should not change the count the user saved.
+#[tracing::instrument(level = "debug", ret)]
 fn describe_set(members: usize, mtime: u64, now: u64) -> String {
     let mut out = format!("{members} workspace{}", if members == 1 { "" } else { "s" });
     if mtime > 0 {
@@ -478,6 +496,7 @@ thread_local! {
 ///
 /// Releasing on the way out is a courtesy, not the safety net: the daemon drops every claim
 /// a connection holds when that connection's socket closes, so a crash releases them too.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn publish_window_claims(mgr: &SessionManager, uids: impl IntoIterator<Item = String>) {
     let held: HashSet<String> = uids.into_iter().collect();
     PUBLISHED_CLAIMS.with(|prev| {
@@ -496,6 +515,7 @@ pub fn publish_window_claims(mgr: &SessionManager, uids: impl IntoIterator<Item 
 /// The thread-local half of [`publish_window_claims`]: record what this process's windows
 /// hold, with no daemon traffic. Split out because the daemon half needs a live
 /// `SessionManager` (and therefore a real pty) while the subtraction it feeds does not.
+#[tracing::instrument(level = "debug", ret)]
 fn set_window_claims(held: HashSet<String>) {
     WINDOW_CLAIMS.with(|c| *c.borrow_mut() = held);
 }
@@ -510,6 +530,7 @@ fn set_window_claims(held: HashSet<String>) {
 /// A claim is scoped to the owner's daemon *connection*, so a process that dies — cleanly,
 /// by panic, or by `SIGKILL` — has its claims dropped the moment the kernel closes its
 /// socket, and its panes appear here no longer.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn claimed_by_other_processes(mgr: &SessionManager) -> HashSet<String> {
     mgr.sessions_claimed_elsewhere()
 }
@@ -528,6 +549,7 @@ pub fn claimed_by_other_processes(mgr: &SessionManager) -> HashSet<String> {
 /// connected shows up here without a reconnect, and a session it killed stops showing up.
 /// In-process mode lists exactly the sessions this process spawned, which is the correct
 /// answer for a single-process run.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn detached(mgr: &SessionManager, claimed_here: &HashSet<String>) -> Vec<DetachedSession> {
     let now = crate::glow::now_epoch_ms();
     let other_procs = claimed_by_other_processes(mgr);
@@ -555,6 +577,7 @@ pub fn detached(mgr: &SessionManager, claimed_here: &HashSet<String>) -> Vec<Det
 /// fills from [`claimed_by_other_processes`] — passed in rather than fetched here, since
 /// M7's source for it needs a live `SessionManager`). Input order is preserved; [`detached`]
 /// re-sorts by last output.
+#[tracing::instrument(level = "debug", ret)]
 pub fn adoptable_uids(
     all: Vec<String>,
     claimed_here: &HashSet<String>,
@@ -570,12 +593,14 @@ pub fn adoptable_uids(
 
 /// A session uid shortened for display (uids are long and opaque; the head is enough to
 /// tell two apart). Mirrors `sidebar::short_id`'s approach.
+#[tracing::instrument(level = "debug", ret)]
 fn short_uid(uid: &str) -> String {
     let head: String = uid.chars().take(12).collect();
     format!("session {head}")
 }
 
 /// The detached row's second line: buffered output size + relative last-output time.
+#[tracing::instrument(level = "debug", ret)]
 fn describe_session(bytes: u64, last: Option<u64>, now: u64) -> String {
     let size = if bytes >= 1_048_576 {
         format!("{:.1} MB", bytes as f64 / 1_048_576.0)
@@ -627,6 +652,7 @@ pub struct ScannedSession {
 
 impl ScannedSession {
     /// Whether a click on this row does anything.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn resumable(&self) -> bool {
         self.command.is_some()
     }
@@ -651,6 +677,7 @@ pub const TOOL_SCAN_TTL_MS: u64 = 20_000;
 /// the scan thread (`history_scan`), never on the UI thread — it walks a whole transcript
 /// store and stats every project directory. The provider carries the human's binary
 /// overrides (it was built with them), so the verdict here honours them.
+#[tracing::instrument(level = "debug", ret, skip(provider))]
 pub fn scan_with(
     provider: &mut dyn hyperpanes_core::tools::history::SessionProvider,
 ) -> Vec<ScannedSession> {
@@ -689,6 +716,7 @@ pub fn scan_with(
 
 /// The row's first line: the transcript's summary, its first user message, or — when a
 /// transcript carries neither — the head of its id, so a row is never blank.
+#[tracing::instrument(level = "debug", ret)]
 fn session_label(s: &hyperpanes_core::tools::history::ToolSession) -> String {
     for candidate in [s.summary.trim(), s.first_user.trim()] {
         if !candidate.is_empty() {
@@ -700,6 +728,7 @@ fn session_label(s: &hyperpanes_core::tools::history::ToolSession) -> String {
 
 /// The row's second line for a resumable session: branch · messages · age. Each part is
 /// dropped when unknown rather than shown empty.
+#[tracing::instrument(level = "debug", ret)]
 fn session_detail(s: &hyperpanes_core::tools::history::ToolSession, now: u64) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(b) = s.branch.as_deref().filter(|b| !b.is_empty()) {
@@ -738,6 +767,7 @@ thread_local! {
 }
 
 /// Record which conversations window `window_id` is showing, replacing its last answer.
+#[tracing::instrument(level = "debug", ret)]
 pub fn publish_open_sessions(window_id: usize, ids: HashSet<String>) {
     OPEN_SESSIONS.with(|c| {
         c.borrow_mut().insert(window_id, ids);
@@ -746,6 +776,7 @@ pub fn publish_open_sessions(window_id: usize, ids: HashSet<String>) {
 
 /// Drop a closed window's claims. Without this its sessions would read as open forever and
 /// a click would look for a pane in a window that is gone.
+#[tracing::instrument(level = "debug", ret)]
 pub fn forget_window(window_id: usize) {
     OPEN_SESSIONS.with(|c| {
         c.borrow_mut().remove(&window_id);
@@ -753,11 +784,13 @@ pub fn forget_window(window_id: usize) {
 }
 
 /// Whether ANY window currently has a pane in conversation `id`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn session_open_in_a_pane(id: &str) -> bool {
     OPEN_SESSIONS.with(|c| c.borrow().values().any(|ids| ids.contains(id)))
 }
 
 /// Store a finished tool scan (called from `history_scan::drain`).
+#[tracing::instrument(level = "debug", ret)]
 pub fn apply_tool_sessions(tool_id: &str, rows: Vec<ScannedSession>) {
     let now = crate::glow::now_epoch_ms();
     TOOL_CACHE.with(|c| {
@@ -768,6 +801,7 @@ pub fn apply_tool_sessions(tool_id: &str, rows: Vec<ScannedSession>) {
 /// The cached rows for `tool_id`, requesting a background (re-)scan when there are none yet
 /// or the last one has aged past [`TOOL_SCAN_TTL_MS`]. Never touches the disk itself: a miss
 /// returns empty and the rows appear a tick after the scan lands.
+#[tracing::instrument(level = "debug", ret)]
 pub fn tool_sessions(
     tool_id: &str,
     overrides: &std::collections::BTreeMap<String, String>,
@@ -785,6 +819,7 @@ pub fn tool_sessions(
 
 /// One cached row by (tool, resume id) — what the resume click looks up. By id rather than
 /// by index so a click can never act on the wrong row after a re-scan reorders the list.
+#[tracing::instrument(level = "debug", ret)]
 pub fn tool_session(tool_id: &str, id: &str) -> Option<ScannedSession> {
     TOOL_CACHE.with(|c| {
         c.borrow()

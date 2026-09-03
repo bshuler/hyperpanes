@@ -18,6 +18,7 @@
 
 use super::{Grant, Right};
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn label(right: Right) -> &'static str {
     match right {
         Right::ScreenRecording => "Screen capture",
@@ -30,10 +31,12 @@ pub fn label(right: Right) -> &'static str {
 }
 
 /// True when we're on a Wayland session rather than X11.
+#[tracing::instrument(level = "debug", ret)]
 fn is_wayland() -> bool {
     std::env::var("WAYLAND_DISPLAY").is_ok_and(|v| !v.is_empty())
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn status(right: Right) -> Grant {
     match right {
         // Portal-mediated on Wayland (the portal asks at capture time), ungated on X11.
@@ -45,10 +48,12 @@ pub fn status(right: Right) -> Grant {
 
 /// The portal raises its own picker when the capture starts, so there is nothing for us to
 /// raise ahead of it — asking twice would only mean two dialogs for one grant.
+#[tracing::instrument(level = "debug", ret)]
 pub fn prompt(right: Right) -> Grant {
     status(right)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn request(right: Right) -> Result<(), String> {
     match right {
         // Nothing to open: the portal's own picker appears when capture starts, and there

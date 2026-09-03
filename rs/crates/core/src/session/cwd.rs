@@ -23,6 +23,7 @@ const ST: &str = "\u{1b}\\"; // ST = ESC \
 ///   * `%20` etc. are percent-decoded
 ///   * a non-empty, non-localhost authority (a REMOTE host) is rejected so a remote
 ///     shell can't relocate the local pane.
+#[tracing::instrument(level = "debug", ret)]
 pub fn file_uri_to_path(uri: &str) -> Option<String> {
     if uri.is_empty() {
         return None;
@@ -70,6 +71,7 @@ pub fn file_uri_to_path(uri: &str) -> Option<String> {
 // Minimal `decodeURIComponent`: decode `%XX` escapes (others pass through, like
 // JS). Returns `None` on a malformed escape or non-UTF-8 result — the caller then
 // falls back to the raw (un-decoded) path, mirroring the TS try/catch.
+#[tracing::instrument(level = "debug", ret)]
 fn decode_uri_component(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -91,6 +93,7 @@ fn decode_uri_component(s: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn hex_val(b: u8) -> Option<u8> {
     match b {
         b'0'..=b'9' => Some(b - b'0'),
@@ -104,6 +107,7 @@ fn hex_val(b: u8) -> Option<u8> {
 //   * `7;<file-uri>` → file_uri_to_path  (pwsh, bash/git-bash)
 //   * `9;9;<path>`   → a raw OS path, optionally double-quoted  (cmd, Win Terminal)
 // Anything else (title `0;…`, hyperlink `8;…`, progress `9;4;…`, …) is not a cwd.
+#[tracing::instrument(level = "debug", ret)]
 fn osc_data_to_cwd(data: &str) -> Option<String> {
     if let Some(rest) = data.strip_prefix("7;") {
         return file_uri_to_path(rest);
@@ -128,6 +132,7 @@ fn osc_data_to_cwd(data: &str) -> Option<String> {
 /// of the LAST recognized sequence in this window (or `None`) plus the carry to feed
 /// the next call. Handles sequences split across chunks (split payload and split
 /// prefix) via a bounded carry.
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_osc_cwd(carry: &str, chunk: &str) -> (Option<String>, String) {
     // Fast reject: nothing pending and no ESC anywhere → impossible to hold an OSC.
     if carry.is_empty() && !chunk.contains('\u{1b}') {

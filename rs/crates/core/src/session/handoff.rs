@@ -70,6 +70,7 @@ pub const MAX_PAYLOAD: usize = 64 * 1024 * 1024;
 ///
 /// Errors if `fds` exceeds [`MAX_FDS_PER_MSG`] or `payload` exceeds [`MAX_PAYLOAD`] — a
 /// caller that needs more must chunk.
+#[tracing::instrument(level = "debug", ret)]
 pub fn send_with_fds(sock: &UnixStream, payload: &[u8], fds: &[RawFd]) -> io::Result<()> {
     if fds.len() > MAX_FDS_PER_MSG {
         return Err(io::Error::new(
@@ -108,6 +109,7 @@ pub fn send_with_fds(sock: &UnixStream, payload: &[u8], fds: &[RawFd]) -> io::Re
 /// closed without sending, which is how a takeover loop learns the incumbent is done.
 /// An EOF *mid-message* is an error, since a truncated handoff must never be mistaken for
 /// a complete one.
+#[tracing::instrument(level = "debug", ret)]
 pub fn recv_with_fds(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Vec<OwnedFd>)>> {
     let mut head = [0u8; 4];
     let (n, fds) = recvmsg_with_fds(sock, &mut head)?;
@@ -136,6 +138,7 @@ pub fn recv_with_fds(sock: &UnixStream) -> io::Result<Option<(Vec<u8>, Vec<Owned
 
 /// One `sendmsg` carrying `buf` plus an `SCM_RIGHTS` control message for `fds`. Returns
 /// the number of `buf` bytes the kernel accepted (a stream socket may take fewer).
+#[tracing::instrument(level = "debug", ret)]
 fn sendmsg_with_fds(sock: &UnixStream, buf: &[u8], fds: &[RawFd]) -> io::Result<usize> {
     debug_assert!(!buf.is_empty(), "SCM_RIGHTS needs at least one data byte");
 
@@ -192,6 +195,7 @@ const RECV_FLAGS: libc::c_int = 0;
 
 /// Mark `fd` close-on-exec. Called on every received descriptor — redundant where
 /// [`RECV_FLAGS`] already set it, and load-bearing on macOS where it did not.
+#[tracing::instrument(level = "debug", ret)]
 fn set_cloexec(fd: RawFd) -> io::Result<()> {
     // SAFETY: `fd` is owned by the caller (already wrapped in an `OwnedFd`) and live.
     unsafe {
@@ -208,6 +212,7 @@ fn set_cloexec(fd: RawFd) -> io::Result<()> {
 
 /// One `recvmsg` into `buf`, collecting any `SCM_RIGHTS` descriptors. Returns the byte
 /// count plus the descriptors, already owned.
+#[tracing::instrument(level = "debug", ret)]
 fn recvmsg_with_fds(sock: &UnixStream, buf: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
     // SAFETY: as in `sendmsg_with_fds` — locals outlive the call, and the control buffer is
     // sized by CMSG_SPACE for the maximum descriptor count we are willing to accept.

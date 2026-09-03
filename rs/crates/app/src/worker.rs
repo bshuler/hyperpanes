@@ -110,12 +110,14 @@ struct ClaimOut {
 }
 
 /// True if argv requests worker mode: `hyperpanes worker ...` (subcommand in argv[1]).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn wants_worker(argv: &[String]) -> bool {
     argv.get(1).map(|a| a == "worker").unwrap_or(false)
 }
 
 /// Parse `worker --queue <q> [--worker <id>] -- <cmd...>`.
 /// `argv[0]` is the program, `argv[1]` is `worker`; parsing starts at index 2.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn parse_args(argv: &[String]) -> Result<WorkerArgs, String> {
     let mut queue: Option<String> = None;
     let mut worker: Option<String> = None;
@@ -267,16 +269,19 @@ pub fn parse_args(argv: &[String]) -> Result<WorkerArgs, String> {
 }
 
 /// pid-suffixed default so two bare `hyperpanes worker` invocations don't share an id.
+#[tracing::instrument(level = "debug", skip_all)]
 fn default_worker_name() -> String {
     format!("worker-{}", std::process::id())
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn short(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
 /// Read `control.json` (env override `HYPERPANES_CONTROL_FILE`, else the state-dir default).
 /// Panes may inherit `HYPERPANES_CONTROL_FILE` set-but-empty from the app; treat empty as unset.
+#[tracing::instrument(level = "debug", skip_all)]
 fn load_discovery() -> Result<Discovery, Box<dyn Error>> {
     let path = std::env::var_os("HYPERPANES_CONTROL_FILE")
         .filter(|v| !v.is_empty())
@@ -292,6 +297,7 @@ fn load_discovery() -> Result<Discovery, Box<dyn Error>> {
 }
 
 /// Entry point from `main`. Drains `--queue` until empty, then returns `Ok(())`.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn run(argv: &[String]) -> Result<(), Box<dyn Error>> {
     let args = match parse_args(argv) {
         Ok(a) => a,
@@ -403,6 +409,7 @@ pub fn run(argv: &[String]) -> Result<(), Box<dyn Error>> {
 
 /// Hold the process (and therefore its pane, which auto-closes on exit) open after the drain, so
 /// the run stays readable. No-op at 0.
+#[tracing::instrument(level = "debug", skip_all)]
 fn linger(secs: u64) {
     if secs == 0 {
         return;
@@ -414,6 +421,7 @@ fn linger(secs: u64) {
 /// One worker's claim → run → ack/nack loop. Returns the number of tasks acked; stops when a
 /// claim comes back empty. Shared by the single-worker and `--count` paths.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(level = "debug", skip_all)]
 fn drain(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -530,6 +538,7 @@ fn drain(
     }
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn claim_one(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -559,10 +568,12 @@ pub struct ChildOutput {
 }
 
 impl ChildOutput {
+    #[tracing::instrument(level = "debug", skip_all)]
     fn piped(&self) -> bool {
         self.stream || self.log_dir.is_some()
     }
     /// Where this task's raw transcript is kept (so it outlives the pane).
+    #[tracing::instrument(level = "debug", skip_all)]
     fn log_path(&self, queue: &str, task_id: &str) -> Option<PathBuf> {
         self.log_dir
             .as_ref()
@@ -573,6 +584,7 @@ impl ChildOutput {
 /// Run the child command with the task in its environment, while a background heartbeat renews
 /// the lease (#12) so a long-running task is not reclaimed mid-flight. Returns Ok(true) on exit 0.
 #[allow(clippy::too_many_arguments)]
+#[tracing::instrument(level = "debug", skip_all)]
 fn run_child(
     child: &[String],
     task: &Task,
@@ -637,6 +649,7 @@ fn run_child(
 /// (b) rendered into the pane. With `--stream`, Claude `--output-format stream-json` lines become
 /// readable progress; anything else passes through unchanged, so a plain shell task still looks
 /// the same. Every line is prefixed with the worker + task so `--count N` interleaving is legible.
+#[tracing::instrument(level = "debug", skip_all)]
 fn run_child_piped(
     mut cmd: Command,
     task: &Task,
@@ -715,6 +728,7 @@ fn run_child_piped(
 /// Render one line of Claude's `--output-format stream-json` into a short human line, or `None`
 /// to drop it. A line that isn't such an event (plain program output) is returned unchanged, so
 /// this is safe to run over any child's stdout.
+#[tracing::instrument(level = "debug", skip_all)]
 fn render_stream_line(line: &str) -> Option<String> {
     let trimmed = line.trim();
     if !trimmed.starts_with('{') {
@@ -779,6 +793,7 @@ fn render_stream_line(line: &str) -> Option<String> {
 }
 
 /// Collapse whitespace and clip to `max` chars, so one rendered event stays one readable line.
+#[tracing::instrument(level = "debug", skip_all)]
 fn one_line(s: &str, max: usize) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {
@@ -789,6 +804,7 @@ fn one_line(s: &str, max: usize) -> String {
 }
 
 /// Sleep up to `ms`, waking early and returning `true` if `stop` gets set; `false` on timeout.
+#[tracing::instrument(level = "debug", skip_all)]
 fn sleep_interruptible(stop: &AtomicBool, ms: u64) -> bool {
     let step = 200u64;
     let mut waited = 0u64;
@@ -803,6 +819,7 @@ fn sleep_interruptible(stop: &AtomicBool, ms: u64) -> bool {
     stop.load(Ordering::Relaxed)
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -810,6 +827,7 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn ack(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -830,6 +848,7 @@ fn ack(
 
 /// Nack a failed task. Returns the resulting queue state: `queued` (will retry) | `failed` |
 /// `dead` (retries exhausted). `delay_ms` overrides the backoff when set (#13).
+#[tracing::instrument(level = "debug", skip_all)]
 fn nack(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -860,6 +879,7 @@ fn nack(
 }
 
 /// POST /tasks/{id}/extend — renew the lease (heartbeat, #12).
+#[tracing::instrument(level = "debug", skip_all)]
 fn extend(
     client: &reqwest::blocking::Client,
     base: &str,
@@ -883,6 +903,7 @@ fn extend(
 /// before any task is claimed. Each task still resolves the ref at claim time (see
 /// `Worktree::create_in`), so a branch that advances mid-run — a dependent wave's integration
 /// branch — is picked up per task.
+#[tracing::instrument(level = "debug", skip_all)]
 fn validate_base(base: &str) -> Result<(), Box<dyn Error>> {
     let ok = Command::new("git")
         .args(["rev-parse", "--verify", "--quiet"])
@@ -910,6 +931,7 @@ struct Worktree {
 }
 
 impl Worktree {
+    #[tracing::instrument(level = "debug", skip_all)]
     fn create(queue: &str, task_id: &str, base: &str) -> Result<Self, Box<dyn Error>> {
         let repo =
             std::env::current_dir().map_err(|e| format!("worktree: cannot resolve cwd: {e}"))?;
@@ -919,6 +941,7 @@ impl Worktree {
     /// Explicit-repo body so tests can prove the fork point without touching the process cwd.
     /// `base` is resolved by git HERE, at task start — not pinned at runner start — so a ref
     /// that advances between tasks forks from its current tip.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn create_in(
         repo: &Path,
         queue: &str,
@@ -1003,6 +1026,7 @@ impl Worktree {
         })
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     fn remove(&self) {
         let _ = Command::new("git")
             .current_dir(&self.repo)

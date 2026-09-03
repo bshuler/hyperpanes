@@ -72,6 +72,7 @@ thread_local! {
 /// `id` is the window's registry id: only window 0 is the app's window in the sense the
 /// human means. Tear-off and re-host windows keep their existing cascade placement, because
 /// restoring them all to one remembered frame would stack them exactly on top of each other.
+#[tracing::instrument(level = "debug", ret, skip(aw))]
 pub fn restore_geometry(id: usize, aw: &crate::AppWindow) {
     if id != 0 || WATCHING.with(|w| w.replace(true)) {
         return;
@@ -113,6 +114,7 @@ pub fn restore_geometry(id: usize, aw: &crate::AppWindow) {
 }
 
 /// One watcher tick: read the live frame, and write it only once it has stopped changing.
+#[tracing::instrument(level = "debug", ret, skip(win))]
 fn poll(win: &slint::Window) {
     // A fullscreen window's frame is the screen, and restoring INTO fullscreen without the
     // human asking is hostile — so fullscreen is simply not observed. The last windowed
@@ -173,6 +175,7 @@ fn poll(win: &slint::Window) {
 /// Called from the watcher once the frame settles, and again from `main` after the event
 /// loop returns — a quit within the settle window would otherwise lose the very last
 /// resize, which is exactly the one the human just made.
+#[tracing::instrument(level = "debug", ret)]
 pub fn flush_geometry() {
     let Some(g) = PENDING.with(|c| c.take()) else {
         return;
@@ -189,6 +192,7 @@ pub fn flush_geometry() {
 ///
 /// An empty list means "could not enumerate" (Wayland, an unexpected platform) and makes
 /// the clamp a no-op rather than a guess — see `WindowGeometry::clamp_to_displays`.
+#[tracing::instrument(level = "debug", ret)]
 fn displays() -> Vec<DisplayRect> {
     super::platform::displays()
         .into_iter()

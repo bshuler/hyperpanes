@@ -58,6 +58,7 @@ struct Owner {
     version: String,
 }
 
+#[tracing::instrument(level = "debug")]
 fn read_owner(path: &Path) -> Option<Owner> {
     let bytes = std::fs::read(path).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -65,6 +66,7 @@ fn read_owner(path: &Path) -> Option<Owner> {
 
 /// The pid recorded in the discovery file, if it parses. `remove_discovery` uses this
 /// to ensure only the recorded owner deletes the file.
+#[tracing::instrument(level = "debug", ret)]
 pub fn recorded_pid(path: &Path) -> Option<u32> {
     read_owner(path).map(|o| o.pid)
 }
@@ -73,10 +75,12 @@ pub fn recorded_pid(path: &Path) -> Option<u32> {
 /// `our_pid` (retrying briefly in case that owner is mid-exit). See the module docs
 /// for the full claim/refuse matrix — everything short of a verified live foreign
 /// owner claims.
+#[tracing::instrument(level = "debug", ret)]
 pub async fn ensure_claimable(path: &Path, our_pid: u32) -> io::Result<()> {
     ensure_claimable_with(path, our_pid, RETRY_TOTAL, RETRY_STEP).await
 }
 
+#[tracing::instrument(level = "debug", ret)]
 async fn ensure_claimable_with(
     path: &Path,
     our_pid: u32,
@@ -102,6 +106,7 @@ async fn ensure_claimable_with(
 /// `Some(owner)` only when the file records a pid that is alive, is not ours, AND
 /// verifiably looks like a hyperpanes process. `None` (claimable) for everything
 /// else, including a live pid with unreadable identity — the guard fails open.
+#[tracing::instrument(level = "debug")]
 fn live_foreign_hyperpanes_owner(path: &Path, our_pid: u32) -> Option<Owner> {
     let owner = read_owner(path)?;
     if owner.pid == our_pid || !pid_alive(owner.pid) {
@@ -118,6 +123,7 @@ fn live_foreign_hyperpanes_owner(path: &Path, our_pid: u32) -> Option<Owner> {
 /// Does a process name/path look like one of ours? Matches the installed GUI
 /// (`/usr/bin/hyperpanes`), dev builds living under a `hyperpanes` checkout, and the
 /// core `headless` bin (whose basename carries no "hyperpanes").
+#[tracing::instrument(level = "debug", ret)]
 fn is_hyperpanes_name(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("hyperpanes")
@@ -125,6 +131,7 @@ fn is_hyperpanes_name(name: &str) -> bool {
             .any(|part| part.strip_suffix(".exe").unwrap_or(part) == "headless")
 }
 
+#[tracing::instrument(level = "debug", ret, skip(owner))]
 fn refusal_message(path: &Path, owner: &Owner) -> String {
     format!(
         "refusing to overwrite control file {path}: a live hyperpanes instance owns it \
@@ -146,6 +153,7 @@ fn refusal_message(path: &Path, owner: &Owner) -> String {
 /// Is a process with this pid alive right now? Zombies count as DEAD: an exiting
 /// owner that its parent has not reaped yet must not block a claim.
 #[cfg(target_os = "linux")]
+#[tracing::instrument(level = "debug", ret)]
 fn pid_alive(pid: u32) -> bool {
     let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
         return false;
@@ -166,6 +174,7 @@ fn pid_alive(pid: u32) -> bool {
 /// Cargo.toml is frozen (no `libc`) — so probe with `ps`. No output ⇒ dead; a
 /// leading `Z` state ⇒ zombie, dead for our purposes.
 #[cfg(all(unix, not(target_os = "linux")))]
+#[tracing::instrument(level = "debug", ret)]
 fn pid_alive(pid: u32) -> bool {
     match std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "stat="])
@@ -180,6 +189,7 @@ fn pid_alive(pid: u32) -> bool {
 }
 
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 fn pid_alive(pid: u32) -> bool {
     use windows::Win32::Foundation::{CloseHandle, ERROR_ACCESS_DENIED, STILL_ACTIVE};
     use windows::Win32::System::Threading::{
@@ -201,6 +211,7 @@ fn pid_alive(pid: u32) -> bool {
 /// The process's name/path, best-effort: comm + argv0 on Linux, `ps -o comm=`
 /// elsewhere on unix, the image path on Windows. `None` when unreadable.
 #[cfg(target_os = "linux")]
+#[tracing::instrument(level = "debug", ret)]
 fn process_name(pid: u32) -> Option<String> {
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).ok();
     let argv0 = std::fs::read(format!("/proc/{pid}/cmdline"))
@@ -222,6 +233,7 @@ fn process_name(pid: u32) -> Option<String> {
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
+#[tracing::instrument(level = "debug", ret)]
 fn process_name(pid: u32) -> Option<String> {
     let out = std::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "comm="])
@@ -236,6 +248,7 @@ fn process_name(pid: u32) -> Option<String> {
 }
 
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 fn process_name(pid: u32) -> Option<String> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::CloseHandle;

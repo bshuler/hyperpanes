@@ -55,6 +55,7 @@ struct Cached {
 }
 
 impl Default for CopilotProvider {
+    #[tracing::instrument(level = "debug")]
     fn default() -> Self {
         Self::new()
     }
@@ -63,6 +64,7 @@ impl Default for CopilotProvider {
 impl CopilotProvider {
     /// A provider with no per-tool path override — detection falls to `PATH` and the
     /// well-known install locations.
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
@@ -75,6 +77,7 @@ impl CopilotProvider {
     /// A provider that honours the human's per-tool binary overrides (the settings page's
     /// `tool id -> path` map). Held rather than passed per call because
     /// [`SessionProvider::resume`] takes `&self`.
+    #[tracing::instrument(level = "debug")]
     pub fn with_overrides(overrides: BTreeMap<String, String>) -> Self {
         Self {
             overrides,
@@ -83,6 +86,7 @@ impl CopilotProvider {
     }
 
     /// Scan `root` (one `.copilot` directory) rather than the real `~/.copilot`.
+    #[tracing::instrument(level = "debug", skip(root))]
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Some(root.into()),
@@ -93,11 +97,13 @@ impl CopilotProvider {
     /// Sessions whose text was re-read from the store by the last
     /// [`scan`](SessionProvider::scan) — the cache effectiveness the 20 s refresh lives or
     /// dies by, surfaced so it can be asserted on.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn last_scan_parsed(&self) -> usize {
         self.last_scan_parsed
     }
 
     /// The database this provider reads, or `None` when no home directory is known.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn store_path(&self) -> Option<PathBuf> {
         match &self.root {
             Some(r) => Some(r.join(STORE_FILE)),
@@ -108,6 +114,7 @@ impl CopilotProvider {
 
 /// `~/.copilot`, the store's home. Windows first because a `HOME` set by a POSIX-ish shell
 /// there is not where the CLI writes — same order `claude_history.rs` uses.
+#[tracing::instrument(level = "debug", ret)]
 pub fn copilot_root() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     if home.is_empty() {
@@ -118,6 +125,7 @@ pub fn copilot_root() -> Option<PathBuf> {
 
 /// Whether `root` (a `.copilot` directory) holds a store worth scanning. Used by callers
 /// that want to skip the whole provider when the tool has never run on this machine.
+#[tracing::instrument(level = "debug", ret)]
 pub fn store_exists(root: &Path) -> bool {
     root.join(STORE_FILE).is_file()
 }
@@ -135,6 +143,7 @@ pub fn store_exists(root: &Path) -> bool {
 /// checkpointed are invisible until it does. On the machine this was written against that
 /// was one session out of 921 — the newest one. A row that shows up a checkpoint late beats
 /// a scanner that touches a running agent's store.
+#[tracing::instrument(level = "debug", ret)]
 fn open_immutable(db: &Path) -> Option<Connection> {
     if !db.is_file() {
         return None;
@@ -150,6 +159,7 @@ fn open_immutable(db: &Path) -> Option<Connection> {
 /// (`file:///Users/me/...`, `file:///C:/Users/me/...`). Percent-encodes everything outside
 /// the unreserved set so a `?` or `#` in a directory name cannot terminate the path and
 /// silently turn into query parameters.
+#[tracing::instrument(level = "debug", ret)]
 fn store_uri(db: &Path) -> String {
     let raw = db.to_string_lossy().replace('\\', "/");
     let mut out = String::from("file:///");
@@ -179,6 +189,7 @@ struct SessionRow {
 impl SessionRow {
     /// What makes a cached row stale. `updated_at` moves on every write to the conversation;
     /// `created_at` joins it so a session id reused after a store wipe cannot look warm.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn fingerprint(&self) -> String {
         format!("{}|{}", self.created_at, self.updated_at)
     }
@@ -186,6 +197,7 @@ impl SessionRow {
 
 /// Read every `sessions` row. A store whose schema we do not recognise (an older or newer
 /// Copilot) yields nothing rather than an error the panel has no way to act on.
+#[tracing::instrument(level = "debug")]
 fn read_rows(conn: &Connection) -> Vec<SessionRow> {
     let Ok(mut stmt) = conn.prepare(
         "SELECT id, COALESCE(cwd,''), COALESCE(repository,''), COALESCE(branch,''), \
@@ -225,6 +237,7 @@ struct Body {
 /// 232 KB. All of it past [`FULL_TEXT_MAX`] is thrown away a few lines below, so bounding it
 /// in SQL means the bytes are never read, never allocated, and never whitespace-collapsed.
 /// One character past the cap keeps the truncation decision where it already lives.
+#[tracing::instrument(level = "debug")]
 fn read_body(conn: &Connection, id: &str) -> Body {
     let mut body = Body::default();
     let Ok(mut stmt) = conn.prepare_cached(
@@ -267,6 +280,7 @@ fn read_body(conn: &Connection, id: &str) -> Body {
 /// `owner/name` repository slug, which is a *label* — [`ProjectOrigin::DecodedUnverified`],
 /// so [`check_project`] refuses to spawn in it and the panel greys the row. A session with
 /// neither has nothing to group under and no path to resume into, so it is dropped.
+#[tracing::instrument(level = "debug", ret, skip(row))]
 fn project_for(row: &SessionRow) -> Option<(PathBuf, ProjectOrigin)> {
     let cwd = Path::new(row.cwd.trim());
     if !row.cwd.trim().is_empty() && cwd.is_absolute() {
@@ -282,6 +296,7 @@ fn project_for(row: &SessionRow) -> Option<(PathBuf, ProjectOrigin)> {
 }
 
 /// Widen one row plus its text into a panel row.
+#[tracing::instrument(level = "debug", ret, skip(row, body))]
 fn to_session(
     row: &SessionRow,
     project: PathBuf,
@@ -315,10 +330,12 @@ fn to_session(
 }
 
 impl SessionProvider for CopilotProvider {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn id(&self) -> &'static str {
         TOOL_ID
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn scan(&mut self) -> Vec<ToolSession> {
         self.last_scan_parsed = 0;
         let Some(db) = self.store_path() else {
@@ -361,6 +378,7 @@ impl SessionProvider for CopilotProvider {
         out
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn resume(&self, session: &ToolSession) -> ResumePlan {
         if session.source != HistorySource::Copilot {
             return ResumePlan::Blocked(ResumeBlocked::Unsupported {
@@ -395,6 +413,7 @@ impl SessionProvider for CopilotProvider {
 // ===== small local mirrors of `claude_history.rs`'s private text helpers =====
 
 /// Collapse all whitespace to single spaces, trim, truncate to [`SUMMARY_MAX`] characters.
+#[tracing::instrument(level = "debug", ret)]
 fn clean_line(s: &str) -> String {
     let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= SUMMARY_MAX {
@@ -407,6 +426,7 @@ fn clean_line(s: &str) -> String {
 
 /// Append one message to the bounded, lowercased, whitespace-collapsed search extract.
 /// Stored lowercased because search never re-lowers it.
+#[tracing::instrument(level = "debug", ret)]
 fn push_full_text(full: &mut String, text: &str) {
     if full.len() >= FULL_TEXT_MAX {
         return;
@@ -438,6 +458,7 @@ fn push_full_text(full: &mut String, text: &str) {
 /// `DEFAULT (datetime('now'))` writes when the CLI omits the value. Parsed by position
 /// rather than inferred: anything else is `None`, and a row with no usable stamp sorts last
 /// instead of sorting wrong.
+#[tracing::instrument(level = "debug", ret)]
 fn epoch_ms(s: &str) -> Option<u64> {
     let b = s.trim().as_bytes();
     if b.len() < 19 {
@@ -479,6 +500,7 @@ fn epoch_ms(s: &str) -> Option<u64> {
 
 /// Days since 1970-01-01 for a proleptic Gregorian date (Howard Hinnant's `days_from_civil`).
 /// Hand-rolled because the crate has no date dependency and is not getting one for this.
+#[tracing::instrument(level = "debug", ret)]
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;

@@ -25,6 +25,7 @@ pub const TOOL_ID: &str = "codex";
 /// and a human who set it means it; `USERPROFILE` before `HOME` for the same reason
 /// `copilot_root` does — a `HOME` set by a POSIX-ish shell on Windows is not where the CLI
 /// writes.
+#[tracing::instrument(level = "debug", ret)]
 pub fn codex_root() -> Option<PathBuf> {
     if let Some(v) = std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(v));
@@ -47,6 +48,7 @@ pub fn codex_root() -> Option<PathBuf> {
 ///
 /// The id is matched against directory *entries*, never joined into the path, so a hostile
 /// value can name nothing outside the tree even if one reached here.
+#[tracing::instrument(level = "debug", ret)]
 pub fn rollout_for_session(root: &Path, session_id: &str) -> Option<PathBuf> {
     if session_id.is_empty() {
         return None;
@@ -65,6 +67,7 @@ pub fn rollout_for_session(root: &Path, session_id: &str) -> Option<PathBuf> {
 }
 
 /// The `rollout-*` file in one day directory whose name ends in `suffix`.
+#[tracing::instrument(level = "debug", ret)]
 fn rollout_in_day(day: &Path, suffix: &str) -> Option<PathBuf> {
     for entry in std::fs::read_dir(day).ok()?.flatten() {
         let name = entry.file_name();
@@ -80,6 +83,7 @@ fn rollout_in_day(day: &Path, suffix: &str) -> Option<PathBuf> {
 ///
 /// Non-numeric entries are skipped rather than sorted in: the tree is `YYYY/MM/DD`, and a
 /// stray file or a `.DS_Store` there must not become a directory the walk descends into.
+#[tracing::instrument(level = "debug", ret)]
 fn numeric_dirs_desc(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();

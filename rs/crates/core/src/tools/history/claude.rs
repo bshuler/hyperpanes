@@ -29,6 +29,7 @@ pub struct ClaudeProvider {
 }
 
 impl Default for ClaudeProvider {
+    #[tracing::instrument(level = "debug")]
     fn default() -> Self {
         Self::new()
     }
@@ -37,6 +38,7 @@ impl Default for ClaudeProvider {
 impl ClaudeProvider {
     /// A provider with no per-tool path override — detection falls to `PATH` and the
     /// well-known install locations.
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Self {
         Self {
             cache: SessionCache::new(),
@@ -48,6 +50,7 @@ impl ClaudeProvider {
     /// A provider that honours the human's per-tool binary overrides (the settings page's
     /// `tool id -> path` map). Held rather than passed per call because
     /// [`SessionProvider::resume`] takes `&self`.
+    #[tracing::instrument(level = "debug")]
     pub fn with_overrides(overrides: BTreeMap<String, String>) -> Self {
         Self {
             overrides,
@@ -56,6 +59,7 @@ impl ClaudeProvider {
     }
 
     /// Scan `root` (one `projects/` directory) rather than every account's store.
+    #[tracing::instrument(level = "debug", skip(root))]
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Some(root.into()),
@@ -65,12 +69,14 @@ impl ClaudeProvider {
 
     /// Transcripts re-parsed by the last [`scan`](SessionProvider::scan) — the cache
     /// effectiveness the global scan lives or dies by, surfaced so it can be asserted on.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn last_scan_parsed(&self) -> usize {
         self.cache.last_scan_parsed()
     }
 
     /// The per-project results behind the flat row list, for callers that want the project
     /// structure (and its [`crate::claude_history::ProjectOrigin`]) rather than rows.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scan_projects(&mut self) -> Vec<ProjectSessions> {
         match &self.root {
             Some(root) => {
@@ -84,6 +90,7 @@ impl ClaudeProvider {
 
 /// Flatten one project's sessions into panel rows, stamping each with the project path and
 /// the provenance of that path.
+#[tracing::instrument(level = "debug", ret)]
 fn rows_for(project: &ProjectSessions) -> impl Iterator<Item = ToolSession> + '_ {
     project.sessions.iter().map(move |s| ToolSession {
         id: s.id.clone(),
@@ -102,11 +109,13 @@ fn rows_for(project: &ProjectSessions) -> impl Iterator<Item = ToolSession> + '_
 }
 
 impl SessionProvider for ClaudeProvider {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn id(&self) -> &'static str {
         // `TOOL_ID` is `&'static str` already; the constant exists so `detect` and this agree.
         TOOL_ID
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn scan(&mut self) -> Vec<ToolSession> {
         let projects = self.scan_projects();
         let mut rows: Vec<ToolSession> = projects.iter().flat_map(rows_for).collect();
@@ -114,6 +123,7 @@ impl SessionProvider for ClaudeProvider {
         rows
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn resume(&self, session: &ToolSession) -> ResumePlan {
         if session.source != HistorySource::Claude {
             return ResumePlan::Blocked(ResumeBlocked::Unsupported {
@@ -147,6 +157,7 @@ impl SessionProvider for ClaudeProvider {
 
 /// Whether `path` looks like a Claude `projects/` store worth scanning. Used by callers that
 /// want to skip the whole provider when the tool has never run on this machine.
+#[tracing::instrument(level = "debug", ret)]
 pub fn store_exists(path: &Path) -> bool {
     path.is_dir()
 }

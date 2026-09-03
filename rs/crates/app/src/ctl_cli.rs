@@ -20,6 +20,7 @@ use serde_json::{json, Value};
 
 use crate::control_cli::{self, Conn};
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn wants_ctl(argv: &[String]) -> bool {
     argv.get(1).map(|a| a == "ctl").unwrap_or(false)
 }
@@ -71,6 +72,7 @@ usage: hyperpanes ctl <verb> [args]
 Ids: a pane id comes from `panes`; a tab id is \"{window}:{index}\" and comes from `tabs`.
 Tab ids are POSITIONAL — re-read `tabs` after anything that reorders or closes one.";
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn run(argv: &[String]) -> std::io::Result<()> {
     let verb = argv.get(2).map(String::as_str).unwrap_or("");
     if verb.is_empty() || verb == "help" || verb == "--help" || verb == "-h" {
@@ -291,10 +293,12 @@ pub fn run(argv: &[String]) -> std::io::Result<()> {
 
 // ---- HTTP ----------------------------------------------------------------------------------
 
+#[tracing::instrument(level = "debug", ret, skip(conn))]
 fn get(conn: &Conn, path: &str) -> std::io::Result<Value> {
     send(conn.client.get(format!("{}{path}", conn.base)), conn, path)
 }
 
+#[tracing::instrument(level = "debug", ret, skip(conn))]
 fn post(conn: &Conn, path: &str, body: Value) -> std::io::Result<Value> {
     send(
         conn.client.post(format!("{}{path}", conn.base)).json(&body),
@@ -303,6 +307,7 @@ fn post(conn: &Conn, path: &str, body: Value) -> std::io::Result<Value> {
     )
 }
 
+#[tracing::instrument(level = "debug", ret, skip(conn))]
 fn patch(conn: &Conn, path: &str, body: Value) -> std::io::Result<Value> {
     send(
         conn.client
@@ -315,6 +320,7 @@ fn patch(conn: &Conn, path: &str, body: Value) -> std::io::Result<Value> {
 
 /// Send, and turn anything that isn't a 2xx into a message on stderr plus exit 1 — an agent
 /// reading stdout should never have to tell a successful response from an error object.
+#[tracing::instrument(level = "debug", ret, skip(conn))]
 fn send(req: reqwest::blocking::RequestBuilder, conn: &Conn, path: &str) -> std::io::Result<Value> {
     let resp = req
         .bearer_auth(&conn.token)
@@ -335,12 +341,14 @@ fn send(req: reqwest::blocking::RequestBuilder, conn: &Conn, path: &str) -> std:
 
 // ---- output --------------------------------------------------------------------------------
 
+#[tracing::instrument(level = "debug", ret)]
 fn print_json(v: Value) {
     println!("{}", serde_json::to_string_pretty(&v).unwrap_or_default());
 }
 
 /// `/state` as an outline. The point is that one screenful answers "what is open, and what is
 /// each thing's id" — the two questions every other verb needs answered first.
+#[tracing::instrument(level = "debug", ret)]
 fn print_outline(state: &Value) {
     for w in state
         .get("windows")
@@ -380,6 +388,7 @@ fn print_outline(state: &Value) {
 
 /// Every pane, flat, with the tab it sits in — the listing to grep when you know a pane by its
 /// title and need its id.
+#[tracing::instrument(level = "debug", ret)]
 fn print_panes(state: &Value) {
     for w in state
         .get("windows")
@@ -416,6 +425,7 @@ fn usage(msg: &str) -> ! {
     std::process::exit(2);
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn need<'a>(v: Option<&'a String>, msg: &str) -> &'a str {
     match v.map(String::as_str).filter(|s| !s.is_empty()) {
         Some(s) => s,
@@ -423,6 +433,7 @@ fn need<'a>(v: Option<&'a String>, msg: &str) -> &'a str {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn path_arg(v: Option<&String>, msg: &str) -> String {
     let p = need(v, msg);
     if p.starts_with('/') {
@@ -432,12 +443,14 @@ fn path_arg(v: Option<&String>, msg: &str) -> String {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn parse_json(v: Option<&String>, msg: &str) -> Value {
     let raw = need(v, msg);
     serde_json::from_str(raw).unwrap_or_else(|e| usage(&format!("{msg}   (bad json: {e})")))
 }
 
 /// Split `<positional> [--flag value | --flag]` into the first positional and a flag map.
+#[tracing::instrument(level = "debug", ret)]
 fn split_flags(args: &[String], msg: &str) -> (String, BTreeMap<String, String>) {
     let (pos, flags) = split_flags_optional(args);
     match pos.into_iter().next() {
@@ -448,6 +461,7 @@ fn split_flags(args: &[String], msg: &str) -> (String, BTreeMap<String, String>)
 
 /// The same split with no required positional. A `--flag` with no value is recorded as present
 /// with an empty value, so `flags.contains_key("raw")` is the test for a bare switch.
+#[tracing::instrument(level = "debug", ret)]
 fn split_flags_optional(args: &[String]) -> (Vec<String>, BTreeMap<String, String>) {
     let mut pos = Vec::new();
     let mut flags = BTreeMap::new();
@@ -472,17 +486,20 @@ fn split_flags_optional(args: &[String]) -> (Vec<String>, BTreeMap<String, Strin
     (pos, flags)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn put_str(cmd: &mut Value, key: &str, val: Option<&String>) {
     if let Some(v) = val.filter(|v| !v.is_empty()) {
         cmd[key] = json!(v);
     }
 }
 
+#[tracing::instrument(level = "debug", ret, skip(conn))]
 fn pane_verb(conn: &Conn, ty: &str, args: &[String], msg: &str) -> std::io::Result<Value> {
     let pane = need(args.first(), msg);
     post(conn, "/command", json!({ "type": ty, "paneId": pane }))
 }
 
+#[tracing::instrument(level = "debug", ret, skip(conn))]
 fn tab_verb(conn: &Conn, ty: &str, args: &[String], msg: &str) -> std::io::Result<Value> {
     let tab = need(args.first(), msg);
     post(conn, "/command", json!({ "type": ty, "tabId": tab }))

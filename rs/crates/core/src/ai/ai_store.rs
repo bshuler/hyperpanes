@@ -21,6 +21,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const TIMELINE_CAP: usize = 200;
 
+#[tracing::instrument(level = "debug", ret)]
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -91,6 +92,7 @@ struct AiMemoryFile {
 }
 
 impl Default for AiMemoryFile {
+    #[tracing::instrument(level = "debug", ret)]
     fn default() -> Self {
         Self {
             version: 1,
@@ -127,6 +129,7 @@ pub struct AiMemoryStore {
 }
 
 impl AiMemoryStore {
+    #[tracing::instrument(level = "debug", skip(file_path))]
     pub fn new(file_path: impl Into<PathBuf>) -> Self {
         Self {
             file_path: file_path.into(),
@@ -136,6 +139,7 @@ impl AiMemoryStore {
 
     /// Read the file into the in-memory cache. A missing OR corrupt/unparseable
     /// file is tolerated — we start empty, never panicking out of `load`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn load(&mut self) {
         self.data = match std::fs::read_to_string(&self.file_path) {
             Ok(text) => match serde_json::from_str::<AiMemoryFile>(&text) {
@@ -149,6 +153,7 @@ impl AiMemoryStore {
         };
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn get_project(&self, path: &str) -> Option<&ProjectMemory> {
         self.data.projects.get(path)
     }
@@ -156,6 +161,7 @@ impl AiMemoryStore {
     /// Create-or-update a project record, shallow-merging the patch over any
     /// existing record. Stamps `summary_updated_at` whenever the summary is touched.
     /// Stores by the caller-supplied key verbatim (no path canonicalization).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn upsert_project(&mut self, path: &str, patch: ProjectPatch) -> ProjectMemory {
         let mut merged = self
             .data
@@ -192,6 +198,7 @@ impl AiMemoryStore {
 
     /// Push an entry onto a project's timeline (creating the project if absent),
     /// trimming to the most-recent `TIMELINE_CAP` entries (drop oldest).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn append_timeline(&mut self, path: &str, entry: TimelineEntry) {
         if !self.data.projects.contains_key(path) {
             self.upsert_project(path, ProjectPatch::default());
@@ -204,12 +211,14 @@ impl AiMemoryStore {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn get_pane(&self, pane_id: &str) -> Option<&PaneMemory> {
         self.data.panes.get(pane_id)
     }
 
     /// Create-or-update a pane record, shallow-merging the patch and bumping
     /// `updated_at`. Stores by the caller-supplied paneId verbatim.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn upsert_pane(&mut self, pane_id: &str, patch: PanePatch) -> PaneMemory {
         let mut merged = self.data.panes.get(pane_id).cloned().unwrap_or(PaneMemory {
             pane_id: pane_id.to_string(),
@@ -245,11 +254,13 @@ impl AiMemoryStore {
         merged
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn prune_pane(&mut self, pane_id: &str) {
         self.data.panes.remove(pane_id);
     }
 
     /// Drop every pane whose id is not in the keep-list.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn prune_panes_except(&mut self, keep_pane_ids: &[String]) {
         let keep: std::collections::HashSet<&str> =
             keep_pane_ids.iter().map(|s| s.as_str()).collect();
@@ -257,12 +268,14 @@ impl AiMemoryStore {
     }
 
     /// Force an immediate atomic write of the in-memory cache.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn flush(&mut self) {
         self.write_now();
     }
 
     // Atomic write via the shared `write_atomic` (temp sibling + rename), so a reader never
     // sees a half-written file and every persisted blob takes the same path to disk.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn write_now(&mut self) {
         self.data.version = 1;
         let result = serde_json::to_string_pretty(&self.data)

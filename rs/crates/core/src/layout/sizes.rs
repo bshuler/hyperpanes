@@ -8,6 +8,7 @@
 pub const MIN_SIZE: f64 = 0.05;
 
 /// `n` equal fractions summing to 1 (empty for `n == 0`).
+#[tracing::instrument(level = "debug", ret)]
 pub fn equal_sizes(n: usize) -> Vec<f64> {
     if n == 0 {
         return Vec::new();
@@ -16,6 +17,7 @@ pub fn equal_sizes(n: usize) -> Vec<f64> {
 }
 
 /// Scale any positive vector to sum 1; a non-positive sum falls back to an equal split.
+#[tracing::instrument(level = "debug", ret)]
 pub fn normalize(sizes: &[f64]) -> Vec<f64> {
     let sum: f64 = sizes.iter().sum();
     if sum <= 0.0 {
@@ -25,6 +27,7 @@ pub fn normalize(sizes: &[f64]) -> Vec<f64> {
 }
 
 /// Are these sizes an (≈) equal split? Used to skip serializing default splits.
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_equal_split(sizes: &[f64]) -> bool {
     if sizes.len() <= 1 {
         return true;
@@ -34,11 +37,13 @@ pub fn is_equal_split(sizes: &[f64]) -> bool {
 }
 
 /// Bound a fraction within `[MIN_SIZE, 1 - MIN_SIZE]`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn clamp_fraction(f: f64) -> f64 {
     f.clamp(MIN_SIZE, 1.0 - MIN_SIZE)
 }
 
 /// Insert a slot at `index`, shrinking the others proportionally (Hyper insertRebalance).
+#[tracing::instrument(level = "debug", ret)]
 pub fn insert_size(sizes: &[f64], index: usize) -> Vec<f64> {
     if sizes.is_empty() {
         return vec![1.0];
@@ -53,6 +58,7 @@ pub fn insert_size(sizes: &[f64], index: usize) -> Vec<f64> {
 }
 
 /// Remove the slot at `index`, spreading its size across the rest (Hyper removalRebalance).
+#[tracing::instrument(level = "debug", ret)]
 pub fn remove_size(sizes: &[f64], index: usize) -> Vec<f64> {
     if sizes.len() <= 1 {
         return Vec::new();
@@ -68,6 +74,7 @@ pub fn remove_size(sizes: &[f64], index: usize) -> Vec<f64> {
 }
 
 /// Move the boundary between slot `i` and `i+1` by `delta` (a fraction), clamped.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resize_at(sizes: &[f64], i: usize, delta: f64) -> Vec<f64> {
     if i + 1 >= sizes.len() {
         return sizes.to_vec();

@@ -117,6 +117,7 @@ struct Shadow {
 }
 
 impl Shadow {
+    #[tracing::instrument(level = "debug")]
     fn new() -> Self {
         Self {
             replay: Replay::new(),
@@ -131,6 +132,7 @@ impl Shadow {
     }
 
     /// A shadow inserted optimistically by a local `create`, before the daemon confirms it.
+    #[tracing::instrument(level = "debug")]
     fn new_pending() -> Self {
         Shadow {
             pending: true,
@@ -220,6 +222,7 @@ impl DaemonSessionManager {
     /// all. If that cannot happen, what we do next depends on what the incumbent is holding
     /// ([`stale_daemon_fallback`]) — an EMPTY daemon is torn down and replaced, but one with
     /// live terminals is driven as it is. It is never killed to force an upgrade.
+    #[tracing::instrument(level = "debug")]
     pub fn new(events: UnboundedSender<SessionEvent>, salt: &str) -> io::Result<Self> {
         Self::new_with_policy(events, salt, VersionPolicy::LockStep)
     }
@@ -230,6 +233,7 @@ impl DaemonSessionManager {
     /// build of our own binary is holding the salt, and it is upgraded (or, failing that, torn
     /// down) before we proceed. [`VersionPolicy::Tolerant`] is the pty-host link on Windows,
     /// where an older peer is the *point* — see that variant's docs.
+    #[tracing::instrument(level = "debug")]
     pub fn new_with_policy(
         events: UnboundedSender<SessionEvent>,
         salt: &str,
@@ -354,6 +358,7 @@ impl DaemonSessionManager {
     /// Build a manager over an already-connected socket — the seam tests use with an
     /// in-process daemon on a temp socket (no spawn/discovery). Sends the `Hello`
     /// handshake, starts the reader, and seeds the shadow from a `ListSessions`.
+    #[tracing::instrument(level = "debug")]
     pub fn from_stream(stream: Conn, events: UnboundedSender<SessionEvent>) -> io::Result<Self> {
         let read_half = transport::try_clone(&stream)?;
         let write_half = stream;
@@ -426,6 +431,7 @@ impl DaemonSessionManager {
 
     /// Send one request frame (fire-and-forget at this layer). Used directly for the
     /// no-reply mutators; [`request`](Self::request) wraps it for round-trips.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn send(&self, msg: &ClientMsg) -> io::Result<()> {
         let mut w = self.write_half.lock().unwrap();
         write_frame(&mut *w, msg)
@@ -436,6 +442,7 @@ impl DaemonSessionManager {
     /// events never reach this channel (the reader routes them elsewhere), so the only
     /// traffic here is replies; `want` still guards against an out-of-order reply from a
     /// prior timed-out round-trip whose answer arrived late.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn request(&self, msg: ClientMsg, want: impl Fn(&DaemonMsg) -> bool) -> Option<DaemonMsg> {
         // Holding the receiver lock for the whole round-trip both makes the channel a
         // single consumer at a time and serializes overlapping requests onto one wire turn.
@@ -460,6 +467,7 @@ impl DaemonSessionManager {
     /// `ListSessions` → insert a shadow for every live uid (preserving any existing mirror),
     /// then `Attach` each so its replay mirror is (re)seeded from the daemon's buffer. Run
     /// once at connect; safe to call again (idempotent per uid).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn seed_from_daemon(&self) {
         let Some(DaemonMsg::Sessions(metas)) = self.request(ClientMsg::ListSessions, |m| {
             matches!(m, DaemonMsg::Sessions(_))
@@ -510,6 +518,7 @@ impl DaemonSessionManager {
     /// Spawn a session for `opts`. PINS the GUI-chosen uid in the wire spec, inserts an
     /// empty shadow so `has`/`replay` answer immediately, and fires a `Create` (the daemon
     /// auto-attaches the creator, so every event from the session's birth streams back).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn create(&self, opts: SpawnOptions) -> io::Result<()> {
         let uid = opts.uid.clone();
         // Insert the shadow up front so a `has(uid)`/`replay(uid)` immediately after create
@@ -528,6 +537,7 @@ impl DaemonSessionManager {
     /// cross the socket). The daemon owns real PTYs, so the daemon backend ignores the
     /// factory and spawns a normal session — preserving the public signature without a
     /// meaningless wire form. (No production caller uses `create_with`.)
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn create_with(
         &self,
         opts: SpawnOptions,
@@ -538,6 +548,7 @@ impl DaemonSessionManager {
 
     /// Whether this manager's socket to the daemon is still good. See the
     /// [`connected`](Self::connected) field: `false` is terminal for this manager.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn is_connected(&self) -> bool {
         self.connected.load(Ordering::SeqCst)
     }
@@ -545,12 +556,14 @@ impl DaemonSessionManager {
     /// Mark the connection dead. Called by the reader when it sees EOF, and by any send
     /// that fails — a socket write returning `BrokenPipe` is the same news arriving by the
     /// other end.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn note_disconnected(&self) {
         self.connected.store(false, Ordering::SeqCst);
     }
 
     /// The error every operation answers with once the daemon is gone. Named so the caller
     /// can hand it to a user unchanged.
+    #[tracing::instrument(level = "debug", ret)]
     fn gone() -> io::Error {
         io::Error::new(
             io::ErrorKind::BrokenPipe,
@@ -563,12 +576,14 @@ impl DaemonSessionManager {
     /// A dead daemon holds no sessions, and the shadow cannot know that on its own: nothing
     /// arrives to remove its entries, because the thing that would send the removal is what
     /// died. So the connection is checked first, and the frozen map is not consulted at all.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn has(&self, uid: &str) -> bool {
         self.is_connected() && self.shadows.lock().unwrap().contains_key(uid)
     }
 
     /// The uids of all live sessions — from the shadow (no I/O). Empty once the daemon is
     /// gone, for the reason on [`has`](Self::has).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn uids(&self) -> Vec<String> {
         if !self.is_connected() {
             return Vec::new();
@@ -578,6 +593,7 @@ impl DaemonSessionManager {
 
     /// Recent output for a re-attaching view — the client mirror buffer (no round-trip).
     /// `None` for an unknown uid, matching the in-process `replay`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn replay(&self, uid: &str) -> Option<String> {
         self.shadows
             .lock()
@@ -589,11 +605,13 @@ impl DaemonSessionManager {
     /// The pty's grid `(cols, rows)` as of the daemon's last snapshot — from the shadow
     /// (no I/O). `None` when the daemon has not reported one. Seed a re-attaching grid at
     /// this size before feeding [`replay`](Self::replay); see [`Shadow::dims`].
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn dims(&self, uid: &str) -> Option<(u16, u16)> {
         self.shadows.lock().unwrap().get(uid).and_then(|s| s.dims)
     }
 
     /// Monotonic UTF-16 output cursor — from the shadow (no I/O).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn output_bytes(&self, uid: &str) -> Option<u64> {
         self.shadows
             .lock()
@@ -604,6 +622,7 @@ impl DaemonSessionManager {
 
     /// Replay + cursor as an atomic pair — one shadows lock, so the pair can't tear
     /// (`apply_event_to_shadow` updates both under the same lock).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn replay_with_cursor(&self, uid: &str) -> Option<(String, u64)> {
         self.shadows
             .lock()
@@ -614,6 +633,7 @@ impl DaemonSessionManager {
 
     /// Epoch-ms of the last output flush — from the shadow (no I/O); `None` if nothing
     /// has flushed yet, mirroring the in-process accessor.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn last_output_at(&self, uid: &str) -> Option<u64> {
         self.shadows
             .lock()
@@ -628,6 +648,7 @@ impl DaemonSessionManager {
     ///
     /// `None` is "no answer" (an unknown uid, a daemon that predates the field, a platform
     /// with no foreground group), never "nothing is running".
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn foreground_name(&self, uid: &str) -> Option<String> {
         self.shadows
             .lock()
@@ -639,6 +660,7 @@ impl DaemonSessionManager {
     /// Where that foreground program is — same shadow, same freshness guarantee, and the
     /// same meaning for `None`. The daemon owns the pty, so it is the only process that can
     /// ask the kernel; this is how the GUI reads the answer.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn foreground_cwd(&self, uid: &str) -> Option<String> {
         self.shadows
             .lock()
@@ -649,6 +671,7 @@ impl DaemonSessionManager {
 
     /// Serialize the pane's current screen — a bounded `RenderScreen`/`Screen` round-trip
     /// (off the hot path). `None` on an unknown uid, a gone session, or a timeout.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn render_screen(&self, uid: &str) -> Option<String> {
         let want_uid = uid.to_string();
         let reply = self.request(
@@ -675,6 +698,7 @@ impl DaemonSessionManager {
     /// *wedged* — alive, not reading — is not: the bytes fit in the socket's send buffer and
     /// the write succeeds locally. Detecting that needs a round-trip, which does not belong
     /// on a per-keystroke path.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn write(&self, uid: &str, data: &str) -> io::Result<()> {
         if !self.is_connected() {
             return Err(Self::gone());
@@ -687,6 +711,7 @@ impl DaemonSessionManager {
     }
 
     /// Resize the pane — fire-and-forget.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn resize(&self, uid: &str, cols: u16, rows: u16) {
         let _ = self.send(&ClientMsg::Resize {
             uid: uid.to_string(),
@@ -699,6 +724,7 @@ impl DaemonSessionManager {
     /// suppresses the natural-exit event for a deliberate kill, so no `Exit` will arrive to
     /// drop it; we drop it here to keep `has`/`uids` correct immediately, mirroring the
     /// in-process `kill` which removes the session synchronously).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn kill(&self, uid: &str) {
         self.shadows.lock().unwrap().remove(uid);
         let _ = self.send(&ClientMsg::Kill {
@@ -707,6 +733,7 @@ impl DaemonSessionManager {
     }
 
     /// Kill every pane — fire-and-forget — and clear the local shadow.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn kill_all(&self) {
         self.shadows.lock().unwrap().clear();
         let _ = self.send(&ClientMsg::KillAll);
@@ -717,6 +744,7 @@ impl DaemonSessionManager {
     /// a reply frame, so the connection just drops (the EOF is the acknowledgement). Clears
     /// the local shadow so a subsequent accessor sees no sessions. No-op-safe: if the daemon
     /// is already gone the send simply fails and is ignored.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn shutdown_daemon(&self) {
         self.shadows.lock().unwrap().clear();
         let _ = self.send(&ClientMsg::Shutdown);
@@ -726,6 +754,7 @@ impl DaemonSessionManager {
 
     /// This connection's daemon-assigned [`ConnId`], or `0` if the handshake never produced
     /// one (a pre-M7 daemon). See the [`conn_id`](Self::conn_id) field.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn conn_id(&self) -> ConnId {
         self.conn_id.load(Ordering::SeqCst)
     }
@@ -741,6 +770,7 @@ impl DaemonSessionManager {
     /// claim send is skipped and the panel falls back to pre-M7 behaviour (nothing looks
     /// claimed; adoption always allowed and harmless, since it re-attaches to a multiplexed
     /// session rather than stealing it).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn claims_supported(&self) -> bool {
         self.daemon_ver.load(Ordering::SeqCst) >= MIN_CLAIM_DAEMON_VER as u64
     }
@@ -757,6 +787,7 @@ impl DaemonSessionManager {
     /// recoverable (click again), adopting a session another window is showing is not.
     ///
     /// [`ClaimRegistry::claim`]: crate::session::claims::ClaimRegistry::claim
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn claim(&self, uid: &str) -> bool {
         // Against a pre-M7 daemon there is no registry to arbitrate, and asking would drop
         // the connection. Answer `true`: that is the M5 behaviour this build replaces, and
@@ -786,6 +817,7 @@ impl DaemonSessionManager {
     ///
     /// The daemon still replies with a `ClaimResult`; it lands in the reply channel and is
     /// skipped by the next round-trip's filter, which drains stale replies before waiting.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn announce_claim(&self, uid: &str) {
         if !self.claims_supported() {
             return; // see `claims_supported`: silence, not a dropped connection
@@ -799,6 +831,7 @@ impl DaemonSessionManager {
     /// connection that does not own it. Not required for correctness on exit (the daemon
     /// drops every claim of a connection when its socket closes), only for a window that
     /// stays alive after closing a pane.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn release(&self, uid: &str) {
         if !self.claims_supported() {
             return; // see `claims_supported`
@@ -817,6 +850,7 @@ impl DaemonSessionManager {
     /// "somebody else's". If we never learned our own conn id (`0`), every claim counts as
     /// somebody else's — see the [`conn_id`](Self::conn_id) field for why that is the safe
     /// direction.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn claims_held_elsewhere(&self) -> HashSet<String> {
         let me = self.conn_id.load(Ordering::SeqCst);
         self.claims
@@ -831,6 +865,7 @@ impl DaemonSessionManager {
     /// Force a fresh `Claims` snapshot from the daemon. The daemon pushes one on every
     /// change already, so this is only for tests and for a caller that wants a synchronous
     /// barrier; the reply is intercepted by the reader thread, not returned here.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn request_claims(&self) {
         if !self.claims_supported() {
             return; // see `claims_supported`
@@ -842,6 +877,7 @@ impl DaemonSessionManager {
 /// The reader thread body: decode inbound frames forever, demuxing events (which update the
 /// shadow/mirror and forward to the GUI channel) from replies (which go to the reply
 /// channel). Exits on EOF, a socket error, or a dropped GUI channel.
+#[tracing::instrument(level = "debug", skip_all)]
 fn reader_loop(
     read_half: Conn,
     shadows: Arc<Mutex<HashMap<String, Shadow>>>,
@@ -922,6 +958,7 @@ fn reader_loop(
 /// arrived live, racing ahead of the replay frame, and must survive: the result is the
 /// replay followed by exactly that tail. Output at or before `cursor` is covered by the
 /// replay and is replaced, so a chunk that was mirrored twice never renders twice.
+#[tracing::instrument(level = "debug", ret, skip(shadow))]
 fn splice_replay(shadow: &mut Shadow, cursor: u64, data: &str) {
     let ahead = shadow.output_bytes.saturating_sub(cursor) as usize;
     let tail = if ahead == 0 {
@@ -938,6 +975,7 @@ fn splice_replay(shadow: &mut Shadow, cursor: u64, data: &str) {
 
 /// The suffix of `s` holding at most `units` UTF-16 code units, cut on a char boundary (a
 /// 2-unit char that straddles the cut is dropped, never split).
+#[tracing::instrument(level = "debug", ret)]
 fn utf16_tail(s: &str, units: usize) -> &str {
     let mut have = 0;
     let mut start = s.len();
@@ -970,6 +1008,7 @@ fn utf16_tail(s: &str, units: usize) -> &str {
 /// Metadata (`output_bytes`/`last_output_at`/`cwd`) is refreshed from the snapshot, but the
 /// local replay mirror is never touched: it is grown by the event stream and is the only
 /// copy of history this process has.
+#[tracing::instrument(level = "debug", ret, skip(shadows))]
 fn reconcile_snapshot(
     shadows: &Mutex<HashMap<String, Shadow>>,
     metas: &[crate::session::proto::SessionMeta],
@@ -1006,6 +1045,7 @@ fn reconcile_snapshot(
 /// Fold one streamed [`SessionEvent`] into the shadow: `Data` grows the mirror + counters,
 /// `Cwd` updates the cached cwd, `Exit` drops the session (mirrors the in-process driver
 /// removing a session from the map on terminal exit, so `has`/`uids` go false).
+#[tracing::instrument(level = "debug", ret, skip(shadows))]
 fn apply_event_to_shadow(shadows: &Mutex<HashMap<String, Shadow>>, ev: &SessionEvent) {
     let mut shadows = shadows.lock().unwrap();
     match ev {
@@ -1035,6 +1075,7 @@ fn apply_event_to_shadow(shadows: &Mutex<HashMap<String, Shadow>>, ev: &SessionE
 /// Epoch-ms now — the client's own `last_output_at` stamp (the daemon's
 /// `SessionEvent::Data` doesn't carry a timestamp, and the GUI compares against its own
 /// wall clock anyway, exactly as the in-process `last_output_at` is a local stamp).
+#[tracing::instrument(level = "debug", ret)]
 fn epoch_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -1046,6 +1087,7 @@ fn epoch_ms() -> u64 {
 /// Build the wire [`SpawnSpec`] from [`SpawnOptions`]: PIN the uid (the GUI owns it),
 /// flatten the integration into the spec's resolved `integration_args`/`integration_env`
 /// (the daemon folds them back via [`SpawnSpec::into_options`]), and carry the rest.
+#[tracing::instrument(level = "debug", skip_all)]
 fn spawn_spec_from(opts: SpawnOptions) -> SpawnSpec {
     let (integration_args, integration_env) = match opts.integration {
         Some(i) => (i.args, i.env),
@@ -1128,6 +1170,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// A handshake that doesn't answer in time is treated as a `Match` (proceed): the gate must
 /// never hard-block launch over a slow or odd handshake — the worst case is talking to a
 /// daemon we couldn't confirm, which is harmless.
+#[tracing::instrument(level = "debug")]
 fn probe_daemon_identity(stream: &Conn) -> io::Result<ProtoCheck> {
     let mut w = transport::try_clone(stream)?;
     let send = write_frame(
@@ -1197,6 +1240,7 @@ const TAKEOVER_BUDGET: Duration = Duration::from_secs(8);
 /// (proto 1): it cannot parse the request and drops the connection, and the successor
 /// declines to fight for the endpoint. The caller then asks [`stale_daemon_fallback`] what to
 /// do, which tears the incumbent down ONLY if it holds no live session.
+#[tracing::instrument(level = "debug", ret)]
 fn hand_over_stale_daemon(salt: &str, endpoint: &Endpoint) -> bool {
     tracing::info!("spawning a successor daemon to take the sessions over");
     if let Err(e) = spawn_daemon_detached(salt) {
@@ -1259,6 +1303,7 @@ enum StaleFallback {
 /// unreadable or unanswered `ListSessions` counts as "it holds some", because guessing
 /// "empty" wrongly destroys a user's work while guessing "occupied" wrongly only defers an
 /// upgrade.
+#[tracing::instrument(level = "debug", ret)]
 fn stale_daemon_fallback(endpoint: &Endpoint, daemon_ver: u32) -> StaleFallback {
     match live_session_count(endpoint) {
         Some(0) => StaleFallback::TearDown,
@@ -1270,6 +1315,7 @@ fn stale_daemon_fallback(endpoint: &Endpoint, daemon_ver: u32) -> StaleFallback 
 /// Live-session count reported by the daemon at `endpoint`, or `None` if it could not be
 /// established (no connect, no `Sessions` reply in time, a reply we could not parse). Opens
 /// its own short-lived connection so it never disturbs a stream the manager will own.
+#[tracing::instrument(level = "debug", ret)]
 fn live_session_count(endpoint: &Endpoint) -> Option<usize> {
     let stream = transport::connect(endpoint).ok()?;
     let mut w = transport::try_clone(&stream).ok()?;
@@ -1300,6 +1346,7 @@ fn live_session_count(endpoint: &Endpoint) -> Option<usize> {
 /// (briefly) for it to stop answering. Best-effort — if the connect fails the daemon is
 /// already gone, and if it lingers, the respawn loop in `new` still converges. `salt` is
 /// unused today (the endpoint is enough) but kept for symmetry with the spawn side.
+#[tracing::instrument(level = "debug", ret)]
 fn tear_down_stale_daemon(endpoint: &Endpoint, _salt: &str) {
     if let Ok(stream) = transport::connect(endpoint) {
         tracing::info!("shutting down the stale session daemon");
@@ -1321,6 +1368,7 @@ fn tear_down_stale_daemon(endpoint: &Endpoint, _salt: &str) {
 /// retry-connect with backoff until [`SPAWN_CONNECT_BUDGET`]. A spawn race — another client
 /// just launched the daemon, so OUR spawn loses the endpoint — is NOT an error: we simply
 /// keep retrying the connect, since whoever won is now (or soon) listening.
+#[tracing::instrument(level = "debug", ret)]
 fn connect_or_spawn(endpoint: &Endpoint, salt: &str) -> io::Result<Conn> {
     // Fast path: a daemon is already up.
     if let Ok(s) = transport::connect(endpoint) {
@@ -1353,6 +1401,7 @@ fn connect_or_spawn(endpoint: &Endpoint, salt: &str) -> io::Result<Conn> {
 
 /// Path to `systemd-run` on a systemd host, else `None`.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn systemd_run_path() -> Option<std::path::PathBuf> {
     for dir in ["/usr/bin", "/bin", "/usr/local/bin"] {
         let p = std::path::Path::new(dir).join("systemd-run");
@@ -1372,6 +1421,7 @@ fn systemd_run_path() -> Option<std::path::PathBuf> {
 /// systemd, survives any GUI teardown); fall back to a bare `setsid` spawn on non-systemd
 /// hosts. Either way we drop the handle — the daemon is long-lived and re-parents to init.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn spawn_daemon_detached(salt: &str) -> io::Result<()> {
     use std::process::{Command, Stdio};
 
@@ -1400,6 +1450,7 @@ fn spawn_daemon_detached(salt: &str) -> io::Result<()> {
 /// `systemd-run` is present but fails to launch). New session so a GUI crash/SIGHUP never
 /// reaches it; null stdio; handle dropped so it re-parents to init.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn spawn_daemon_setsid(exe: &std::path::Path, salt: &str) -> io::Result<()> {
     use std::os::unix::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1437,6 +1488,7 @@ fn spawn_daemon_setsid(exe: &std::path::Path, salt: &str) -> io::Result<()> {
 /// signal and no cgroup to inherit, so unlike unix there is nothing further to escape: the
 /// spawned process is already independent once we drop its handle.
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 fn spawn_daemon_detached(salt: &str) -> io::Result<()> {
     use std::os::windows::process::CommandExt;
     use std::process::{Command, Stdio};
@@ -1462,6 +1514,7 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
+    #[tracing::instrument(level = "debug", skip_all)]
     fn env(pairs: &[(&str, &str)]) -> crate::session::spawn::EnvMap {
         pairs
             .iter()
@@ -1513,10 +1566,12 @@ mod tests {
 
     // ---- shadow folding (no socket needed) ----
 
+    #[tracing::instrument(level = "debug")]
     fn shadows() -> Arc<Mutex<HashMap<String, Shadow>>> {
         Arc::default()
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     fn meta(uid: &str, foreground: Option<&str>) -> crate::session::proto::SessionMeta {
         crate::session::proto::SessionMeta {
             uid: uid.to_string(),
@@ -1717,6 +1772,7 @@ mod tests {
     use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver};
 
     // A unique temp socket path per test AND per run (pid + thread id) — never collides.
+    #[tracing::instrument(level = "debug", ret)]
     fn temp_socket(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
             "hp-m1-{tag}-{}-{:?}.sock",
@@ -1728,6 +1784,7 @@ mod tests {
     // Block (on a helper thread / spin) until an event channel yields one matching `pred`,
     // or the deadline passes. Drains intervening events. The channel is the GUI's
     // `UnboundedReceiver<SessionEvent>` that the manager's reader thread feeds.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn recv_event_until(
         rx: &mut UnboundedReceiver<SessionEvent>,
         timeout: Dur,
@@ -1749,6 +1806,7 @@ mod tests {
 
     // Spin until `cond` is true or the deadline passes (for shadow propagation, which lands
     // a beat after the event since the reader thread applies it asynchronously).
+    #[tracing::instrument(level = "debug", skip_all)]
     fn wait_until(timeout: Dur, mut cond: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -1760,6 +1818,7 @@ mod tests {
         cond()
     }
 
+    #[tracing::instrument(level = "debug")]
     fn connect_manager(socket: &Path) -> (DaemonSessionManager, UnboundedReceiver<SessionEvent>) {
         let stream = std::os::unix::net::UnixStream::connect(socket).expect("connect");
         let (etx, erx) = unbounded_channel::<SessionEvent>();
@@ -2061,6 +2120,7 @@ mod tests {
     // Wrap a real connected daemon socket in a SessionManager::Daemon — the same backend the
     // GUI holds (`new_daemon` builds this; here we connect to a temp-socket in-process daemon
     // instead of spawning `current_exe`, which a test binary can't do).
+    #[tracing::instrument(level = "debug")]
     fn daemon_manager(socket: &Path) -> (SessionManager, UnboundedReceiver<SessionEvent>) {
         let stream = std::os::unix::net::UnixStream::connect(socket).expect("connect");
         let (etx, erx) = unbounded_channel::<SessionEvent>();
@@ -2394,6 +2454,7 @@ mod tests {
         fn write(&self, uid: &str, data: &str);
     }
     impl WriteToBackend for crate::session_manager::SessionManager {
+        #[tracing::instrument(level = "debug", ret, skip(self))]
         fn write(&self, uid: &str, data: &str) {
             // A dropped write here would not fail the benchmark, it would silently bias it:
             // the echo it was waiting for never comes and the sample is a timeout.
@@ -2402,12 +2463,14 @@ mod tests {
         }
     }
     impl WriteToBackend for DaemonSessionManager {
+        #[tracing::instrument(level = "debug", ret, skip(self))]
         fn write(&self, uid: &str, data: &str) {
             self.write(uid, data)
                 .expect("benchmark write reached the session");
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     fn bench_echo(
         uid: &str,
         mgr: &impl WriteToBackend,

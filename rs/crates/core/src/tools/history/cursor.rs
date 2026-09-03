@@ -68,6 +68,7 @@ pub struct CursorProvider {
 }
 
 impl Default for CursorProvider {
+    #[tracing::instrument(level = "debug")]
     fn default() -> Self {
         Self::new()
     }
@@ -76,6 +77,7 @@ impl Default for CursorProvider {
 impl CursorProvider {
     /// A provider with no per-tool path override — detection falls to `PATH` and the
     /// well-known install locations.
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Self {
         Self {
             metas: HashMap::new(),
@@ -89,6 +91,7 @@ impl CursorProvider {
     /// A provider that honours the human's per-tool binary overrides (the settings page's
     /// `tool id -> path` map). Held rather than passed per call because
     /// [`SessionProvider::resume`] takes `&self`.
+    #[tracing::instrument(level = "debug")]
     pub fn with_overrides(overrides: BTreeMap<String, String>) -> Self {
         Self {
             overrides,
@@ -97,6 +100,7 @@ impl CursorProvider {
     }
 
     /// Scan `root` (one `.cursor` directory) rather than the machine's own.
+    #[tracing::instrument(level = "debug", skip(root))]
     pub fn with_root(root: impl Into<PathBuf>) -> Self {
         Self {
             root: Some(root.into()),
@@ -106,11 +110,13 @@ impl CursorProvider {
 
     /// Files re-parsed by the last [`scan`](SessionProvider::scan) — the cache effectiveness
     /// the 20 s panel refresh lives or dies by, surfaced so it can be asserted on.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn last_scan_parsed(&self) -> usize {
         self.last_scan_parsed
     }
 
     /// The store to read: the test seam if one was given, else this machine's `~/.cursor`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn store(&self) -> Option<PathBuf> {
         match &self.root {
             Some(r) => Some(r.clone()),
@@ -121,6 +127,7 @@ impl CursorProvider {
     /// Index `chats/<hash>/<id>/meta.json` by session id. Cheap — the files are one short
     /// line each — but still fingerprinted, because a live session rewrites its `meta.json`
     /// on every turn and the panel re-scans every 20 s.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn read_chats(&mut self, chats: &Path) -> BTreeMap<String, ChatMeta> {
         let mut out = BTreeMap::new();
         let mut live: HashSet<PathBuf> = HashSet::new();
@@ -150,6 +157,7 @@ impl CursorProvider {
     /// Only `agent-transcripts/<id>/<id>.jsonl` counts. The sibling `subagents/*.jsonl` are
     /// a delegated agent's own trace, not a conversation anyone resumes, and naming the file
     /// after its directory is the deterministic way to tell them apart.
+    #[tracing::instrument(level = "debug", skip(self))]
     fn read_transcripts(&mut self, project_dir: &Path, live: &mut HashSet<PathBuf>) -> Vec<Found> {
         let mut out = Vec::new();
         for session_dir in child_dirs(&project_dir.join("agent-transcripts")) {
@@ -178,10 +186,12 @@ struct Found {
 }
 
 impl SessionProvider for CursorProvider {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn id(&self) -> &'static str {
         TOOL_ID
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn scan(&mut self) -> Vec<ToolSession> {
         self.last_scan_parsed = 0;
         let Some(store) = self.store() else {
@@ -245,6 +255,7 @@ impl SessionProvider for CursorProvider {
         rows
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn resume(&self, session: &ToolSession) -> ResumePlan {
         if session.source != HistorySource::Cursor {
             return ResumePlan::Blocked(ResumeBlocked::Unsupported {
@@ -276,6 +287,7 @@ impl SessionProvider for CursorProvider {
 }
 
 /// `~/.cursor` for the current user, or `None` if no home directory is known.
+#[tracing::instrument(level = "debug", ret)]
 pub fn cursor_root() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     if home.is_empty() {
@@ -286,12 +298,14 @@ pub fn cursor_root() -> Option<PathBuf> {
 
 /// Whether `path` looks like a `.cursor` store worth scanning. Either tree alone is enough —
 /// a machine that has only ever run the IDE has `projects/` and no `chats/`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn store_exists(path: &Path) -> bool {
     path.join("chats").is_dir() || path.join("projects").is_dir()
 }
 
 /// Cursor's name for `project`'s transcript directory: Claude's encoding with the leading
 /// separator's `-` dropped (`/Users/me/src` -> `Users-me-src`).
+#[tracing::instrument(level = "debug", ret)]
 pub fn encode_project_dir_cursor(project: &Path) -> String {
     let e = encode_project_dir(project);
     e.strip_prefix('-').map(str::to_string).unwrap_or(e)
@@ -299,6 +313,7 @@ pub fn encode_project_dir_cursor(project: &Path) -> String {
 
 /// Put the leading separator back, so the shared inverses ([`decode_by_probing`],
 /// [`decode_project_dir`]) run on Cursor names unchanged rather than being reimplemented.
+#[tracing::instrument(level = "debug", ret)]
 fn as_claude_encoded(name: &str) -> String {
     #[cfg(windows)]
     {
@@ -317,6 +332,7 @@ fn as_claude_encoded(name: &str) -> String {
 /// kind, a `cwd` that does not re-encode is a real directory but not provably this one's, and
 /// the lossy substitution is a label only. `empty-window` — Cursor's sentinel for a window
 /// with no folder open — lands on that last rung, which is exactly right: there is no project.
+#[tracing::instrument(level = "debug", ret)]
 fn resolve_dir(dir: &Path, cwds: &[PathBuf]) -> (PathBuf, ProjectOrigin) {
     let Some(encoded) = dir_name(dir) else {
         return (dir.to_path_buf(), ProjectOrigin::DecodedUnverified);
@@ -343,6 +359,7 @@ fn resolve_dir(dir: &Path, cwds: &[PathBuf]) -> (PathBuf, ProjectOrigin) {
 
 /// Insert `row`, or replace an existing reading of the same session with a better-evidenced
 /// one. `ProjectOrigin`'s declaration order is its strength order, so this is a `min`.
+#[tracing::instrument(level = "debug", ret)]
 fn keep_stronger(best: &mut BTreeMap<String, ToolSession>, row: ToolSession) {
     match best.get(&row.id) {
         Some(prev) if prev.project_origin <= row.project_origin => {}
@@ -356,6 +373,7 @@ fn keep_stronger(best: &mut BTreeMap<String, ToolSession>, row: ToolSession) {
 /// sessions in the same directory can arrive by different rungs of [`resolve_dir`], and the
 /// panel draws one heading per project — a heading whose rows disagree about whether the path
 /// is real would be a bug in the label, not in the data.
+#[tracing::instrument(level = "debug", ret)]
 fn unify_origins(rows: &mut [ToolSession]) {
     let mut strongest: HashMap<PathBuf, ProjectOrigin> = HashMap::new();
     for r in rows.iter() {
@@ -374,6 +392,7 @@ fn unify_origins(rows: &mut [ToolSession]) {
 /// Widen one session into a panel row. `meta` is the `chats` entry when there is one,
 /// `transcript` the JSONL when there is one; at least one of the two exists or there is no
 /// session to draw.
+#[tracing::instrument(level = "debug", ret)]
 fn row(
     id: &str,
     meta: Option<&ChatMeta>,
@@ -430,6 +449,7 @@ struct ChatMeta {
     has_conversation: bool,
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn read_chat_meta(path: &Path) -> Option<ChatMeta> {
     let text = fs::read_to_string(path).ok()?;
     let meta: ChatMeta = serde_json::from_str(&text).ok()?;
@@ -453,6 +473,7 @@ struct Transcript {
 ///
 /// Cursor's records are `{"role":"user"|"assistant","message":{"content":[…]}}`, plus a
 /// trailing `{"type":"turn_ended",…}` that carries no text.
+#[tracing::instrument(level = "debug", ret)]
 fn read_transcript(path: &Path) -> Option<Transcript> {
     use std::io::{BufRead, BufReader};
     let file = fs::File::open(path).ok()?;
@@ -501,6 +522,7 @@ fn read_transcript(path: &Path) -> Option<Transcript> {
 /// The human's prompt out of a `user` record. Cursor wraps it as
 /// `<timestamp>…</timestamp>\n<user_query>\n…\n</user_query>` — literal, fixed tags, so this
 /// is a slice rather than a guess. Text carrying no `<user_query>` is returned whole.
+#[tracing::instrument(level = "debug", ret)]
 fn user_query(text: &str) -> &str {
     const OPEN: &str = "<user_query>";
     const CLOSE: &str = "</user_query>";
@@ -517,6 +539,7 @@ fn user_query(text: &str) -> &str {
 /// The human-visible text of a record's `message.content`: every `{"type":"text"}` block,
 /// space-joined. `tool_use` blocks are skipped — they are the machine's half of the turn, and
 /// a shell command line is not what someone searching for a conversation is looking for.
+#[tracing::instrument(level = "debug", ret)]
 fn message_text(v: &serde_json::Value) -> Option<String> {
     let content = v.get("message")?.get("content")?;
     if let Some(s) = content.as_str() {
@@ -540,6 +563,7 @@ fn message_text(v: &serde_json::Value) -> Option<String> {
 /// Append one message to the full-text extract: whitespace-collapsed, lowercased (search is
 /// case-insensitive and never re-lowers the stored text), and cut at a char boundary once
 /// [`FULL_TEXT_MAX`] is reached.
+#[tracing::instrument(level = "debug", ret)]
 fn push_full_text(full: &mut String, text: &str) {
     if full.len() >= FULL_TEXT_MAX {
         return;
@@ -565,6 +589,7 @@ fn push_full_text(full: &mut String, text: &str) {
 }
 
 /// Collapse all whitespace to single spaces, trim, and truncate to [`SUMMARY_MAX`] chars.
+#[tracing::instrument(level = "debug", ret)]
 fn clean_summary(s: &str) -> String {
     let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= SUMMARY_MAX {
@@ -584,6 +609,7 @@ struct Cached<T> {
 }
 
 /// `(mtime epoch ms, size bytes)` for `path`, or `None` when stat fails.
+#[tracing::instrument(level = "debug", ret)]
 fn fingerprint(path: &Path) -> Option<(u64, u64)> {
     let m = fs::metadata(path).ok()?;
     let mtime = m
@@ -597,6 +623,7 @@ fn fingerprint(path: &Path) -> Option<(u64, u64)> {
 /// The cached value for `path` when its `(mtime, size)` is unchanged, else `parse`d and
 /// cached. Counts a parse in `parsed` only when one happened, so "warm scan parsed nothing"
 /// stays a statement about work done, not about files that failed to open.
+#[tracing::instrument(level = "debug", skip_all)]
 fn cached<T: Clone>(
     map: &mut HashMap<PathBuf, Cached<T>>,
     path: &Path,
@@ -626,6 +653,7 @@ fn cached<T: Clone>(
 /// The subdirectories of `dir`, sorted, so an ambiguous name resolves the same way on every
 /// scan. `is_dir()` on the path rather than the entry's file type: a symlinked component is
 /// ordinary in the directories people keep code in.
+#[tracing::instrument(level = "debug", ret)]
 fn child_dirs(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
@@ -639,6 +667,7 @@ fn child_dirs(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn dir_name(dir: &Path) -> Option<String> {
     dir.file_name().map(|n| n.to_string_lossy().into_owned())
 }

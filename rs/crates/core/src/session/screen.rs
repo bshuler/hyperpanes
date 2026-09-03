@@ -33,6 +33,7 @@ pub struct Screen {
 impl Screen {
     /// A blank screen of `cols`×`rows`. Scrollback is disabled: screen reads only ever
     /// serialize the visible viewport, so per-session history would be wasted memory.
+    #[tracing::instrument(level = "debug")]
     pub fn new(cols: u16, rows: u16) -> Self {
         let cols = (cols as usize).max(1);
         let rows = (rows as usize).max(1);
@@ -51,16 +52,19 @@ impl Screen {
     }
 
     /// Feed a raw output chunk (same bytes the renderer's terminal would receive).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn advance(&mut self, bytes: &[u8]) {
         self.parser.advance(&mut self.term, bytes);
     }
 
     /// Current grid dimensions `(cols, rows)` — what remote clients must emulate at.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn dims(&self) -> (u16, u16) {
         (self.cols as u16, self.rows as u16)
     }
 
     /// Resize the screen grid. No-op if unchanged dimensions are passed.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn resize(&mut self, cols: u16, rows: u16) {
         let cols = (cols as usize).max(1);
         let rows = (rows as usize).max(1);
@@ -75,6 +79,7 @@ impl Screen {
     /// Serialize the visible grid to clean text: one line per screen row, trailing
     /// whitespace trimmed per line, trailing blank lines dropped. ANSI styling is
     /// already consumed by the parser, so the output is plain characters only.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn render(&self) -> String {
         let grid = self.term.grid();
         let mut lines: Vec<String> = Vec::with_capacity(self.rows);
@@ -106,6 +111,7 @@ impl Screen {
 /// One-shot convenience: render `bytes` onto a fresh `cols`×`rows` screen and return
 /// the serialized text. Equivalent to `new` + `advance` + `render`; handy for tests
 /// and for rendering a captured replay buffer without keeping a live `Screen`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn render_bytes(cols: u16, rows: u16, bytes: &[u8]) -> String {
     let mut screen = Screen::new(cols, rows);
     screen.advance(bytes);

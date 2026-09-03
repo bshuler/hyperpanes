@@ -22,6 +22,7 @@ pub const EXECUTABLE_EXTS: &[&str] = &[
 ];
 
 /// True when `abs_path`'s (lowercased) extension is one we refuse to OS-open.
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_executable_ext(abs_path: &str) -> bool {
     match ext_lower(abs_path) {
         Some(ext) => EXECUTABLE_EXTS.contains(&ext.as_str()),
@@ -32,6 +33,7 @@ pub fn is_executable_ext(abs_path: &str) -> bool {
 /// The lowercased extension *including the leading dot* (e.g. `.ts`), or `None` when the
 /// final path component has no `.` (or is a dotfile like `.gitignore`, which `path::extension`
 /// treats as having no extension — matching Node's `path.extname`).
+#[tracing::instrument(level = "debug", ret)]
 fn ext_lower(p: &str) -> Option<String> {
     Path::new(p)
         .extension()
@@ -54,6 +56,7 @@ pub struct ResolveResult {
 
 /// Best-effort home directory (the pty's own start dir falls back to this, matching
 /// `opts.cwd || os.homedir()`). Empty string if neither is set.
+#[tracing::instrument(level = "debug", ret)]
 fn home_dir() -> String {
     std::env::var("USERPROFILE")
         .or_else(|_| std::env::var("HOME"))
@@ -63,6 +66,7 @@ fn home_dir() -> String {
 /// Lexically resolve `token` against `base` into an absolute, normalized path string — PURE
 /// (no filesystem access). Expands a leading `~` to the home dir, then joins onto `base` when
 /// the token is relative, and collapses `.`/`..` segments (like Node's `path.resolve`).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve_token(base: &str, token: &str) -> String {
     resolve_token_with_home(base, token, &home_dir())
 }
@@ -71,6 +75,7 @@ pub fn resolve_token(base: &str, token: &str) -> String {
 /// the process environment. `std::env::set_var` is process-WIDE and Rust runs a crate's tests as
 /// threads in one process, so a test that pointed `HOME` at a fixture path leaked that home into
 /// every test beside it — and into anything they spawned, which inherited the bogus `HOME`.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve_token_with_home(base: &str, token: &str, home: &str) -> String {
     let expanded: String = if token == "~" || token.starts_with("~/") || token.starts_with("~\\") {
         format!("{}{}", home, &token[1..])
@@ -89,6 +94,7 @@ pub fn resolve_token_with_home(base: &str, token: &str, home: &str) -> String {
 
 /// Lexically collapse `.` and `..` segments without touching disk. Keeps the path's prefix
 /// (Windows drive) and root, and leaves any leading `..` that can't be popped (relative input).
+#[tracing::instrument(level = "debug", ret)]
 fn normalize(p: &Path) -> String {
     let mut out: Vec<Component> = Vec::new();
     for comp in p.components() {
@@ -116,6 +122,7 @@ fn normalize(p: &Path) -> String {
 }
 
 /// Resolve a single `token` against `cwd` (falling back to the home dir) and stat it.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve_path(cwd: Option<&str>, token: &str) -> ResolveResult {
     let base = match cwd {
         Some(c) if !c.is_empty() => c.to_string(),
@@ -142,6 +149,7 @@ pub fn resolve_path(cwd: Option<&str>, token: &str) -> ResolveResult {
 
 /// Resolve each candidate `token` against `cwd` and stat it (the batched form the renderer
 /// calls). Mirrors `resolvePaths` in `paths.ts`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_paths(cwd: Option<&str>, tokens: &[String]) -> Vec<ResolveResult> {
     tokens.iter().map(|t| resolve_path(cwd, t)).collect()
 }
@@ -160,6 +168,7 @@ pub struct OpenResult {
 }
 
 impl OpenResult {
+    #[tracing::instrument(level = "debug", ret)]
     fn ok() -> Self {
         OpenResult {
             ok: true,
@@ -167,6 +176,7 @@ impl OpenResult {
             error: None,
         }
     }
+    #[tracing::instrument(level = "debug", skip_all)]
     fn err(msg: impl Into<String>) -> Self {
         OpenResult {
             ok: false,
@@ -174,6 +184,7 @@ impl OpenResult {
             error: Some(msg.into()),
         }
     }
+    #[tracing::instrument(level = "debug", ret, skip(ext))]
     fn blocked(ext: impl Into<String>) -> Self {
         OpenResult {
             ok: false,
@@ -200,6 +211,7 @@ pub enum OpenPlan {
 
 /// Choose the open strategy. `vscode` is the detected `code` binary, or `None` when it is not on
 /// PATH. Mirrors the branch order in `openResolvedPath` in `paths.ts`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn plan_open(
     is_dir: bool,
     abs_path: &str,
@@ -244,6 +256,7 @@ pub fn plan_open(
 /// any extension; otherwise zero-config VS Code if on PATH; otherwise the OS default handler,
 /// which refuses to execute scripts/binaries. Directories just open the folder. Mirrors
 /// `openResolvedPath` in `paths.ts`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_resolved_path(
     abs_path: &str,
     line: Option<u32>,
@@ -292,6 +305,7 @@ pub fn open_resolved_path(
 /// into argv BEFORE substitution so `{path}` stays a single argument even with spaces, then
 /// re-quote each piece. Returns the joined, shell-ready command line (also used by tests).
 /// Mirrors `runEditorTemplate` in `paths.ts`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn editor_command_line(
     template: &str,
     abs_path: &str,
@@ -318,6 +332,7 @@ pub fn editor_command_line(
     argv.iter().map(|a| quote(a)).collect::<Vec<_>>().join(" ")
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn run_editor_template(template: &str, abs_path: &str, line: Option<u32>, col: Option<u32>) {
     let cmd = editor_command_line(template, abs_path, line, col);
     if cmd.is_empty() {
@@ -327,6 +342,7 @@ fn run_editor_template(template: &str, abs_path: &str, line: Option<u32>, col: O
 }
 
 /// Shell-quote one argument for the platform (mirrors `quote` in `paths.ts`).
+#[tracing::instrument(level = "debug", ret)]
 pub fn quote(arg: &str) -> String {
     if cfg!(windows) {
         format!("\"{}\"", arg.replace('"', "\"\""))
@@ -342,6 +358,7 @@ trait NoWindow {
 }
 impl NoWindow for Command {
     #[cfg(windows)]
+    #[tracing::instrument(level = "debug", ret)]
     fn no_window(&mut self) -> &mut Self {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -354,6 +371,7 @@ impl NoWindow for Command {
 }
 
 /// Cached one-shot detection of VS Code on PATH (the zero-config default editor).
+#[tracing::instrument(level = "debug", ret)]
 fn detect_vscode() -> Option<String> {
     static VSCODE: OnceLock<Option<String>> = OnceLock::new();
     VSCODE
@@ -375,6 +393,7 @@ fn detect_vscode() -> Option<String> {
 
 /// Launch a detached command line through the shell so things like `code.cmd` resolve. Errors
 /// are swallowed — a missing editor just no-ops. Mirrors `launch` in `paths.ts`.
+#[tracing::instrument(level = "debug", ret)]
 fn launch(command_line: &str) {
     let result = if cfg!(windows) {
         Command::new("cmd")
@@ -404,6 +423,7 @@ fn launch(command_line: &str) {
 /// The launch itself now lives in [`crate::open`] — this stays as the `&str`-taking front
 /// door its callers already use, and routes a URL to the browser path (which screens the
 /// scheme) and everything else to the file/folder path.
+#[tracing::instrument(level = "debug", ret)]
 pub fn os_open(path: &str) -> Result<(), String> {
     if crate::open::is_openable_url(path) {
         crate::open::open_url(path)

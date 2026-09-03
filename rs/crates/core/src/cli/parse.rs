@@ -77,6 +77,7 @@ struct CliWin {
 
 /// Coerce a `--attach=<target>` value into a routing target. Bare/`focused`/
 /// `current` → focused; `last` → last; a leading integer → that id; else focused.
+#[tracing::instrument(level = "debug", ret)]
 fn parse_routing_target(v: &str) -> RoutingTarget {
     let s = v.to_lowercase();
     if s == "last" {
@@ -93,6 +94,7 @@ fn parse_routing_target(v: &str) -> RoutingTarget {
 
 /// Mimic JS `parseInt(v, 10)`: skip leading whitespace, optional sign, then read
 /// the leading run of decimal digits. `None` when no digit is found (NaN).
+#[tracing::instrument(level = "debug", ret)]
 fn parse_int(s: &str) -> Option<i64> {
     let t = s.trim_start();
     let bytes = t.as_bytes();
@@ -117,6 +119,7 @@ fn parse_int(s: &str) -> Option<i64> {
 
 /// Mimic node `path.resolve(p)` for a single segment: make absolute against the
 /// process cwd, then normalise away `.` / `..` components.
+#[tracing::instrument(level = "debug", ret)]
 fn resolve_path(p: &str) -> String {
     let path = Path::new(p);
     let abs = if path.is_absolute() {
@@ -142,10 +145,12 @@ fn resolve_path(p: &str) -> String {
 /// Parse a launch command line into a workspace + routing. `argv[0]` is the
 /// program path (ignored, as in the TS port). `exists_fn` decides whether a
 /// positional `.json`/`.hyperpanes` is real (injected for testability).
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_cli(argv: &[String]) -> ParsedCli {
     parse_cli_with(argv, |p| Path::new(p).exists())
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn parse_cli_with(argv: &[String], exists_fn: impl Fn(&str) -> bool) -> ParsedCli {
     let args: &[String] = if argv.is_empty() { &[] } else { &argv[1..] };
 
@@ -444,6 +449,7 @@ pub fn parse_cli_with(argv: &[String], exists_fn: impl Fn(&str) -> bool) -> Pars
 
 // ---- cursor helpers (the TS closures, reified over index cursors) ----
 
+#[tracing::instrument(level = "debug", ret, skip(windows))]
 fn open_window(
     windows: &mut Vec<CliWin>,
     cur_win: &mut Option<usize>,
@@ -456,6 +462,7 @@ fn open_window(
     *cur_pane = None;
 }
 
+#[tracing::instrument(level = "debug", ret, skip(windows))]
 fn open_tab(
     windows: &mut Vec<CliWin>,
     cur_win: &mut Option<usize>,
@@ -476,6 +483,7 @@ fn open_tab(
     *cur_pane = None;
 }
 
+#[tracing::instrument(level = "debug", ret, skip_all)]
 fn ensure_tab(
     windows: &mut Vec<CliWin>,
     cur_win: &mut Option<usize>,
@@ -492,6 +500,7 @@ fn win_mut(windows: &mut [CliWin], cur_win: Option<usize>) -> Option<&mut CliWin
     cur_win.and_then(move |w| windows.get_mut(w))
 }
 
+#[tracing::instrument(level = "debug", skip(windows))]
 fn tab_mut(
     windows: &mut [CliWin],
     cur_win: Option<usize>,
@@ -502,6 +511,7 @@ fn tab_mut(
     windows.get_mut(w)?.tabs.get_mut(t)
 }
 
+#[tracing::instrument(level = "debug", skip(windows))]
 fn pane_mut(
     windows: &mut [CliWin],
     cur_win: Option<usize>,

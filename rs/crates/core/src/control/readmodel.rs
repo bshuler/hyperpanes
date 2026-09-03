@@ -29,6 +29,7 @@ pub enum PaneStatus {
 }
 
 impl PaneStatus {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn as_str(self) -> &'static str {
         match self {
             PaneStatus::Running => "running",
@@ -53,6 +54,7 @@ pub enum Activity {
 
 impl Activity {
     /// The precise wire string (used by the new `liveness` channel and internal logic).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn as_str(self) -> &'static str {
         match self {
             Activity::Busy => "busy",
@@ -65,6 +67,7 @@ impl Activity {
     /// The LEGACY-frame string: `AwaitingInput` collapses to `idle` so the frozen
     /// `activity` frame + `/state.activity` field keep their `busy|idle|exited` value set
     /// and no existing client sees a novel value.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn legacy_str(self) -> &'static str {
         match self {
             Activity::AwaitingInput => "idle",
@@ -153,6 +156,7 @@ pub struct ReadModel {
 }
 
 impl ReadModel {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -160,12 +164,14 @@ impl ReadModel {
     // ---- structure maintenance ------------------------------------------------------------
 
     /// Append a window (initial seed / a new OS window).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn add_window(&mut self, window: WindowInfo) {
         self.windows.push(window);
         self.reindex();
     }
 
     /// Drop a window and everything under it.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn drop_window(&mut self, window_id: i64) -> bool {
         let before = self.windows.len();
         self.windows.retain(|w| w.window_id != window_id);
@@ -188,6 +194,7 @@ impl ReadModel {
     /// `list_panes` (the g4 vanish bug). Panes the GUI DID host and dropped (a GUI close,
     /// possibly parked in the closed-tab undo buffer with the session alive) are NOT revived.
     /// Returns the carried-over pane ids (for the caller's log line).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn publish_replace(
         &mut self,
         drop_windows: &[i64],
@@ -236,6 +243,7 @@ impl ReadModel {
     }
 
     /// Rebuild the reverse indexes from the tree. Runs only on structure change.
+    #[tracing::instrument(level = "debug", ret)]
     fn reindex(&mut self) {
         let mut uid_to_pane = HashMap::new();
         let mut pane_loc = HashMap::new();
@@ -256,12 +264,14 @@ impl ReadModel {
 
     // ---- lookups --------------------------------------------------------------------------
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_empty(&self) -> bool {
         self.windows.is_empty()
     }
 
     /// A pane's addressing coordinates, or `None` if unknown. (Inherent name avoids clashing
     /// with the `ScopeTree::pane_coords` trait method below.)
+    #[tracing::instrument(level = "debug", ret)]
     pub fn coords_of(&self, pane_id: &str) -> Option<PaneCoords> {
         self.pane_loc.get(pane_id).map(|(w, t)| PaneCoords {
             pane_id: pane_id.to_string(),
@@ -276,6 +286,7 @@ impl ReadModel {
     /// exactly this) would otherwise get `404 no such pane` on every message it sends or reads.
     /// Also accepts a session uid, which is what a pane's own tooling sometimes has to hand.
     /// Returns the id as the read-model knows it, or `None` when nothing matches.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn resolve_pane_id(&self, id: &str) -> Option<String> {
         if self.pane_loc.contains_key(id) {
             return Some(id.to_string());
@@ -290,10 +301,12 @@ impl ReadModel {
         self.uid_to_pane(id)
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn tab_window(&self, tab_id: &str) -> Option<i64> {
         self.tab_to_window.get(tab_id).copied()
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn has_window(&self, window_id: i64) -> bool {
         self.windows.iter().any(|w| w.window_id == window_id)
     }
@@ -301,6 +314,7 @@ impl ReadModel {
     /// How many tabs a window currently holds. Tab ids are positional
     /// (`"{window_id}:{index}"`), so this is also the index an appended tab will take —
     /// which is how a queued `newTab` can name its id before the UI thread has run it.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn tab_count(&self, window_id: i64) -> Option<usize> {
         self.windows
             .iter()
@@ -309,6 +323,7 @@ impl ReadModel {
     }
 
     /// The tab with this id, if the model knows it.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn tab(&self, tab_id: &str) -> Option<&TabInfo> {
         let wid = self.tab_window(tab_id)?;
         self.windows
@@ -319,10 +334,12 @@ impl ReadModel {
             .find(|t| t.id == tab_id)
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn uid_to_pane(&self, uid: &str) -> Option<String> {
         self.uid_to_pane.get(uid).cloned()
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn pane(&self, pane_id: &str) -> Option<&PaneInfo> {
         let (w, t) = self.pane_loc.get(pane_id)?;
         self.windows
@@ -350,6 +367,7 @@ impl ReadModel {
     }
 
     /// The active tab id of a window (or its first tab if none is marked active).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn active_tab_id(&self, window_id: i64) -> Option<String> {
         let w = self.windows.iter().find(|w| w.window_id == window_id)?;
         w.active_tab_id
@@ -357,11 +375,13 @@ impl ReadModel {
             .or_else(|| w.tabs.first().map(|t| t.id.clone()))
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn first_window_id(&self) -> Option<i64> {
         self.windows.first().map(|w| w.window_id)
     }
 
     /// A flat projection of every pane (for the activity ticker + event resolution).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn panes(&self) -> Vec<PaneRef> {
         let mut out = Vec::new();
         for w in &self.windows {
@@ -387,6 +407,7 @@ impl ReadModel {
 
     /// Insert a pane into a window's active tab (or its first tab). Returns false if the
     /// window has no tab to host it.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn insert_pane(&mut self, window_id: i64, pane: PaneInfo) -> bool {
         let target_tab = match self.active_tab_id(window_id) {
             Some(t) => t,
@@ -403,6 +424,7 @@ impl ReadModel {
     }
 
     /// Insert a pane into a SPECIFIC tab. Returns false if the tab is unknown.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn insert_pane_in_tab(&mut self, tab_id: &str, pane: PaneInfo) -> bool {
         for w in &mut self.windows {
             if let Some(tab) = w.tabs.iter_mut().find(|t| t.id == tab_id) {
@@ -415,6 +437,7 @@ impl ReadModel {
     }
 
     /// Append a whole tab to a window. Returns false if the window is unknown.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn insert_tab(&mut self, window_id: i64, tab: TabInfo) -> bool {
         if let Some(w) = self.windows.iter_mut().find(|w| w.window_id == window_id) {
             w.tabs.push(tab);
@@ -427,6 +450,7 @@ impl ReadModel {
     /// Remove a pane; returns its session uid so the caller can kill the pty. The host tab is
     /// kept even if it becomes empty (mirrors the read-model — closing the GUI tab is a
     /// separate window concern).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn remove_pane(&mut self, pane_id: &str) -> Option<String> {
         let (w, t) = self.pane_loc.get(pane_id)?.clone();
         let win = self.windows.iter_mut().find(|win| win.window_id == w)?;
@@ -438,6 +462,7 @@ impl ReadModel {
     }
 
     /// Set a tab's tiling layout. Returns false if the tab is unknown.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn set_layout(&mut self, tab_id: &str, layout: &str) -> bool {
         for w in &mut self.windows {
             if let Some(tab) = w.tabs.iter_mut().find(|t| t.id == tab_id) {
@@ -450,6 +475,7 @@ impl ReadModel {
 
     /// Rename a pane's header. `set_subtitle` decides whether `subtitle` is touched at all;
     /// an empty subtitle clears it (TS `subtitle:""`).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn rename_pane(
         &mut self,
         pane_id: &str,
@@ -469,6 +495,7 @@ impl ReadModel {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn recolor_pane(&mut self, pane_id: &str, color: &str) -> bool {
         match self.pane_mut(pane_id) {
             Some(p) => {
@@ -480,6 +507,7 @@ impl ReadModel {
     }
 
     /// Enable/disable per-pane "talk". Returns false if the pane is unknown.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn set_talk(&mut self, pane_id: &str, enabled: bool) -> bool {
         match self.pane_mut(pane_id) {
             Some(p) => {
@@ -493,6 +521,7 @@ impl ReadModel {
     /// `(pane id, label)` for every pane currently talking — the speech service's
     /// only read-model dependency, so its background loop can scan for talkers
     /// without knowing the windows/tabs tree shape.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn talking_panes(&self) -> Vec<(String, String)> {
         let mut out = Vec::new();
         for w in &self.windows {
@@ -510,16 +539,19 @@ impl ReadModel {
     /// Record which pane the GUI currently has focused (`None` = unknown). Wired up
     /// by a GUI publisher later; the speech service's `focusedOnly` filter consults
     /// [`Self::focused_pane`] in the meantime.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn set_focused_pane(&mut self, pane_id: Option<String>) {
         self.focused_pane = pane_id;
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn focused_pane(&self) -> Option<&str> {
         self.focused_pane.as_deref()
     }
 
     /// Merge a metadata patch (string → set, null → delete) and return the TRUE merged meta
     /// (mirrors the synchronous `setMeta` echo, agent-orchestration #7). `None` ⇒ no such pane.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn set_meta(
         &mut self,
         pane_id: &str,
@@ -553,6 +585,7 @@ impl ReadModel {
     /// *within* the already-active tab moves nothing it diffs — so the request was invisible
     /// and the keyboard stayed on whichever sibling pane already held it. The pane id is
     /// parked here instead, for [`Self::take_pending_focus`].
+    #[tracing::instrument(level = "debug", ret)]
     pub fn focus_pane(&mut self, pane_id: &str) -> bool {
         let (w, t) = match self.pane_loc.get(pane_id) {
             Some(loc) => loc.clone(),
@@ -568,12 +601,14 @@ impl ReadModel {
 
     /// Take the pane a `focusPane` asked for, if one is waiting. One-shot: the GUI host
     /// consumes it on its next sync tick, and re-publishing the live tree must not replay it.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn take_pending_focus(&mut self) -> Option<String> {
         self.pending_focus.take()
     }
 
     /// Mark a pane exited (from a session `Exit` event), returning its id + coords so the
     /// caller can fan out the `exit`/`activity` frames. Identified by session uid.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn mark_exited(&mut self, uid: &str, code: i32) -> Option<(String, PaneCoords)> {
         let pane_id = self.uid_to_pane.get(uid)?.clone();
         let coords = self.coords_of(&pane_id)?;
@@ -585,6 +620,7 @@ impl ReadModel {
     }
 
     /// Update a pane's cwd from an OSC-7 sniff (identified by session uid).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn set_cwd(&mut self, uid: &str, cwd: &str) -> bool {
         let pane_id = match self.uid_to_pane.get(uid) {
             Some(id) => id.clone(),
@@ -600,6 +636,7 @@ impl ReadModel {
     }
 
     /// Set a pane's session uid + reset status to running (used by restartPane).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn respawn_pane(&mut self, pane_id: &str, new_uid: &str) -> bool {
         match self.pane_mut(pane_id) {
             Some(p) => {
@@ -617,6 +654,7 @@ impl ReadModel {
     /// Serialize `/state` filtered to `scope` (None = master = everything verbatim). `activity`
     /// resolves each pane's liveness from the session manager. Returns an ordered struct so the
     /// JSON byte order matches the TS source.
+    #[tracing::instrument(level = "debug", ret, skip_all)]
     pub fn state_for_scope(
         &self,
         scope: Option<&Scope>,
@@ -627,6 +665,7 @@ impl ReadModel {
 
     /// [`Self::state_for_scope`] + per-pane grid dims (`cols`/`rows`, omitted when the
     /// resolver returns `None`) — additive, for remote clients that emulate the pane.
+    #[tracing::instrument(level = "debug", ret, skip_all)]
     pub fn state_for_scope_with_dims(
         &self,
         scope: Option<&Scope>,
@@ -684,12 +723,15 @@ impl ReadModel {
 
 /// `ScopeTree` over the live model, for `scope::check_mintable` (no-escalation minting).
 impl ScopeTree for ReadModel {
+    #[tracing::instrument(level = "debug", ret)]
     fn pane_coords(&self, pane_id: &str) -> Option<PaneCoords> {
         self.coords_of(pane_id)
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn tab_window(&self, tab_id: &str) -> Option<i64> {
         ReadModel::tab_window(self, tab_id)
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn has_window(&self, window_id: i64) -> bool {
         ReadModel::has_window(self, window_id)
     }
@@ -763,10 +805,12 @@ pub struct PaneOut {
     pub kind: Option<String>,
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn is_false(b: &bool) -> bool {
     !*b
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn pane_out(p: &PaneInfo, activity: Activity, dims: Option<(u16, u16)>) -> PaneOut {
     PaneOut {
         id: p.id.clone(),

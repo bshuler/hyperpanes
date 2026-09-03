@@ -141,6 +141,7 @@ impl HookedTool {
     /// `root_env` wins when it is set and non-empty: it is the tool's OWN override, so a
     /// human who moved `$CODEX_HOME` has moved the file codex reads — writing the
     /// home-relative path instead would register a hook nothing ever loads.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn settings_file(&self, home: &Path) -> PathBuf {
         let rel = |base: PathBuf| self.settings_rel.iter().fold(base, |p, s| p.join(s));
         match self.root_env {
@@ -220,6 +221,7 @@ pub static HOOKED_TOOLS: &[HookedTool] = &[
 /// — un-namespaced, the second tool's marker would silently answer for the first.
 ///
 /// The shipped hook scripts recompute this path in `sh`; the two must move together.
+#[tracing::instrument(level = "debug", ret)]
 pub fn marker_dir(tool_id: &str) -> PathBuf {
     state_dir().join("tool-sessions").join(tool_id)
 }
@@ -244,6 +246,7 @@ struct HookMarker {
 ///
 /// Never trusted blindly — the same gates `claude_panes` applies. The file is written by
 /// an external script, and the id it carries ends up on a command line.
+#[tracing::instrument(level = "debug", ret)]
 pub fn read_pane_mark(tool_id: &str, pane_id: &str) -> Option<ToolSessionMark> {
     // A pane id is a path component here; a hostile one must not be able to climb out of
     // the marker directory. Real ids are uid/alias strings, so refusing is free.
@@ -266,6 +269,7 @@ pub fn read_pane_mark(tool_id: &str, pane_id: &str) -> Option<ToolSessionMark> {
 /// never fired — the first hit in [`HOOKED_TOOLS`] order wins. That is a stable, boring
 /// answer to a situation with no right one, and it costs nothing: adoption only ever fills
 /// an EMPTY mark, so whichever tool got there first has already been recorded anyway.
+#[tracing::instrument(level = "debug", ret)]
 pub fn read_any_pane_mark(pane_id: &str) -> Option<ToolSessionMark> {
     HOOKED_TOOLS
         .iter()
@@ -275,6 +279,7 @@ pub fn read_any_pane_mark(pane_id: &str) -> Option<ToolSessionMark> {
 /// Resolve a bundled hook script, mirroring the packaged layouts
 /// [`crate::claude_hook::bundled_hook_path`] handles: next to the exe, the macOS `.app`
 /// `Contents/Resources`, and the FHS `share`/`lib` install prefixes.
+#[tracing::instrument(level = "debug", ret)]
 fn bundled_script(dir: &str, script: &str) -> Option<PathBuf> {
     let rel = Path::new("resources").join(dir).join(script);
     let exe_dir = std::env::current_exe()
@@ -295,6 +300,7 @@ const WINDOWS_HOOK: (&str, &str) = ("hooks", "hp-session-hook.ps1");
 
 /// The command string to register for `tool`, or `None` when this build's layout ships no
 /// script for it (a dev build run straight out of `target/`, say).
+#[tracing::instrument(level = "debug", skip_all)]
 fn hook_command(tool: &HookedTool) -> Option<String> {
     // `cfg!` rather than `#[cfg]` so both arms compile everywhere: the Windows arm is then
     // type-checked on the machines this is actually developed on, and `HookedTool::script`
@@ -319,6 +325,7 @@ fn hook_command(tool: &HookedTool) -> Option<String> {
 /// path is quoted because an install under `C:\Program Files\…` contains a space, and
 /// `-NoProfile` so that a user profile cannot slow down or break something that runs at
 /// every session start.
+#[tracing::instrument(level = "debug", ret)]
 fn windows_hook_command(script: &Path, tool_id: &str) -> String {
     format!(
         "powershell -NoProfile -ExecutionPolicy Bypass -File \"{}\" -Tool {tool_id}",
@@ -327,6 +334,7 @@ fn windows_hook_command(script: &Path, tool_id: &str) -> String {
 }
 
 /// The user's home, for locating `~/.cursor`, `~/.copilot`, `~/.codex` and `~/.gemini`.
+#[tracing::instrument(level = "debug", ret)]
 fn home_dir() -> Option<PathBuf> {
     if let Some(v) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(v));
@@ -337,6 +345,7 @@ fn home_dir() -> Option<PathBuf> {
 /// Register every bundled hook script in its tool's settings file. Returns the number of
 /// files newly modified (0 = already registered / no such tool installed / nothing
 /// bundled). Best-effort: per-file errors are logged and never fatal.
+#[tracing::instrument(level = "debug", ret)]
 pub fn ensure_registered() -> usize {
     let Some(home) = home_dir() else {
         return 0;
@@ -372,6 +381,7 @@ pub fn ensure_registered() -> usize {
 /// reason: a `~/.cursor` that does not exist means cursor-agent is not installed (or has
 /// never run), and conjuring a config for a tool the human does not use is not this
 /// program's business.
+#[tracing::instrument(level = "debug", skip_all)]
 fn ensure_in_file(file: &Path, cmd: &str, tool: &HookedTool) -> Result<bool, String> {
     match file.parent() {
         Some(p) if p.is_dir() => {}
@@ -405,6 +415,7 @@ fn ensure_in_file(file: &Path, cmd: &str, tool: &HookedTool) -> Result<bool, Str
 /// Ensure `hooks.<event>` contains an entry running `cmd`, spelled `shape`'s way. Returns
 /// whether it added one (idempotent: a no-op if already present; leaves a malformed shape
 /// untouched, returning false rather than repairing a file the human may have meant).
+#[tracing::instrument(level = "debug", ret)]
 fn ensure_event(root: &mut Value, event: &str, cmd: &str, shape: HookShape) -> bool {
     let Some(obj) = root.as_object_mut() else {
         return false;
@@ -433,6 +444,7 @@ fn ensure_event(root: &mut Value, event: &str, cmd: &str, shape: HookShape) -> b
 /// hook in the *other* form is left alone rather than gaining a duplicate — the cost of
 /// being wrong here is a tool that calls the same script twice per session, and the check
 /// is free.
+#[tracing::instrument(level = "debug", ret)]
 fn entry_runs(entry: &Value, cmd: &str) -> bool {
     if entry.get("command").and_then(Value::as_str) == Some(cmd) {
         return true;

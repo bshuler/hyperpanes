@@ -30,6 +30,7 @@ const DEFAULT_PATHEXT: &str = ".COM;.EXE;.BAT;.CMD;.VBS;.VBE;.JS;.JSE;.WSF;.WSH;
 
 /// Case-insensitive lookup of `name` first in the optional `env` override, then in
 /// the process environment — the port of TS `getEnvVar`.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn get_env_var(name: &str, env: Option<&EnvMap>) -> Option<String> {
     let target = name.to_ascii_uppercase();
     if let Some(env) = env {
@@ -51,6 +52,7 @@ pub fn get_env_var(name: &str, env: Option<&EnvMap>) -> Option<String> {
 /// exit code flows back via `onExit` (powers pane status + restart). The invocation
 /// flag is keyed off the shell, not the platform, so a custom shell (pwsh, or
 /// git-bash on Windows) is launched with the right switch. Port of TS `buildArgs`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn build_args(shell: &str, command: Option<&str>, base_args: Option<&[String]>) -> Vec<String> {
     let command = match command {
         Some(c) => c,
@@ -74,6 +76,7 @@ pub fn build_args(shell: &str, command: Option<&str>, base_args: Option<&[String
 
 // Mirror of the TS regex `/(?:^|[\\/])(?:bash|zsh|fish|sh|dash|ash)(?:\.exe)?$/`:
 // a POSIX shell basename, optionally `.exe`, at the end of the (lowercased) path.
+#[tracing::instrument(level = "debug", ret)]
 fn is_posix_shell(lower: &str) -> bool {
     let stem = lower.strip_suffix(".exe").unwrap_or(lower);
     // basename after the last path separator
@@ -81,6 +84,7 @@ fn is_posix_shell(lower: &str) -> bool {
     matches!(base, "bash" | "zsh" | "fish" | "sh" | "dash" | "ash")
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn real_is_file(p: &str) -> bool {
     std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
 }
@@ -88,12 +92,14 @@ fn real_is_file(p: &str) -> bool {
 /// Resolve a Windows command name to a concrete executable path by searching cwd
 /// then PATH and applying PATHEXT — port of TS `resolveWindowsCommand`. Uses the
 /// real filesystem; see [`resolve_windows_command_with`] for the injectable core.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve_windows_command(command: &str, cwd: Option<&str>, env: Option<&EnvMap>) -> String {
     resolve_windows_command_with(command, cwd, env, &real_is_file)
 }
 
 /// Injectable core of [`resolve_windows_command`]: `is_file` decides which candidate
 /// paths "exist" (the unit tests substitute a closure for `fs.statSync`).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve_windows_command_with(
     command: &str,
     cwd: Option<&str>,
@@ -162,6 +168,7 @@ pub fn resolve_windows_command_with(
 }
 
 // The process cwd as a string (best-effort). Mirrors Node `process.cwd()`.
+#[tracing::instrument(level = "debug", ret)]
 fn process_cwd() -> String {
     std::env::current_dir()
         .ok()
@@ -173,6 +180,7 @@ fn process_cwd() -> String {
 // base-relative path and normalize `.`/`..`/duplicate-separator segments. Only the
 // Windows shapes the resolver needs (drive-qualified absolutes and cwd-relative
 // names) are handled — this is a win32-only code path.
+#[tracing::instrument(level = "debug", ret)]
 fn win_resolve(base: &str, p: &str) -> String {
     let pb = p.as_bytes();
     let is_abs = (pb.len() >= 2 && pb[0].is_ascii_alphabetic() && pb[1] == b':')
@@ -186,6 +194,7 @@ fn win_resolve(base: &str, p: &str) -> String {
     normalize_win(&combined)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn normalize_win(path: &str) -> String {
     let bytes = path.as_bytes();
     let (drive, rest) = if bytes.len() >= 2 && bytes[1] == b':' {
@@ -218,6 +227,7 @@ fn normalize_win(path: &str) -> String {
 ///   * no `command` → an interactive shell, with any `args` handed to it verbatim.
 ///
 /// Port of TS `resolveSpawn`. Uses the real fs/platform; see [`resolve_spawn_with`].
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve_spawn(
     shell: &str,
     command: Option<&str>,
@@ -231,6 +241,7 @@ pub fn resolve_spawn(
 /// Injectable core of [`resolve_spawn`] — `windows` selects the direct-spawn path
 /// resolution and `is_file` stands in for `fs.statSync` (so the P4a tests are
 /// deterministic on any host).
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve_spawn_with(
     shell: &str,
     command: Option<&str>,
@@ -263,6 +274,7 @@ pub fn resolve_spawn_with(
 /// (`pwsh.exe`) when installed — only pwsh gets our PSReadLine history prediction and
 /// OSC-7 cwd reporting — else `COMSPEC` (cmd), else Windows PowerShell. Resolved once
 /// and cached. Elsewhere: `$SHELL` or `/bin/bash`. Port of TS `defaultShell`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn default_shell() -> String {
     if cfg!(windows) {
         static WIN_DEFAULT: OnceLock<String> = OnceLock::new();
@@ -311,6 +323,7 @@ pub struct EnvInputs<'a> {
 /// GUI-native panes are self-describing too. Never an empty string a child might
 /// mistake for "unset but present" (see `hyperpanes pair`'s workaround for that
 /// symptom).
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_control_file(explicit: Option<&str>) -> Option<String> {
     resolve_control_file_with(explicit, |name| std::env::var(name).ok()).or_else(|| {
         Some(
@@ -321,6 +334,7 @@ pub fn resolve_control_file(explicit: Option<&str>) -> Option<String> {
     })
 }
 
+#[tracing::instrument(level = "debug", ret, skip_all)]
 fn resolve_control_file_with(
     explicit: Option<&str>,
     env_lookup: impl Fn(&str) -> Option<String>,
@@ -350,6 +364,7 @@ pub const HARNESS_MARKERS: &[&str] = &[
     "CLAUDE_CODE_SSE_PORT",
 ];
 
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn build_env(inputs: &EnvInputs<'_>) -> EnvMap {
     let mut env: EnvMap = inputs.process_env.clone();
     if let Some(o) = inputs.opts_env {

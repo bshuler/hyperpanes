@@ -11,6 +11,7 @@ use std::process::{Command, Stdio};
 use super::BrowserApp;
 use crate::tools::detect::on_path;
 
+#[tracing::instrument(level = "debug", ret)]
 fn detached(cmd: &mut Command) -> Result<(), String> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -21,6 +22,7 @@ fn detached(cmd: &mut Command) -> Result<(), String> {
 }
 
 /// `xdg-open <target>`, falling back to `gio open <target>` when xdg-utils isn't installed.
+#[tracing::instrument(level = "debug", ret)]
 fn xdg(target: &str) -> Result<(), String> {
     let first = detached(Command::new("xdg-open").arg(target));
     if first.is_ok() {
@@ -35,6 +37,7 @@ fn xdg(target: &str) -> Result<(), String> {
 }
 
 /// A leading `-` would be read as an option by either handler.
+#[tracing::instrument(level = "debug", ret)]
 fn safe_arg(path: &Path) -> String {
     let s = path.to_string_lossy().to_string();
     if s.starts_with('-') {
@@ -44,18 +47,22 @@ fn safe_arg(path: &Path) -> String {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_url(url: &str) -> Result<(), String> {
     xdg(url)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_url_with(launcher: &str, url: &str) -> Result<(), String> {
     detached(Command::new(launcher).arg(url))
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_path(path: &Path) -> Result<(), String> {
     xdg(&safe_arg(path))
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn reveal_path(path: &Path) -> Result<(), String> {
     if path.is_dir() {
         return xdg(&safe_arg(path));
@@ -82,6 +89,7 @@ pub fn reveal_path(path: &Path) -> Result<(), String> {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_path_with(launcher: &str, path: &Path) -> Result<(), String> {
     let arg = safe_arg(path);
     // The launcher is the absolute path of a desktop entry when we found one, and an
@@ -105,6 +113,7 @@ pub fn open_path_with(launcher: &str, path: &Path) -> Result<(), String> {
 
 /// The `applications` directories, in the order XDG searches them: the user's own first,
 /// so a local override shadows the system copy of the same entry.
+#[tracing::instrument(level = "debug", ret)]
 fn desktop_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     let home = std::env::var("HOME").unwrap_or_default();
@@ -132,6 +141,7 @@ fn desktop_dirs() -> Vec<PathBuf> {
 /// that does exist is content-sniffed — an empty `.py` comes back `text/plain` and the
 /// menu loses every Python editor. The glob table is what we actually mean: what this
 /// *name* is.
+#[tracing::instrument(level = "debug", ret)]
 fn mimes_for(ext: &str) -> Vec<String> {
     let pattern = format!("*.{ext}");
     let mut out = Vec::new();
@@ -152,6 +162,7 @@ fn mimes_for(ext: &str) -> Vec<String> {
 
 /// One desktop entry's `Name` and `MimeType`, or `None` when it is not a launchable
 /// application (hidden, or no types at all).
+#[tracing::instrument(level = "debug", ret)]
 fn desktop_entry(file: &Path) -> Option<(String, Vec<String>)> {
     let body = std::fs::read_to_string(file).ok()?;
     let mut name = None;
@@ -185,6 +196,7 @@ fn desktop_entry(file: &Path) -> Option<(String, Vec<String>)> {
     (!mimes.is_empty()).then_some((name, mimes))
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn handlers_for_ext(ext: &str) -> Vec<super::HandlerApp> {
     let mimes = mimes_for(ext);
     if mimes.is_empty() {
@@ -248,6 +260,7 @@ const KNOWN: &[(&str, &str, &[&str])] = &[
     ("librewolf", "LibreWolf", &["librewolf"]),
 ];
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn list_browsers() -> Vec<BrowserApp> {
     let mut out = Vec::new();
     for (id, name, bins) in KNOWN {

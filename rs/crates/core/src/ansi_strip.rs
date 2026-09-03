@@ -13,12 +13,14 @@ const OSC8: char = '\u{9d}'; // 8-bit OSC
 const BEL: char = '\u{07}'; // OSC terminator (BEL)
 
 /// Strip ANSI escape sequences, leaving printable text / newlines / tabs intact.
+#[tracing::instrument(level = "debug", ret)]
 pub fn strip_ansi(input: &str) -> String {
     strip_esc_fe(&strip_csi(&strip_osc(input)))
 }
 
 // OSC: (ESC ] | 8-bit OSC) … (BEL | ST = ESC \). Lazy to the terminator. An
 // unterminated OSC start is left as-is (the regex match simply fails).
+#[tracing::instrument(level = "debug", ret)]
 fn strip_osc(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::new();
@@ -60,6 +62,7 @@ fn strip_osc(input: &str) -> String {
 }
 
 // CSI: (ESC [ | 8-bit CSI) params(0x30-0x3F) intermediates(0x20-0x2F) final(0x40-0x7E).
+#[tracing::instrument(level = "debug", ret)]
 fn strip_csi(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::new();
@@ -92,6 +95,7 @@ fn strip_csi(input: &str) -> String {
 }
 
 // Remaining two-byte ESC Fe sequences (ESC followed by 0x40-0x5F), e.g. ESC M.
+#[tracing::instrument(level = "debug", ret)]
 fn strip_esc_fe(input: &str) -> String {
     let chars: Vec<char> = input.chars().collect();
     let mut out = String::new();

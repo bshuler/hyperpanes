@@ -36,6 +36,7 @@ struct UnixNames {
 
 /// The per-user runtime dir: `$XDG_RUNTIME_DIR` (Linux), `$TMPDIR` (macOS per-user
 /// confstr dir), `/tmp` as the last resort. Relative values are ignored.
+#[tracing::instrument(level = "debug", ret)]
 fn runtime_dir() -> PathBuf {
     for var in ["XDG_RUNTIME_DIR", "TMPDIR"] {
         if let Some(v) = std::env::var_os(var) {
@@ -50,6 +51,7 @@ fn runtime_dir() -> PathBuf {
     PathBuf::from("/tmp")
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn unix_names(salt: &str) -> UnixNames {
     let h = format!("{:016x}", fnv1a64(salt));
     let lock = runtime_dir().join(format!("hyperpanes.singleton.{h}.lock"));
@@ -73,6 +75,7 @@ fn unix_names(salt: &str) -> UnixNames {
     }
 }
 
+#[tracing::instrument(level = "debug")]
 pub fn acquire(salt: &str) -> io::Result<Instance> {
     let names = unix_names(salt);
     if let Some(dir) = names.lock.parent() {
@@ -108,6 +111,7 @@ pub struct PrimaryInstance {
 
 impl PrimaryInstance {
     /// The hand-off endpoint we serve (exposed mainly for diagnostics/tests).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pipe_name(&self) -> &str {
         &self.names.endpoint
     }
@@ -120,6 +124,7 @@ impl PrimaryInstance {
     /// Per-connection errors (a secondary that died mid-send, a malformed payload)
     /// are swallowed and the loop continues — one bad launch must never take down
     /// the primary's hand-off channel. Only failure to bind the socket is fatal.
+    #[tracing::instrument(level = "debug", ret, skip(self, handler))]
     pub async fn run_server<F>(self, mut handler: F) -> io::Result<()>
     where
         F: FnMut(HandoffMessage),
@@ -145,6 +150,7 @@ pub struct SecondaryInstance {
 
 impl SecondaryInstance {
     /// The hand-off endpoint we forward to (exposed mainly for diagnostics/tests).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pipe_name(&self) -> &str {
         &self.names.endpoint
     }
@@ -152,6 +158,7 @@ impl SecondaryInstance {
     /// Connect to the primary's socket and send our `{argv,cwd}` as JSON. Retries
     /// briefly while the socket is not yet accepting (we may have lost the acquire
     /// race to a primary that is still between `acquire` and `run_server`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub async fn forward(&self, msg: &HandoffMessage) -> io::Result<()> {
         let bytes = serde_json::to_vec(msg)?;
         let mut stream = connect_with_retry(&self.names).await?;
@@ -163,6 +170,7 @@ impl SecondaryInstance {
 }
 
 #[cfg(target_os = "linux")]
+#[tracing::instrument(level = "debug", ret)]
 fn bind_listener(names: &UnixNames) -> io::Result<UnixListener> {
     use std::os::linux::net::SocketAddrExt;
     let addr = std::os::unix::net::SocketAddr::from_abstract_name(names.abstract_name.as_bytes())?;
@@ -172,6 +180,7 @@ fn bind_listener(names: &UnixNames) -> io::Result<UnixListener> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[tracing::instrument(level = "debug", ret)]
 fn bind_listener(names: &UnixNames) -> io::Result<UnixListener> {
     // We hold the flock, so an existing socket file is a dead primary's leftover.
     let _ = fs::remove_file(&names.socket);
@@ -179,6 +188,7 @@ fn bind_listener(names: &UnixNames) -> io::Result<UnixListener> {
 }
 
 #[cfg(target_os = "linux")]
+#[tracing::instrument(level = "debug", ret)]
 fn connect_once(names: &UnixNames) -> io::Result<UnixStream> {
     use std::os::linux::net::SocketAddrExt;
     let addr = std::os::unix::net::SocketAddr::from_abstract_name(names.abstract_name.as_bytes())?;
@@ -188,6 +198,7 @@ fn connect_once(names: &UnixNames) -> io::Result<UnixStream> {
 }
 
 #[cfg(not(target_os = "linux"))]
+#[tracing::instrument(level = "debug", ret)]
 fn connect_once(names: &UnixNames) -> io::Result<UnixStream> {
     let stream = std::os::unix::net::UnixStream::connect(&names.socket)?;
     stream.set_nonblocking(true)?;
@@ -196,6 +207,7 @@ fn connect_once(names: &UnixNames) -> io::Result<UnixStream> {
 
 // Tolerate the brief window where the primary holds the flock but has not bound its
 // listener yet (mirrors the Windows ERROR_PIPE_BUSY retry).
+#[tracing::instrument(level = "debug", ret)]
 async fn connect_with_retry(names: &UnixNames) -> io::Result<UnixStream> {
     let mut last = io::Error::new(io::ErrorKind::TimedOut, "hand-off socket never came up");
     for _ in 0..50 {

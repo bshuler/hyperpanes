@@ -83,6 +83,7 @@ pub static GUI_RESTARTING: std::sync::atomic::AtomicBool =
 /// `hyperpanes_core::logging`): the GUI, the session daemon, the crash dialog and the
 /// pipeable/worker command lines each get their own file so a `ctl` burst cannot roll the
 /// GUI's log out from under a bug report.
+#[tracing::instrument(level = "debug", ret)]
 fn log_role(argv: &[String]) -> &'static str {
     if session_daemon_salt(argv).is_some() {
         return "daemon";
@@ -102,6 +103,7 @@ fn log_role(argv: &[String]) -> &'static str {
 /// present. Accepts both `--session-daemon <salt>` and `--session-daemon=<salt>`. Returns
 /// `None` for a normal GUI launch. Kept here (not in core) so `main` stays the entry and
 /// core owns the daemon logic.
+#[tracing::instrument(level = "debug", ret)]
 fn session_daemon_salt(argv: &[String]) -> Option<String> {
     let mut it = argv.iter();
     while let Some(arg) = it.next() {
@@ -122,6 +124,7 @@ fn session_daemon_salt(argv: &[String]) -> Option<String> {
 /// running session daemon, tell it to shut down its sessions + exit, then return). A bare
 /// flag — the salt is the user-data dir (the same key the daemon's discovery uses), resolved
 /// in `main`. No-op if no daemon is running.
+#[tracing::instrument(level = "debug", ret)]
 fn wants_kill_daemon(argv: &[String]) -> bool {
     argv.iter().any(|a| a == "--kill-daemon")
 }
@@ -142,6 +145,7 @@ pub(crate) mod perf {
     static PATH: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
 
     /// Capture t0 + resolve the log path. Call once at the very top of `main`.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn init() {
         let _ = START.get_or_init(Instant::now);
         let _ = PATH.get_or_init(|| {
@@ -158,11 +162,13 @@ pub(crate) mod perf {
 
     /// Whether perf logging is on (cheap — a resolved `OnceLock` load).
     #[inline]
+    #[tracing::instrument(level = "debug", ret)]
     pub fn enabled() -> bool {
         matches!(PATH.get(), Some(Some(_)))
     }
 
     /// Milliseconds since [`init`].
+    #[tracing::instrument(level = "debug", ret)]
     pub fn elapsed_ms() -> f64 {
         START
             .get()
@@ -170,6 +176,7 @@ pub(crate) mod perf {
             .unwrap_or(0.0)
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     fn write_line(line: &str) {
         if let Some(Some(p)) = PATH.get() {
             if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -183,6 +190,7 @@ pub(crate) mod perf {
     }
 
     /// Record a one-off timestamped milestone (used for the startup path, #2).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn mark(label: &str) {
         if !enabled() {
             return;
@@ -222,6 +230,7 @@ pub(crate) mod perf {
     /// activity. `drain_ns` covers the session-event drain+feed, `render_ns` the per-window
     /// render pump, `tick_ns` the whole tick — so the summary shows the app's busy fraction
     /// (is the app the throughput bottleneck, or is it idle waiting on the pty?).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn tick(
         events: u64,
         bytes: u64,
@@ -278,6 +287,7 @@ enum InfoMode {
 /// Classifies `argv` as a `--help`/`--version` request, or `None` for anything else (including
 /// a bare GUI launch or a subcommand like `worker`/`pair`). Only looks at `argv[1]` — the first
 /// CLI arg after the program path — so e.g. `hyperpanes -c "echo --help"` isn't misclassified.
+#[tracing::instrument(level = "debug", ret)]
 fn cli_info_mode(argv: &[String]) -> Option<InfoMode> {
     match argv.get(1).map(String::as_str) {
         Some("--help") | Some("-h") | Some("help") => Some(InfoMode::Help),
@@ -695,6 +705,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Seed a richer workspace (2 tabs, several panes, non-default layouts) so a
 /// screenshot exercises the Wave-1 surface. Gated by `HYPERPANES_DEMO`.
+#[tracing::instrument(level = "debug", skip_all)]
 pub(crate) fn demo_seed(st: &mut State, mgr: &SessionManager) {
     use hyperpanes_core::layout::presets::Layout;
     // tab 0: 3 panes in main-stack (shows the main divider + focus ring)
@@ -710,6 +721,7 @@ pub(crate) fn demo_seed(st: &mut State, mgr: &SessionManager) {
 }
 
 /// Whether `text` is the Slint special key `k`.
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn is_key(text: &str, k: Key) -> bool {
     let s: SharedString = k.into();
     text == s.as_str()
@@ -724,6 +736,7 @@ pub(crate) fn is_key(text: &str, k: Key) -> bool {
 /// and Cmd+C has to copy, and the swap gave both the other one's job. So the bytes written to the
 /// pty take their control modifier from the *physical* Control key, and Cmd is left free to be
 /// the app's modifier (`pane.copy`, `pane.paste`).
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn pty_ctrl(msg: &KeyMsg) -> bool {
     if cfg!(target_os = "macos") {
         msg.meta
@@ -736,6 +749,7 @@ pub(crate) fn pty_ctrl(msg: &KeyMsg) -> bool {
 /// (Slint reports Shift/Ctrl/Alt/Meta as low control codepoints), F-keys, and
 /// other special keys Slint delivers as control/private-use codepoints that
 /// `encode_key` would otherwise pass through as garbage bytes.
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn forwardable(text: &str) -> bool {
     // Special keys we explicitly translate to terminal sequences (encode_key).
     const ALLOWED: [Key; 14] = [
@@ -777,6 +791,7 @@ pub(crate) fn forwardable(text: &str) -> bool {
 /// (letters, digits, and symbols like `=`/`-`/`0`) lower-cased so a chord matches regardless
 /// of Shift. With Ctrl held Slint reports a control char (Ctrl+A = U+0001 … Ctrl+Z = U+001A),
 /// so map that back to its letter. Shared by the router and the keybindings editor's capture.
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn key_tok_from_text(text: &str, control: bool) -> Option<keybindings::KeyTok> {
     use keybindings::KeyTok;
     // Named keys first — these must win before the Ctrl control-char remap (e.g. Ctrl+Tab
@@ -842,12 +857,14 @@ pub(crate) fn key_tok_from_text(text: &str, control: bool) -> Option<keybindings
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn key_tok(msg: &KeyMsg) -> Option<keybindings::KeyTok> {
     key_tok_from_text(&msg.text, msg.control)
 }
 
 /// Resolve a key event to a bound [`Command`] via the user's keymap (overrides win over
 /// defaults — see [`keybindings::Keymap::match_chord`]).
+#[tracing::instrument(level = "debug", ret, skip(keymap))]
 pub(crate) fn route_chord(keymap: &keybindings::Keymap, msg: &KeyMsg) -> Option<Command> {
     let tok = key_tok(msg)?;
     keymap.match_chord(msg.control, msg.alt, msg.shift, tok)
@@ -863,6 +880,7 @@ pub(crate) fn route_chord(keymap: &keybindings::Keymap, msg: &KeyMsg) -> Option<
 /// included, until a click). Routing the keys here keeps the terminal `FocusScope` focused
 /// the whole time, so the palette needs no focus hand-off in either direction.
 /// `None` = swallow (no key reaches the pty while the palette is open).
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn palette_key(query: &str, msg: &KeyMsg) -> Option<Command> {
     if is_key(&msg.text, Key::UpArrow) {
         return Some(Command::PaletteNav(-1));
@@ -907,6 +925,7 @@ pub(crate) fn palette_key(query: &str, msg: &KeyMsg) -> Option<Command> {
 /// picks a history row, else submits; Esc collapses the options/list, then closes the box; Ctrl+V
 /// pastes an image attachment (or text). Left/Right/Up/Down on the bare text field never reach
 /// here — the TextInput moves its cursor with them.
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn goal_key(field: usize, menu_open: bool, msg: &KeyMsg) -> Option<Command> {
     // Ctrl+O toggles the option chips (Slint may deliver the letter or the control char).
     if msg.control && !msg.alt && (msg.text == "o" || msg.text == "O" || msg.text == "\u{0f}") {
@@ -978,6 +997,7 @@ pub(crate) fn goal_key(field: usize, menu_open: bool, msg: &KeyMsg) -> Option<Co
 /// One predicate rather than a check at each entry point, so the SIGPIPE decision is made in a
 /// single place and can be tested without spawning a process. Deliberately excludes the modes
 /// that outlive their output: the session daemon, the worker, and the GUI.
+#[tracing::instrument(level = "debug", ret)]
 fn pipeable_cli(argv: &[String]) -> bool {
     ctl_cli::wants_ctl(argv)
         || pair::wants_pair(argv)
@@ -990,6 +1010,7 @@ fn pipeable_cli(argv: &[String]) -> bool {
 /// the way it ends `cat` or `ls` — silently, with the conventional status — instead of
 /// returning an error that `println!` escalates into a panic.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn restore_default_sigpipe() {
     // SAFETY: `signal(2)` with `SIG_DFL` only writes this process's disposition for one
     // signal. Called once, on the main thread, before any of these CLIs has written a byte.
@@ -1001,6 +1022,7 @@ fn restore_default_sigpipe() {
 /// No-op off unix: there is no SIGPIPE, and a closed pipe already surfaces as an ordinary
 /// write error.
 #[cfg(not(unix))]
+#[tracing::instrument(level = "debug", ret)]
 fn restore_default_sigpipe() {}
 
 #[cfg(test)]

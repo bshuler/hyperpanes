@@ -34,6 +34,7 @@ pub const TOOL_ID: &str = "gemini";
 /// environment variable — reading it as one would send us to the wrong tree.) `USERPROFILE`
 /// before `HOME` because gemini asks Node for `os.homedir()`, which on Windows is
 /// `USERPROFILE` and not the `HOME` a POSIX-ish shell may have set.
+#[tracing::instrument(level = "debug", ret)]
 pub fn gemini_root() -> Option<PathBuf> {
     let home = std::env::var_os("GEMINI_CLI_HOME")
         .filter(|v| !v.is_empty())
@@ -55,6 +56,7 @@ pub fn gemini_root() -> Option<PathBuf> {
 ///
 /// The id is matched against directory *entries*, never joined into the path, so a hostile
 /// value can name nothing outside the tree even if one reached here.
+#[tracing::instrument(level = "debug", ret)]
 pub fn chat_for_session(root: &Path, session_id: &str) -> Option<PathBuf> {
     let prefix = session_prefix(session_id)?;
     let needle = format!("-{prefix}.jsonl");
@@ -84,6 +86,7 @@ pub fn chat_for_session(root: &Path, session_id: &str) -> Option<PathBuf> {
 /// Rejects anything that is not plain lowercase-hex-or-dash, which is what a gemini session
 /// id is: it keeps a path separator out of the needle, and it means a caller passing
 /// something that was never a session id gets `None` rather than a scan.
+#[tracing::instrument(level = "debug", ret)]
 fn session_prefix(session_id: &str) -> Option<String> {
     if session_id.len() < 8
         || !session_id
@@ -100,6 +103,7 @@ fn session_prefix(session_id: &str) -> Option<String> {
 /// Gemini writes a header record there — `{"sessionId":…,"projectHash":…,"kind":"main"}` —
 /// before any message. Only that line is read: the file is an append-only log that grows
 /// for as long as the conversation does, and this runs on the tailer's timer.
+#[tracing::instrument(level = "debug", ret)]
 fn header_session_id(path: &Path) -> Option<String> {
     use std::io::{BufRead, Read};
     let file = std::fs::File::open(path).ok()?;
@@ -118,6 +122,7 @@ fn header_session_id(path: &Path) -> Option<String> {
 ///
 /// Unordered, because unlike codex's dated tree there is nothing chronological in these
 /// names to sort by, and the full-id check makes the answer independent of visit order.
+#[tracing::instrument(level = "debug", ret)]
 fn project_dirs(dir: &Path) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(dir) else {
         return Vec::new();

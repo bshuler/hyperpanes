@@ -20,6 +20,7 @@ pub struct Match {
 /// Find every case-insensitive occurrence of `query` across `lines`, where each entry is
 /// `(absolute_line, row_text)`. Matches within a line don't overlap (the scan resumes past
 /// each hit). Returns them in line order (the caller supplies lines top→bottom).
+#[tracing::instrument(level = "debug", ret)]
 pub fn find_matches(lines: &[(i32, String)], query: &str) -> Vec<Match> {
     let mut out = Vec::new();
     if query.is_empty() {
@@ -53,6 +54,7 @@ pub fn find_matches(lines: &[(i32, String)], query: &str) -> Vec<Match> {
 /// Pick the index of the result to activate when search results change, biased to the first
 /// match at or below `prefer_line` (so opening search jumps to the nearest match below the
 /// viewport top, like xterm's `findNext`). Returns `None` for an empty set.
+#[tracing::instrument(level = "debug", ret)]
 pub fn initial_index(matches: &[Match], prefer_line: i32) -> Option<usize> {
     if matches.is_empty() {
         return None;
@@ -64,6 +66,7 @@ pub fn initial_index(matches: &[Match], prefer_line: i32) -> Option<usize> {
 }
 
 /// Step `idx` by `+1` (next) or `-1` (prev) with wraparound over `len` results.
+#[tracing::instrument(level = "debug", ret)]
 pub fn step(idx: usize, len: usize, forward: bool) -> usize {
     if len == 0 {
         return 0;

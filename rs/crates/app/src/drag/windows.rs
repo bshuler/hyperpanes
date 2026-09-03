@@ -9,6 +9,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+#[tracing::instrument(level = "debug", ret)]
 fn hwnd(raw: isize) -> HWND {
     HWND(raw as *mut c_void)
 }
@@ -26,16 +27,19 @@ unsafe extern "system" fn ghost_wndproc(h: HWND, msg: u32, wp: WPARAM, lp: LPARA
 pub struct PlatformPointer;
 
 impl super::GlobalPointer for PlatformPointer {
+    #[tracing::instrument(level = "debug", ret)]
     fn poll(&self) -> Option<(slint::PhysicalPosition, bool)> {
         let (x, y) = cursor_pos();
         Some((slint::PhysicalPosition::new(x, y), left_button_down()))
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn supports_cross_window(&self) -> bool {
         true
     }
 }
 
 /// Screen-global cursor position (physical px). Slint exposes no equivalent.
+#[tracing::instrument(level = "debug", ret)]
 pub fn cursor_pos() -> (i32, i32) {
     let mut p = POINT::default();
     unsafe {
@@ -45,12 +49,14 @@ pub fn cursor_pos() -> (i32, i32) {
 }
 
 /// Is the primary (left) mouse button currently held?
+#[tracing::instrument(level = "debug", ret)]
 pub fn left_button_down() -> bool {
     unsafe { (GetAsyncKeyState(VK_LBUTTON.0 as i32) as u16 & 0x8000) != 0 }
 }
 
 /// A window's screen rect (physical px), `(left, top, right, bottom)`. `0`-rect when
 /// the HWND isn't realized yet.
+#[tracing::instrument(level = "debug", ret)]
 pub fn window_rect(raw: isize) -> (i32, i32, i32, i32) {
     let mut r = RECT::default();
     if raw != 0 {
@@ -70,6 +76,7 @@ pub struct Ghost {
 }
 
 impl Ghost {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new() -> Ghost {
         let w = 200;
         let h = 44;
@@ -114,6 +121,7 @@ impl Ghost {
     }
 
     /// Move + show, offset a little below/right of the cursor hotspot.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn follow(&self, p: (i32, i32)) {
         unsafe {
             let _ = SetWindowPos(
@@ -128,6 +136,7 @@ impl Ghost {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn hide(&self) {
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_HIDE);

@@ -58,6 +58,7 @@ struct AdoptedPty {
 
 impl AdoptedPty {
     /// Run `f` with the master descriptor, or fail with a broken pipe if this pty was killed.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn with_fd<T>(&self, f: impl FnOnce(RawFd) -> io::Result<T>) -> io::Result<T> {
         let guard = self.master.lock().unwrap();
         match guard.as_ref() {
@@ -71,6 +72,7 @@ impl AdoptedPty {
 }
 
 /// The foreground process group of the terminal on `fd`, if it has one.
+#[tracing::instrument(level = "debug", ret)]
 fn foreground_pgrp(fd: RawFd) -> Option<i32> {
     // SAFETY: `fd` is a live pty master descriptor for the duration of the call.
     match unsafe { libc::tcgetpgrp(fd) } {
@@ -83,6 +85,7 @@ impl Pty for AdoptedPty {
     /// Write to the slave's stdin. There is no `Box<dyn Write>` to borrow — only the raw
     /// master — so this is a plain `write(2)` loop: partial writes are resumed and `EINTR`
     /// is retried.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn write(&self, data: &[u8]) -> io::Result<()> {
         self.with_fd(|fd| {
             let mut sent = 0usize;
@@ -108,6 +111,7 @@ impl Pty for AdoptedPty {
         })
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         let ws = libc::winsize {
             ws_row: rows.max(1),
@@ -138,6 +142,7 @@ impl Pty for AdoptedPty {
     /// once the child's slave descriptors are gone, and emits the single [`PtyEvent::Exit`].
     ///
     /// Idempotent — a second call is a no-op, as `kill` on an already-dead child is.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn kill(&self) -> io::Result<()> {
         let mut guard = self.master.lock().unwrap();
         let Some(master) = guard.take() else {
@@ -155,6 +160,7 @@ impl Pty for AdoptedPty {
     /// An adopted pty is itself handoff-able, so a *second* upgrade carries the same session
     /// on again. Without this a terminal would survive exactly one upgrade and die on the
     /// next. `None` once killed — there is no longer a descriptor to hand over.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn handoff_info(&self) -> Option<HandoffInfo> {
         let guard = self.master.lock().unwrap();
         let fd = guard.as_ref()?.as_raw_fd();
@@ -166,6 +172,7 @@ impl Pty for AdoptedPty {
 }
 
 /// Duplicate `fd` into a fresh owned descriptor (close-on-exec).
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn dup_cloexec(fd: RawFd) -> io::Result<OwnedFd> {
     // SAFETY: `fd` is live for the call; F_DUPFD_CLOEXEC returns a new descriptor owned by
     // no one else, wrapped immediately below so it cannot leak.
@@ -185,6 +192,7 @@ pub(crate) fn dup_cloexec(fd: RawFd) -> io::Result<OwnedFd> {
 ///
 /// `pgrp` is the child's foreground process group as reported by the predecessor
 /// ([`HandoffInfo::pgrp`]); pass `None` if it was unavailable.
+#[tracing::instrument(level = "debug", skip(on_event))]
 pub fn adopt_pty(
     master: OwnedFd,
     pgrp: Option<i32>,

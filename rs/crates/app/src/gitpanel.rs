@@ -28,6 +28,7 @@ trait NoWindow {
 }
 impl NoWindow for Command {
     #[cfg(windows)]
+    #[tracing::instrument(level = "debug", ret)]
     fn no_window(&mut self) -> &mut Self {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -51,6 +52,7 @@ pub enum Section {
 }
 
 impl Section {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn title(self) -> &'static str {
         match self {
             Section::Staged => "Staged Changes",
@@ -75,6 +77,7 @@ pub struct GitRow {
 }
 
 impl GitRow {
+    #[tracing::instrument(level = "debug", ret)]
     fn new(path: String, code: char, section: Section) -> Self {
         // Split on `/`: git reports repo-relative paths with forward slashes on every
         // platform, so this is correct on Windows too and needs no `Path` round-trip.
@@ -109,20 +112,24 @@ pub struct GitStatus {
 
 impl GitStatus {
     /// "There is nothing to show" — no repo, no git, or a git that failed.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn none() -> Self {
         Self::default()
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_repo(&self) -> bool {
         self.root.is_some()
     }
 
     /// Rows of one section, in git's own (path-sorted) order.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn section(&self, section: Section) -> impl Iterator<Item = &GitRow> {
         self.rows.iter().filter(move |r| r.section == section)
     }
 
     /// `main ↑2 ↓1` — the header line, already assembled so the UI does no formatting.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn head_summary(&self) -> String {
         let mut s = self.branch.clone();
         if self.ahead > 0 {
@@ -137,6 +144,7 @@ impl GitStatus {
 
 /// The status letter for a porcelain v2 `XY` half. `.` (and a stray space, which v1 uses
 /// in the same position) mean "unchanged in this half" and produce no row.
+#[tracing::instrument(level = "debug", ret)]
 fn code_of(c: u8) -> Option<char> {
     match c {
         b'.' | b' ' => None,
@@ -152,6 +160,7 @@ fn code_of(c: u8) -> Option<char> {
 /// Records are NUL-terminated. A `2` (rename/copy) record carries its ORIGINAL path in the
 /// following NUL-field, so the iterator has to consume two fields for one row — the reason
 /// this is a hand-rolled loop and not a `split('\0').map(..)`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_status_v2(out: &str) -> GitStatus {
     let mut st = GitStatus {
         branch: "HEAD detached".to_string(),
@@ -226,6 +235,7 @@ pub fn parse_status_v2(out: &str) -> GitStatus {
 }
 
 /// Run the status query in `root`. `None` on any failure — see the module note.
+#[tracing::instrument(level = "debug", ret)]
 pub fn status_in(root: &Path) -> Option<GitStatus> {
     let out = Command::new("git")
         .arg("-C")
@@ -252,6 +262,7 @@ pub fn status_in(root: &Path) -> Option<GitStatus> {
 
 /// The whole read: find the repo enclosing `cwd`, then describe it. `None` when `cwd` is
 /// not inside a repo.
+#[tracing::instrument(level = "debug", ret)]
 pub fn status_for(cwd: &str) -> Option<GitStatus> {
     let root = crate::sidebar::git_root_of(cwd)?;
     status_in(&root)

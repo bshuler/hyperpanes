@@ -33,12 +33,14 @@ pub const FONT_OPTIONS: [(&str, &str); 7] = [
 ];
 
 /// The path the empty "System default" value resolves to: Consolas (always installed).
+#[tracing::instrument(level = "debug", ret)]
 pub fn default_font() -> String {
     super::resolve_font("consola.ttf").unwrap_or_else(|| FALLBACK_FONT.to_string())
 }
 
 /// Family-name resolution beyond the file-name join — not needed on Windows, where the
 /// picker values are real file names under `C:/Windows/Fonts`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_family(_family: &str) -> Option<String> {
     None
 }
@@ -46,11 +48,13 @@ pub fn resolve_family(_family: &str) -> Option<String> {
 /// The shell to prefer when the user picked "System" (empty token): **pwsh** (PowerShell 7)
 /// when it's available, else `None` to let core pick the OS default. Mirrors the renderer's
 /// "use pwsh if installed" default.
+#[tracing::instrument(level = "debug", ret)]
 pub fn preferred_shell() -> Option<String> {
     pwsh_available().then(|| "pwsh".to_string())
 }
 
 /// Whether `pwsh.exe` (PowerShell 7+) resolves — its canonical install dir, then `PATH`.
+#[tracing::instrument(level = "debug", ret)]
 fn pwsh_available() -> bool {
     if std::path::Path::new(r"C:\Program Files\PowerShell\7\pwsh.exe").exists() {
         return true;
@@ -63,6 +67,7 @@ fn pwsh_available() -> bool {
 /// The directories scanned for the candidate font files: the system font folder, the per-user
 /// font folder (where user-installed fonts land on modern Windows), and the baked-in font dir
 /// (so the shipped OFL fonts always resolve even when not installed).
+#[tracing::instrument(level = "debug", ret)]
 pub fn font_dirs() -> Vec<std::path::PathBuf> {
     let mut dirs = vec![std::path::PathBuf::from("C:/Windows/Fonts")];
     if let Some(local) = std::env::var_os("LOCALAPPDATA") {

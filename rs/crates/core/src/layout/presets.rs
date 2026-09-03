@@ -33,6 +33,7 @@ impl Layout {
     /// The kebab token this layout serializes to: the strings of the TS `Layout` union, plus
     /// `grid-<cols>x<rows>` for an explicit shape. Borrowed for every preset, so only the
     /// fixed grids allocate.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn token(self) -> Cow<'static, str> {
         match self {
             Layout::Auto => Cow::Borrowed("auto"),
@@ -48,6 +49,7 @@ impl Layout {
     /// Parse a token back to a layout. `None` for anything unrecognised — including a
     /// `grid-CxR` with a zero or non-numeric dimension — so each caller picks its own
     /// fallback rather than inheriting one from here.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn from_token(s: &str) -> Option<Layout> {
         match s {
             "auto" => Some(Layout::Auto),
@@ -71,6 +73,7 @@ impl Layout {
 // what the workspace format stores. Writing it by hand keeps every layout — old and new — a
 // single flat string, so a `grid-2x2` costs no more compatibility than a `grid` did.
 impl Serialize for Layout {
+    #[tracing::instrument(level = "debug", skip(s))]
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&self.token())
     }
@@ -81,6 +84,7 @@ impl Serialize for Layout {
 // preferred layout is a far smaller loss than losing the tab; this matches the app's
 // `GroupSpec.layout` path, which is an `Option<String>` parsed with the same fallback.
 impl<'de> Deserialize<'de> for Layout {
+    #[tracing::instrument(level = "debug", ret, skip(d))]
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
         let s = String::deserialize(d)?;
         Ok(Layout::from_token(&s).unwrap_or(Layout::Auto))
@@ -96,6 +100,7 @@ pub const AUTO_COLUMNS_MAX: usize = 3;
 /// `'rows'` are manual-only and never produced here. Concrete layouts pass through
 /// unchanged, so compute_tiles/compute_dividers/neighbor_index always see a real
 /// preset — never `'auto'`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn effective_layout(layout: Layout, n: usize) -> Layout {
     if layout != Layout::Auto {
         return layout;
@@ -169,6 +174,7 @@ const FULL: Rect = Rect {
 /// visibly taller-celled than a 2x2 instead of collapsing into one; only the last row that
 /// actually holds panes spreads its items across the full width, exactly as the square grid
 /// does with its partial row.
+#[tracing::instrument(level = "debug", ret)]
 fn grid_tiles(n: usize, cols: usize, min_rows: usize) -> Vec<Tile> {
     let cols = cols.max(1);
     let rows = min_rows.max(n.div_ceil(cols));
@@ -199,6 +205,7 @@ fn grid_tiles(n: usize, cols: usize, min_rows: usize) -> Vec<Tile> {
 /// Maps (layout, pane count, sizes) to a rectangle per pane. Every pane gets a
 /// tile every time (panes stay mounted); `visible: false` just hides it (used by
 /// the `single` preset) so terminal sessions and scrollback are never destroyed.
+#[tracing::instrument(level = "debug", ret)]
 pub fn compute_tiles(
     layout: Layout,
     n: usize,
@@ -311,6 +318,7 @@ pub fn compute_tiles(
 /// Draggable seams for the current layout. Phase 2 resizes columns, rows, and
 /// the main divider of main-stack; every grid (square or explicit) and the stack
 /// interior use fixed splits.
+#[tracing::instrument(level = "debug", ret)]
 pub fn compute_dividers(
     layout: Layout,
     n: usize,

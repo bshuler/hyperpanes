@@ -21,6 +21,7 @@ pub use hyperpanes_core::persistence::projects::Project;
 /// any project whose repo folder no longer exists on disk is forgotten (removed from
 /// `projects.json`) and dropped from the result. Done app-side via the existing core
 /// `remove_project`, so a deleted/moved repo silently disappears from the rail.
+#[tracing::instrument(level = "debug", ret)]
 pub fn list() -> Vec<Project> {
     let all = projects::list_projects();
     let mut kept = Vec::with_capacity(all.len());
@@ -37,6 +38,7 @@ pub fn list() -> Vec<Project> {
 /// Walk up from `cwd` looking for the nearest ancestor that contains a `.git` entry,
 /// returning that directory as the git root. Mirrors what the Electron main process
 /// did before calling `upsertProjectByRoot`. `None` when `cwd` isn't inside a repo.
+#[tracing::instrument(level = "debug", ret)]
 pub fn git_root_of(cwd: &str) -> Option<PathBuf> {
     let mut dir: Option<&Path> = Some(Path::new(cwd));
     while let Some(d) = dir {
@@ -79,6 +81,7 @@ trait NoWindow {
 }
 impl NoWindow for Command {
     #[cfg(windows)]
+    #[tracing::instrument(level = "debug", ret)]
     fn no_window(&mut self) -> &mut Self {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -91,6 +94,7 @@ impl NoWindow for Command {
 }
 
 /// Turn a `branch` porcelain value (`refs/heads/feature`) into a short display label.
+#[tracing::instrument(level = "debug", ret)]
 fn short_branch(refname: &str) -> String {
     refname
         .strip_prefix("refs/heads/")
@@ -102,6 +106,7 @@ fn short_branch(refname: &str) -> String {
 /// blank line; each starts with `worktree <path>` and may carry `HEAD <sha>`, `branch
 /// <ref>`, `bare`, `detached`, `locked`, `prunable`. The FIRST record is always the main
 /// working tree (git lists it first), so we flag it `is_main`.
+#[tracing::instrument(level = "debug", ret)]
 fn parse_porcelain(out: &str) -> Vec<WorktreeRow> {
     let mut rows = Vec::new();
     let mut path: Option<String> = None;
@@ -211,6 +216,7 @@ fn parse_porcelain(out: &str) -> Vec<WorktreeRow> {
 /// Run `git worktree list --porcelain` in `repo_path` and parse the result. Any failure
 /// (no git, not a repo) yields an empty list — the project simply shows no worktrees.
 /// Runs on the background scanner thread (`history_scan`), never the UI thread.
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn enumerate_worktrees(repo_path: &str) -> Vec<WorktreeRow> {
     let Ok(out) = Command::new("git")
         .args(["worktree", "list", "--porcelain"])
@@ -232,6 +238,7 @@ pub(crate) fn enumerate_worktrees(repo_path: &str) -> Vec<WorktreeRow> {
 /// end-of-options sentinel is mandatory: a worktree path beginning with `-` (or any
 /// `-`-prefixed token git would otherwise read as a flag) must be treated as a positional
 /// path, never an option. Returns the trimmed stderr on failure.
+#[tracing::instrument(level = "debug", ret)]
 pub fn remove_worktree(repo_path: &str, worktree_path: &str) -> Result<(), String> {
     let out = Command::new("git")
         .args(["worktree", "remove", "--", worktree_path])
@@ -282,6 +289,7 @@ thread_local! {
 /// while the flyout was shut). The caches are NOT cleared — the panel renders the
 /// previous rows instantly and updates when the fresh scans land (#6). Called from the
 /// projection each tick.
+#[tracing::instrument(level = "debug", ret)]
 pub fn note_flyout_open(open: bool) {
     WT_LAST_OPEN.with(|last| {
         let mut last = last.borrow_mut();
@@ -304,6 +312,7 @@ pub fn note_flyout_open(open: bool) {
 /// The worktrees of the repo at `repo_path`, served from the cache. A miss requests a
 /// background enumeration and returns empty — the rows appear when the scan lands (the
 /// pump drains it and dirties the state). Never blocks; cheap to call every render.
+#[tracing::instrument(level = "debug", ret)]
 pub fn worktrees_for(repo_path: &str) -> Vec<WorktreeRow> {
     WT_CACHE.with(|c| {
         if let Some(rows) = c.borrow().get(repo_path) {
@@ -317,11 +326,13 @@ pub fn worktrees_for(repo_path: &str) -> Vec<WorktreeRow> {
 /// Request a background re-enumeration of `repo_path`'s worktrees (used after a
 /// successful removal). The cached rows stay up until the fresh scan lands, so the tree
 /// never blanks — the removed row disappears a tick later.
+#[tracing::instrument(level = "debug", ret)]
 pub fn invalidate(repo_path: &str) {
     crate::history_scan::request_worktrees(repo_path);
 }
 
 /// Store a finished background worktree enumeration (called from `history_scan::drain`).
+#[tracing::instrument(level = "debug", ret)]
 pub fn apply_worktrees(repo_path: &str, rows: Vec<WorktreeRow>) {
     WT_CACHE.with(|c| {
         c.borrow_mut().insert(repo_path.to_string(), rows);
@@ -329,6 +340,7 @@ pub fn apply_worktrees(repo_path: &str, rows: Vec<WorktreeRow>) {
 }
 
 /// Store a finished background session scan (called from `history_scan::drain`).
+#[tracing::instrument(level = "debug", ret)]
 pub fn apply_sessions(project_root: &str, sessions: Vec<claude_history::ClaudeSession>) {
     CLAUDE_CACHE.with(|c| {
         c.borrow_mut().insert(project_root.to_string(), sessions);
@@ -364,6 +376,7 @@ pub struct ClaudeSessionRow {
     pub count: i32,
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -373,12 +386,14 @@ fn now_ms() -> u64 {
 
 /// First 8 chars of a session id (the UUID head) — a fallback label when a transcript has no
 /// summary line nor a first user message.
+#[tracing::instrument(level = "debug", ret)]
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
 
 /// A compact relative-time label for `started_at` (epoch ms) vs `now` (epoch ms). Empty when
 /// the timestamp is unknown. Coarse buckets — minutes → hours → days → weeks → months → years.
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn relative_time(started_at: Option<u64>, now: u64) -> String {
     let Some(t) = started_at else {
         return String::new();
@@ -413,6 +428,7 @@ pub(crate) fn relative_time(started_at: Option<u64>, now: u64) -> String {
 /// The raw (uncapped, unfiltered) sessions for `project_root`, served from the cache. A
 /// miss requests a background scan and returns empty — the rows appear when the scan
 /// lands. Never touches the disk on the UI thread.
+#[tracing::instrument(level = "debug", ret)]
 fn claude_sessions_cached(project_root: &str) -> Vec<claude_history::ClaudeSession> {
     CLAUDE_CACHE.with(|c| {
         if let Some(sessions) = c.borrow().get(project_root) {
@@ -428,6 +444,7 @@ fn claude_sessions_cached(project_root: &str) -> Vec<claude_history::ClaudeSessi
 /// [`claude_history::filter_sessions`]; empty query = everything), shaped for the sidebar.
 /// Served from the cache (read on first miss), filtered BEFORE the [`CLAUDE_HISTORY_LIMIT`]
 /// cap so a search reaches past the top-N. Cheap to call every render.
+#[tracing::instrument(level = "debug", ret)]
 pub fn claude_sessions_for(project_root: &str, query: &str) -> Vec<ClaudeSessionRow> {
     let sessions = claude_sessions_cached(project_root);
     let now = now_ms();
@@ -450,6 +467,7 @@ pub fn claude_sessions_for(project_root: &str, query: &str) -> Vec<ClaudeSession
 
 /// Whether `project_root` has ANY session history at all (unfiltered) — gates the
 /// Worktrees|History segmented bar so an unmatched query can't collapse it.
+#[tracing::instrument(level = "debug", ret)]
 pub fn claude_has_history(project_root: &str) -> bool {
     !claude_sessions_cached(project_root).is_empty()
 }
@@ -458,6 +476,7 @@ pub fn claude_has_history(project_root: &str) -> bool {
 
 /// The per-project history-UI state: `(segment, query)` — segment 0 = Worktrees,
 /// 1 = History. Defaults to `(0, "")` for a project never touched.
+#[tracing::instrument(level = "debug", ret)]
 pub fn history_ui_for(project_root: &str) -> (i32, String) {
     HIST_UI.with(|m| {
         m.borrow()
@@ -468,6 +487,7 @@ pub fn history_ui_for(project_root: &str) -> (i32, String) {
 }
 
 /// Record a history-UI edit for `project_root` (from the polled `HistoryUi` global).
+#[tracing::instrument(level = "debug", ret)]
 pub fn set_history_ui(project_root: &str, segment: i32, query: &str) {
     HIST_UI.with(|m| {
         m.borrow_mut().insert(
@@ -479,6 +499,7 @@ pub fn set_history_ui(project_root: &str, segment: i32, query: &str) {
 
 /// Consume the `HistoryUi.seq` poll: returns `true` (and records `seq`) when it moved
 /// since the last call — i.e. the UI pushed a new segment/query edit to fold in.
+#[tracing::instrument(level = "debug", ret)]
 pub fn history_seq_changed(seq: i32) -> bool {
     HIST_SEQ.with(|last| {
         let mut last = last.borrow_mut();
@@ -494,6 +515,7 @@ pub fn history_seq_changed(seq: i32) -> bool {
 /// The shell command that resumes a Claude session in a fresh pane: `claude --resume <id>`.
 /// Session ids are UUIDs (hex + `-`), so no shell-quoting is required. The caller spawns this
 /// via the existing New-Pane path (`State::add_pane_opts` with `command` + the project `cwd`).
+#[tracing::instrument(level = "debug", ret)]
 pub fn claude_resume_command(session_id: &str) -> String {
     format!("claude --resume {session_id}")
 }

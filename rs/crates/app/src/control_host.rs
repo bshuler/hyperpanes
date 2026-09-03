@@ -132,6 +132,7 @@ const HEAL_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
 impl ControlHost {
     /// Build the host from persisted `control-settings.json` (+ env overrides) and start the
     /// server immediately if it is enabled.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn new(mgr: &Arc<SessionManager>) -> Self {
         let settings = control_settings::load();
         // Panes may inherit `HYPERPANES_CONTROL_FILE` set-but-empty from the app; treat
@@ -172,6 +173,7 @@ impl ControlHost {
     /// The external pane id a control-spawned pane advertises (its `HYPERPANES_PANE_ID` and the
     /// key the Claude session hook writes markers under). `None` for GUI-native panes, whose
     /// pane id IS their session uid.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_id_for_uid(&self, uid: &str) -> Option<String> {
         self.pane_ids.borrow().get(uid).cloned()
     }
@@ -179,6 +181,7 @@ impl ControlHost {
     /// Inverse of [`Self::pane_id_for_uid`]: the session uid hosting the pane that advertises
     /// `pane_id` externally. `None` when no alias exists — for GUI-native panes the caller
     /// falls back to identity (uid == pane id).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn uid_for_pane_id(&self, pane_id: &str) -> Option<String> {
         self.pane_ids
             .borrow()
@@ -194,6 +197,7 @@ impl ControlHost {
     /// prune drops it, and the pane comes back under a different id — breaking every marker
     /// an MCP client had recorded against it. A pane with no alias (GUI-native, id == uid)
     /// needs nothing moved, so this is a no-op for it.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn rebind_uid(&self, old_uid: &str, new_uid: &str) {
         let moved = {
             let mut ids = self.pane_ids.borrow_mut();
@@ -214,6 +218,7 @@ impl ControlHost {
     /// daemon goes down with us and every pane dies). Serviced by the next app tick, which
     /// is what makes this safe to call from a menu click — the quit happens after the click
     /// handler has returned, not underneath it.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn request_restart(&self, scope: u8) {
         self.pending_restart.set(scope.max(self.pending_restart.get()));
     }
@@ -221,6 +226,7 @@ impl ControlHost {
     /// Take (and clear) a pending `restartApp` request: 0 = none, 1 = gui, 2 = full.
     /// Set by the control route off the UI thread, or by [`Self::request_restart`] on it;
     /// the App tick executes it. The wider scope wins when both asked at once.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn take_restart_request(&self) -> u8 {
         let local = self.pending_restart.replace(0);
         let remote = self.shared.borrow().as_ref().map_or(0, |s| {
@@ -233,6 +239,7 @@ impl ControlHost {
     /// at spawn, but this uid→pane-id map lived only in the GUI's memory — so after a GUI
     /// relaunch re-attached a control-spawned pane, nothing could resolve its external id
     /// (Claude session markers are keyed by it). Best-effort; reloaded by [`Self::start`].
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn persist_pane_ids(&self) {
         let sorted: std::collections::BTreeMap<_, _> = self
             .pane_ids
@@ -251,6 +258,7 @@ impl ControlHost {
     /// ephemeral loopback port, master token, `control.json` discovery file). The activity ticker
     /// is spawned as a SEPARATE task so [`Self::stop`] can abort it (it loops forever otherwise).
     /// Every spawn goes through the stored runtime `Handle` (never the ambient guard).
+    #[tracing::instrument(level = "debug", skip_all)]
     fn start(&self, mgr: &Arc<SessionManager>) {
         if self.shared.borrow().is_some() {
             return;
@@ -309,6 +317,7 @@ impl ControlHost {
     /// Stop the server: abort the serve task AND the activity ticker, drop every WS client (so
     /// their `handle_ws` tasks see the channel close and exit, releasing their `Arc<Shared>`), and
     /// remove the stale discovery file. Nothing is left looping or retaining `Shared` after this.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn stop(&self) {
         if let Some(t) = self.task.borrow_mut().take() {
             t.abort();
@@ -333,6 +342,7 @@ impl ControlHost {
     }
 
     /// Toggle the server on/off live, persisting the setting.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn set_enabled(&self, on: bool, mgr: &Arc<SessionManager>) {
         if self.enabled.get() == on {
             return;
@@ -347,6 +357,7 @@ impl ControlHost {
     }
 
     /// Flip `allow_input` live (gates `/panes/{id}/input`), persisting the setting.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_allow_input(&self, on: bool) {
         if self.allow_input.get() == on {
             return;
@@ -358,6 +369,7 @@ impl ControlHost {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn persist(&self) {
         // Preserve fields this host doesn't own (bindAddress/port live only in the file):
         // load-modify-save so toggling the booleans can't erase a remote-access config.
@@ -368,6 +380,7 @@ impl ControlHost {
     }
 
     /// `(enabled, allow_input, port-if-running)` for the Preferences status line.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn status(&self) -> (bool, bool, Option<u16>) {
         let port = self
             .shared
@@ -382,6 +395,7 @@ impl ControlHost {
 
     /// Kill any in-flight/queued speech immediately. No-op (returns `false`) when the control
     /// server isn't running — the `SpeechService` lives on `Shared`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn speech_stop_all(&self) -> bool {
         match self.shared.borrow().as_ref() {
             Some(s) => {
@@ -394,6 +408,7 @@ impl ControlHost {
 
     /// Flip the global speech mute flag, returning the new value. `None` when the control
     /// server isn't running.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn speech_toggle_muted(&self) -> Option<bool> {
         let shared = self.shared.borrow();
         let s = shared.as_ref()?;
@@ -404,6 +419,7 @@ impl ControlHost {
 
     /// Flip "only speak the focused pane", returning the new value. `None` when the control
     /// server isn't running.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn speech_toggle_focused_only(&self) -> Option<bool> {
         let shared = self.shared.borrow();
         let s = shared.as_ref()?;
@@ -414,6 +430,7 @@ impl ControlHost {
 
     /// Toast every pane with `talk` on that hasn't been notified yet that speech needs the
     /// control server running (it hosts the `SpeechService`). No-op once already shown per pane.
+    #[tracing::instrument(level = "debug", ret, skip(self, windows))]
     fn notice_talk_needs_backend(&self, windows: &[Rc<Window>]) {
         let mut shown = self.talk_notice_shown.borrow_mut();
         for w in windows {
@@ -433,6 +450,7 @@ impl ControlHost {
 
     /// The stable control pane-id behind a GUI session uid. GUI panes use the uid itself; a
     /// control-created pane keeps the uuid `dispatch` minted, which `pane_ids` remembers.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn pane_id_for(&self, uid: &str) -> String {
         self.pane_ids
             .borrow()
@@ -447,6 +465,7 @@ impl ControlHost {
     /// the recorder to finalize its WAV and then runs the transcriber, which is seconds of
     /// work — so it goes to a worker thread and reports back through `dictation_notices`,
     /// which the next [`Self::sync`] tick drains onto the pane.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn toggle_dictation(&self, uid: &str) -> String {
         let shared = match self.shared.borrow().as_ref() {
             Some(s) => Arc::clone(s),
@@ -478,6 +497,7 @@ impl ControlHost {
     /// deliver any worker-thread transcript notice as a toast, and cancel a recorder whose
     /// pane has gone away (a closed pane must not leave a microphone running — the control
     /// route does the same on `closePane`).
+    #[tracing::instrument(level = "debug", ret, skip(self, shared, windows))]
     fn sync_dictation(&self, shared: &Arc<Shared>, windows: &[Rc<Window>]) {
         let recording = shared.dictation.recording_panes();
         let notices: Vec<(String, String)> = match self.dictation_notices.lock() {
@@ -532,6 +552,7 @@ impl ControlHost {
 
     /// Forward one session event to the running server (model cwd/exit + `/events` WS frames).
     /// Cheap no-op when stopped; the Data path inside short-circuits when no WS clients.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn tee_event(&self, ev: &SessionEvent) {
         if let Some(s) = self.shared.borrow().as_ref() {
             server::process_session_event(s, ev.clone());
@@ -543,6 +564,7 @@ impl ControlHost {
     /// The read-model bridge: reconcile any control-originated structural change back into the
     /// live GUI (on the UI thread), then republish the GUI tree into the read-model. No-op when
     /// the server is stopped.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn sync(&self, windows: &[Rc<Window>], mgr: &Arc<SessionManager>) {
         let shared = match self.shared.borrow().as_ref() {
             Some(s) => Arc::clone(s),
@@ -639,6 +661,7 @@ impl ControlHost {
     /// [`HEAL_DEBOUNCE`] so a transient mid-flight state (e.g. daemon re-attach at startup)
     /// is never misread as a lost pane. The original label/spec/meta died with the model
     /// entry, so the restored pane carries `label:"recovered"` + `meta.hp.recovered:"1"`.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn heal_lost_panes(
         &self,
         model: &mut ReadModel,
@@ -706,6 +729,7 @@ impl ControlHost {
     /// active tab id, and a representative session uid living in each window's active tab. The
     /// representative uid lets the focus reconcile resolve the focused tab by a pane that's
     /// actually in it (stable across GUI tab reorder/close) rather than parsing the positional id.
+    #[tracing::instrument(level = "debug", skip(self, windows))]
     fn snapshot_model(
         &self,
         model: &ReadModel,
@@ -755,6 +779,7 @@ impl ControlHost {
 
     /// Apply control-originated deltas (diffing the model snapshot against the last published
     /// baseline) to the live GUI state. Returns whether anything structural changed (add/remove).
+    #[tracing::instrument(level = "debug", skip_all)]
     fn reconcile(
         &self,
         windows: &[Rc<Window>],
@@ -908,6 +933,7 @@ impl ControlHost {
     /// `new_uid` in place: clear the dead session's stale grid, re-prime from the new session's
     /// replay buffer, re-arm startup gating, and re-pin the stable control pane-id onto the new
     /// uid (so the republish keeps the pane's id steady for the MCP client).
+    #[tracing::instrument(level = "debug", skip_all)]
     fn rebind_respawn(
         &self,
         windows: &[Rc<Window>],
@@ -948,6 +974,7 @@ impl ControlHost {
     ///
     /// Runs *before* the snapshot/publish block, so an edit applied this tick is already visible
     /// in the `/state` the same tick publishes. Returns whether anything changed.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn apply_ui_ops(
         &self,
         shared: &Arc<Shared>,
@@ -1054,6 +1081,7 @@ impl ControlHost {
     /// Publish the live preferences into [`Shared::settings`], the read side of `GET /settings`.
     /// Cheap and unconditional: serializing the struct is a few dozen fields, and the
     /// alternative (a change signal from every settings write path) is one more thing to forget.
+    #[tracing::instrument(level = "debug", ret, skip(self, shared, windows))]
     fn publish_settings(&self, shared: &Arc<Shared>, windows: &[Rc<Window>]) {
         // Any window will do — the blob is app-wide.
         if let Some(w) = windows.first() {
@@ -1064,6 +1092,7 @@ impl ControlHost {
     /// Wholesale-rebuild the read-model from the live GUI tree, re-stamping the control-owned
     /// fields, and refresh the baselines for the next reconcile. Returns whether the published
     /// structure (pane set or active tabs) changed versus the previous publish.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn publish(
         &self,
         model: &mut ReadModel,
@@ -1200,6 +1229,7 @@ impl ControlHost {
     /// resolved (in order): a sibling pane already in the GUI for the same model tab → a tab made
     /// this tick for that model tab → the positional model tab id → otherwise a brand-new GUI tab
     /// (an `attach as:tab` group). Adopting into a background tab does NOT steal the user's focus.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn adopt_control_pane(
         &self,
         windows: &[Rc<Window>],
@@ -1273,6 +1303,7 @@ impl ControlHost {
 
     /// Resolve which existing GUI tab index a control-spawned pane should be adopted into, or
     /// `None` if the model placed it in a tab the GUI doesn't host yet (→ make a new tab).
+    #[tracing::instrument(level = "debug", ret, skip_all)]
     fn resolve_adopt_tab(
         &self,
         w: &Rc<Window>,
@@ -1325,6 +1356,7 @@ struct ModelPane {
 /// The GUI session uid currently mapped to control `pane_id`, if any. A GUI pane's effective
 /// pane-id is its own uid unless `pane_ids` pins a control-minted id onto it. Used to detect a
 /// respawn: the model carries a new `session_uid` under a still-live stable `pane_id`.
+#[tracing::instrument(level = "debug", ret, skip(windows))]
 fn gui_uid_for_pane_id(
     windows: &[Rc<Window>],
     pane_ids: &HashMap<String, String>,
@@ -1346,6 +1378,7 @@ fn gui_uid_for_pane_id(
 /// GUI (including its kept-alive off-layout buffers) knows the uid. GUI-native panes are
 /// excluded structurally — their alias entry is `uid == pane_id`. Pure, so it is unit-testable
 /// without a Slint window. Returns `(uid, pane_id)` pairs.
+#[tracing::instrument(level = "debug", skip_all)]
 fn lost_control_panes(
     pane_ids: &HashMap<String, String>,
     model: &ReadModel,
@@ -1367,6 +1400,7 @@ fn lost_control_panes(
 
 /// [`gui_uids`] plus the sessions the GUI keeps alive OFF-layout on purpose: the closed-tab
 /// undo buffer and parked reminder panes. The self-heal must not resurrect either.
+#[tracing::instrument(level = "debug", ret, skip(windows))]
 fn gui_uids_with_parked(windows: &[Rc<Window>]) -> HashSet<String> {
     let mut set = gui_uids(windows);
     for w in windows {
@@ -1384,6 +1418,7 @@ fn gui_uids_with_parked(windows: &[Rc<Window>]) -> HashSet<String> {
 }
 
 /// Every session uid the GUI currently hosts across all windows + tabs.
+#[tracing::instrument(level = "debug", ret, skip(windows))]
 fn gui_uids(windows: &[Rc<Window>]) -> HashSet<String> {
     let mut set = HashSet::new();
     for w in windows {
@@ -1397,6 +1432,7 @@ fn gui_uids(windows: &[Rc<Window>]) -> HashSet<String> {
 }
 
 /// Apply a control-originated label / color / subtitle change to the GUI pane with `uid`.
+#[tracing::instrument(level = "debug", ret, skip(windows, c))]
 fn apply_pane_chrome(windows: &[Rc<Window>], uid: &str, c: &ModelPane) {
     for w in windows {
         let mut st = w.state.borrow_mut();
@@ -1415,6 +1451,7 @@ fn apply_pane_chrome(windows: &[Rc<Window>], uid: &str, c: &ModelPane) {
 }
 
 /// Remove the GUI pane with `uid` without killing its (already-dead) session.
+#[tracing::instrument(level = "debug", ret, skip(windows))]
 fn remove_from_gui(windows: &[Rc<Window>], uid: &str) {
     for w in windows {
         let has = w.state.borrow_mut().find_pane(uid).is_some();
@@ -1426,6 +1463,7 @@ fn remove_from_gui(windows: &[Rc<Window>], uid: &str) {
 }
 
 /// Parse the tab index out of a `"{window_id}:{tab_index}"` id.
+#[tracing::instrument(level = "debug")]
 fn parse_tab_index(tab_id: &str) -> Option<usize> {
     tab_id.rsplit(':').next()?.parse().ok()
 }
@@ -1449,10 +1487,12 @@ fn resolve_tab<'a>(windows: &'a [Rc<Window>], tab_id: &str) -> Option<(&'a Rc<Wi
 }
 
 /// Format a Slint color as `#rrggbb` (the read-model's `color` shape).
+#[tracing::instrument(level = "debug", ret)]
 fn color_hex(c: Color) -> String {
     format!("#{:02x}{:02x}{:02x}", c.red(), c.green(), c.blue())
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn env_truthy(name: &str) -> bool {
     matches!(
         std::env::var(name).ok().as_deref(),

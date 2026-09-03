@@ -27,6 +27,7 @@ pub struct QueuedPrompt {
     pub queued_at: u64,
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn queue_file() -> PathBuf {
     // Test seam: an explicit path override, honored only when set. Production never sets it,
     // so the queue always lives at the real state-dir path. Tests use it to get a hermetic,
@@ -38,6 +39,7 @@ fn queue_file() -> PathBuf {
     paths::resume_prompts_json()
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn load() -> Vec<QueuedPrompt> {
     let Ok(text) = fs::read_to_string(queue_file()) else {
         return Vec::new();
@@ -45,6 +47,7 @@ fn load() -> Vec<QueuedPrompt> {
     serde_json::from_str(&text).unwrap_or_default()
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn persist(all: &[QueuedPrompt]) {
     if let Ok(json) = serde_json::to_vec_pretty(all) {
         let _ = paths::write_atomic(&queue_file(), &json);
@@ -53,6 +56,7 @@ fn persist(all: &[QueuedPrompt]) {
 
 /// Append a prompt for `session_id`. The id must be marker-shaped
 /// ([`crate::claude_panes::valid_session_id`]) and the text non-empty.
+#[tracing::instrument(level = "debug", ret)]
 pub fn enqueue(session_id: &str, text: &str) -> Result<(), String> {
     if !crate::claude_panes::valid_session_id(session_id) {
         return Err(format!("not a valid session id: {session_id}"));
@@ -74,6 +78,7 @@ pub fn enqueue(session_id: &str, text: &str) -> Result<(), String> {
 }
 
 /// Remove and return every queued prompt for `session_id`, oldest first.
+#[tracing::instrument(level = "debug", ret)]
 pub fn take_for(session_id: &str) -> Vec<QueuedPrompt> {
     let all = load();
     let (taken, kept): (Vec<_>, Vec<_>) = all.into_iter().partition(|p| p.session_id == session_id);
@@ -84,6 +89,7 @@ pub fn take_for(session_id: &str) -> Vec<QueuedPrompt> {
 }
 
 /// Does anything wait for any session? Cheap gate for the delivery tick (one stat).
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_empty() -> bool {
     match fs::metadata(queue_file()) {
         Err(_) => true,
@@ -93,6 +99,7 @@ pub fn is_empty() -> bool {
 }
 
 /// Peek at all queued prompts (for a `/state`-style listing; never removes).
+#[tracing::instrument(level = "debug", ret)]
 pub fn list() -> Vec<QueuedPrompt> {
     load()
 }

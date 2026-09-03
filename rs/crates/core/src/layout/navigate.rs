@@ -15,6 +15,7 @@ pub enum Direction {
     Down,
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn center(t: &Tile) -> (f64, f64) {
     (t.rect.x + t.rect.w / 2.0, t.rect.y + t.rect.h / 2.0)
 }
@@ -22,6 +23,7 @@ fn center(t: &Tile) -> (f64, f64) {
 /// Picks the nearest tile in `dir` from the tile at `from_index`, scoring by the
 /// distance along the travel axis plus a penalty for perpendicular drift (so
 /// focus moves to the best-aligned neighbour). Returns its index or `None`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn neighbor_index(tiles: &[Tile], from_index: usize, dir: Direction) -> Option<usize> {
     let from = tiles.iter().find(|t| t.index == from_index)?;
     let (fcx, fcy) = center(from);

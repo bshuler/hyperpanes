@@ -55,6 +55,7 @@ pub enum HistorySource {
 
 impl HistorySource {
     /// The human label shown next to a session row (e.g. "Claude").
+    #[tracing::instrument(level = "debug", ret)]
     pub fn label(self) -> &'static str {
         match self {
             HistorySource::Claude => "Claude",
@@ -67,6 +68,7 @@ impl HistorySource {
     /// The [`crate::tools::registry::TOOLS`] id this source's transcripts belong to — the
     /// join back to the catalogue, so a session row can resolve the binary that resumes it
     /// without a second table mapping sources to tools.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn tool_id(self) -> &'static str {
         match self {
             HistorySource::Claude => "claude",
@@ -122,6 +124,7 @@ pub struct ClaudeSession {
 /// always present). Slow path: the cached [`ClaudeSession::full_text`] — the bounded
 /// extract of the whole conversation's user+assistant text — so search reaches *inside*
 /// a transcript, not just its label.
+#[tracing::instrument(level = "debug", ret)]
 pub fn session_matches(session: &ClaudeSession, query: &str) -> bool {
     let q = query.trim().to_lowercase();
     if q.is_empty() {
@@ -137,6 +140,7 @@ pub fn session_matches(session: &ClaudeSession, query: &str) -> bool {
 
 /// Filter `sessions` down to those matching `query` (see [`session_matches`]), preserving
 /// order. An empty/blank query returns the full list.
+#[tracing::instrument(level = "debug", ret)]
 pub fn filter_sessions(sessions: &[ClaudeSession], query: &str) -> Vec<ClaudeSession> {
     sessions
         .iter()
@@ -148,12 +152,14 @@ pub fn filter_sessions(sessions: &[ClaudeSession], query: &str) -> Vec<ClaudeSes
 /// Encode an absolute project path the way Claude Code names its per-project transcript
 /// directory: every character that is not ASCII alphanumeric becomes `-` (so `:`, `\`, `/`,
 /// `.`, `_`, spaces … all map to `-`). No run-collapsing — each char maps to exactly one `-`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn encode_project_dir(project_root: &Path) -> String {
     encode_path_str(&project_root.to_string_lossy())
 }
 
 /// String form of [`encode_project_dir`] (kept separate so tests can pass raw path strings
 /// without constructing platform `Path`s).
+#[tracing::instrument(level = "debug", ret)]
 pub fn encode_path_str(path: &str) -> String {
     path.chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
@@ -162,6 +168,7 @@ pub fn encode_path_str(path: &str) -> String {
 
 /// `~/.claude/projects` for the current user (`%USERPROFILE%` on Windows, `$HOME` elsewhere),
 /// or `None` if no home directory is known.
+#[tracing::instrument(level = "debug", ret)]
 pub fn claude_projects_root() -> Option<PathBuf> {
     let home = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME"))?;
     if home.is_empty() {
@@ -176,6 +183,7 @@ pub fn claude_projects_root() -> Option<PathBuf> {
 /// that account's store, NOT `~/.claude/projects`. Union of: `$CLAUDE_CONFIG_DIR` (if set), every
 /// registered account ([`crate::claude_accounts::config_dirs`]), and the default `~/.claude` —
 /// deduped, order-preserved (default first). Empty only when no home dir is known.
+#[tracing::instrument(level = "debug", ret)]
 pub fn claude_projects_roots() -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = Vec::new();
     let push = |dir: PathBuf, roots: &mut Vec<PathBuf>| {
@@ -198,6 +206,7 @@ pub fn claude_projects_roots() -> Vec<PathBuf> {
 
 /// The sessions for `project_root`, resolved against the real `~/.claude/projects`. A missing
 /// home dir or missing encoded directory yields an empty list. Newest-first.
+#[tracing::instrument(level = "debug", ret)]
 pub fn sessions_for_project(project_root: &Path) -> Vec<ClaudeSession> {
     let Some(root) = claude_projects_root() else {
         return Vec::new();
@@ -207,6 +216,7 @@ pub fn sessions_for_project(project_root: &Path) -> Vec<ClaudeSession> {
 
 /// Like [`sessions_for_project`] but against an explicit `projects_root` (the directory that
 /// holds the encoded per-project folders) — the testable seam.
+#[tracing::instrument(level = "debug", ret)]
 pub fn sessions_for_project_in(projects_root: &Path, project_root: &Path) -> Vec<ClaudeSession> {
     let dir = projects_root.join(encode_project_dir(project_root));
     sessions_in_dir(&dir)
@@ -214,6 +224,7 @@ pub fn sessions_for_project_in(projects_root: &Path, project_root: &Path) -> Vec
 
 /// List + summarize every `*.jsonl` transcript directly inside `session_dir`, newest-first
 /// (by mtime). A missing/unreadable directory yields an empty list.
+#[tracing::instrument(level = "debug", ret)]
 pub fn sessions_in_dir(session_dir: &Path) -> Vec<ClaudeSession> {
     let Ok(entries) = fs::read_dir(session_dir) else {
         return Vec::new();
@@ -262,6 +273,7 @@ pub enum ProjectOrigin {
 impl ProjectOrigin {
     /// Whether the path re-encodes to the directory it was found in — the only two ways of
     /// arriving at a path we would stand behind.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_exact(self) -> bool {
         matches!(
             self,
@@ -292,6 +304,7 @@ const PROBE_BUDGET: usize = 64;
 /// The naive inverse of [`encode_project_dir`]: every `-` becomes a path separator. Wrong
 /// wherever the original had a `.`, `_` or space (so: often) — only ever a last resort,
 /// and always reported as [`ProjectOrigin::DecodedUnverified`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn decode_project_dir(encoded: &str) -> PathBuf {
     #[cfg(windows)]
     {
@@ -314,6 +327,7 @@ pub fn decode_project_dir(encoded: &str) -> PathBuf {
 /// `-Users-bshuler-code-what-is-light` to `/Users/bshuler/code/what_is_light`, neither of
 /// which any substitution rule could produce. Returns `None` when the project has been
 /// deleted or moved (common — worktrees outlive nothing) or the budget runs out.
+#[tracing::instrument(level = "debug", ret)]
 pub fn decode_by_probing(encoded: &str) -> Option<PathBuf> {
     let (root, rest) = probe_root(encoded)?;
     let mut budget = PROBE_BUDGET;
@@ -322,6 +336,7 @@ pub fn decode_by_probing(encoded: &str) -> Option<PathBuf> {
 
 /// Split an encoded name into the filesystem root it started at and the rest. A leading `-`
 /// is the encoding of a leading `/`; `C--` is a Windows drive.
+#[tracing::instrument(level = "debug", ret)]
 fn probe_root(encoded: &str) -> Option<(PathBuf, &str)> {
     let b = encoded.as_bytes();
     if b.first() == Some(&b'-') {
@@ -339,6 +354,7 @@ fn probe_root(encoded: &str) -> Option<(PathBuf, &str)> {
 /// One level of [`decode_by_probing`]: consume the longest prefix of `rest` that some child
 /// directory of `dir` encodes to, then recurse. Children are tried in sorted order so an
 /// ambiguous name resolves the same way on every scan.
+#[tracing::instrument(level = "debug", ret)]
 fn probe_from(dir: &Path, rest: &str, budget: &mut usize) -> Option<PathBuf> {
     if rest.is_empty() {
         return Some(dir.to_path_buf());
@@ -379,6 +395,7 @@ fn probe_from(dir: &Path, rest: &str, budget: &mut usize) -> Option<PathBuf> {
 /// `cwd` that proves itself against the directory name, then a filesystem probe, then a
 /// transcript `cwd` that does not prove itself, then the lossy decode — see
 /// [`ProjectOrigin`] for why the caller is told which.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_project(dir: &Path, sessions: &[ClaudeSession]) -> (PathBuf, ProjectOrigin) {
     let encoded = dir
         .file_name()
@@ -405,6 +422,7 @@ pub fn resolve_project(dir: &Path, sessions: &[ClaudeSession]) -> (PathBuf, Proj
 
 /// The per-project subdirectories directly inside `projects_root`, sorted by name. Files and
 /// unreadable roots yield nothing.
+#[tracing::instrument(level = "debug", ret)]
 pub fn project_dirs_in(projects_root: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(projects_root) else {
         return Vec::new();
@@ -420,6 +438,7 @@ pub fn project_dirs_in(projects_root: &Path) -> Vec<PathBuf> {
 
 /// Wrap one directory's sessions in a [`ProjectSessions`], or `None` when it held no
 /// transcripts (Claude Code leaves behind directories holding only a `memory/` subtree).
+#[tracing::instrument(level = "debug", ret)]
 fn project_sessions(dir: &Path, sessions: Vec<ClaudeSession>) -> Option<ProjectSessions> {
     if sessions.is_empty() {
         return None;
@@ -436,6 +455,7 @@ fn project_sessions(dir: &Path, sessions: Vec<ClaudeSession>) -> Option<ProjectS
 /// Merge per-directory results that resolved to the same project path (two accounts, or a
 /// project reachable through more than one encoding), and order by project path so the
 /// caller's grouping is a property of the order, not of a second pass.
+#[tracing::instrument(level = "debug", ret)]
 fn merge_projects(mut found: Vec<ProjectSessions>) -> Vec<ProjectSessions> {
     found.sort_by(|a, b| a.project.cmp(&b.project).then_with(|| a.dir.cmp(&b.dir)));
     let mut out: Vec<ProjectSessions> = Vec::new();
@@ -458,6 +478,7 @@ fn merge_projects(mut found: Vec<ProjectSessions>) -> Vec<ProjectSessions> {
 /// Every project under `projects_root`, ordered by project path, each project's sessions
 /// newest-first. The un-cached seam — [`SessionCache::scan_all_in`] is the one to use when
 /// this runs more than once.
+#[tracing::instrument(level = "debug", ret)]
 pub fn all_projects_in(projects_root: &Path) -> Vec<ProjectSessions> {
     let found = project_dirs_in(projects_root)
         .into_iter()
@@ -468,6 +489,7 @@ pub fn all_projects_in(projects_root: &Path) -> Vec<ProjectSessions> {
 
 /// Every project across every account's transcript store ([`claude_projects_roots`]) —
 /// "every locally resumable conversation", which is what the session view asks for.
+#[tracing::instrument(level = "debug", ret)]
 pub fn all_projects() -> Vec<ProjectSessions> {
     let found = claude_projects_roots()
         .iter()
@@ -484,6 +506,7 @@ pub fn all_projects() -> Vec<ProjectSessions> {
 /// `started_at` from the file mtime, summary/first-user/full-text from a bounded parse).
 /// `None` for non-`.jsonl` paths or a stem-less filename — the per-file seam shared by
 /// [`sessions_in_dir`] and the incremental [`SessionCache`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn read_session_file(path: &Path) -> Option<ClaudeSession> {
     if !path
         .extension()
@@ -509,6 +532,7 @@ pub fn read_session_file(path: &Path) -> Option<ClaudeSession> {
 
 /// `(mtime epoch ms, size bytes)` for `path`, or `None` when stat fails. The change
 /// fingerprint the [`SessionCache`] keys re-scans on.
+#[tracing::instrument(level = "debug", ret)]
 fn file_fingerprint(path: &Path) -> Option<(u64, u64)> {
     let m = fs::metadata(path).ok()?;
     let mtime = m
@@ -521,6 +545,7 @@ fn file_fingerprint(path: &Path) -> Option<(u64, u64)> {
 
 /// Order sessions newest-first by `started_at`, breaking ties by id (descending) so the
 /// result is deterministic even when mtimes are equal.
+#[tracing::instrument(level = "debug", ret)]
 fn sort_newest_first(v: &mut [ClaudeSession]) {
     v.sort_by(|a, b| {
         b.started_at
@@ -555,6 +580,7 @@ struct Prefix {
 /// `system` record 6 times. Line 1 is usually a `mode` / `summary` record with no `cwd` at
 /// all; the first one carrying it landed by line 9 in every case, comfortably inside
 /// [`SUMMARY_SCAN_LINES`], so this rides along on the existing pass for free.
+#[tracing::instrument(level = "debug")]
 fn summarize_file(path: &Path) -> Prefix {
     use std::io::{BufRead, BufReader};
     let Ok(file) = fs::File::open(path) else {
@@ -643,6 +669,7 @@ fn summarize_file(path: &Path) -> Prefix {
 /// lowercased (search is case-insensitive and never re-lowers the stored text), space-
 /// separated from the previous message, and truncated (char-boundary safe) once the
 /// [`FULL_TEXT_MAX`] cap is reached.
+#[tracing::instrument(level = "debug", ret)]
 fn push_full_text(full: &mut String, text: &str) {
     if full.len() >= FULL_TEXT_MAX {
         return;
@@ -674,6 +701,7 @@ fn push_full_text(full: &mut String, text: &str) {
 /// those as a session's opening message is how the sidebar came to caption half its rows
 /// `<local-command-caveat>Caveat: The messa…`. They are not the human's words, so they are
 /// neither the fallback summary nor searchable text.
+#[tracing::instrument(level = "debug", ret)]
 fn is_synthetic_user(v: &serde_json::Value, text: &str) -> bool {
     if v.get("isMeta").and_then(|m| m.as_bool()).unwrap_or(false) {
         return true;
@@ -694,6 +722,7 @@ fn is_synthetic_user(v: &serde_json::Value, text: &str) -> bool {
 /// which is either a plain string or an array of content blocks (all `{"type":"text"}`
 /// blocks, space-joined — tool_use / tool_result blocks are skipped). Returns `None` for
 /// tool-traffic-only messages with no text.
+#[tracing::instrument(level = "debug", ret)]
 fn message_text(v: &serde_json::Value) -> Option<String> {
     let content = v.get("message")?.get("content")?;
     if let Some(s) = content.as_str() {
@@ -720,12 +749,14 @@ fn message_text(v: &serde_json::Value) -> Option<String> {
 
 /// Collapse all whitespace (incl. newlines) to single spaces, trim, and truncate to
 /// [`SUMMARY_MAX`] characters (char-boundary safe, with an ellipsis).
+#[tracing::instrument(level = "debug", ret)]
 fn clean_summary(s: &str) -> String {
     let collapsed = s.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_chars(&collapsed, SUMMARY_MAX)
 }
 
 /// Truncate `s` to at most `max` characters, appending `…` when shortened.
+#[tracing::instrument(level = "debug", ret)]
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         return s.to_string();
@@ -757,17 +788,20 @@ struct CachedFile {
 }
 
 impl SessionCache {
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Files (re-)parsed by the most recent [`scan_dir`](Self::scan_dir) call.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn last_scan_parsed(&self) -> usize {
         self.last_scan_parsed
     }
 
     /// Scan `project_root`'s sessions through the real `~/.claude/projects` (the
     /// non-test entry point; see [`scan_dir`](Self::scan_dir) for the seam).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scan_project(&mut self, project_root: &Path) -> Vec<ClaudeSession> {
         let Some(root) = claude_projects_root() else {
             return Vec::new();
@@ -781,6 +815,7 @@ impl SessionCache {
     /// so the resume/history browser must union them. Session ids are unique across accounts,
     /// so the merge needs no dedup. One cache backs all dirs (files keyed by full path), so
     /// each account's unchanged transcripts stay warm across scans.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scan_project_all(&mut self, project_root: &Path) -> Vec<ClaudeSession> {
         let encoded = encode_project_dir(project_root);
         let mut out: Vec<ClaudeSession> = Vec::new();
@@ -798,6 +833,7 @@ impl SessionCache {
     /// ([`all_projects_in`]) with the per-file `(mtime, size)` reuse, so after the first
     /// index a refresh costs one `read_dir` per project plus a stat per transcript and is
     /// O(new files), not O(transcripts). Ordered by project path, sessions newest-first.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scan_all_in(&mut self, projects_root: &Path) -> Vec<ProjectSessions> {
         let mut found: Vec<ProjectSessions> = Vec::new();
         let mut parsed = 0usize;
@@ -814,6 +850,7 @@ impl SessionCache {
 
     /// [`scan_all_in`](Self::scan_all_in) across every account's transcript store
     /// ([`claude_projects_roots`]) — what a "all my Claude sessions" view scans.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scan_all(&mut self) -> Vec<ProjectSessions> {
         let mut found: Vec<ProjectSessions> = Vec::new();
         let mut parsed = 0usize;
@@ -834,6 +871,7 @@ impl SessionCache {
     /// reusing cached [`ClaudeSession`]s for the rest; entries whose file vanished are
     /// dropped. Returns the directory's sessions newest-first. A missing/unreadable
     /// directory yields an empty list (and evicts that directory's cached files).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn scan_dir(&mut self, session_dir: &Path) -> Vec<ClaudeSession> {
         self.last_scan_parsed = 0;
         let mut seen: Vec<PathBuf> = Vec::new();

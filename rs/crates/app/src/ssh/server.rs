@@ -51,6 +51,7 @@ pub struct ServeOpts {
 ///
 /// Split out and public so the security-relevant choices are directly assertable in tests
 /// rather than buried in a `serve` function that needs a socket to run.
+#[tracing::instrument(level = "debug", ret)]
 pub fn build_config(host_key: russh::keys::PrivateKey) -> server::Config {
     server::Config {
         // Identify honestly. A fake OpenSSH banner would only mislead the operator reading
@@ -83,6 +84,7 @@ pub fn build_config(host_key: russh::keys::PrivateKey) -> server::Config {
 ///
 /// `verbose` prints to stdout (the `hyperpanes ssh serve` foreground path); the daemon path
 /// passes `false` and everything goes to the debug log instead.
+#[tracing::instrument(level = "debug", ret)]
 pub fn serve_blocking(paths: &SshPaths, salt: &str, verbose: bool) -> Result<(), String> {
     let settings = SshSettings::load(&paths.settings)?;
     let addr = settings.resolve_bind()?;
@@ -164,6 +166,7 @@ pub fn serve_blocking(paths: &SshPaths, salt: &str, verbose: bool) -> Result<(),
 ///
 /// Taking the listener rather than an address is what lets the tests bind port 0 and talk to
 /// a real server over a real socket.
+#[tracing::instrument(level = "debug", ret)]
 pub async fn serve_on(
     listener: TcpListener,
     config: Arc<server::Config>,
@@ -183,6 +186,7 @@ struct SshServer {
 impl server::Server for SshServer {
     type Handler = SshHandler;
 
+    #[tracing::instrument(level = "debug", skip(self))]
     fn new_client(&mut self, peer: Option<SocketAddr>) -> SshHandler {
         SshHandler {
             opts: self.opts.clone(),
@@ -193,6 +197,7 @@ impl server::Server for SshServer {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn handle_session_error(&mut self, error: russh::Error) {
         // Includes ordinary disconnects; only ever a debug-log line.
         tracing::debug!("ssh: session ended: {error}");
@@ -218,6 +223,7 @@ pub struct SshHandler {
 
 impl SshHandler {
     /// Start the attach bridge for `channel`, or explain on the channel why it cannot.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn start(
         &mut self,
         channel: ChannelId,
@@ -275,6 +281,7 @@ impl server::Handler for SshHandler {
 
     /// Reject, always. `none` must never authenticate; russh's default already rejects, and
     /// this override exists so that stays true if the default ever changes.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn auth_none(&mut self, _user: &str) -> Result<Auth, Self::Error> {
         Ok(reject())
     }
@@ -282,6 +289,7 @@ impl server::Handler for SshHandler {
     /// Reject, always. There is no password to be right: nothing in hyperpanes stores or
     /// checks one, and adding one would put a guessable credential in front of every
     /// terminal on the machine.
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> {
         tracing::debug!("ssh: {} tried password auth as {user:?} — refused (publickey only)",
             self.peer);
@@ -289,6 +297,7 @@ impl server::Handler for SshHandler {
     }
 
     /// Reject, always — same reason as `auth_password`.
+    #[tracing::instrument(level = "debug", skip_all)]
     async fn auth_keyboard_interactive<'a>(
         &'a mut self,
         _user: &str,
@@ -302,6 +311,7 @@ impl server::Handler for SshHandler {
     /// has no CA: the authorized-keys file lists key material, and only key material on that
     /// list gets in. russh's default already rejects; this override keeps that true if the
     /// default ever changes, the same reason `auth_none` is spelled out above.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn auth_openssh_certificate(
         &mut self,
         _user: &str,
@@ -313,6 +323,7 @@ impl server::Handler for SshHandler {
     /// The probe a client makes before signing. **russh's default here is `Accept`**, which
     /// would let an unknown key proceed; overriding it is what makes the probe answer the
     /// truth. Ownership is not proven at this point, so nothing but the answer depends on it.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn auth_publickey_offered(
         &mut self,
         _user: &str,
@@ -328,6 +339,7 @@ impl server::Handler for SshHandler {
     /// The real check: the signature is verified by russh before this runs, so the client has
     /// proven it holds the private half. All that is left is whether that public half is on
     /// the list — re-read from disk here so a revoke takes effect on the next connection.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn auth_publickey(
         &mut self,
         user: &str,
@@ -353,6 +365,7 @@ impl server::Handler for SshHandler {
 
     // ---- channels ----------------------------------------------------------------------
 
+    #[tracing::instrument(level = "debug", ret, skip_all)]
     async fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
@@ -371,6 +384,7 @@ impl server::Handler for SshHandler {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn pty_request(
         &mut self,
         channel: ChannelId,
@@ -394,6 +408,7 @@ impl server::Handler for SshHandler {
     }
 
     /// A plain `ssh host`: attach, choosing a pane from the username hint or interactively.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn shell_request(
         &mut self,
         channel: ChannelId,
@@ -408,6 +423,7 @@ impl server::Handler for SshHandler {
 
     /// `ssh host <pane>` / `ssh host list`. The command is NOT executed — there is no shell
     /// behind this server. It is read only as a pane selector.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn exec_request(
         &mut self,
         channel: ChannelId,
@@ -422,6 +438,7 @@ impl server::Handler for SshHandler {
 
     /// No sftp, no scp, no anything. russh's default is a silent no-op that leaves the client
     /// waiting forever, so answer with an explicit failure.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn subsystem_request(
         &mut self,
         channel: ChannelId,
@@ -434,6 +451,7 @@ impl server::Handler for SshHandler {
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn data(
         &mut self,
         channel: ChannelId,
@@ -448,6 +466,7 @@ impl server::Handler for SshHandler {
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn window_change_request(
         &mut self,
         channel: ChannelId,
@@ -472,6 +491,7 @@ impl server::Handler for SshHandler {
 
     /// The client hung up. Dropping the [`Bridge`] EOFs the input reader, which detaches and
     /// unblocks the attach thread — the session itself keeps running.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn channel_close(
         &mut self,
         channel: ChannelId,
@@ -481,6 +501,7 @@ impl server::Handler for SshHandler {
         Ok(())
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     async fn channel_eof(
         &mut self,
         channel: ChannelId,
@@ -496,6 +517,7 @@ impl SshHandler {
     /// call: the lists are tiny and a revoke that needs a restart is a revoke that does not work.
     /// An expired device pairing is not authorized — the SSH door shuts on the same millisecond
     /// as the control-API door.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn lookup(&self, key: &PublicKey) -> Option<String> {
         match keys::Authorizer::load(&self.opts.paths) {
             Ok(set) => set.authorize(key, keys::now_ms()).map(|e| e.describe()),
@@ -510,6 +532,7 @@ impl SshHandler {
 }
 
 /// A rejection that offers publickey again (and nothing else) as the way forward.
+#[tracing::instrument(level = "debug", ret)]
 fn reject() -> Auth {
     Auth::Reject {
         proceed_with_methods: Some(MethodSet::from(&[MethodKind::PublicKey][..])),
@@ -519,6 +542,7 @@ fn reject() -> Auth {
 
 /// SSH sends the grid as `u32`. Clamp into the `u16` the pty layer speaks, and never accept a
 /// zero dimension — a 0-column grid would divide by zero downstream.
+#[tracing::instrument(level = "debug", ret)]
 fn clamp_grid(cols: u32, rows: u32) -> (u16, u16) {
     (
         cols.clamp(1, u16::MAX as u32) as u16,
@@ -529,6 +553,7 @@ fn clamp_grid(cols: u32, rows: u32) -> (u16, u16) {
 /// Read an `exec` command as a pane selector. Returns `(query, list_only)`.
 ///
 /// Deliberately tiny: this is not a shell and must never look like one.
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_command(cmd: &str) -> (Option<String>, bool) {
     let cmd = cmd.trim();
     let mut words = cmd.split_whitespace();
@@ -547,6 +572,7 @@ pub fn parse_command(cmd: &str) -> (Option<String>, bool) {
 /// is also whatever the client's OS put there by default (`bert`, `mobile`, `root`). Treating
 /// that as a pane query would make every ordinary `ssh host` fail with "no session matches
 /// 'bert'" instead of showing the chooser. So only the two unambiguous spellings count.
+#[tracing::instrument(level = "debug", ret)]
 pub fn query_from_user(user: &str) -> Option<String> {
     let user = user.trim();
     if user == "list" {

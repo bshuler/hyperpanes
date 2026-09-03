@@ -48,6 +48,7 @@ pub enum ApplyStrategy {
 
 /// This platform's apply strategy.
 #[allow(dead_code)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn apply_strategy() -> ApplyStrategy {
     platform::APPLY_STRATEGY
 }
@@ -93,6 +94,7 @@ struct Inner {
 }
 
 impl Default for Inner {
+    #[tracing::instrument(level = "debug")]
     fn default() -> Self {
         Inner {
             phase: Phase::Idle,
@@ -119,6 +121,7 @@ pub struct Updater {
 }
 
 impl Default for Updater {
+    #[tracing::instrument(level = "debug", skip_all)]
     fn default() -> Self {
         Updater {
             inner: Arc::new(Mutex::new(Inner::default())),
@@ -133,11 +136,13 @@ fn guard(inner: &Mutex<Inner>) -> MutexGuard<'_, Inner> {
 }
 
 impl Updater {
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// A snapshot for the per-tick UI mirror.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn snapshot(&self) -> Snapshot {
         let g = guard(&self.inner);
         Snapshot {
@@ -152,6 +157,7 @@ impl Updater {
     /// failure it silently resets to Idle (no alarming message), and it stays silent when
     /// already up to date — only a genuinely newer release surfaces a hint. A manual check
     /// (`quiet = false`) reports every outcome, including errors.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn check(&self, quiet: bool) {
         {
             let mut g = guard(&self.inner);
@@ -200,6 +206,7 @@ impl Updater {
     /// Download the staged release's installer asset to a temp path on a background thread,
     /// updating progress as it streams. No-op unless a prior check found a newer release with
     /// a downloadable installer asset.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn download(&self) {
         let url;
         let name;
@@ -247,6 +254,7 @@ impl Updater {
 
     /// The staged installer path, only when an installer has actually been downloaded
     /// ([`Phase::Downloaded`]). The caller launches it + quits the app.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn installer_path(&self) -> Option<PathBuf> {
         let g = guard(&self.inner);
         (g.phase == Phase::Downloaded)
@@ -255,6 +263,7 @@ impl Updater {
     }
 
     /// Force an error state with `msg` (used when launching the installer fails).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_error(&self, msg: String) {
         let mut g = guard(&self.inner);
         g.phase = Phase::Error;
@@ -272,6 +281,7 @@ struct ReleaseInfo {
 /// Blocking GitHub "latest release" query — builds a short-timeout client, parses `tag_name`
 /// and locates the `*-setup.exe` installer asset. Pure (no shared state) so it's trivially
 /// run on a worker thread; all failures map to an `Err(String)`.
+#[tracing::instrument(level = "debug")]
 fn fetch_latest() -> Result<ReleaseInfo, String> {
     let client = reqwest::blocking::Client::builder()
         .user_agent(USER_AGENT)
@@ -316,6 +326,7 @@ fn fetch_latest() -> Result<ReleaseInfo, String> {
 
 /// Stream the installer to `%TEMP%\hyperpanes-update\<name>`, updating `inner.progress` as it
 /// goes. Returns the written path.
+#[tracing::instrument(level = "debug", ret, skip(inner))]
 fn download_to_temp(url: &str, name: &str, inner: &Arc<Mutex<Inner>>) -> Result<PathBuf, String> {
     use std::io::{Read, Write};
     let client = reqwest::blocking::Client::builder()
@@ -359,6 +370,7 @@ fn download_to_temp(url: &str, name: &str, inner: &Arc<Mutex<Inner>>) -> Result<
 /// Whether dotted-numeric `latest` is a higher version than `current` (each `v`-stripped).
 /// Compares component-by-component as integers, ignoring any pre-release/build suffix — good
 /// enough for `0.0.2` vs `0.1.0`; a non-numeric or equal version is "not newer".
+#[tracing::instrument(level = "debug", ret)]
 fn is_newer(latest: &str, current: &str) -> bool {
     let a = parse_ver(latest);
     let b = parse_ver(current);
@@ -374,6 +386,7 @@ fn is_newer(latest: &str, current: &str) -> bool {
 }
 
 /// Parse a version string into its leading numeric components (`v1.2.3-rc1` → `[1,2,3]`).
+#[tracing::instrument(level = "debug", ret)]
 fn parse_ver(v: &str) -> Vec<u64> {
     v.trim()
         .trim_start_matches('v')

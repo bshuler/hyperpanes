@@ -39,11 +39,13 @@ impl Endpoint {
     /// Wrap an already-known address (a socket path on unix, a pipe name on Windows).
     /// [`endpoint_for`] is the normal way in; this exists for callers handed an address
     /// rather than a salt — notably tests, which bind a temp socket of their own.
+    #[tracing::instrument(level = "debug", ret, skip(raw))]
     pub fn new(raw: impl Into<String>) -> Self {
         Self(raw.into())
     }
 
     /// The endpoint as the OS spells it (a socket path, or a `\\.\pipe\…` name).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -51,12 +53,14 @@ impl Endpoint {
     /// The endpoint as a filesystem path — unix only, where the socket *is* a file (the
     /// tear-down path watches for it to disappear).
     #[cfg(unix)]
+    #[tracing::instrument(level = "debug", ret)]
     pub fn path(&self) -> &std::path::Path {
         std::path::Path::new(&self.0)
     }
 }
 
 impl std::fmt::Display for Endpoint {
+    #[tracing::instrument(level = "debug", ret, skip(f))]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
     }
@@ -66,6 +70,7 @@ impl std::fmt::Display for Endpoint {
 /// from the salt alone (never pass it around), so a dev/isolated user-data dir gets its own
 /// daemon on every OS.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn endpoint_for(salt: &str) -> Endpoint {
     Endpoint(
         crate::session::daemon::socket_path_for(salt)
@@ -76,6 +81,7 @@ pub fn endpoint_for(salt: &str) -> Endpoint {
 
 /// Windows: the salted named pipe (same FNV-1a token as the unix socket name).
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn endpoint_for(salt: &str) -> Endpoint {
     Endpoint(crate::session::daemon::windows::pipe_name(salt))
 }
@@ -93,6 +99,7 @@ pub type Conn = std::fs::File;
 
 /// Open a connection to the daemon at `ep`, or fail if none is listening.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn connect(ep: &Endpoint) -> io::Result<Conn> {
     std::os::unix::net::UnixStream::connect(ep.path())
 }
@@ -102,6 +109,7 @@ pub fn connect(ep: &Endpoint) -> io::Result<Conn> {
 /// a *transient* condition, not "no daemon", and surfacing it would make the client
 /// needlessly respawn a daemon that is right there.
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn connect(ep: &Endpoint) -> io::Result<Conn> {
     const ERROR_PIPE_BUSY: i32 = 231;
     let deadline = Instant::now() + Duration::from_secs(2);
@@ -122,12 +130,14 @@ pub fn connect(ep: &Endpoint) -> io::Result<Conn> {
 
 /// A second handle onto the same connection — the client gives one half to its reader
 /// thread and keeps the other for writes.
+#[tracing::instrument(level = "debug", ret)]
 pub fn try_clone(conn: &Conn) -> io::Result<Conn> {
     conn.try_clone()
 }
 
 /// Whether a daemon is answering on `ep` right now. Used by the tear-down path to watch a
 /// stale daemon go away; a connect that succeeds is dropped immediately.
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_live(ep: &Endpoint) -> bool {
     connect(ep).is_ok()
 }
@@ -146,6 +156,7 @@ pub fn is_live(ep: &Endpoint) -> bool {
 /// consumes at all. A timeout part-way through a frame's bytes would desync unix's framing,
 /// so don't reach for this in the middle of a stream.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug")]
 pub fn read_frame_deadline<T: for<'de> serde::Deserialize<'de>>(
     conn: &Conn,
     budget: Duration,
@@ -176,6 +187,7 @@ pub fn read_frame_deadline<T: for<'de> serde::Deserialize<'de>>(
 /// the shared decoder. Peeking never consumes, so a timeout leaves the stream byte-exact for
 /// whoever reads next — unlike a partial blocking read, which would desync the framing.
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn read_frame_deadline<T: for<'de> serde::Deserialize<'de>>(
     conn: &Conn,
     budget: Duration,
@@ -204,6 +216,7 @@ pub fn read_frame_deadline<T: for<'de> serde::Deserialize<'de>>(
 /// (all any caller needs). `Ok(None)` means the deadline passed with fewer buffered — the
 /// caller treats that as "no answer", and nothing has been consumed.
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 fn peek_until(conn: &Conn, want: usize, deadline: Instant) -> io::Result<Option<[u8; 4]>> {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;

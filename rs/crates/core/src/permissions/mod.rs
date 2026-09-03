@@ -58,6 +58,7 @@ pub enum Right {
 
 impl Right {
     /// Stable identifier for logs, settings, and the UI. Never localise this.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn id(self) -> &'static str {
         match self {
             Right::ScreenRecording => "screen-recording",
@@ -70,11 +71,13 @@ impl Right {
     }
 
     /// Human-facing name, in the OS's own words where they differ (see the per-OS files).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn label(self) -> &'static str {
         platform::label(self)
     }
 
     /// Every right, in a stable order — for a settings page that lists them all.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn all() -> &'static [Right] {
         &[
             Right::ScreenRecording,
@@ -101,12 +104,14 @@ pub enum Grant {
 impl Grant {
     /// True when the caller should not bother offering a "Grant…" affordance — either it
     /// already has the right, or this OS never gates it.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_settled(self) -> bool {
         matches!(self, Grant::Granted | Grant::NotApplicable)
     }
 }
 
 /// What we currently know about `right` on this OS.
+#[tracing::instrument(level = "debug", ret)]
 pub fn status(right: Right) -> Grant {
     platform::status(right)
 }
@@ -117,6 +122,7 @@ pub fn status(right: Right) -> Grant {
 /// right, at the moment it needs it — macOS shows each of these dialogs once ever, so one
 /// raised from a settings list is one the feature will never get. Where the OS has no such
 /// dialog this is just [`status`], which is why a caller can reach for it unconditionally.
+#[tracing::instrument(level = "debug", ret)]
 pub fn prompt(right: Right) -> Grant {
     platform::prompt(right)
 }
@@ -127,6 +133,7 @@ pub fn prompt(right: Right) -> Grant {
 /// `Ok(())` means we got them there, *not* that they granted anything; re-read [`status`]
 /// afterwards. `Err` on an OS with no such gate, so a caller that ignores `NotApplicable`
 /// still fails loudly rather than silently doing nothing.
+#[tracing::instrument(level = "debug", ret)]
 pub fn request(right: Right) -> Result<(), String> {
     if status(right) == Grant::NotApplicable {
         return Err(format!(

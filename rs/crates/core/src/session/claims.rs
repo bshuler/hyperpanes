@@ -80,11 +80,13 @@ pub enum ClaimOutcome {
 
 impl ClaimOutcome {
     /// Whether the claim was granted.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn granted(self) -> bool {
         matches!(self, ClaimOutcome::Granted)
     }
 
     /// The incumbent owner when denied.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn owner(self) -> Option<ConnId> {
         match self {
             ClaimOutcome::Granted => None,
@@ -107,6 +109,7 @@ pub struct ClaimRegistry {
 
 impl ClaimRegistry {
     /// An empty registry whose first minted connection id is `1`.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new() -> Self {
         ClaimRegistry {
             claims: Mutex::new(HashMap::new()),
@@ -117,6 +120,7 @@ impl ClaimRegistry {
     /// Mint the next connection id. Monotonic and never `0` (see [`ConnId`]), so an id is
     /// never reused within a daemon's lifetime and a released claim can never be confused
     /// with a later connection's.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn next_conn_id(&self) -> ConnId {
         self.next_conn.fetch_add(1, Ordering::SeqCst)
     }
@@ -128,6 +132,7 @@ impl ClaimRegistry {
     /// orphan both land in this function, the mutex orders them, and the second sees an
     /// occupied entry. There is exactly one [`ClaimOutcome::Granted`] per uid until it is
     /// released.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn claim(&self, uid: &str, conn: ConnId) -> ClaimOutcome {
         let mut map = self.claims.lock().unwrap();
         match map.get(uid) {
@@ -145,6 +150,7 @@ impl ClaimRegistry {
     /// Give up `conn`'s claim on `uid`. A release from a connection that does **not** own it
     /// is ignored — one process can never knock another's claim loose. Returns whether
     /// anything changed.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn release(&self, uid: &str, conn: ConnId) -> bool {
         let mut map = self.claims.lock().unwrap();
         if map.get(uid) == Some(&conn) {
@@ -158,6 +164,7 @@ impl ClaimRegistry {
     /// Drop **every** claim held by `conn` — the crash-safety path, called from the daemon's
     /// per-connection teardown (which runs on socket EOF, i.e. whenever the owning process
     /// dies for any reason). Returns whether anything changed.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn release_conn(&self, conn: ConnId) -> bool {
         let mut map = self.claims.lock().unwrap();
         let before = map.len();
@@ -168,11 +175,13 @@ impl ClaimRegistry {
     /// Drop any claim on `uid` regardless of owner — for a session that no longer exists
     /// (natural exit, `Kill`). Keeps the table from pinning uids that can never be adopted.
     /// Returns whether anything changed.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn forget_uid(&self, uid: &str) -> bool {
         self.claims.lock().unwrap().remove(uid).is_some()
     }
 
     /// Drop every claim — for `KillAll`, where no session survives to be claimed.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn clear(&self) -> bool {
         let mut map = self.claims.lock().unwrap();
         let had = !map.is_empty();
@@ -182,6 +191,7 @@ impl ClaimRegistry {
 
     /// The whole table as wire records, sorted by uid so a snapshot is byte-stable and a
     /// client (or a test) can compare two of them directly.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn snapshot(&self) -> Vec<ClaimInfo> {
         let map = self.claims.lock().unwrap();
         let mut out: Vec<ClaimInfo> = map
@@ -196,6 +206,7 @@ impl ClaimRegistry {
     }
 
     /// The connection holding `uid`, if any.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn owner_of(&self, uid: &str) -> Option<ConnId> {
         self.claims.lock().unwrap().get(uid).copied()
     }

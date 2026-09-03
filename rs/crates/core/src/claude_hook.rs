@@ -19,6 +19,7 @@ use crate::persistence::paths::write_atomic;
 /// [`crate::shell_integration::shell_integration_dir`] handles: next to the exe, the macOS
 /// `.app` `Contents/Resources`, and the FHS `share`/`lib` install prefixes. Returns the first
 /// that exists.
+#[tracing::instrument(level = "debug", ret)]
 pub fn bundled_hook_path() -> Option<PathBuf> {
     let rel = Path::new("resources")
         .join("claude")
@@ -45,6 +46,7 @@ pub fn bundled_hook_path() -> Option<PathBuf> {
 /// `~/.claude*` dirs, else `~/.claude`), plus `$CLAUDE_CONFIG_DIR` if set — so the marker keeps
 /// working across every account the goals system rotates through. Only existing config dirs are
 /// targeted (`ensure_in_file` skips a missing parent).
+#[tracing::instrument(level = "debug", ret)]
 fn target_settings_files() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
     let push = |d: PathBuf, dirs: &mut Vec<PathBuf>| {
@@ -63,6 +65,7 @@ fn target_settings_files() -> Vec<PathBuf> {
 
 /// Register `hook_path` in every target settings file. Returns the number of files newly
 /// modified (0 = all already had it / none exist). Best-effort: per-file errors are logged.
+#[tracing::instrument(level = "debug", ret)]
 pub fn ensure_registered(hook_path: &Path) -> usize {
     let cmd = hook_path.to_string_lossy().to_string();
     let mut changed = 0;
@@ -84,6 +87,7 @@ pub fn ensure_registered(hook_path: &Path) -> usize {
 
 /// Merge the hook command into one `settings.json`'s SessionStart + SessionEnd. Returns whether
 /// the file was written. Pure JSON logic in [`ensure_event`] keeps this testable.
+#[tracing::instrument(level = "debug", ret)]
 fn ensure_in_file(file: &Path, cmd: &str) -> Result<bool, String> {
     match file.parent() {
         Some(p) if p.is_dir() => {}
@@ -109,6 +113,7 @@ fn ensure_in_file(file: &Path, cmd: &str) -> Result<bool, String> {
 /// Ensure `hooks.<event>` contains a matcher group whose `hooks[].command == cmd`. Returns
 /// whether it added one (idempotent: a no-op if already present; leaves a malformed shape
 /// untouched, returning false).
+#[tracing::instrument(level = "debug", ret)]
 fn ensure_event(root: &mut Value, event: &str, cmd: &str) -> bool {
     let Some(obj) = root.as_object_mut() else {
         return false;

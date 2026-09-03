@@ -88,6 +88,7 @@ thread_local! {
 /// Spawn the scanner thread and return its UI-side handle. The thread owns one
 /// [`SessionCache`] per project (the mtime/size fingerprints live there, across
 /// flyout open/close cycles) and exits when the UI side drops the channels.
+#[tracing::instrument(level = "debug")]
 fn spawn_scanner() -> Scanner {
     let (job_tx, job_rx) = channel::<Job>();
     let (res_tx, res_rx) = channel::<ScanResult>();
@@ -183,6 +184,7 @@ fn spawn_scanner() -> Scanner {
 /// The provider serving `tool_id`, or `None` for a tool that has no history provider yet
 /// (it still gets a mode in the strip — the panel shows its empty state rather than the
 /// tool vanishing from a list the human curated).
+#[tracing::instrument(level = "debug")]
 fn provider_for(
     tool_id: &str,
     overrides: &BTreeMap<String, String>,
@@ -209,6 +211,7 @@ fn provider_for(
 
 /// Ask for a (re-)scan of `project_root`'s Claude sessions. No-op while one is already
 /// in flight for that project.
+#[tracing::instrument(level = "debug", ret)]
 pub fn request_sessions(project_root: &str) {
     let fresh = PENDING_SESS.with(|p| p.borrow_mut().insert(project_root.to_string()));
     if fresh {
@@ -219,6 +222,7 @@ pub fn request_sessions(project_root: &str) {
 }
 
 /// Ask for a (re-)enumeration of `repo_path`'s worktrees. No-op while one is in flight.
+#[tracing::instrument(level = "debug", ret)]
 pub fn request_worktrees(repo_path: &str) {
     let fresh = PENDING_WT.with(|p| p.borrow_mut().insert(repo_path.to_string()));
     if fresh {
@@ -238,10 +242,12 @@ pub fn request_worktrees(repo_path: &str) {
 /// scanner is still walking the transcripts states a verdict on a question nobody has
 /// answered. `PENDING_TOOL` already holds exactly that fact — it is what keeps a second
 /// request from queueing a duplicate job — so this only reads it.
+#[tracing::instrument(level = "debug", ret)]
 pub fn tool_scan_pending(tool_id: &str) -> bool {
     PENDING_TOOL.with(|p| p.borrow().contains(tool_id))
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn request_tool_sessions(tool_id: &str, overrides: BTreeMap<String, String>) {
     let fresh = PENDING_TOOL.with(|p| p.borrow_mut().insert(tool_id.to_string()));
     if fresh {
@@ -262,6 +268,7 @@ pub fn request_tool_sessions(tool_id: &str, overrides: BTreeMap<String, String>)
 ///
 /// A pane with a directory the resume path could not use is not watched at all
 /// ([`PaneWatch::new`] refuses it), because an adoption made there could never be spent.
+#[tracing::instrument(level = "debug", ret)]
 pub fn watch_pane(uid: &str, tool: &str, cwd: &str) {
     WATCHES.with(|w| {
         let mut w = w.borrow_mut();
@@ -278,6 +285,7 @@ pub fn watch_pane(uid: &str, tool: &str, cwd: &str) {
 
 /// Stop watching pane `uid` — it closed, or it has a conversation now. Watches are keyed
 /// by uid and would otherwise outlive every pane the session ever opened.
+#[tracing::instrument(level = "debug", ret)]
 pub fn forget_pane(uid: &str) {
     WATCHES.with(|w| {
         w.borrow_mut().remove(uid);
@@ -286,6 +294,7 @@ pub fn forget_pane(uid: &str) {
 
 /// Drop every watch whose pane is not in `alive`. The pump passes the panes that still
 /// want a conversation found, so this collects both closed panes and panes that got one.
+#[tracing::instrument(level = "debug", ret)]
 pub fn retain_panes(alive: &HashSet<String>) {
     WATCHES.with(|w| {
         w.borrow_mut().retain(|uid, _| alive.contains(uid));
@@ -302,6 +311,7 @@ pub fn retain_panes(alive: &HashSet<String>) {
 /// every watch on the same tool consumes the same snapshot.
 ///
 /// [`session_infer::SCAN_EVERY`]: hyperpanes_core::tools::session_infer::SCAN_EVERY
+#[tracing::instrument(level = "debug", ret)]
 pub fn poll_inference(overrides: &BTreeMap<String, String>) -> Vec<(String, ToolSessionMark)> {
     let now = std::time::Instant::now();
     let mut adopted: Vec<(String, ToolSessionMark)> = Vec::new();
@@ -344,6 +354,7 @@ pub fn poll_inference(overrides: &BTreeMap<String, String>) -> Vec<(String, Tool
 }
 
 /// Ask for a raw store read for `tool_id`. No-op while one is in flight.
+#[tracing::instrument(level = "debug", ret)]
 fn request_tool_store(tool_id: &str, overrides: BTreeMap<String, String>) {
     let fresh = PENDING_STORE.with(|p| p.borrow_mut().insert(tool_id.to_string()));
     if fresh {
@@ -356,6 +367,7 @@ fn request_tool_store(tool_id: &str, overrides: BTreeMap<String, String>) {
 /// Drain every finished scan into the sidebar caches. Returns `true` when anything
 /// landed — the caller (the pump) marks the state dirty so the projection re-runs and
 /// the flyout refreshes. Called every tick; an empty channel is a cheap `try_recv` miss.
+#[tracing::instrument(level = "debug", ret)]
 pub fn drain() -> bool {
     let mut any = false;
     SCANNER.with(|s| {

@@ -35,6 +35,7 @@ static HOVER_CURSOR: AtomicIsize = AtomicIsize::new(0);
 
 /// Lazily materialize an embedded `.cur` into a usable HCURSOR (write-to-temp +
 /// `LoadCursorFromFileW`), caching it in `cell`. Returns `0` on failure.
+#[tracing::instrument(level = "debug", ret)]
 fn load_cursor(bytes: &[u8], file: &str, cell: &AtomicIsize) -> isize {
     let cached = cell.load(Ordering::Relaxed);
     if cached != 0 {
@@ -69,6 +70,7 @@ static OLD_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 /// so every `WM_SETCURSOR` routes to the source window's proc).
 static DRAG_CURSOR: AtomicIsize = AtomicIsize::new(0);
 
+#[tracing::instrument(level = "debug", ret)]
 fn hwnd(raw: isize) -> HWND {
     HWND(raw as *mut c_void)
 }
@@ -160,6 +162,7 @@ unsafe extern "system" fn subclass_proc(
 
 /// Pull the native HWND (as isize) out of a Slint window. 0 until the native
 /// window is realized by the event loop (callers retry).
+#[tracing::instrument(level = "debug", ret)]
 pub fn hwnd_of(win: &slint::Window) -> isize {
     let sh = win.window_handle();
     match HasWindowHandle::window_handle(&sh) {
@@ -173,6 +176,7 @@ pub fn hwnd_of(win: &slint::Window) -> isize {
 
 /// Strip the OS title bar (`WS_CAPTION`) while keeping the resize border +
 /// min/max/sysmenu, so our Slint top bar is the only chrome.
+#[tracing::instrument(level = "debug", ret)]
 pub fn make_frameless(raw: isize) {
     unsafe {
         let h = hwnd(raw);
@@ -206,6 +210,7 @@ pub fn make_frameless(raw: isize) {
 }
 
 /// Begin a system move-drag (the standard frameless "drag the bar" trick).
+#[tracing::instrument(level = "debug", ret)]
 pub fn start_drag(raw: isize) {
     unsafe {
         let h = hwnd(raw);
@@ -223,6 +228,7 @@ pub fn start_drag(raw: isize) {
 /// it now, and capture the mouse to `raw` so every `WM_SETCURSOR` (over any window or
 /// the desktop) routes to our subclass and keeps the cursor consistent for the whole
 /// drag. (Win32 has no closed-hand system cursor; the move cursor reads as "carrying".)
+#[tracing::instrument(level = "debug", ret)]
 pub fn begin_drag_cursor(raw: isize) {
     // Custom closed-hand "grabbing" cursor; fall back to the 4-way move if it won't load.
     let mut c = load_cursor(GRABBING_CUR_BYTES, "hp_grabbing.cur", &GRABBING_CUR);
@@ -243,6 +249,7 @@ pub fn begin_drag_cursor(raw: isize) {
 }
 
 /// Stop forcing the drag cursor and release the mouse capture (drop / cancel).
+#[tracing::instrument(level = "debug", ret)]
 pub fn end_drag_cursor(_raw: isize) {
     DRAG_CURSOR.store(0, Ordering::Relaxed);
     unsafe {
@@ -253,6 +260,7 @@ pub fn end_drag_cursor(_raw: isize) {
 /// Show / hide the open-hand "grab" cursor while hovering a drag handle (not dragging).
 /// Sets it immediately and records it so the subclass keeps it on subsequent
 /// `WM_SETCURSOR`s until cleared.
+#[tracing::instrument(level = "debug", ret)]
 pub fn set_hover_cursor(on: bool) {
     if on {
         let c = load_cursor(GRAB_CUR_BYTES, "hp_grab.cur", &GRAB_CUR);
@@ -266,6 +274,7 @@ pub fn set_hover_cursor(on: bool) {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn minimize(raw: isize) {
     unsafe {
         let _ = ShowWindow(hwnd(raw), SW_MINIMIZE);
@@ -276,6 +285,7 @@ pub fn minimize(raw: isize) {
 /// then make it foreground. `SetForegroundWindow` can be refused by the shell's
 /// foreground lock, but it is granted for a process the human just clicked in — which is
 /// the only way this is reached.
+#[tracing::instrument(level = "debug", ret)]
 pub fn raise(raw: isize) {
     unsafe {
         let h = hwnd(raw);
@@ -286,6 +296,7 @@ pub fn raise(raw: isize) {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn toggle_max(raw: isize) {
     unsafe {
         let h = hwnd(raw);
@@ -298,6 +309,7 @@ pub fn toggle_max(raw: isize) {
 }
 
 /// Whether the window is currently maximized (drives the restore-vs-maximize icon).
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_maximized(raw: isize) -> bool {
     if raw == 0 {
         return false;
@@ -308,6 +320,7 @@ pub fn is_maximized(raw: isize) -> bool {
 /// Post `WM_CLOSE` to a window. Unused by the managed multi-window close path
 /// (which flags the window for reaping), kept for completeness of the Win32 glue.
 #[allow(dead_code)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn close(raw: isize) {
     unsafe {
         let _ = PostMessageW(Some(hwnd(raw)), WM_CLOSE, WPARAM(0), LPARAM(0));
@@ -315,6 +328,7 @@ pub fn close(raw: isize) {
 }
 
 /// Cover the current monitor borderlessly, returning the prior placement.
+#[tracing::instrument(level = "debug", ret)]
 pub fn enter_fullscreen(raw: isize) -> Option<SavedPlacement> {
     unsafe {
         let h = hwnd(raw);
@@ -353,6 +367,7 @@ pub fn enter_fullscreen(raw: isize) -> Option<SavedPlacement> {
 }
 
 /// Restore the placement captured by [`enter_fullscreen`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn exit_fullscreen(raw: isize, saved: SavedPlacement) {
     unsafe {
         let h = hwnd(raw);
@@ -382,6 +397,7 @@ pub fn exit_fullscreen(raw: isize, saved: SavedPlacement) {
 /// toward the origin), which makes this conservative in the right direction: a frame that
 /// is genuinely off every display is still pulled back, and a frame that merely hangs a
 /// little past an edge on a scaled display is left where the human put it.
+#[tracing::instrument(level = "debug", ret)]
 pub fn displays() -> Vec<(i32, i32, i32, i32)> {
     // SAFETY: pure reads of process-wide system metrics; no handles, no state.
     let (x, y, w, h) = unsafe {

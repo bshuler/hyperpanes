@@ -46,6 +46,7 @@ impl IdleEffect {
     ];
 
     /// Parse a persisted token, defaulting to Firefly for an unknown/empty value.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn from_token(s: &str) -> Self {
         match s {
             "pulse" => Self::Pulse,
@@ -57,6 +58,7 @@ impl IdleEffect {
     }
 
     /// The token persisted for this effect.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn token(self) -> &'static str {
         match self {
             Self::Firefly => "firefly",
@@ -68,6 +70,7 @@ impl IdleEffect {
     }
 
     /// The index of this effect's token in [`Self::OPTIONS`] (the picker's active row).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn index(self) -> usize {
         Self::OPTIONS
             .iter()
@@ -77,6 +80,7 @@ impl IdleEffect {
 
     /// Whether one pulse interpolates its keyframes linearly (fluorescent — snappy/electric)
     /// rather than with `ease-in-out` (every other animated style).
+    #[tracing::instrument(level = "debug", ret)]
     fn linear(self) -> bool {
         matches!(self, Self::Fluorescent)
     }
@@ -84,6 +88,7 @@ impl IdleEffect {
 
 /// CSS `ease-in-out` (`cubic-bezier(0.42, 0, 0.58, 1)`), approximated by smoothstep — a
 /// monotonic 0→1 curve that's visually indistinguishable for an opacity fade.
+#[tracing::instrument(level = "debug", ret)]
 fn ease_in_out(t: f32) -> f32 {
     let t = t.clamp(0.0, 1.0);
     t * t * (3.0 - 2.0 * t)
@@ -92,6 +97,7 @@ fn ease_in_out(t: f32) -> f32 {
 /// Interpolate an opacity keyframe list at progress `t ∈ [0,1]`. `stops` are `(offset,
 /// opacity)` pairs sorted by ascending offset (a hard WAAPI requirement). `linear` selects
 /// the per-segment easing.
+#[tracing::instrument(level = "debug", ret)]
 fn interp(stops: &[(f32, f32)], t: f32, linear: bool) -> f32 {
     if stops.is_empty() {
         return 0.0;
@@ -141,6 +147,7 @@ pub struct Glow {
 
 impl Glow {
     /// A fresh, dark glow seeded from `seed` (e.g. a hash of the pane uid).
+    #[tracing::instrument(level = "debug")]
     pub fn new(seed: u64) -> Self {
         Glow {
             alpha: 0.0,
@@ -156,6 +163,7 @@ impl Glow {
     }
 
     /// Next pseudo-random float in `[0,1)` (xorshift64).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn rand(&mut self) -> f32 {
         let mut x = self.rng;
         x ^= x << 13;
@@ -167,11 +175,13 @@ impl Glow {
     }
 
     /// `base + rand()*spread` — the renderer's `rand(base, spread)`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn rand_range(&mut self, base: f32, spread: f32) -> f32 {
         base + self.rand() * spread
     }
 
     /// Reset to dark (idle ended or no effect armed).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn reset(&mut self) {
         self.alpha = 0.0;
         self.effect = None;
@@ -180,6 +190,7 @@ impl Glow {
     }
 
     /// The one-off start delay (ms) before the first pulse of `e`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn start_delay_for(&mut self, e: IdleEffect) -> f32 {
         match e {
             IdleEffect::Firefly => self.rand_range(350.0, 500.0),
@@ -190,6 +201,7 @@ impl Glow {
 
     /// Begin a fresh pulse cycle of `e` at `now`: roll this cycle's duration, period and
     /// keyframes from the PRNG (the deterministic styles roll the same values every time).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn begin_cycle(&mut self, e: IdleEffect, now: Instant) {
         let dur = match e {
             IdleEffect::Firefly => self.rand_range(850.0, 550.0),
@@ -229,6 +241,7 @@ impl Glow {
     /// catches and holds lit (with a faint buzz and one mid-cycle stutter). Levels are
     /// re-rolled each cycle so it never reads as a fixed loop; the offsets stay fixed and
     /// strictly ascending.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn fluorescent_stops(&mut self) -> Vec<(f32, f32)> {
         let lit = 0.36 + self.rand() * 0.1; // the level it settles to once "on"
         let flash = |r: f32| 0.75 + r * 0.25; // a strike flash from a [0,1) roll
@@ -259,6 +272,7 @@ impl Glow {
     /// Advance the animation and return the alpha to display. `idle` gates the glow on the
     /// pane's quiescence; when it goes false the glow resets to dark. `now` is a shared
     /// monotonic instant read once per tick.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn update(&mut self, effect: IdleEffect, idle: bool, now: Instant) -> f32 {
         if !idle {
             self.reset();
@@ -316,6 +330,7 @@ impl Glow {
 
 /// Wall-clock epoch-ms now, to compare against `SessionManager::last_output_at` (which is
 /// also epoch-ms). `0` on the (impossible) pre-epoch error.
+#[tracing::instrument(level = "debug", ret)]
 pub fn now_epoch_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
@@ -346,6 +361,7 @@ const AI_NAMES: [&str; 13] = [
 
 /// Whether `hay` (a pane's shell/OSC title) names an AI/agent CLI — a case-insensitive
 /// token match so "claude" hits but an unrelated word merely *containing* a name does not.
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_ai_pane(hay: &str) -> bool {
     let lower = hay.to_ascii_lowercase();
     // Split on anything that isn't a name character so "user@host: claude" → ["user","host","claude"].
@@ -357,6 +373,7 @@ pub fn is_ai_pane(hay: &str) -> bool {
 /// Extract the last OSC window-title (`ESC ] 0|2 ; <title> BEL`/`ST`) from a pty output
 /// chunk, if any. Lets the app sniff a pane's running program app-side (an agent CLI sets
 /// the terminal title) without a core/widget change. Returns the newest title in `data`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn sniff_osc_title(data: &str) -> Option<String> {
     let mut found: Option<String> = None;
     let bytes = data.as_bytes();
@@ -389,6 +406,7 @@ pub fn sniff_osc_title(data: &str) -> Option<String> {
 }
 
 /// A cheap stable seed from a pane uid (FNV-1a) so each pane's firefly is out of phase.
+#[tracing::instrument(level = "debug", ret)]
 pub fn seed_from(uid: &str) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for b in uid.as_bytes() {

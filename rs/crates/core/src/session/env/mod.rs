@@ -51,6 +51,7 @@ pub struct PlatformEnv;
 /// The freshest spawn-base environment this platform can produce. Windows: the
 /// registry-merged machine+user environment with process-only vars layered in (see
 /// the module docs). Non-Windows, or if the registry is unreadable: the process env.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn fresh_env() -> EnvMap {
     let process: EnvMap = std::env::vars().collect();
     PlatformEnv.fresh_env_with_process(process)
@@ -59,6 +60,7 @@ pub fn fresh_env() -> EnvMap {
 /// Pure merge core of [`fresh_env`] — see the module docs for the three layers.
 /// Registry names are matched case-insensitively (Windows env semantics); the
 /// returned map keeps each winner's original spelling.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn merge_fresh_env(machine: &[RawVar], user: &[RawVar], process: &EnvMap) -> EnvMap {
     // 1. machine ◁ user (CI upsert; PATH concatenates instead of replacing).
     let mut merged: Vec<RawVar> = machine.to_vec();
@@ -126,6 +128,7 @@ pub fn merge_fresh_env(machine: &[RawVar], user: &[RawVar], process: &EnvMap) ->
 
 /// Expand `%NAME%` tokens in a `REG_EXPAND_SZ` value. Unknown tokens are left
 /// verbatim and an unpaired `%` passes through, matching `ExpandEnvironmentStrings`.
+#[tracing::instrument(level = "debug", skip_all)]
 fn expand_value(value: &str, lookup: &dyn Fn(&str) -> Option<String>) -> String {
     let mut out = String::with_capacity(value.len());
     let mut rest = value;

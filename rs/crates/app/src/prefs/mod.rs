@@ -41,12 +41,14 @@ pub use platform::{font_dirs, FONT_OPTIONS, SHELL_OPTIONS};
 // lets the user type any font-file path. Selection is persisted by value.
 
 /// Whether `font` is a user-typed custom value (non-empty and not one of [`FONT_OPTIONS`]).
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_custom_font(font: &str) -> bool {
     !font.is_empty() && !FONT_OPTIONS.iter().any(|(_, v)| *v == font)
 }
 
 /// The human label for a saved font value — the matching [`FONT_OPTIONS`] label, "Custom"
 /// for a user-typed path, else the default. Used by the preview HUD.
+#[tracing::instrument(level = "debug", ret)]
 pub fn font_label(font: &str) -> &str {
     if let Some((label, _)) = FONT_OPTIONS.iter().find(|(_, v)| *v == font) {
         label
@@ -73,6 +75,7 @@ pub const BUNDLED_FONTS: [(&str, &[u8]); 2] = [
 ];
 
 /// Where the baked-in fonts are extracted: `%APPDATA%\hyperpanes\fonts`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn bundled_font_dir() -> std::path::PathBuf {
     paths::user_data_dir().join("fonts")
 }
@@ -80,6 +83,7 @@ pub fn bundled_font_dir() -> std::path::PathBuf {
 /// Extract the baked-in fonts to [`bundled_font_dir`] (writing each only when missing or a
 /// different size, so an app update refreshes them). Best-effort; call once at startup before
 /// any font is resolved. A failure just means those fonts fall back like an uninstalled one.
+#[tracing::instrument(level = "debug", ret)]
 pub fn init_bundled_fonts() {
     let dir = bundled_font_dir();
     let _ = std::fs::create_dir_all(&dir);
@@ -96,6 +100,7 @@ pub fn init_bundled_fonts() {
 
 /// Resolve a candidate font-file name to an installed absolute path (forward-slashed), or
 /// `None` if it isn't present in any font directory.
+#[tracing::instrument(level = "debug", ret)]
 fn resolve_font(file: &str) -> Option<String> {
     font_dirs().into_iter().find_map(|d| {
         let p = d.join(file);
@@ -107,6 +112,7 @@ fn resolve_font(file: &str) -> Option<String> {
 /// used verbatim; the empty "System" default asks the platform provider for its preferred
 /// shell (Windows: pwsh when installed), falling back to the OS default that core resolves.
 /// Returns `None` to mean "let core pick the system shell".
+#[tracing::instrument(level = "debug", ret)]
 pub fn effective_shell(default_shell: &str) -> Option<String> {
     if !default_shell.is_empty() {
         return Some(default_shell.to_string());
@@ -131,6 +137,7 @@ pub const IDLE_STEP_SECONDS: u32 = 30;
 /// only ever produce a value that already satisfies this; a JSON caller (control API) and an
 /// old persisted blob can both hand over anything, and the dial has to be able to show the
 /// result.
+#[tracing::instrument(level = "debug", ret)]
 pub fn idle_seconds_on_grid(secs: u32) -> u32 {
     let step = IDLE_STEP_SECONDS;
     let snapped = (secs / step) * step;
@@ -253,6 +260,7 @@ pub const BROWSER_MODE_APP: &str = "app";
 pub const BROWSER_MODE_ASK: &str = "ask";
 
 impl Default for Settings {
+    #[tracing::instrument(level = "debug", ret)]
     fn default() -> Self {
         Settings {
             font_family: String::new(),
@@ -290,22 +298,26 @@ impl Settings {
     /// The resolved font path to load: the saved `font_family` path if it's still present,
     /// else the first available family, else the always-present fallback. So a font that was
     /// uninstalled (or a blank default) never loads nothing.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn font_path(&self) -> String {
         resolve_or_default(&self.font_family)
     }
 
     /// Clamp the base font size into the supported range.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn clamp_font(px: f32) -> f32 {
         px.clamp(MIN_FONT_PX, MAX_FONT_PX)
     }
 
     /// Whether `id` is starred.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_favorite_tool(&self, id: &str) -> bool {
         self.tool_favorites.iter().any(|f| f == id)
     }
 
     /// Star/unstar `id`, keeping the user's chosen order. Starring appends (newest last)
     /// rather than sorting by the registry, because the order IS the preference.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn toggle_favorite_tool(&mut self, id: &str) {
         match self.tool_favorites.iter().position(|f| f == id) {
             Some(i) => {
@@ -321,6 +333,7 @@ impl Settings {
     /// which is also what a mode of `"app"` degrades to when the chosen browser has been
     /// uninstalled. `"ask"` is NOT resolved here — that one needs a human, so the caller
     /// checks [`Self::browser_asks`] first.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn browser_launcher(&self) -> Option<String> {
         if self.browser_mode != BROWSER_MODE_APP || self.browser_app.is_empty() {
             return None;
@@ -332,6 +345,7 @@ impl Settings {
     }
 
     /// Whether opening a URL should put the choice to the user.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn browser_asks(&self) -> bool {
         self.browser_mode == BROWSER_MODE_ASK
     }
@@ -342,6 +356,7 @@ impl Settings {
     /// which is right for an old file — but it also means a bad value written by a script
     /// would persist silently and take effect as something other than what was asked. So
     /// [`save`] (and the control plane's settings patch) refuse a blob that fails this.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn validate(&self) -> Result<(), String> {
         let palettes = crate::theme::UI_PALETTES.len();
         if self.ui_palette >= palettes {
@@ -425,6 +440,7 @@ pub const MAX_STATUS_LOOP_PROMPT: usize = 4000;
 pub const MAX_RESTART_LOOP_HOURS: u32 = 720;
 
 /// `"a", "b", "c"` — the accepted-values list in a validation message.
+#[tracing::instrument(level = "debug", skip_all)]
 fn join_tokens<'a>(tokens: impl Iterator<Item = &'a str>) -> String {
     tokens
         .map(|t| format!("{t:?}"))
@@ -438,6 +454,7 @@ fn join_tokens<'a>(tokens: impl Iterator<Item = &'a str>) -> String {
 /// absolute path. Anything that can't be found falls back to the platform default, so
 /// loading never fails. Shared by the live settings and the in-dialog appearance draft so
 /// both highlight the same font.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_or_default(font: &str) -> String {
     if font.is_empty() {
         return platform::default_font();
@@ -453,6 +470,7 @@ pub fn resolve_or_default(font: &str) -> String {
 }
 
 /// Load the persisted settings (defaults on a missing/corrupt file).
+#[tracing::instrument(level = "debug", ret)]
 pub fn load() -> Settings {
     let path = paths::user_data_dir().join("native-settings.json");
     let Ok(raw) = std::fs::read_to_string(&path) else {
@@ -464,6 +482,7 @@ pub fn load() -> Settings {
 /// Persist `settings` atomically. Errors are swallowed (a settings write failing must
 /// never take down the UI) but logged — a blob that fails [`Settings::validate`] is
 /// refused and logged at `warn`, since that one is a caller's bug rather than the disk's.
+#[tracing::instrument(level = "debug", ret)]
 pub fn save(settings: &Settings) {
     if let Err(e) = try_save(settings) {
         tracing::warn!("settings not saved: {e}");
@@ -473,6 +492,7 @@ pub fn save(settings: &Settings) {
 /// [`save`] with the outcome: `Err` names the invalid field (nothing was written) or the
 /// I/O failure. For callers that can relay the reason — the control plane's `PATCH
 /// /settings` and the preferences dialog.
+#[tracing::instrument(level = "debug", ret)]
 pub fn try_save(settings: &Settings) -> Result<(), String> {
     settings.validate()?;
     let path = paths::user_data_dir().join("native-settings.json");

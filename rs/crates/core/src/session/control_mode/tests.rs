@@ -12,6 +12,7 @@ use super::*;
 /// Frozen so `%begin`'s timestamp is comparable.
 const T: u64 = 1_788_035_366;
 
+#[tracing::instrument(level = "debug")]
 fn srv() -> ControlServer {
     let mut a = PaneInfo::new("pane-aaaaaaaa-1111-4111-8111-111111111111");
     a.cols = Some(80);
@@ -20,6 +21,7 @@ fn srv() -> ControlServer {
     ControlServer::new("cap", vec![a]).with_clock(Clock::Fixed(T))
 }
 
+#[tracing::instrument(level = "debug")]
 fn two_pane() -> ControlServer {
     let mut a = PaneInfo::new("pane-aaaaaaaa-1111-4111-8111-111111111111");
     a.cols = Some(80);
@@ -33,6 +35,7 @@ fn two_pane() -> ControlServer {
 }
 
 /// Lines as UTF-8 strings, for the many assertions where the payload is ASCII.
+#[tracing::instrument(level = "debug", ret)]
 fn text(lines: &[Line]) -> Vec<String> {
     lines
         .iter()
@@ -570,6 +573,7 @@ fn display_message_reports_the_claimed_version() {
 // send-keys — every form a real client sends
 // =====================================================================================
 
+#[tracing::instrument(level = "debug", ret, skip(s))]
 fn one_write(s: &mut ControlServer, cmd: &str) -> Vec<u8> {
     let r = s.command(cmd);
     assert!(
@@ -1286,6 +1290,7 @@ fn has_pane_and_uids_track_the_published_set() {
 // =====================================================================================
 
 /// Body lines of a successful command block (everything between `%begin` and `%end`).
+#[tracing::instrument(level = "debug", ret, skip(s))]
 fn ok_body(s: &mut ControlServer, cmd: &str) -> Vec<String> {
     let lines = text(&s.command(cmd).lines);
     assert!(
@@ -1295,6 +1300,7 @@ fn ok_body(s: &mut ControlServer, cmd: &str) -> Vec<String> {
     lines[1..lines.len() - 1].to_vec()
 }
 
+#[tracing::instrument(level = "debug", ret, skip(s))]
 fn errored(s: &mut ControlServer, cmd: &str) -> bool {
     text(&s.command(cmd).lines)
         .last()

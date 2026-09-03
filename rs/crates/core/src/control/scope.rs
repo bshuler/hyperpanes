@@ -55,6 +55,7 @@ pub trait ScopeTree {
 }
 
 /// Whether `scope` (`None` = unscoped/master) may touch a specific pane.
+#[tracing::instrument(level = "debug", ret)]
 pub fn pane_in_scope(scope: Option<&Scope>, c: &PaneCoords) -> bool {
     let scope = match scope {
         None => return true,
@@ -75,6 +76,7 @@ pub fn pane_in_scope(scope: Option<&Scope>, c: &PaneCoords) -> bool {
 }
 
 /// Whether `scope` may act on a whole window (e.g. a window-targeted command).
+#[tracing::instrument(level = "debug", ret)]
 pub fn window_in_scope(scope: Option<&Scope>, window_id: i64) -> bool {
     let scope = match scope {
         None => return true,
@@ -87,6 +89,7 @@ pub fn window_in_scope(scope: Option<&Scope>, window_id: i64) -> bool {
 }
 
 /// Whether `scope` may act on a tab (its tab id, or its owning window).
+#[tracing::instrument(level = "debug", ret)]
 pub fn tab_in_scope(scope: Option<&Scope>, tab_id: &str, window_id: i64) -> bool {
     let scope = match scope {
         None => return true,
@@ -105,6 +108,7 @@ pub fn tab_in_scope(scope: Option<&Scope>, tab_id: &str, window_id: i64) -> bool
 /// Whether `scope` may act on a work queue (by its `queueId`). Queues are a flat
 /// namespace that doesn't map onto the pane tree, so this is a direct membership
 /// check; `None` (master) reaches every queue (worker-pool §7).
+#[tracing::instrument(level = "debug", ret)]
 pub fn queue_in_scope(scope: Option<&Scope>, queue: &str) -> bool {
     match scope {
         None => true,
@@ -119,6 +123,7 @@ pub fn queue_in_scope(scope: Option<&Scope>, queue: &str) -> bool {
 /// be reachable by the minter's scope (so a parent can only mint NARROWER tokens
 /// — no privilege escalation). `tree` comes from the live tree; unknown ids are
 /// rejected. Returns the first problem, or `None` if OK.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn check_mintable(
     parent: Option<&Scope>,
     child: &Scope,
@@ -180,6 +185,7 @@ pub fn check_mintable(
 
 /// Validate + normalize an untrusted scope payload (from JSON over `/tokens`).
 /// Drops non-arrays / wrong element types; returns `None` if nothing usable.
+#[tracing::instrument(level = "debug", ret)]
 pub fn coerce_scope(v: &Value) -> Option<Scope> {
     let obj = v.as_object()?;
     let nums = |key: &str| -> Option<Vec<i64>> {

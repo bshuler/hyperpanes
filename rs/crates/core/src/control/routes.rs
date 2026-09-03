@@ -49,6 +49,7 @@ use crate::control::work::{
 use crate::persistence::projects;
 
 /// Build the full router with the shared state baked in.
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 pub fn router(shared: Arc<Shared>) -> Router {
     Router::new()
         .route("/health", get(health))
@@ -90,6 +91,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
 
 // ---- response helpers ---------------------------------------------------------------------
 
+#[tracing::instrument(level = "debug", ret)]
 fn jstatus(code: u16, body: Value) -> Response {
     (
         StatusCode::from_u16(code).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
@@ -98,12 +100,14 @@ fn jstatus(code: u16, body: Value) -> Response {
         .into_response()
 }
 
+#[tracing::instrument(level = "debug", ret, skip(body))]
 fn ok_json<T: Serialize>(body: T) -> Response {
     Json(body).into_response()
 }
 
 // ---- auth ---------------------------------------------------------------------------------
 
+#[tracing::instrument(level = "debug", skip_all)]
 fn bearer_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get(axum::http::header::AUTHORIZATION)
@@ -115,6 +119,7 @@ fn bearer_header(headers: &HeaderMap) -> Option<String> {
 /// Resolve the presented bearer (HTTP header only — `?token=` is WS-only, per TS). 401 on failure.
 // pre-existing; deferred per repo lint policy (test.yml)
 #[allow(clippy::result_large_err)]
+#[tracing::instrument(level = "debug", skip_all)]
 fn authorize(shared: &Arc<Shared>, headers: &HeaderMap) -> Result<TokenInfo, Response> {
     let token = bearer_header(headers);
     shared
@@ -139,6 +144,7 @@ struct FoundPane {
 
 // pre-existing; deferred per repo lint policy (test.yml)
 #[allow(clippy::result_large_err)]
+#[tracing::instrument(level = "debug", skip(shared))]
 fn find_pane_scoped(
     shared: &Arc<Shared>,
     scope: Option<&Scope>,
@@ -190,6 +196,7 @@ struct HealthOut {
     allow_input: bool,
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn health(State(shared): State<Arc<Shared>>) -> Response {
     ok_json(HealthOut {
         ok: true,
@@ -232,6 +239,7 @@ struct StateWithSpeechOut {
     dictation: DictationOut,
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn state(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
     let info = match authorize(&shared, &headers) {
         Ok(i) => i,
@@ -274,6 +282,7 @@ struct MintOut {
     events: Value,
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn tokens(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Bytes) -> Response {
     let info = match authorize(&shared, &headers) {
         Ok(i) => i,
@@ -365,6 +374,7 @@ struct DeviceListItem {
 /// Rewrite `device-tokens.json` from the live store (best-effort — the in-memory table is
 /// authoritative for this process; the file only has to be right for the next start). Kept beside
 /// the active `control.json` so tests/embeds with a custom control file stay self-consistent.
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 fn persist_devices(shared: &Arc<Shared>) {
     let records: Vec<_> = shared
         .tokens
@@ -394,6 +404,7 @@ fn persist_devices(shared: &Arc<Shared>) {
 /// same record so the embedded SSH server accepts that key, and so one `hyperpanes revoke <label>`
 /// drops both doors at once. It is validated by the caller (`hyperpanes pair --ssh-key`); the
 /// server only stores what it is given, exactly as it does the label.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn devices_mint(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -454,6 +465,7 @@ async fn devices_mint(
 }
 
 /// GET /devices — list paired devices (label + expiry only; tokens are never echoed back).
+#[tracing::instrument(level = "debug", skip_all)]
 async fn devices_list(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
     let info = match authorize(&shared, &headers) {
         Ok(i) => i,
@@ -480,6 +492,7 @@ async fn devices_list(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> 
 
 /// DELETE /devices?label=<label> — revoke every device carrying `label` (a query param so labels
 /// may hold spaces or slashes). `revoked` = how many were dropped.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn devices_revoke(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -504,6 +517,7 @@ async fn devices_revoke(
 
 // ---- /panes/{id}/output -------------------------------------------------------------------
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn output(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -543,6 +557,7 @@ async fn output(
 /// grow a filesystem read primitive. Query: `path` (absolute or `~/...`), optional
 /// `maxBytes` (default 256 KiB, capped 2 MiB). Non-UTF-8 content 415s rather than
 /// mangling bytes; oversized files return the head with `truncated: true`.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn fs_read(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -624,6 +639,7 @@ async fn fs_read(
     }))
 }
 
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 fn pane_status_str(shared: &Arc<Shared>, pane_id: &str) -> &'static str {
     shared
         .model
@@ -634,6 +650,7 @@ fn pane_status_str(shared: &Arc<Shared>, pane_id: &str) -> &'static str {
         .unwrap_or(PaneStatus::Exited.as_str())
 }
 
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 fn build_output_body(
     shared: &Arc<Shared>,
     pane_id: &str,
@@ -647,6 +664,7 @@ fn build_output_body(
     }
 }
 
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 fn read_output_body(
     shared: &Arc<Shared>,
     pane_id: &str,
@@ -694,6 +712,7 @@ fn read_output_body(
     body
 }
 
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 fn build_screen_body(
     shared: &Arc<Shared>,
     pane_id: &str,
@@ -737,6 +756,7 @@ fn build_screen_body(
 
 /// Block until the pane has been output-quiet for `settle_ms` (or `timeout_ms` elapses), driving
 /// an adaptive poll over the live tracking maps (pure `wait_decision`/`next_poll_delay`).
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 async fn wait_for_quiet(
     shared: &Arc<Shared>,
     uid: &str,
@@ -771,6 +791,7 @@ async fn wait_for_quiet(
 /// `409` rather than `500`: nothing malfunctioned here. The pane the caller named is simply
 /// not there any more — its process exited, or the session daemon holding it did — and the
 /// only wrong answer is the `200 {"ok": true}` this used to give.
+#[tracing::instrument(level = "debug", ret)]
 fn write_failed(pane_id: &str, e: &std::io::Error) -> Response {
     jstatus(
         409,
@@ -782,6 +803,7 @@ fn write_failed(pane_id: &str, e: &std::io::Error) -> Response {
     )
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn input(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -884,6 +906,7 @@ struct MessagesOut {
     latest_seq: u64,
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn messages_get(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -914,6 +937,7 @@ async fn messages_get(
     ok_json(out)
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn messages_post(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -964,6 +988,7 @@ async fn messages_post(
 
 /// Whether inbox nudges are enabled at all — `HYPERPANES_MSG_NUDGE=0` (or `false`/`off`) in the
 /// app's environment turns the whole mechanism off, leaving the bus pull-only as before.
+#[tracing::instrument(level = "debug", ret)]
 fn nudges_enabled() -> bool {
     !matches!(
         std::env::var("HYPERPANES_MSG_NUDGE").as_deref(),
@@ -974,6 +999,7 @@ fn nudges_enabled() -> bool {
 /// Arm (and, if needed, spawn) the waiter that types a one-line "you have mail" into `pane_id`
 /// once it goes quiet. See `control::nudge` for the policy: role opt-in, coalescing,
 /// never-mid-turn, rate limit.
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 fn arm_inbox_nudge(shared: &Arc<Shared>, pane_id: &str, seq: u64) {
     if !nudges_enabled() {
         return;
@@ -1039,6 +1065,7 @@ fn arm_inbox_nudge(shared: &Arc<Shared>, pane_id: &str, seq: u64) {
 
 // ---- /panes/{id}/lock ---------------------------------------------------------------------
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn lock_post(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -1085,6 +1112,7 @@ async fn lock_post(
     }
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn lock_delete(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -1154,6 +1182,7 @@ struct QueuesOut {
 /// Map a lease-guarded outcome (`ack`/`nack`/`extend`) to the byte-exact response: the
 /// `ok_body` closure builds the 200 body from the resulting task; `Conflict → 409` (stale
 /// `fencingToken`); `NotFound → 404`.
+#[tracing::instrument(level = "debug", skip_all)]
 fn lease_response(
     outcome: LeaseOutcome,
     id: &str,
@@ -1167,6 +1196,7 @@ fn lease_response(
 }
 
 /// The shared queue-scope gate: 403 unless `queue_in_scope` (master passes).
+#[tracing::instrument(level = "debug", ret)]
 fn queue_scope_gate(scope: Option<&Scope>, queue: &str) -> Option<Response> {
     if queue_in_scope(scope, queue) {
         None
@@ -1179,6 +1209,7 @@ fn queue_scope_gate(scope: Option<&Scope>, queue: &str) -> Option<Response> {
 }
 
 // POST /queues/{queue}/tasks — enqueue
+#[tracing::instrument(level = "debug", skip_all)]
 async fn task_enqueue(
     State(shared): State<Arc<Shared>>,
     Path(queue): Path<String>,
@@ -1261,6 +1292,7 @@ async fn task_enqueue(
 }
 
 // GET /queues/{queue}/tasks — list/inspect (cursor `after`, optional `state`, `limit`)
+#[tracing::instrument(level = "debug", skip_all)]
 async fn tasks_list(
     State(shared): State<Arc<Shared>>,
     Path(queue): Path<String>,
@@ -1298,6 +1330,7 @@ async fn tasks_list(
 }
 
 // POST /queues/{queue}/claim — claim the next task(s) (competing consumers)
+#[tracing::instrument(level = "debug", skip_all)]
 async fn task_claim(
     State(shared): State<Arc<Shared>>,
     Path(queue): Path<String>,
@@ -1352,6 +1385,7 @@ async fn task_claim(
 }
 
 // POST /queues/{queue}/purge — drop terminal tasks (retention/cleanup)
+#[tracing::instrument(level = "debug", skip_all)]
 async fn queue_purge(
     State(shared): State<Arc<Shared>>,
     Path(queue): Path<String>,
@@ -1381,6 +1415,7 @@ async fn queue_purge(
 }
 
 // GET /queues — every queue + its depth (scope-filtered)
+#[tracing::instrument(level = "debug", skip_all)]
 async fn queues_list(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
     let info = match authorize(&shared, &headers) {
         Ok(i) => i,
@@ -1395,6 +1430,7 @@ async fn queues_list(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> R
 }
 
 // GET /tasks/{id} — fetch one task (scope resolved from its queue)
+#[tracing::instrument(level = "debug", skip_all)]
 async fn task_get(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -1420,6 +1456,7 @@ async fn task_get(
 /// Returns `(fencing_token, body)` on success.
 // pre-existing; deferred per repo lint policy (test.yml)
 #[allow(clippy::result_large_err)]
+#[tracing::instrument(level = "debug", skip_all)]
 fn lease_op_preamble(
     shared: &Arc<Shared>,
     info: &TokenInfo,
@@ -1453,6 +1490,7 @@ fn lease_op_preamble(
 }
 
 // POST /tasks/{id}/ack — complete a claimed task (lease-guarded)
+#[tracing::instrument(level = "debug", skip_all)]
 async fn task_ack(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -1481,6 +1519,7 @@ async fn task_ack(
 }
 
 // POST /tasks/{id}/nack — fail/retry a claimed task (lease-guarded)
+#[tracing::instrument(level = "debug", skip_all)]
 async fn task_nack(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -1510,6 +1549,7 @@ async fn task_nack(
 }
 
 // POST /tasks/{id}/extend — heartbeat: extend the lease (lease-guarded)
+#[tracing::instrument(level = "debug", skip_all)]
 async fn task_extend(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -1547,6 +1587,7 @@ async fn task_extend(
 
 // ---- /command -----------------------------------------------------------------------------
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn command(State(shared): State<Arc<Shared>>, headers: HeaderMap, body: Bytes) -> Response {
     let info = match authorize(&shared, &headers) {
         Ok(i) => i,
@@ -1672,6 +1713,7 @@ const DICTATION_VERBS: &[&str] = &["startDictation", "stopDictation", "cancelDic
 /// is [sanitized](crate::control::dictation_service::sanitize_for_pane) before it reaches the
 /// pty, and Enter is a SEPARATE delayed write exactly as in `/panes/{id}/input`, so a
 /// bracketed-paste TUI reads it as a keypress rather than pasted content.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn dictation_command(
     shared: &Arc<Shared>,
     info: &TokenInfo,
@@ -1736,6 +1778,7 @@ async fn dictation_command(
 const TAB_VERBS: &[&str] = &["newTab", "closeTab", "renameTab", "focusTab", "moveTab"];
 
 /// Queue a UI op, turning a full queue into a 503 rather than a silent drop.
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 fn queue_ui_op(shared: &Arc<Shared>, op: UiOp, body: Value) -> Response {
     if shared.ui_ops.lock().unwrap().push(op) {
         jstatus(202, body)
@@ -1752,6 +1795,7 @@ fn queue_ui_op(shared: &Arc<Shared>, op: UiOp, body: Value) -> Response {
 /// index — the worst possible failure mode for `closeTab`.
 // pre-existing convention; deferred per repo lint policy (test.yml)
 #[allow(clippy::result_large_err)]
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 fn find_tab(shared: &Arc<Shared>, cmd: &Value) -> Result<(String, i64), Response> {
     let tab_id = match cmd.get("tabId").and_then(Value::as_str) {
         Some(t) if !t.is_empty() => t.to_string(),
@@ -1774,6 +1818,7 @@ fn find_tab(shared: &Arc<Shared>, cmd: &Value) -> Result<(String, i64), Response
 /// Handle one tab verb. Tab edits are structural and window-wide, so — like `restartApp` —
 /// they need a root token; a scoped token is a grant over named panes, not over the workspace
 /// those panes happen to sit in.
+#[tracing::instrument(level = "debug", skip_all)]
 fn tab_command(shared: &Arc<Shared>, info: &TokenInfo, ty: &str, cmd: &Value) -> Response {
     if info.scope.is_some() {
         return jstatus(403, json!({ "error": format!("{ty} needs a root token") }));
@@ -1904,6 +1949,7 @@ fn tab_command(shared: &Arc<Shared>, info: &TokenInfo, ty: &str, cmd: &Value) ->
 
 /// The app's live preferences. Published by the GUI each sync tick — absent (503) when no GUI
 /// is attached, rather than a defaults blob that would not describe anything real.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn settings_get(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
     if let Err(e) = authorize(&shared, &headers) {
         return e;
@@ -1920,6 +1966,7 @@ async fn settings_get(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> 
 /// Merge a camelCase patch into the app preferences. Root token only: preferences are global,
 /// and some of them (`keepAlive`, `browserMode`) change what happens to every pane in the app.
 /// Unknown keys are rejected up front — a typo that silently does nothing is worse than a 400.
+#[tracing::instrument(level = "debug", skip_all)]
 async fn settings_patch(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -1990,6 +2037,7 @@ async fn settings_patch(
 // `core::persistence::projects` layer owns the file; a write marks the GUI host's dirty flag so
 // the rail refreshes live (`ControlHost::sync`).
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn projects_list(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
     if let Err(e) = authorize(&shared, &headers) {
         return e;
@@ -1997,6 +2045,7 @@ async fn projects_list(State(shared): State<Arc<Shared>>, headers: HeaderMap) ->
     ok_json(json!({ "projects": projects::list_projects() }))
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn projects_add(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -2023,6 +2072,7 @@ async fn projects_add(
     ok_json(json!({ "ok": true, "added": added, "project": project }))
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn projects_patch(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -2058,6 +2108,7 @@ async fn projects_patch(
     ok_json(json!({ "ok": true }))
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn projects_delete(
     State(shared): State<Arc<Shared>>,
     Path(id): Path<String>,
@@ -2073,6 +2124,7 @@ async fn projects_delete(
 
 // ---- /events (WebSocket) ------------------------------------------------------------------
 
+#[tracing::instrument(level = "debug", skip_all)]
 async fn events_ws(
     State(shared): State<Arc<Shared>>,
     headers: HeaderMap,
@@ -2094,6 +2146,7 @@ async fn events_ws(
     ws.on_upgrade(move |socket| handle_ws(shared2, socket, scope))
 }
 
+#[tracing::instrument(level = "debug", ret, skip(shared))]
 async fn handle_ws(shared: Arc<Shared>, mut socket: WebSocket, scope: Option<Scope>) {
     let (id, mut rx) = shared.events.add_client(scope);
     // Greet first (this frame is queued ahead of any fan-out).
@@ -2126,34 +2179,40 @@ async fn handle_ws(shared: Arc<Shared>, mut socket: WebSocket, scope: Option<Sco
 
 // ---- fallbacks ----------------------------------------------------------------------------
 
+#[tracing::instrument(level = "debug", ret)]
 async fn method_not_allowed() -> Response {
     jstatus(405, json!({ "error": "method not allowed" }))
 }
 
+#[tracing::instrument(level = "debug", ret)]
 async fn not_found(uri: Uri) -> Response {
     jstatus(404, json!({ "error": "not found", "path": uri.path() }))
 }
 
 // ---- query-param parsing (mirrors the TS posNum / nonNegNum / Number(tail)) ----------------
 
+#[tracing::instrument(level = "debug", ret)]
 fn pos_num(v: Option<&String>) -> Option<i64> {
     v.and_then(|s| s.parse::<f64>().ok())
         .filter(|n| n.is_finite() && *n > 0.0)
         .map(|n| n as i64)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn non_neg_num(v: Option<&String>) -> Option<i64> {
     v.and_then(|s| s.parse::<f64>().ok())
         .filter(|n| n.is_finite() && *n >= 0.0)
         .map(|n| n as i64)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn tail_num(v: Option<&String>) -> Option<usize> {
     v.and_then(|s| s.parse::<f64>().ok())
         .filter(|n| n.is_finite() && *n > 0.0)
         .map(|n| n as usize)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
     let start = lines.len().saturating_sub(n);

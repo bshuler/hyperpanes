@@ -43,6 +43,7 @@ pub enum WaitVerdict {
 // `last_output_at`: ms epoch of the pane's last pty output, or None if none yet.
 // `total_bytes`: monotonic count of bytes ever emitted by the pane.
 // `since`: require total_bytes to exceed this before settling.
+#[tracing::instrument(level = "debug", ret)]
 pub fn wait_decision(
     last_output_at: Option<i64>,
     total_bytes: i64,
@@ -73,6 +74,7 @@ pub fn wait_decision(
 // How long to sleep before the next quiescence check: just past the point the
 // pane would become quiet, clamped to the poll band and never overshooting the
 // deadline. Pure so the cadence is testable.
+#[tracing::instrument(level = "debug", ret)]
 pub fn next_poll_delay(
     last_output_at: Option<i64>,
     now: i64,
@@ -116,6 +118,7 @@ pub struct SinceSlice {
 // ⚠ The cursor counts UTF-16 code units, matching the JS `.length` the control
 // server persists — we slice over `encode_utf16()` units, NOT UTF-8 bytes, so the
 // cursor arithmetic is byte-parity with the TS source for non-ASCII output.
+#[tracing::instrument(level = "debug", ret)]
 pub fn slice_since(replay: &str, total_bytes: i64, since: i64) -> SinceSlice {
     if since >= total_bytes {
         return SinceSlice {
@@ -164,11 +167,13 @@ pub fn slice_since(replay: &str, total_bytes: i64, since: i64) -> SinceSlice {
 //   /❯/
 //   /\?\s*$/
 
+#[tracing::instrument(level = "debug", ret)]
 fn is_word(c: char) -> bool {
     c.is_ascii_alphanumeric() || c == '_'
 }
 
 // `\b<sub>\b` — find `sub` (already lowercase) with a word boundary on each side.
+#[tracing::instrument(level = "debug", ret)]
 fn bounded_contains(s: &str, sub: &str) -> bool {
     let mut start = 0;
     while let Some(pos) = s[start..].find(sub) {
@@ -188,6 +193,7 @@ fn bounded_contains(s: &str, sub: &str) -> bool {
 }
 
 // `press\s+(enter|return|any key)` over a lowercase line.
+#[tracing::instrument(level = "debug", ret)]
 fn matches_press_key(s: &str) -> bool {
     let b = s.as_bytes();
     let needle = b"press";
@@ -218,6 +224,7 @@ fn matches_press_key(s: &str) -> bool {
 // Best-effort "is this pane blocked on a prompt?" over the RENDERED screen text
 // (clean — run it on a mode:"screen" read, not the mangled raw stream). Looks at
 // the last non-empty line only. A heuristic, not a guarantee.
+#[tracing::instrument(level = "debug", ret)]
 pub fn detect_awaiting_input(screen_text: &str) -> bool {
     let lines: Vec<&str> = screen_text.split('\n').collect();
     let mut i = lines.len() as isize - 1;

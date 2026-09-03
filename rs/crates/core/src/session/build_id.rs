@@ -39,6 +39,7 @@
 use std::sync::OnceLock;
 
 /// This process's build identity. Stable for the life of the process; see the module docs.
+#[tracing::instrument(level = "debug", ret)]
 pub fn build_id() -> &'static str {
     static ID: OnceLock<String> = OnceLock::new();
     ID.get_or_init(compute)
@@ -50,10 +51,12 @@ pub fn build_id() -> &'static str {
 /// `#[serde(default)]`, so its shorter reply still parses), or one that could not stat its
 /// own executable. Unknown never forces anything: the whole point of the additive field is
 /// that meeting an older peer stays exactly as safe as it was before it existed.
+#[tracing::instrument(level = "debug", ret)]
 pub fn differs(peer: &str) -> bool {
     !peer.is_empty() && peer != build_id()
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn compute() -> String {
     let ver = env!("CARGO_PKG_VERSION");
     match fingerprint() {
@@ -66,6 +69,7 @@ fn compute() -> String {
 
 /// Hash the executable's on-disk identity: path, length, mtime. `None` if the exe cannot be
 /// located or stat'd.
+#[tracing::instrument(level = "debug", ret)]
 fn fingerprint() -> Option<u64> {
     let exe = std::env::current_exe().ok()?;
     let meta = std::fs::metadata(&exe).ok()?;
@@ -87,15 +91,18 @@ fn fingerprint() -> Option<u64> {
 struct Fnv(u64);
 
 impl Fnv {
+    #[tracing::instrument(level = "debug")]
     fn new() -> Self {
         Fnv(0xcbf2_9ce4_8422_2325)
     }
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn write(&mut self, bytes: &[u8]) {
         for b in bytes {
             self.0 ^= u64::from(*b);
             self.0 = self.0.wrapping_mul(0x100_0000_01b3);
         }
     }
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn finish(&self) -> u64 {
         self.0
     }

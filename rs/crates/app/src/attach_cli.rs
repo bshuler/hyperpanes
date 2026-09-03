@@ -44,6 +44,7 @@ use hyperpanes_core::session::proto::SessionMeta;
 
 /// Whether `argv` is `hyperpanes attach …`. Checked in `main` alongside the other
 /// subcommands, before the GUI/single-instance path.
+#[tracing::instrument(level = "debug", ret)]
 pub fn wants_attach(argv: &[String]) -> bool {
     argv.get(1).map(|a| a == "attach").unwrap_or(false)
 }
@@ -63,6 +64,7 @@ pub struct AttachOpts {
 }
 
 impl Default for AttachOpts {
+    #[tracing::instrument(level = "debug", ret)]
     fn default() -> Self {
         Self {
             query: None,
@@ -80,6 +82,7 @@ impl AttachOpts {
     /// silent win for one of them. Unknown flags are rejected outright — a typo'd
     /// `--resize` that quietly did nothing would be a very confusing bug given what the
     /// flag does.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn parse(argv: &[String]) -> Result<Self, String> {
         let mut out = Self::default();
         let mut it = argv.iter().skip(2); // argv[0]=exe, argv[1]="attach"
@@ -133,6 +136,7 @@ to send the literal control byte through to the pane.
 #[cfg_attr(not(unix), allow(dead_code))]
 /// Human-readable \"how long ago\" for the chooser, from an epoch-ms stamp and \"now\".
 /// Split out (and pure) so the formatting is testable without a clock.
+#[tracing::instrument(level = "debug", ret)]
 fn ago(last_ms: Option<u64>, now_ms: u64) -> String {
     let Some(last) = last_ms else {
         return "never".to_string();
@@ -148,6 +152,7 @@ fn ago(last_ms: Option<u64>, now_ms: u64) -> String {
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
+#[tracing::instrument(level = "debug", ret)]
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -157,6 +162,7 @@ fn now_ms() -> u64 {
 
 #[cfg_attr(not(unix), allow(dead_code))]
 /// One chooser/`--list` row: `1) pane-1a2b3c4d  120x40  ~/code/hyperpanes   2m ago`.
+#[tracing::instrument(level = "debug", ret)]
 fn row(index: usize, s: &SessionMeta, now: u64) -> String {
     let grid = match (s.cols, s.rows) {
         (Some(c), Some(r)) => format!("{c}x{r}"),
@@ -171,6 +177,7 @@ fn row(index: usize, s: &SessionMeta, now: u64) -> String {
 }
 
 #[cfg_attr(not(unix), allow(dead_code))]
+#[tracing::instrument(level = "debug", ret)]
 fn print_sessions(sessions: &[SessionMeta]) {
     let now = now_ms();
     for (i, s) in sessions.iter().enumerate() {
@@ -204,12 +211,14 @@ mod tty {
     static SAVED: AtomicPtr<libc::termios> = AtomicPtr::new(std::ptr::null_mut());
     static SAVED_FD: AtomicI32 = AtomicI32::new(-1);
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_tty(fd: RawFd) -> bool {
         // SAFETY: `isatty` only inspects the descriptor.
         unsafe { libc::isatty(fd) == 1 }
     }
 
     /// This terminal's `(cols, rows)`, or `None` if the descriptor is not a terminal.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn size(fd: RawFd) -> Option<(u16, u16)> {
         let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
         // SAFETY: `TIOCGWINSZ` writes exactly one `winsize` through the pointer we pass.
@@ -225,6 +234,7 @@ mod tty {
     /// it is called from the fatal-signal handler and from the panic hook, neither of which
     /// may allocate, lock, or reach the guard on somebody's stack. Ordinary scope exit does
     /// **not** come through here — [`RawGuard`]'s `Drop` restores from its own copy.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn restore() {
         let saved = SAVED.load(Ordering::SeqCst);
         let fd = SAVED_FD.load(Ordering::SeqCst);
@@ -250,6 +260,7 @@ mod tty {
     }
 
     impl RawGuard {
+        #[tracing::instrument(level = "debug")]
         pub fn enter(fd: RawFd) -> io::Result<Self> {
             let mut term: libc::termios = unsafe { std::mem::zeroed() };
             // SAFETY: `tcgetattr` fills the struct we own.
@@ -274,6 +285,7 @@ mod tty {
     }
 
     impl Drop for RawGuard {
+        #[tracing::instrument(level = "debug", ret, skip(self))]
         fn drop(&mut self) {
             // SAFETY: `original` is this guard's own copy of the settings read from `fd`.
             unsafe { libc::tcsetattr(self.fd, libc::TCSANOW, &self.original) };
@@ -295,6 +307,7 @@ mod tty {
     /// Install the `SIGWINCH` watcher and the restore-then-die handlers. Also chains a panic
     /// hook that restores before the default hook prints, so a panic message lands on a
     /// cooked terminal instead of a staircase of raw-mode lines.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn install_handlers() {
         // SAFETY: both handlers are `extern "C"` and touch only async-signal-safe calls.
         unsafe {
@@ -315,6 +328,7 @@ mod tty {
     pub struct FdReader(pub RawFd);
 
     impl Read for FdReader {
+        #[tracing::instrument(level = "debug", ret, skip(self))]
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
             loop {
                 // SAFETY: `read` writes at most `buf.len()` bytes into `buf`.
@@ -338,6 +352,7 @@ mod tty {
     pub struct FdWriter(pub RawFd);
 
     impl Write for FdWriter {
+        #[tracing::instrument(level = "debug", ret, skip(self))]
         fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
             loop {
                 // SAFETY: `write` reads at most `buf.len()` bytes from `buf`.
@@ -355,6 +370,7 @@ mod tty {
                 return Err(e);
             }
         }
+        #[tracing::instrument(level = "debug", ret, skip(self))]
         fn flush(&mut self) -> io::Result<()> {
             Ok(()) // unbuffered: `write` already reached the descriptor
         }
@@ -365,6 +381,7 @@ mod tty {
 /// The salt every hyperpanes client keys its daemon by: this install's user-data dir.
 /// Identical to `main`'s `--kill-daemon` path and to `SessionManager::new_daemon`, so
 /// `attach` always finds the daemon THIS build would attach to.
+#[tracing::instrument(level = "debug", ret)]
 fn salt() -> String {
     hyperpanes_core::persistence::paths::user_data_dir()
         .to_string_lossy()
@@ -377,6 +394,7 @@ fn salt() -> String {
 /// that silently does nothing, say so. The plan scopes M2 to "usable over a stock system
 /// sshd immediately", which is the unix leg; a Windows console client is follow-up work.
 #[cfg(not(unix))]
+#[tracing::instrument(level = "debug", ret)]
 pub fn run(_argv: &[String]) -> Result<(), String> {
     Err("hyperpanes attach is not available on Windows yet \
          (the GUI binary has no console subsystem, and the console raw-mode bindings are \
@@ -385,6 +403,7 @@ pub fn run(_argv: &[String]) -> Result<(), String> {
 }
 
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn run(argv: &[String]) -> Result<(), String> {
     use hyperpanes_core::session::attach::{self, detach_key_label, Attachment, PumpEnd};
     use std::io::Write;
@@ -492,6 +511,7 @@ pub fn run(argv: &[String]) -> Result<(), String> {
                 // thread — never reached.
                 struct Disconnect(attach::AttachWriter);
                 impl Drop for Disconnect {
+                    #[tracing::instrument(level = "debug", ret, skip(self))]
                     fn drop(&mut self) {
                         self.0.disconnect();
                     }
@@ -566,6 +586,7 @@ const CLEAR_SCREEN: &[u8] = b"\x1b[H\x1b[2J\x1b[3J";
 /// only if stdin is a terminal, because a non-interactive caller (a script, an SSH
 /// `ProxyCommand`) has nobody to answer the prompt.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn choose(sessions: &[SessionMeta], query: Option<&str>) -> Result<String, String> {
     use hyperpanes_core::session::attach::{self, UidMatch};
     use std::io::Write;

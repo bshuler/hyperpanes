@@ -70,6 +70,7 @@ pub struct Transcript {
 }
 
 impl Dictation {
+    #[tracing::instrument(level = "debug")]
     pub fn new(dir: PathBuf) -> Self {
         Self {
             live: Mutex::new(HashMap::new()),
@@ -78,12 +79,14 @@ impl Dictation {
     }
 
     /// Panes currently recording, for the read-model's mic indicator.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn recording_panes(&self) -> Vec<String> {
         let mut v: Vec<String> = self.live.lock().unwrap().keys().cloned().collect();
         v.sort();
         v
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn is_recording(&self, pane_id: &str) -> bool {
         self.live.lock().unwrap().contains_key(pane_id)
     }
@@ -93,6 +96,7 @@ impl Dictation {
     /// Starting a pane that is already recording is a no-op rather than an error: the mic
     /// button is a toggle, and two clicks racing must not leave an orphaned recorder
     /// nobody can stop.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn start(&self, pane_id: &str, settings: &SttSettings) -> Result<&'static str, String> {
         let mut live = self.live.lock().unwrap();
         if live.contains_key(pane_id) {
@@ -160,6 +164,7 @@ impl Dictation {
     }
 
     /// Stop `pane_id`'s recording and transcribe it. Blocking.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn stop(&self, pane_id: &str, settings: &SttSettings) -> Result<Transcript, String> {
         let Some(rec) = self.live.lock().unwrap().remove(pane_id) else {
             return Err(format!("pane is not recording: {pane_id}"));
@@ -178,6 +183,7 @@ impl Dictation {
     /// Throw away `pane_id`'s recording without transcribing it — the pane closed, or the
     /// user cancelled. Never errors: cancelling something that is not running is the
     /// state the caller wanted.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn cancel(&self, pane_id: &str) {
         let Some(rec) = self.live.lock().unwrap().remove(pane_id) else {
             return;
@@ -188,6 +194,7 @@ impl Dictation {
     }
 
     /// Cancel every recording — process shutdown, so no recorder outlives the app.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn cancel_all(&self) {
         let ids = self.recording_panes();
         for id in ids {
@@ -202,6 +209,7 @@ impl Dictation {
 /// mid-write leaves a file no decoder will open. Every recorder is therefore asked
 /// politely first — `q` on stdin for ffmpeg, SIGINT for the rest — and killed only after
 /// [`STOP_GRACE`] proves it is not going to exit on its own.
+#[tracing::instrument(level = "debug", ret, skip(rec))]
 fn finish_recording(rec: Recording) {
     let mut child = match rec.capture {
         // The in-process recorder finalizes its own header on the way out, and `finish`
@@ -243,6 +251,7 @@ fn finish_recording(rec: Recording) {
 }
 
 /// Send SIGINT to `child`. No-op off Unix, where the graceful stop is stdin-based.
+#[tracing::instrument(level = "debug", ret)]
 fn interrupt(child: &Child) {
     #[cfg(unix)]
     {
@@ -257,6 +266,7 @@ fn interrupt(child: &Child) {
 }
 
 /// Run the configured transcriber over `wav`.
+#[tracing::instrument(level = "debug", ret)]
 fn transcribe(wav: &Path, elapsed: Duration, settings: &SttSettings) -> Result<Transcript, String> {
     let size = std::fs::metadata(wav).map(|m| m.len()).unwrap_or(0);
     if size < MIN_WAV_BYTES {
@@ -302,6 +312,7 @@ fn transcribe(wav: &Path, elapsed: Duration, settings: &SttSettings) -> Result<T
 
 /// Pane ids come from the control API, so they reach here unvalidated — keep the WAV name
 /// to characters that cannot walk out of the dictation directory.
+#[tracing::instrument(level = "debug", ret)]
 fn sanitize(pane_id: &str) -> String {
     let s: String = pane_id
         .chars()

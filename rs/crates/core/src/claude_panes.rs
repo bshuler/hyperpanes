@@ -46,6 +46,7 @@ pub const META_CONFIG_DIR_KEY: &str = "claude.config_dir";
 /// Is `cwd` safe to interpolate into a single-quoted `cd '<cwd>'`? Absolute, no control
 /// characters, and no single quotes (rather than escaping, refuse — real project paths
 /// never contain them, and refusing keeps the injection reasoning trivial).
+#[tracing::instrument(level = "debug", ret)]
 pub fn valid_resume_cwd(cwd: &str) -> bool {
     cwd.starts_with('/')
         && cwd.len() < 1024
@@ -57,6 +58,7 @@ pub fn valid_resume_cwd(cwd: &str) -> bool {
 /// pass as a spawn env value)? Same gate as [`valid_resume_cwd`] — absolute, bounded, no
 /// single quotes, no control chars — since a marker is external, best-effort state that
 /// lands on a command line. A non-empty but invalid dir is treated as "no config dir".
+#[tracing::instrument(level = "debug", ret)]
 pub fn valid_config_dir(dir: &str) -> bool {
     valid_resume_cwd(dir)
 }
@@ -80,6 +82,7 @@ pub struct PaneClaudeSession {
 }
 
 /// The marker file for one pane id.
+#[tracing::instrument(level = "debug", ret)]
 fn marker_path(pane_id: &str) -> PathBuf {
     paths::claude_sessions_dir().join(format!("{pane_id}.json"))
 }
@@ -88,6 +91,7 @@ fn marker_path(pane_id: &str) -> PathBuf {
 /// later interpolated into a shell command line, so this is a safety gate, not a nicety.
 /// Public because restore re-checks ids read back from `workspace.json` — that file is
 /// user-editable, so the write-time validation here cannot be assumed to hold.
+#[tracing::instrument(level = "debug", ret)]
 pub fn valid_session_id(id: &str) -> bool {
     (8..=64).contains(&id.len()) && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')
 }
@@ -95,6 +99,7 @@ pub fn valid_session_id(id: &str) -> bool {
 /// Read the live-session marker for `pane_id`, if one exists and is well-formed.
 /// Missing file, unparseable JSON, or a malformed id all yield `None` — a marker is
 /// best-effort state written by an external hook, never trusted blindly.
+#[tracing::instrument(level = "debug", ret)]
 pub fn read_pane_session(pane_id: &str) -> Option<PaneClaudeSession> {
     let text = fs::read_to_string(marker_path(pane_id)).ok()?;
     let parsed: PaneClaudeSession = serde_json::from_str(&text).ok()?;

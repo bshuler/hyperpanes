@@ -65,6 +65,7 @@ struct FontFace {
 
 impl FontFace {
     #[inline]
+    #[tracing::instrument(level = "debug", skip(self))]
     fn font(&self) -> FontRef<'_> {
         // Cheap: parses only the table directory. Re-derived per use so `Font` needn't hold
         // a self-referential `FontRef` borrowing `data`.
@@ -96,6 +97,7 @@ pub struct Font {
 }
 
 impl Font {
+    #[tracing::instrument(level = "debug")]
     pub fn from_path(path: &str, px: f32) -> anyhow::Result<Self> {
         let data = std::fs::read(path)?;
         let font = FontRef::from_index(&data, 0)
@@ -143,6 +145,7 @@ impl Font {
     /// font/size reload constructs a fresh one), so a renderer that caches glyphs by key can
     /// compare against it and drop stale entries on reload. See [`crate::render::GpuRenderer`].
     #[inline]
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn generation(&self) -> u64 {
         self.generation
     }
@@ -151,6 +154,7 @@ impl Font {
     /// `ch`. Falls back to `(0, 0)` — the primary font's `.notdef` — so an unmapped char
     /// still draws something (and stays cached under the primary, like before).
     #[inline]
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn resolve(&mut self, ch: char) -> (u16, u16) {
         if let Some(&hit) = self.resolve_cache.get(&ch) {
             return hit;
@@ -169,6 +173,7 @@ impl Font {
         result
     }
 
+    #[tracing::instrument(level = "debug", skip(self, key))]
     pub fn rasterize(&mut self, key: GlyphKey) -> &CachedGlyph {
         if !self.cache.contains_key(&key) {
             let glyph = self.render_glyph(key);
@@ -177,6 +182,7 @@ impl Font {
         self.cache.get(&key).unwrap()
     }
 
+    #[tracing::instrument(level = "debug", skip(self, key))]
     fn render_glyph(&mut self, key: GlyphKey) -> CachedGlyph {
         let face = match self.faces.get(key.font_id as usize) {
             Some(f) => f,
@@ -255,6 +261,7 @@ enum FallbackSpec {
 }
 
 impl FallbackSpec {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn load(&self) -> Option<Vec<u8>> {
         match self {
             FallbackSpec::Embedded(bytes) => Some(bytes.to_vec()),
@@ -274,6 +281,7 @@ impl FallbackSpec {
 /// closest font and would silently pull in something wrong). Prefers the Regular face over
 /// alphabetically-earlier Bold/Italic siblings. Called once per fallback per font load (a
 /// rare event: startup + preference changes), so a shell-out is fine.
+#[tracing::instrument(level = "debug", ret)]
 fn fontconfig_family_file(family: &str) -> Option<String> {
     let out = std::process::Command::new("fc-list")
         .args(["--format", "%{file}\\n", family])
@@ -303,6 +311,7 @@ fn fontconfig_family_file(family: &str) -> Option<String> {
 ///
 /// Emoji render monochrome everywhere (the pipeline is alpha-mask only — a colour bitmap
 /// strike collapses to its alpha channel, i.e. a silhouette); colour is a follow-up.
+#[tracing::instrument(level = "debug")]
 fn fallback_specs() -> Vec<FallbackSpec> {
     #[cfg(windows)]
     return vec![
@@ -337,6 +346,7 @@ fn fallback_specs() -> Vec<FallbackSpec> {
 
 /// Uniform shrink factor so this fallback's glyphs fit the primary cell height. Returns
 /// `None` if the bytes aren't a valid font (so the face is dropped from the chain).
+#[tracing::instrument(level = "debug", ret)]
 fn compute_fit(data: &[u8], px: f32, cell_h: u32) -> Option<f32> {
     let font = FontRef::from_index(data, 0)?;
     let m = font.metrics(&[]).scale(px);
@@ -352,6 +362,7 @@ fn compute_fit(data: &[u8], px: f32, cell_h: u32) -> Option<f32> {
 /// How far, in pixels, synthetic bold smears a glyph to the right. Proportional to the font
 /// size and capped at one pixel so a bold cell can never bleed more than a column into its
 /// neighbour.
+#[tracing::instrument(level = "debug", ret)]
 fn bold_smear(px: f32) -> f32 {
     (px * 0.03).clamp(0.0, 1.0)
 }
@@ -369,6 +380,7 @@ fn bold_smear(px: f32) -> f32 {
 ///
 /// Compositing on the raster cannot do that: `over` is monotone, so an emboldened glyph is
 /// never dimmer than its regular form at any pixel. `bold_never_dims_a_glyph` pins that.
+#[tracing::instrument(level = "debug", ret)]
 fn embolden_mask(mask: &[u8], w: u32, h: u32, d: f32) -> (Vec<u8>, u32) {
     if d <= 0.0 || w == 0 || h == 0 {
         return (mask.to_vec(), w);

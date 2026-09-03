@@ -63,6 +63,7 @@ pub struct Policy {
 }
 
 impl Default for Policy {
+    #[tracing::instrument(level = "debug", ret)]
     fn default() -> Self {
         Policy {
             enabled: false,
@@ -79,6 +80,7 @@ impl Default for Policy {
 impl Policy {
     /// Parse a policy out of a pane's `meta` map. An absent/unparseable key falls back to
     /// the [`Default`] value, so a partial config is always valid.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn from_meta(meta: &BTreeMap<String, String>) -> Policy {
         let mut p = Policy::default();
         if let Some(v) = meta.get("hp.supervise") {
@@ -130,6 +132,7 @@ impl Policy {
         p
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     fn is_success(&self, code: i32) -> bool {
         self.success_codes.contains(&code)
     }
@@ -138,6 +141,7 @@ impl Policy {
     /// `attempt = 0`). Exponential is `min(cap, base << attempt)`, saturating; fixed is
     /// always `base`. Pure and deterministic (jitter is added by the scheduler, not here,
     /// so the cap and growth are testable).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn delay_for(&self, attempt: u32) -> u64 {
         match self.backoff {
             Backoff::Fixed => self.backoff_ms,
@@ -186,12 +190,14 @@ pub struct Supervisor {
 }
 
 impl Supervisor {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new() -> Self {
         Self::default()
     }
 
     /// Register / update a pane's policy (called at spawn and on `setMeta`). A disabled
     /// policy is still recorded so a later `setMeta` enabling it starts from a clean count.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn set_policy(&mut self, pane_id: &str, policy: Policy) {
         let entry = self
             .panes
@@ -204,17 +210,20 @@ impl Supervisor {
     }
 
     /// Forget a pane (on `closePane`).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn forget(&mut self, pane_id: &str) {
         self.panes.remove(pane_id);
     }
 
     /// Drop ledger entries for panes no longer in the live set (reconciliation after a
     /// `closePane`, where dispatch doesn't call into the supervisor directly).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn retain_panes(&mut self, live: &std::collections::HashSet<&str>) {
         self.panes.retain(|id, _| live.contains(id.as_str()));
     }
 
     /// Whether a pane is currently supervised (enabled policy present).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_supervised(&self, pane_id: &str) -> bool {
         self.panes.get(pane_id).is_some_and(|e| e.policy.enabled)
     }
@@ -222,6 +231,7 @@ impl Supervisor {
     /// A health signal: the worker reached a prompt-ready / agent-done state, so it ran
     /// long enough to be considered healthy → reset its retry budget (phase-4 interlock).
     /// No-op for an unknown / unsupervised pane.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn note_healthy(&mut self, pane_id: &str) {
         if let Some(e) = self.panes.get_mut(pane_id) {
             e.retries_used = 0;
@@ -231,6 +241,7 @@ impl Supervisor {
     /// Decide what to do about an exit, WITHOUT mutating the retry count (the caller bumps
     /// it via [`record_restart`] only once a respawn actually succeeds, so a failed respawn
     /// doesn't silently burn the budget twice). Pure given the current ledger.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn on_exit(&self, pane_id: &str, code: i32) -> Decision {
         let Some(e) = self.panes.get(pane_id) else {
             return Decision::None;
@@ -274,6 +285,7 @@ impl Supervisor {
 
     /// Record that a scheduled restart actually fired (the respawn succeeded), bumping the
     /// retry counter. Returns the new count.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn record_restart(&mut self, pane_id: &str) -> u32 {
         match self.panes.get_mut(pane_id) {
             Some(e) => {
@@ -285,6 +297,7 @@ impl Supervisor {
     }
 
     /// The current retry count for a pane (test/observability helper).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn retries_used(&self, pane_id: &str) -> u32 {
         self.panes.get(pane_id).map(|e| e.retries_used).unwrap_or(0)
     }

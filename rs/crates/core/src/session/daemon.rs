@@ -103,6 +103,7 @@ const ACCEPT_POLL_MS: u64 = 15;
 /// The configured idle grace — [`DEFAULT_IDLE_GRACE_MS`] unless `HYPERPANES_DAEMON_IDLE_MS`
 /// is set to a parseable millisecond count (the test hook for a short grace).
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn idle_grace() -> Duration {
     idle_grace_from(std::env::var("HYPERPANES_DAEMON_IDLE_MS").ok().as_deref())
 }
@@ -111,6 +112,7 @@ fn idle_grace() -> Duration {
 /// process env — a global `set_var` would race the other env-sensitive tests). `None` or an
 /// unparseable value → [`DEFAULT_IDLE_GRACE_MS`].
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn idle_grace_from(raw: Option<&str>) -> Duration {
     let ms = raw
         .and_then(|v| v.parse::<u64>().ok())
@@ -126,6 +128,7 @@ fn idle_grace_from(raw: Option<&str>) -> Duration {
 /// binds the UDS, and serves. If another daemon already holds the salt, returns cleanly
 /// (the lock is held → `AddrInUse`).
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn run(salt: &str) -> io::Result<()> {
     let names = daemon_names(salt);
     if let Some(dir) = names.lock.parent() {
@@ -265,6 +268,7 @@ const TAKEOVER_LOCK_BUDGET_HOLDING: Duration = Duration::from_secs(30);
 /// Bind the daemon socket, retrying briefly when `holding_sessions` — see
 /// [`TAKEOVER_LOCK_BUDGET_HOLDING`] for why a successor mid-handoff must not fail fast.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn bind_with_retry(
     socket: &Path,
     holding_sessions: bool,
@@ -313,6 +317,7 @@ const TAKEOVER_RECV_TIMEOUT: Duration = Duration::from_secs(5);
 /// and that must be distinguishable from "there were no sessions" — the caller falls back to
 /// the old tear-down only in the former case.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn take_over(socket: &Path) -> io::Result<Vec<(SessionSnapshot, OwnedFd)>> {
     let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
     stream.set_read_timeout(Some(TAKEOVER_RECV_TIMEOUT))?;
@@ -368,6 +373,7 @@ fn take_over(socket: &Path) -> io::Result<Vec<(SessionSnapshot, OwnedFd)>> {
 /// by the kernel when it exits, which is strictly after it unlinks its socket — so success
 /// here is also the signal that the socket path is free to rebind.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn acquire_when_released(lock: &std::fs::File, budget: Duration) -> bool {
     let deadline = Instant::now() + budget;
     loop {
@@ -386,6 +392,7 @@ fn acquire_when_released(lock: &std::fs::File, budget: Duration) -> bool {
 /// trust boundary (filesystem-scoped to the user, no network surface). Best-effort on the
 /// `chmod` (a pre-existing `$XDG_RUNTIME_DIR` is already `0700` and owned by us).
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn ensure_runtime_dir(dir: &Path) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(dir)?;
@@ -427,6 +434,7 @@ struct Lifecycle {
 
 #[cfg(unix)]
 impl Lifecycle {
+    #[tracing::instrument(level = "debug")]
     fn new(socket: PathBuf) -> Self {
         Lifecycle {
             active_conns: AtomicU64::new(0),
@@ -437,15 +445,18 @@ impl Lifecycle {
     }
 
     /// A connection started — bump the counter. Returns the new count.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn conn_opened(&self) -> u64 {
         self.active_conns.fetch_add(1, Ordering::SeqCst) + 1
     }
 
     /// A connection ended — drop the counter.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn conn_closed(&self) {
         self.active_conns.fetch_sub(1, Ordering::SeqCst);
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn conn_count(&self) -> u64 {
         self.active_conns.load(Ordering::SeqCst)
     }
@@ -461,6 +472,7 @@ impl Lifecycle {
     /// `shutting_down` latch — a `Shutdown` message that arrives just as the idle monitor
     /// fires won't double-tear-down. `kill` reaps the PTYs (a no-op for the idle path, which
     /// is already at 0 sessions).
+    #[tracing::instrument(level = "debug", ret, skip(self, kill_sessions))]
     fn shutdown(&self, kill_sessions: impl FnOnce()) {
         // First-wins: only one caller runs the teardown body. In `Exit` mode a loser parks
         // until the winner's `exit` takes the process down; in `FlagOnly` mode it just returns.
@@ -498,6 +510,7 @@ struct DaemonNames {
 /// The per-user runtime dir: `$XDG_RUNTIME_DIR` then `$TMPDIR` (absolute only), `/tmp`
 /// last — the same resolution `single_instance::unix` uses.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn runtime_dir() -> PathBuf {
     for var in ["XDG_RUNTIME_DIR", "TMPDIR"] {
         if let Some(v) = std::env::var_os(var) {
@@ -516,6 +529,7 @@ fn runtime_dir() -> PathBuf {
 /// salt (a userData path, with spaces/colons/slashes) into a fixed-width, namespace-safe
 /// token. Tiny and dependency-free.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn fnv1a64(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.bytes() {
@@ -526,6 +540,7 @@ fn fnv1a64(s: &str) -> u64 {
 }
 
 #[cfg(unix)]
+#[tracing::instrument(level = "debug")]
 fn daemon_names(salt: &str) -> DaemonNames {
     let h = format!("{:016x}", fnv1a64(salt));
     let dir = runtime_dir();
@@ -540,6 +555,7 @@ fn daemon_names(salt: &str) -> DaemonNames {
 /// the SAME path the daemon's own [`run`]/[`connect`](DaemonClient::connect) use, without
 /// re-deriving the hash (one source of truth for the name scheme).
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn socket_path_for(salt: &str) -> PathBuf {
     daemon_names(salt).socket
 }
@@ -550,6 +566,7 @@ pub(crate) fn socket_path_for(salt: &str) -> PathBuf {
 /// `Ok(false)` if none was listening (a clean no-op). Blocks only for the short teardown
 /// confirmation, so the `--kill-daemon` CLI returns promptly.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn kill_daemon(salt: &str) -> io::Result<bool> {
     let socket = socket_path_for(salt);
     let mut stream = match std::os::unix::net::UnixStream::connect(&socket) {
@@ -583,6 +600,7 @@ pub fn kill_daemon(salt: &str) -> io::Result<bool> {
 /// Tighten the socket to owner-only (`0600`), matching the single-instance trust boundary
 /// (filesystem-scoped to the user, no network surface). Best-effort.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn restrict_socket_perms(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
@@ -628,6 +646,7 @@ struct Daemon {
 impl Daemon {
     /// Build the registry + event pump. The pump thread drains the registry's event
     /// receiver, records cwds, and rebroadcasts onto the bus.
+    #[tracing::instrument(level = "debug", skip(lifecycle))]
     fn new(lifecycle: Arc<Lifecycle>) -> Self {
         let (etx, mut erx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let registry = SessionRegistry::new(etx);
@@ -727,12 +746,14 @@ impl Daemon {
 
     /// Push the current claim table to every connection (M7). Called after any change, so a
     /// client's shadow is a full, idempotent snapshot rather than a delta it could miss.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn broadcast_claims(&self) {
         let _ = self.notices.send(DaemonMsg::Claims(self.claims.snapshot()));
     }
 
     /// Push the current session set to every connection (M7) — the fix for a client whose
     /// uid shadow would otherwise never learn about sessions another client created.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn broadcast_sessions(&self) {
         let _ = self
             .notices
@@ -749,6 +770,7 @@ impl Daemon {
     ///
     /// A session that fails to adopt is dropped with a log line rather than failing startup —
     /// losing one pane to a bad descriptor must not cost the user every other pane.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn adopt_all(&self, inherited: Vec<(SessionSnapshot, OwnedFd)>) {
         let total = inherited.len();
         let mut adopted = 0usize;
@@ -789,6 +811,7 @@ impl Daemon {
     /// The monitor exits the WHOLE process (through [`Lifecycle::shutdown`]) rather than
     /// unwinding `serve`, because the accept loop is parked in a blocking `accept()` — there
     /// is no live session or client to disturb, so a clean `exit(0)` is the right teardown.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn start_idle_monitor(&self, grace: Duration) {
         let lifecycle = Arc::clone(&self.lifecycle);
         let registry = self.registry.clone();
@@ -829,6 +852,7 @@ impl Daemon {
     /// exiting the test process), the listener is non-blocking and the loop polls the
     /// shutdown latch between accepts, returning once it is set. Returns only on shutdown or
     /// an accept error severe enough to stop.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn serve(&self, listener: std::os::unix::net::UnixListener) -> io::Result<()> {
         // Non-blocking + a short poll interval, so the loop notices a flagged shutdown
         // promptly without a busy spin. (In production the process exits before this matters,
@@ -864,6 +888,7 @@ impl Daemon {
     /// thread reads + dispatches [`ClientMsg`]s, while a spawned writer thread forwards
     /// broadcast events (for attached uids) and the replies this thread hands it over a
     /// channel. The attached-uid set is shared between the halves.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn handle_connection(&self, stream: std::os::unix::net::UnixStream) {
         // Count this connection for the idle condition. The decrement on the way out is in a
         // guard so it runs on every exit path (clean close, malformed frame, panic).
@@ -885,6 +910,7 @@ impl Daemon {
             conn_id: ClaimConnId,
         }
         impl Drop for ConnGuard<'_> {
+            #[tracing::instrument(level = "debug", ret, skip(self))]
             fn drop(&mut self) {
                 self.lifecycle.conn_closed();
                 if self.claims.release_conn(self.conn_id) {
@@ -999,6 +1025,7 @@ impl Daemon {
     /// Teardown skips `kill_sessions` for the obvious reason, and still unlinks the socket so
     /// the successor can rebind it. The successor waits for our flock — released by the
     /// kernel when we exit, i.e. strictly after that unlink — before binding.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn hand_over(&self, sock: &std::os::unix::net::UnixStream) {
         let handed = self.registry.hand_off();
         let cwds = self.cwds.lock().unwrap().clone();
@@ -1044,6 +1071,7 @@ impl Daemon {
 
     /// Handle one [`ClientMsg`]. Returns `false` to close the connection. Replies are sent
     /// to the writer thread via `out`; mutators act on the registry fire-and-forget.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn dispatch(
         &self,
         msg: ClientMsg,
@@ -1233,6 +1261,7 @@ impl Daemon {
     }
 
     /// Snapshot every live session into [`SessionMeta`] (uid + counters + cached cwd).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn list_sessions(&self) -> Vec<SessionMeta> {
         session_metas(&self.registry, &self.cwds)
     }
@@ -1242,6 +1271,7 @@ impl Daemon {
 /// the registry and cwd cache but not a `Daemon` (it is spawned while one is being built) —
 /// can build the same snapshot for its `SessionsChanged` push.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret, skip(registry))]
 fn session_metas(
     registry: &SessionRegistry,
     cwds: &Mutex<std::collections::HashMap<String, String>>,
@@ -1280,6 +1310,7 @@ fn session_metas(
 /// broadcast events for attached uids. Exits when the reply channel is closed (the reader
 /// half dropped its sender) and the bus yields nothing pending.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", skip_all)]
 fn writer_loop(
     mut write_half: std::os::unix::net::UnixStream,
     out_rx: std::sync::mpsc::Receiver<DaemonMsg>,
@@ -1386,6 +1417,7 @@ fn writer_loop(
 
 /// The uid a session event pertains to (for the attached-set filter).
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", ret)]
 fn event_uid(ev: &SessionEvent) -> &str {
     match ev {
         SessionEvent::Data { uid, .. }
@@ -1414,12 +1446,14 @@ pub struct DaemonClient {
 impl DaemonClient {
     /// Connect to the daemon serving `salt`. Errors if no daemon is listening (M1 adds the
     /// spawn-then-retry; M0 connects to an already-running daemon).
+    #[tracing::instrument(level = "debug")]
     pub fn connect(salt: &str) -> io::Result<Self> {
         let names = daemon_names(salt);
         Self::connect_path(&names.socket)
     }
 
     /// Connect to a daemon at an explicit socket path (used by tests with a temp socket).
+    #[tracing::instrument(level = "debug")]
     pub fn connect_path(path: &Path) -> io::Result<Self> {
         let stream = std::os::unix::net::UnixStream::connect(path)?;
         let read_half = stream.try_clone()?;
@@ -1449,6 +1483,7 @@ impl DaemonClient {
 
     /// Send one request to the daemon (length-framed). Fire-and-forget at this layer —
     /// callers that expect a reply read it off [`recv`](DaemonClient::recv).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn send(&self, msg: &ClientMsg) -> io::Result<()> {
         let mut w = self.write_half.lock().unwrap();
         write_frame(&mut *w, msg)
@@ -1456,6 +1491,7 @@ impl DaemonClient {
 
     /// Block for the next inbound [`DaemonMsg`] (reply or streamed event), up to `timeout`.
     /// `None` on timeout or a closed connection.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn recv(&self, timeout: std::time::Duration) -> Option<DaemonMsg> {
         self.inbox.recv_timeout(timeout).ok()
     }
@@ -1469,6 +1505,7 @@ impl Drop for DaemonClient {
     /// (wedging the idle-exit's "0 clients" condition forever). A `shutdown(Both)` signals
     /// EOF to the daemon's connection reader AND unblocks our own reader thread's `read`, so
     /// the connection truly closes and the daemon's `conn_count` returns to zero.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn drop(&mut self) {
         if let Ok(w) = self.write_half.lock() {
             let _ = w.shutdown(std::net::Shutdown::Both);
@@ -1496,12 +1533,14 @@ pub(crate) struct InProcessDaemon {
 impl InProcessDaemon {
     /// Whether the daemon has begun (test-mode) shutdown — set by a `Shutdown` message or the
     /// idle monitor firing. `pub(crate)` so the M3 `daemon_client` tests can assert teardown.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub(crate) fn is_shutting_down(&self) -> bool {
         self.lifecycle.is_shutting_down()
     }
 
     /// The bound socket path (gone once shutdown has unlinked it).
     #[allow(dead_code)]
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub(crate) fn socket(&self) -> &Path {
         &self.socket
     }
@@ -1515,12 +1554,14 @@ impl InProcessDaemon {
 /// own loopback tests use. No idle monitor (M0/M1 tests don't want an idle-exit racing
 /// them); the M3 idle test uses [`spawn_in_process_with_idle`].
 #[cfg(all(unix, test))]
+#[tracing::instrument(level = "debug")]
 pub(crate) fn spawn_in_process(socket: &Path) -> io::Result<InProcessDaemon> {
     spawn_in_process_inner(socket, None)
 }
 
 /// Like [`spawn_in_process`] but arms the idle-exit monitor with `grace` (the M3 idle test).
 #[cfg(all(unix, test))]
+#[tracing::instrument(level = "debug")]
 pub(crate) fn spawn_in_process_with_idle(
     socket: &Path,
     grace: Duration,
@@ -1529,6 +1570,7 @@ pub(crate) fn spawn_in_process_with_idle(
 }
 
 #[cfg(all(unix, test))]
+#[tracing::instrument(level = "debug")]
 fn spawn_in_process_inner(
     socket: &Path,
     idle_grace: Option<Duration>,
@@ -1567,6 +1609,7 @@ fn spawn_in_process_inner(
 
 /// Non-unix, non-Windows `run`: no transport exists for this OS.
 #[cfg(not(any(unix, windows)))]
+#[tracing::instrument(level = "debug", ret)]
 pub fn run(_salt: &str) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -1576,6 +1619,7 @@ pub fn run(_salt: &str) -> io::Result<()> {
 
 /// Non-unix, non-Windows `kill_daemon`: nothing can be running, so nothing to kill.
 #[cfg(not(any(unix, windows)))]
+#[tracing::instrument(level = "debug", ret)]
 pub fn kill_daemon(_salt: &str) -> io::Result<bool> {
     Ok(false)
 }
@@ -1584,6 +1628,7 @@ pub fn kill_daemon(_salt: &str) -> io::Result<bool> {
 /// endpoint until idle-grace expires or a `Shutdown`/`Takeover` ends it. See
 /// [`windows::run`](self::windows::run).
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn run(salt: &str) -> io::Result<()> {
     windows::run(salt)
 }
@@ -1591,6 +1636,7 @@ pub fn run(salt: &str) -> io::Result<()> {
 /// Windows `kill_daemon` — connect to the salt's pipe and send `Shutdown`; `Ok(false)` when
 /// no daemon is listening. See [`windows::kill_daemon`](self::windows::kill_daemon).
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn kill_daemon(salt: &str) -> io::Result<bool> {
     windows::kill_daemon(salt)
 }
@@ -1611,6 +1657,7 @@ mod tests {
 
     // A unique temp socket path per test AND per run (pid + thread id), so parallel and
     // repeated runs never collide on the bind path.
+    #[tracing::instrument(level = "debug", ret)]
     fn temp_socket(tag: &str) -> PathBuf {
         // Unix-socket paths (`sun_path`) are capped: 108 bytes on Linux but only **104 on
         // macOS/BSD** -- which is shorter than the macOS per-user temp dir
@@ -1635,6 +1682,7 @@ mod tests {
 
     // Drain a client's inbox until `pred` matches one message or the deadline passes.
     // Returns the matching message if found.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn recv_until(
         client: &DaemonClient,
         timeout: Duration,
@@ -1926,6 +1974,7 @@ mod tests {
     // ====================== M3 lifecycle ======================
 
     // Spin until `cond` is true or the deadline passes (for the async shutdown-latch flip).
+    #[tracing::instrument(level = "debug", skip_all)]
     fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + timeout;
         while Instant::now() < deadline {
@@ -2297,6 +2346,7 @@ mod tests {
     /// …and when the daemon told it somebody else already owned the uid.
     const EXIT_DENIED: i32 = 3;
 
+    #[tracing::instrument(level = "debug", ret)]
     fn epoch_ms() -> u128 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2306,6 +2356,7 @@ mod tests {
 
     /// Build the `Command` that re-runs THIS test binary as a separate process, executing
     /// exactly one ignored test (the child role).
+    #[tracing::instrument(level = "debug", ret)]
     fn child_role(role: &str, socket: &Path, uid: &str) -> std::process::Command {
         let mut cmd = std::process::Command::new(std::env::current_exe().expect("test exe"));
         cmd.args([
@@ -2321,6 +2372,7 @@ mod tests {
     }
 
     /// Connect a child to the daemon and complete the handshake, returning the client.
+    #[tracing::instrument(level = "debug")]
     fn child_client(socket: &Path) -> DaemonClient {
         let client = DaemonClient::connect_path(socket).expect("child connects to daemon");
         client
@@ -2415,6 +2467,7 @@ mod tests {
     }
 
     /// Read and discard everything already queued for this client.
+    #[tracing::instrument(level = "debug", ret, skip(client))]
     fn drain_pending(client: &DaemonClient) {
         while client.recv(Duration::from_millis(50)).is_some() {}
     }
@@ -2426,6 +2479,7 @@ mod tests {
     /// question — a real client does not care (it just overwrites its map with each
     /// snapshot), but a test asking "what is true right now" does. Drain what is queued
     /// first; the next `Claims` frame is then the answer to *this* `ListClaims`.
+    #[tracing::instrument(level = "debug", ret, skip(client))]
     fn claims_now(client: &DaemonClient) -> Vec<crate::session::claims::ClaimInfo> {
         drain_pending(client);
         client.send(&ClientMsg::ListClaims).expect("list claims");

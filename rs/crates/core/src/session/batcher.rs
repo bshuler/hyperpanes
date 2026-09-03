@@ -30,6 +30,7 @@ pub struct DataBatcher {
 }
 
 impl DataBatcher {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -39,6 +40,7 @@ impl DataBatcher {
     /// fresh batch with a fresh timer) — exactly the TS order of operations. Returns
     /// `None` when nothing was flushed synchronously (the common case: the time
     /// flush will carry this data out later).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn write(&mut self, chunk: &str, now_ms: u64) -> Option<String> {
         let chunk_len = chunk.encode_utf16().count();
         let mut flushed = None;
@@ -56,6 +58,7 @@ impl DataBatcher {
 
     /// Flush now, clearing any armed timer. Returns the buffered data, or `None` when
     /// the buffer is empty (matching TS `flush()`'s early return — no empty emit).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn flush(&mut self) -> Option<String> {
         self.deadline = None;
         if self.data.is_empty() {
@@ -67,11 +70,13 @@ impl DataBatcher {
 
     /// The armed time-flush deadline (`now_ms` basis), if any — for the async driver
     /// to `sleep_until`. `None` means no data is pending.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn deadline(&self) -> Option<u64> {
         self.deadline
     }
 
     /// Whether any data is currently buffered.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn has_pending(&self) -> bool {
         !self.data.is_empty()
     }

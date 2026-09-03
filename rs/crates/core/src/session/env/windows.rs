@@ -6,6 +6,7 @@
 use super::*;
 
 impl FreshEnvProvider for PlatformEnv {
+    #[tracing::instrument(level = "debug", skip_all)]
     fn fresh_env_with_process(&self, process: EnvMap) -> EnvMap {
         let machine = registry::read_env_key(
             registry::HKEY_LOCAL_MACHINE,
@@ -64,12 +65,14 @@ mod registry {
         fn RegCloseKey(hkey: Hkey) -> i32;
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(std::iter::once(0)).collect()
     }
 
     /// Enumerate the string values (`REG_SZ` / `REG_EXPAND_SZ`) of `root\sub_key`.
     /// `None` when the key can't be opened (the caller falls back to the process env).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn read_env_key(root: Hkey, sub_key: &str) -> Option<Vec<RawVar>> {
         let mut hkey: Hkey = 0;
         let sub = wide(sub_key);

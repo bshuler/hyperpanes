@@ -37,6 +37,7 @@ struct AccountEntry {
 
 /// Load the account list: registry file → discovery → default. Never empty (falls back to a
 /// single `~/.claude`). Deduped by resolved `config_dir`, order preserved.
+#[tracing::instrument(level = "debug", ret)]
 pub fn load() -> Vec<Account> {
     let home = home_dir();
     if let Ok(text) = std::fs::read_to_string(crate::persistence::paths::claude_accounts_json()) {
@@ -62,6 +63,7 @@ pub fn load() -> Vec<Account> {
 }
 
 /// Just the config dirs (the shape the hook-registration + env-feed want).
+#[tracing::instrument(level = "debug", ret)]
 pub fn config_dirs() -> Vec<PathBuf> {
     load().into_iter().map(|a| a.config_dir).collect()
 }
@@ -69,6 +71,7 @@ pub fn config_dirs() -> Vec<PathBuf> {
 /// Parse the registry JSON into accounts, expanding a leading `~` against `home`. Pure (no fs),
 /// so it's unit-testable. An entry with an empty `configDir` is skipped; an empty `name`
 /// defaults to the dir's basename.
+#[tracing::instrument(level = "debug", ret)]
 fn accounts_from_json(v: &Value, home: Option<&Path>) -> Vec<Account> {
     let Ok(file) = serde_json::from_value::<AccountsFile>(v.clone()) else {
         return Vec::new();
@@ -95,6 +98,7 @@ fn accounts_from_json(v: &Value, home: Option<&Path>) -> Vec<Account> {
 
 /// Discover `~/.claude*` sibling dirs that hold a `.credentials.json` (a logged-in account).
 /// `~/.claude` sorts first (the primary), the rest alphabetically for a stable order.
+#[tracing::instrument(level = "debug", ret)]
 fn discover(home: Option<&Path>) -> Vec<Account> {
     let Some(home) = home else {
         return Vec::new();
@@ -131,6 +135,7 @@ fn discover(home: Option<&Path>) -> Vec<Account> {
     found
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn expand_tilde(s: &str, home: Option<&Path>) -> PathBuf {
     if let Some(rest) = s.strip_prefix("~/") {
         if let Some(home) = home {
@@ -145,6 +150,7 @@ fn expand_tilde(s: &str, home: Option<&Path>) -> PathBuf {
     PathBuf::from(s)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn dedup(accounts: Vec<Account>) -> Vec<Account> {
     let mut seen = std::collections::HashSet::new();
     accounts
@@ -153,6 +159,7 @@ fn dedup(accounts: Vec<Account>) -> Vec<Account> {
         .collect()
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME").map(PathBuf::from)
 }

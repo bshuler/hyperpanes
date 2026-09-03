@@ -59,6 +59,7 @@ pub struct InstanceNames {
 /// identical names; different salt → (with overwhelming probability) different names. The
 /// salt is hashed so it is always a short, namespace-safe token regardless of its content
 /// (a userData path can contain spaces, backslashes, drive colons, …).
+#[tracing::instrument(level = "debug", ret)]
 pub fn instance_names(salt: &str) -> InstanceNames {
     let h = format!("{:016x}", fnv1a64(salt));
     InstanceNames {
@@ -72,6 +73,7 @@ pub fn instance_names(salt: &str) -> InstanceNames {
 /// lock was keyed under), falling back to the username. Unix: keyed off
 /// `$XDG_RUNTIME_DIR` (already per-user) then `$HOME` then `$USER` — the seam-doc
 /// shape, landed by the `unix-core` track under the granted `mod.rs` exception.
+#[tracing::instrument(level = "debug", ret)]
 pub fn user_salt() -> String {
     #[cfg(windows)]
     {
@@ -110,6 +112,7 @@ pub fn user_salt() -> String {
 
 // FNV-1a (64-bit). Tiny, dependency-free, and stable across runs/processes — all we need to
 // turn an arbitrary salt into a fixed-width hex token.
+#[tracing::instrument(level = "debug", ret)]
 fn fnv1a64(s: &str) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in s.bytes() {

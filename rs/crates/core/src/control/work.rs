@@ -85,6 +85,7 @@ pub enum TaskState {
 
 impl TaskState {
     /// Lowercase wire form — also the value stored in the `state` column.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn as_str(self) -> &'static str {
         match self {
             TaskState::Queued => "queued",
@@ -97,6 +98,7 @@ impl TaskState {
 
     /// Inverse of [`as_str`](Self::as_str); unknown text falls back to `Queued` (we fully
     /// control writes, so this only guards against a hand-edited DB).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn from_wire(s: &str) -> TaskState {
         match s {
             "claimed" => TaskState::Claimed,
@@ -108,6 +110,7 @@ impl TaskState {
     }
 
     /// `Done`/`Failed`/`Dead` are terminal — no further lease ops are accepted.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_terminal(self) -> bool {
         matches!(self, TaskState::Done | TaskState::Failed | TaskState::Dead)
     }
@@ -117,6 +120,7 @@ impl TaskState {
 /// exponential `base * 2^(attempts-1)` capped at [`BACKOFF_CAP_MS`]. `attempts` is the
 /// task's attempt count *at nack time* (already incremented by the preceding claim), so
 /// the first retry (attempts == 1) waits [`BACKOFF_BASE_MS`].
+#[tracing::instrument(level = "debug", ret)]
 pub fn backoff(attempts: u32, override_ms: Option<i64>) -> i64 {
     if let Some(o) = override_ms {
         return o.max(0);
@@ -128,6 +132,7 @@ pub fn backoff(attempts: u32, override_ms: Option<i64>) -> i64 {
 }
 
 /// Whether a failed attempt has exhausted its retries and must dead-letter (doc 05).
+#[tracing::instrument(level = "debug", ret)]
 pub fn should_dead_letter(attempts: u32, max_attempts: u32) -> bool {
     attempts >= max_attempts
 }
@@ -209,6 +214,7 @@ pub struct EnqueueOpts {
 }
 
 impl Default for EnqueueOpts {
+    #[tracing::instrument(level = "debug", ret)]
     fn default() -> Self {
         EnqueueOpts {
             kind: "manual".to_string(),
@@ -287,6 +293,7 @@ pub struct Counts {
 }
 
 impl Counts {
+    #[tracing::instrument(level = "debug", ret)]
     fn add(&mut self, state: &str, n: usize) {
         match TaskState::from_wire(state) {
             TaskState::Queued => self.queued += n,
@@ -297,6 +304,7 @@ impl Counts {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn total(&self) -> usize {
         self.queued + self.claimed + self.done + self.failed + self.dead
     }
@@ -368,6 +376,7 @@ impl WorkQueue {
     /// Open (or create) the queue DB at `path`, in WAL mode. Does **not** run the boot
     /// requeue — the embedder calls [`recover_in_flight`](Self::recover_in_flight) after
     /// open (doc 01 §3.3) so tests can observe pre-recovery state.
+    #[tracing::instrument(level = "debug")]
     pub fn open(path: &Path) -> rusqlite::Result<Self> {
         let conn = Connection::open(path)?;
         Self::init(conn)
@@ -375,11 +384,13 @@ impl WorkQueue {
 
     /// Open an ephemeral in-memory queue — the deterministic test substrate (doc 01 §3.1),
     /// the queue's analogue of `serve_for_test`'s ephemeral server.
+    #[tracing::instrument(level = "debug")]
     pub fn open_in_memory() -> rusqlite::Result<Self> {
         let conn = Connection::open_in_memory()?;
         Self::init(conn)
     }
 
+    #[tracing::instrument(level = "debug")]
     fn init(conn: Connection) -> rusqlite::Result<Self> {
         // WAL = single writer + concurrent readers (matches one Mutex<WorkQueue>);
         // NORMAL is durable across a process crash (the stated requirement). On a
@@ -440,6 +451,7 @@ impl WorkQueue {
     /// Enqueue a task into `queue`. If `opts.dedupe_key` matches a still-live row
     /// (`queued`/`claimed`) the existing task is returned unchanged (idempotent enqueue);
     /// the key frees once that task reaches a terminal state.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn enqueue(&mut self, queue: &str, payload: &str, opts: EnqueueOpts, now: i64) -> Task {
         if let Some(key) = opts.dedupe_key.as_deref() {
             if let Some(existing) = self.find_live_by_dedupe(queue, key) {
@@ -492,6 +504,7 @@ impl WorkQueue {
     /// `seq`). Runs in a single `BEGIN IMMEDIATE` transaction with a guarded re-check, so
     /// two concurrent claimers can never win the same row. `lease_ms <= 0` falls back to
     /// the task's `visibility_timeout_ms`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn claim(&mut self, queue: &str, worker: &str, lease_ms: i64, now: i64) -> Option<Claim> {
         let next_fence = self.fence + 1;
         let tx = self
@@ -544,6 +557,7 @@ impl WorkQueue {
     /// Complete a claimed task (`Claimed → Done`), recording `result`. Lease-guarded.
     /// Re-acking an already-`Done` task with the **same** token is idempotent success (a
     /// worker retrying a lost 200); any other state / token mismatch is `Conflict`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn ack(
         &mut self,
         id: &str,
@@ -580,6 +594,7 @@ impl WorkQueue {
     /// Fail/retry a claimed task. Lease-guarded. `requeue=true` & `attempts < max_attempts`
     /// → `Queued` with `available_at = now + backoff`; `requeue=true` & exhausted →
     /// `Dead`; `requeue=false` → `Failed`. The stale-worker case (token mismatch) is `Conflict`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn nack(&mut self, id: &str, fencing_token: u64, opts: NackOpts, now: i64) -> LeaseOutcome {
         let Some(task) = Self::fetch(&self.conn, id).ok().flatten() else {
             return LeaseOutcome::NotFound;
@@ -618,6 +633,7 @@ impl WorkQueue {
 
     /// Heartbeat for a long task: extend the current lease by `extra_ms` (from the existing
     /// deadline — never shortens it). Lease-guarded.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn extend(
         &mut self,
         id: &str,
@@ -649,6 +665,7 @@ impl WorkQueue {
     /// The visibility-timeout sweep (run on a background ticker). Every `claimed` task
     /// whose deadline has passed is requeued (`attempts < max_attempts`) or dead-lettered.
     /// Requeue keeps the now-stale token on the row, so the late worker is fenced out.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn reap_expired(&mut self, now: i64) -> Vec<Reaped> {
         let ids = self.claimed_ids(
             "visibility_deadline IS NOT NULL AND visibility_deadline <= ?1",
@@ -660,6 +677,7 @@ impl WorkQueue {
     /// Fast requeue on worker exit (doc 01 §6): immediately recover a dead pane's in-flight
     /// claims without waiting a full visibility timeout. Hook this from the session
     /// `Exit` arm once `uid → paneId` is resolved.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn requeue_worker(&mut self, worker: &str, now: i64) -> Vec<Reaped> {
         let ids = self.claimed_ids("claimed_by = ?1", params![worker]);
         self.requeue_or_dead_letter(ids, now, "worker exited: lease released")
@@ -669,6 +687,7 @@ impl WorkQueue {
     /// control-server restart *every* worker is already dead — proactively requeue all
     /// `claimed` rows (exhausted ones dead-letter). No queued work is lost; only genuinely
     /// in-flight tasks re-run (the at-least-once contract).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn recover_in_flight(&mut self, now: i64) -> Vec<Reaped> {
         let ids = self.claimed_ids("1 = 1", []);
         self.requeue_or_dead_letter(
@@ -679,6 +698,7 @@ impl WorkQueue {
     }
 
     /// Collect ids of `claimed` rows matching an extra predicate.
+    #[tracing::instrument(level = "debug", ret, skip(self, p))]
     fn claimed_ids(&self, predicate: &str, p: impl Params) -> Vec<String> {
         let sql = format!("SELECT id FROM tasks WHERE state='claimed' AND {predicate}");
         let mut stmt = match self.conn.prepare(&sql) {
@@ -692,6 +712,7 @@ impl WorkQueue {
         ids
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn requeue_or_dead_letter(&mut self, ids: Vec<String>, now: i64, reason: &str) -> Vec<Reaped> {
         let mut out = Vec::new();
         for id in ids {
@@ -729,12 +750,14 @@ impl WorkQueue {
     // --- reads ------------------------------------------------------------
 
     /// Fetch one task by id.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn get(&self, id: &str) -> Option<Task> {
         Self::fetch(&self.conn, id).ok().flatten()
     }
 
     /// List a queue's tasks with `seq > after` (the cursor), optionally filtered by state,
     /// ordered by `seq` ascending, capped at `limit`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn list(&self, queue: &str, filter: ListFilter, after: u64, limit: usize) -> Vec<Task> {
         let mut sql = format!("SELECT {COLS} FROM tasks WHERE queue = ?1 AND seq > ?2");
         if let Some(state) = filter.state {
@@ -754,6 +777,7 @@ impl WorkQueue {
     }
 
     /// Depth-by-state for one queue (so a controller can tell when its batch has drained).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn counts(&self, queue: &str) -> Counts {
         let mut c = Counts::default();
         let Ok(mut stmt) = self
@@ -774,6 +798,7 @@ impl WorkQueue {
 
     /// Every queue with at least one task, plus its depth — for a `/queues` overview.
     /// Sorted by queue name (deterministic).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn queues(&self) -> Vec<QueueSummary> {
         let mut map: std::collections::BTreeMap<String, Counts> = std::collections::BTreeMap::new();
         let Ok(mut stmt) = self
@@ -800,6 +825,7 @@ impl WorkQueue {
 
     /// Retention: delete terminal (`done`/`failed`/`dead`) tasks in `queue` last touched at
     /// or before `older_than` (ms epoch). Returns the number removed.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn purge(&mut self, queue: &str, older_than: i64) -> usize {
         self.conn
             .execute(
@@ -812,6 +838,7 @@ impl WorkQueue {
 
     // --- helpers ----------------------------------------------------------
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn find_live_by_dedupe(&self, queue: &str, key: &str) -> Option<Task> {
         self.conn
             .query_row(
@@ -828,6 +855,7 @@ impl WorkQueue {
             .flatten()
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     fn fetch(conn: &Connection, id: &str) -> rusqlite::Result<Option<Task>> {
         conn.query_row(
             &format!("SELECT {COLS} FROM tasks WHERE id = ?1"),
@@ -839,6 +867,7 @@ impl WorkQueue {
 }
 
 /// Map a `tasks` row (in `COLS` order) to a [`Task`].
+#[tracing::instrument(level = "debug", ret)]
 fn row_to_task(r: &Row) -> rusqlite::Result<Task> {
     let state: String = r.get(5)?;
     Ok(Task {

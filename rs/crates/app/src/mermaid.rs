@@ -113,6 +113,7 @@ const MARGIN: f32 = 16.0;
 ///
 /// The error is a short human sentence, not a code: it is shown to the reader in
 /// place of the diagram, so "sequenceDiagram: no messages" beats `E_EMPTY`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn render(src: &str) -> Result<Diagram, String> {
     let header = src
         .lines()
@@ -143,11 +144,13 @@ pub enum Dir {
 
 impl Dir {
     /// Ranks advance along the vertical axis (TD/TB/BT) rather than the horizontal.
+    #[tracing::instrument(level = "debug", ret)]
     fn vertical(self) -> bool {
         matches!(self, Dir::Down | Dir::Up)
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn direction_of(header: &str) -> Dir {
     match header.split_whitespace().nth(1).unwrap_or("TD") {
         "LR" => Dir::Right,
@@ -197,6 +200,7 @@ impl Graph {
     /// The index of `id`, defining it on first sight. A later mention that carries
     /// a shape upgrades the placeholder — mermaid lets `A --> B` come before
     /// `B[the real label]`, and the label must win wherever it appears.
+    #[tracing::instrument(level = "debug", ret)]
     fn intern(&mut self, id: &str, text: Option<String>, shape: Option<i32>) -> usize {
         let at = self.specs.iter().position(|s| s.id == id);
         let i = match at {
@@ -223,6 +227,7 @@ impl Graph {
 /// Lines that configure rather than describe, and are silently dropped. `subgraph`
 /// is here too: the grouping box is not drawn, but its members still are, which
 /// reads far better than refusing the whole diagram over it.
+#[tracing::instrument(level = "debug", ret)]
 fn is_noise(line: &str) -> bool {
     const SKIP: [&str; 9] = [
         "subgraph",
@@ -239,6 +244,7 @@ fn is_noise(line: &str) -> bool {
         .any(|p| line == p.trim_end() || line.starts_with(p))
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn flowchart(src: &str, dir: Dir) -> Result<Diagram, String> {
     let mut g = Graph::default();
     for (i, raw) in src.lines().enumerate() {
@@ -262,6 +268,7 @@ fn flowchart(src: &str, dir: Dir) -> Result<Diagram, String> {
 }
 
 /// One statement: a chain of nodes joined by edge operators (`A --> B --> C`).
+#[tracing::instrument(level = "debug", ret)]
 fn statement(g: &mut Graph, line: &str) {
     let chars: Vec<char> = line.chars().collect();
     let mut prev: Option<usize> = None;
@@ -302,6 +309,7 @@ fn statement(g: &mut Graph, line: &str) {
 }
 
 /// A `%%` comment runs to end of line, but only outside a label.
+#[tracing::instrument(level = "debug", ret)]
 fn strip_comment(line: &str) -> &str {
     match line.find("%%") {
         Some(i) if !line[..i].contains('[') && !line[..i].contains('(') => &line[..i],
@@ -322,6 +330,7 @@ struct Op {
 /// An operator must open with `--`, `-.` or `==`, which is what keeps a hyphenated
 /// id (`my-node`) from reading as one. Bracket depth is tracked so an arrow inside
 /// a label (`A[x --> y]`) is text.
+#[tracing::instrument(level = "debug")]
 fn next_edge(chars: &[char], from: usize) -> Option<(usize, Op)> {
     let mut depth = 0i32;
     let mut quoted = false;
@@ -351,6 +360,7 @@ fn next_edge(chars: &[char], from: usize) -> Option<(usize, Op)> {
 }
 
 /// Try to read an operator starting exactly at `i`.
+#[tracing::instrument(level = "debug")]
 fn edge_at(chars: &[char], i: usize) -> Option<Op> {
     let two: String = chars.iter().skip(i).take(2).collect();
     let stroke = match two.as_str() {
@@ -406,6 +416,7 @@ struct Close {
 }
 
 /// The `-->` half of a `-- text -->`, searched for after the opening run.
+#[tracing::instrument(level = "debug")]
 fn closing_run(chars: &[char], from: usize) -> Option<(usize, Close)> {
     let mut i = from;
     while i < chars.len() {
@@ -435,6 +446,7 @@ fn closing_run(chars: &[char], from: usize) -> Option<(usize, Close)> {
 }
 
 /// `|label|` immediately after an operator.
+#[tracing::instrument(level = "debug", ret)]
 fn pipe_label(chars: &[char], from: usize) -> Option<(String, usize)> {
     let mut i = from;
     while i < chars.len() && chars[i] == ' ' {
@@ -459,6 +471,7 @@ fn pipe_label(chars: &[char], from: usize) -> Option<(String, usize)> {
 
 /// Read `id`, `id[Text]`, `id(Text)`, `id{Text}`, `id((Text))` … into the graph.
 /// `None` for an empty token, so a trailing operator does not mint a blank node.
+#[tracing::instrument(level = "debug", ret)]
 fn node_token(g: &mut Graph, tok: &str) -> Option<usize> {
     let tok = tok.trim();
     if tok.is_empty() {
@@ -486,6 +499,7 @@ fn node_token(g: &mut Graph, tok: &str) -> Option<usize> {
 }
 
 /// Which bracket pair wraps a node's label, and the label inside it.
+#[tracing::instrument(level = "debug", ret)]
 fn shape_of(body: &str) -> (i32, &str) {
     const FORMS: [(&str, &str, i32); 9] = [
         ("((", "))", SHAPE_CIRCLE),
@@ -509,6 +523,7 @@ fn shape_of(body: &str) -> (i32, &str) {
 
 /// A label as it should read on screen: quotes dropped, `<br>` flattened to a
 /// space (a node is one line), entities left alone.
+#[tracing::instrument(level = "debug", ret)]
 fn clean_text(s: &str) -> String {
     let mut t = s.trim().to_string();
     for br in ["<br/>", "<br />", "<br>"] {
@@ -524,6 +539,7 @@ fn clean_text(s: &str) -> String {
 // flowchart: layout
 // ---------------------------------------------------------------------------
 
+#[tracing::instrument(level = "debug", ret)]
 fn node_w(text: &str, shape: i32) -> f32 {
     let chars = text.chars().count() as f32;
     let w = (chars * CHAR_W + PAD_X).clamp(MIN_NODE_W, MAX_NODE_W);
@@ -534,6 +550,7 @@ fn node_w(text: &str, shape: i32) -> f32 {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn node_h(shape: i32) -> f32 {
     if shape == SHAPE_DIAMOND {
         DIAMOND_H
@@ -551,6 +568,7 @@ fn node_h(shape: i32) -> f32 {
 /// the back edges come out of the ranking and stay in the drawing. Depth-first
 /// from each node in author order, which makes the choice of which edge to call
 /// the back one deterministic.
+#[tracing::instrument(level = "debug", ret)]
 fn back_edges(n: usize, edges: &[(usize, usize)]) -> Vec<bool> {
     let mut out: Vec<Vec<usize>> = vec![Vec::new(); n];
     for (i, (a, b)) in edges.iter().enumerate() {
@@ -594,6 +612,7 @@ fn back_edges(n: usize, edges: &[(usize, usize)]) -> Vec<bool> {
 /// Ranking is longest-path relaxation over the graph minus its back edges: a
 /// topological sort would hang on a cycle, and relaxing over one inverts it. The
 /// node-count bound stays as a backstop.
+#[tracing::instrument(level = "debug", ret)]
 fn place(g: &Graph, dir: Dir) -> Diagram {
     let n = g.specs.len();
     let pairs: Vec<(usize, usize)> = g.edges.iter().map(|e| (e.from, e.to)).collect();
@@ -716,6 +735,7 @@ fn place(g: &Graph, dir: Dir) -> Diagram {
 
 /// Draw one edge: a straight run between the two node borders, an arrowhead if the
 /// operator had one, and the label parked at the midpoint.
+#[tracing::instrument(level = "debug", ret)]
 fn connect(d: &mut Diagram, e: &Edge) {
     let (a, b) = (&d.nodes[e.from], &d.nodes[e.to]);
     let (acx, acy) = (a.x + a.w / 2.0, a.y + a.h / 2.0);
@@ -752,6 +772,7 @@ fn connect(d: &mut Diagram, e: &Edge) {
 
 /// Where the ray leaving `(cx, cy)` in direction `(dx, dy)` crosses the node's
 /// box, pushed 2px clear so the stroke does not touch the border.
+#[tracing::instrument(level = "debug", ret)]
 fn border(cx: f32, cy: f32, w: f32, h: f32, dx: f32, dy: f32) -> (f32, f32) {
     let (hw, hh) = (w / 2.0, h / 2.0);
     let tx = if dx.abs() > 0.001 {
@@ -772,6 +793,7 @@ fn border(cx: f32, cy: f32, w: f32, h: f32, dx: f32, dy: f32) -> (f32, f32) {
 
 /// A dotted line, chopped by hand: the renderer has no dash-array, so the dashes
 /// are geometry like everything else here.
+#[tracing::instrument(level = "debug", ret)]
 fn dashes(x1: f32, y1: f32, x2: f32, y2: f32) -> String {
     const ON: f32 = 5.0;
     const OFF: f32 = 4.0;
@@ -800,10 +822,12 @@ fn dashes(x1: f32, y1: f32, x2: f32, y2: f32) -> String {
 /// A filled triangle at `(x2, y2)`, pointing the way the line runs. The one
 /// arrowhead size the flow and sequence dialects use; [`triangle`] is the same
 /// shape with the size left to the caller, for UML's larger open head.
+#[tracing::instrument(level = "debug", ret)]
 fn arrowhead(x1: f32, y1: f32, x2: f32, y2: f32) -> String {
     triangle(x1, y1, x2, y2, 9.0, 4.5)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn diamond_path(nd: &Node) -> String {
     let (cx, cy) = (nd.x + nd.w / 2.0, nd.y + nd.h / 2.0);
     format!(
@@ -821,6 +845,7 @@ fn diamond_path(nd: &Node) -> String {
 
 /// One decimal is the whole precision a px-space path needs, and it keeps the
 /// command strings short enough to be worth diffing in a test.
+#[tracing::instrument(level = "debug", ret)]
 fn n1(v: f32) -> String {
     format!("{v:.1}")
 }
@@ -847,6 +872,7 @@ struct Msg {
 /// The same [`Diagram`] carries it: a lifeline is a dashed path, a message is a
 /// solid one with an arrowhead, and a participant is a node box. Nothing about the
 /// painting side has to know which dialect it is drawing.
+#[tracing::instrument(level = "debug", ret)]
 fn sequence(src: &str) -> Result<Diagram, String> {
     let mut names: Vec<(String, String)> = Vec::new(); // (id, label)
     let mut msgs: Vec<Msg> = Vec::new();
@@ -1000,6 +1026,7 @@ fn sequence(src: &str) -> Result<Diagram, String> {
 
 /// `A->>B: text` and its relatives. The arrow forms differ only in dashing and
 /// whether the head is drawn, which is all the geometry needs to know.
+#[tracing::instrument(level = "debug", skip_all)]
 fn seq_message(
     line: &str,
     names: &mut Vec<(String, String)>,
@@ -1058,9 +1085,11 @@ struct Rect {
 }
 
 impl Rect {
+    #[tracing::instrument(level = "debug", ret)]
     fn cx(self) -> f32 {
         self.x + self.w / 2.0
     }
+    #[tracing::instrument(level = "debug", ret)]
     fn cy(self) -> f32 {
         self.y + self.h / 2.0
     }
@@ -1077,6 +1106,7 @@ const MAX_ROWS: usize = 12;
 ///
 /// The flowchart parser does this inline because it also has to watch bracket
 /// depth mid-line; everything below is line-oriented and shares this instead.
+#[tracing::instrument(level = "debug", ret)]
 fn statements(src: &str, header: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut header_seen = false;
@@ -1097,6 +1127,7 @@ fn statements(src: &str, header: &str) -> Vec<String> {
 /// Rank by longest path, the same relaxation [`place`] uses and with the same
 /// [`back_edges`] pass in front of it: an inheritance or state chart loops back on
 /// itself as readily as a flowchart does.
+#[tracing::instrument(level = "debug", ret)]
 fn rank_blocks(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
     let back = back_edges(n, edges);
     let mut rank = vec![0usize; n];
@@ -1122,6 +1153,7 @@ fn rank_blocks(n: usize, edges: &[(usize, usize)]) -> Vec<usize> {
 ///
 /// Always top-down: `classDiagram` and `erDiagram` have no direction keyword, and
 /// a state chart's `direction` is a hint the reader loses nothing by ignoring.
+#[tracing::instrument(level = "debug", ret)]
 fn stack_blocks(sizes: &[(f32, f32)], rank: &[usize]) -> (Vec<Rect>, f32, f32) {
     let depth = rank.iter().copied().max().unwrap_or(0) + 1;
     let mut rows: Vec<Vec<usize>> = vec![Vec::new(); depth];
@@ -1165,6 +1197,7 @@ fn stack_blocks(sizes: &[(f32, f32)], rank: &[usize]) -> (Vec<Rect>, f32, f32) {
 
 /// Where a straight run between two blocks meets their borders, or `None` when
 /// the two are concentric and there is no direction to leave in.
+#[tracing::instrument(level = "debug", ret)]
 fn rect_link(a: Rect, b: Rect) -> Option<(f32, f32, f32, f32)> {
     let (dx, dy) = (b.cx() - a.cx(), b.cy() - a.cy());
     if dx == 0.0 && dy == 0.0 {
@@ -1176,6 +1209,7 @@ fn rect_link(a: Rect, b: Rect) -> Option<(f32, f32, f32, f32)> {
 }
 
 /// How wide a compartment has to be to hold `title` over `rows`.
+#[tracing::instrument(level = "debug", ret)]
 fn compartment_size(title: &str, rows: &[String]) -> (f32, f32) {
     let mut w = node_w(title, SHAPE_RECT);
     for r in rows {
@@ -1197,6 +1231,7 @@ fn compartment_size(title: &str, rows: &[String]) -> (f32, f32) {
 /// float in the middle of its own members. Rows are [`Label`]s because labels are
 /// painted after nodes, so they land on top of the body instead of behind it, and
 /// because a row is text with no border of its own.
+#[tracing::instrument(level = "debug", ret)]
 fn compartment(d: &mut Diagram, r: Rect, title: &str, rows: &[String]) {
     d.nodes.push(Node {
         x: r.x,
@@ -1229,6 +1264,7 @@ fn compartment(d: &mut Diagram, r: Rect, title: &str, rows: &[String]) {
 
 /// Push `row` onto a compartment, replacing the last row with an ellipsis once the
 /// box is full — a truncated list that says so beats one that quietly stops.
+#[tracing::instrument(level = "debug", ret)]
 fn push_row(rows: &mut Vec<String>, row: String) {
     if row.is_empty() {
         return;
@@ -1265,6 +1301,7 @@ enum Tip {
 }
 
 /// A triangle whose tip is at `(x2, y2)`, pointing the way the run travels.
+#[tracing::instrument(level = "debug", ret)]
 fn triangle(x1: f32, y1: f32, x2: f32, y2: f32, len: f32, half: f32) -> String {
     let (dx, dy) = (x2 - x1, y2 - y1);
     let l = (dx * dx + dy * dy).sqrt();
@@ -1287,6 +1324,7 @@ fn triangle(x1: f32, y1: f32, x2: f32, y2: f32, len: f32, half: f32) -> String {
 
 /// A kite whose forward point is at `(x2, y2)` and whose long axis lies along the
 /// run — UML's composition/aggregation marker.
+#[tracing::instrument(level = "debug", ret)]
 fn rhombus(x1: f32, y1: f32, x2: f32, y2: f32, len: f32, half: f32) -> String {
     let (dx, dy) = (x2 - x1, y2 - y1);
     let l = (dx * dx + dy * dy).sqrt();
@@ -1312,6 +1350,7 @@ fn rhombus(x1: f32, y1: f32, x2: f32, y2: f32, len: f32, half: f32) -> String {
 /// Draw `tip` at `(x2, y2)`, routing it to whichever of the two fills gives it the
 /// right weight. Hollow markers go to `diamonds`, which is stroked over the pane's
 /// surface colour and so reads as an outline.
+#[tracing::instrument(level = "debug", ret)]
 fn marker(d: &mut Diagram, tip: Tip, x1: f32, y1: f32, x2: f32, y2: f32) {
     match tip {
         Tip::None => {}
@@ -1323,6 +1362,7 @@ fn marker(d: &mut Diagram, tip: Tip, x1: f32, y1: f32, x2: f32, y2: f32) {
 }
 
 /// A caption centred on `(cx, cy)`, sized to its own text.
+#[tracing::instrument(level = "debug", ret)]
 fn caption(d: &mut Diagram, cx: f32, cy: f32, text: &str) {
     if text.is_empty() {
         return;
@@ -1339,6 +1379,7 @@ fn caption(d: &mut Diagram, cx: f32, cy: f32, text: &str) {
 /// The two end captions of a relationship — ER cardinality, or UML multiplicity —
 /// parked a fifth of the way in from each end so they clear the node borders and
 /// the midpoint label both.
+#[tracing::instrument(level = "debug", ret)]
 fn end_captions(d: &mut Diagram, run: (f32, f32, f32, f32), at_from: &str, at_to: &str) {
     let (sx, sy, ex, ey) = run;
     caption(d, sx + (ex - sx) * 0.2, sy + (ey - sy) * 0.2 - 2.0, at_from);
@@ -1351,6 +1392,7 @@ fn end_captions(d: &mut Diagram, run: (f32, f32, f32, f32), at_from: &str, at_to
 /// renderer's SVG path parser and this module has no way to test what that parser
 /// accepts; `L` commands are the subset every consumer of the other four strings
 /// already proves works.
+#[tracing::instrument(level = "debug", ret)]
 fn disc(cx: f32, cy: f32, r: f32) -> String {
     const SIDES: usize = 16;
     let mut out = String::new();
@@ -1388,6 +1430,7 @@ struct Compartment {
     rows: Vec<String>,
 }
 
+#[tracing::instrument(level = "debug", ret, skip(boxes))]
 fn intern_block(boxes: &mut Vec<Compartment>, id: &str) -> usize {
     let id = id.trim();
     if let Some(i) = boxes.iter().position(|b| b.id == id) {
@@ -1421,6 +1464,7 @@ const CLASS_REL: [(&str, Tip, Tip, bool); 14] = [
 ];
 
 /// Configuration and prose, dropped the way `is_noise` drops a flowchart's.
+#[tracing::instrument(level = "debug", ret)]
 fn is_class_noise(line: &str) -> bool {
     const SKIP: [&str; 10] = [
         "direction",
@@ -1438,6 +1482,7 @@ fn is_class_noise(line: &str) -> bool {
 }
 
 /// Split `Foo "1"` into the id and the multiplicity written beside it.
+#[tracing::instrument(level = "debug", ret)]
 fn endpoint(tok: &str) -> (String, String) {
     let mut note = String::new();
     let mut id = String::new();
@@ -1462,6 +1507,7 @@ fn endpoint(tok: &str) -> (String, String) {
 /// dialect fits the existing primitives at all: the distinction between
 /// inheritance and dependency is entirely in the tip and the dashing, and both are
 /// things the [`Diagram`] already carries.
+#[tracing::instrument(level = "debug", ret)]
 fn class_diagram(src: &str, kind: &str) -> Result<Diagram, String> {
     let mut boxes: Vec<Compartment> = Vec::new();
     let mut rels: Vec<Rel> = Vec::new();
@@ -1519,6 +1565,7 @@ fn class_diagram(src: &str, kind: &str) -> Result<Diagram, String> {
     Ok(blocks_to_diagram(&boxes, &rels))
 }
 
+#[tracing::instrument(level = "debug", skip(boxes))]
 fn class_relation(boxes: &mut Vec<Compartment>, body: &str, label: &str) -> Option<Rel> {
     for (op, from_tip, to_tip, dashed) in CLASS_REL {
         let Some(at) = body.find(op) else { continue };
@@ -1546,6 +1593,7 @@ fn class_relation(boxes: &mut Vec<Compartment>, body: &str, label: &str) -> Opti
 
 /// Rank, place and stroke a set of compartments — the shared back half of the
 /// class and ER dialects, which differ only in what they call a row.
+#[tracing::instrument(level = "debug", ret, skip(boxes, rels))]
 fn blocks_to_diagram(boxes: &[Compartment], rels: &[Rel]) -> Diagram {
     let sizes: Vec<(f32, f32)> = boxes
         .iter()
@@ -1596,6 +1644,7 @@ struct Transition {
 }
 
 /// The index of state `id` in `(id, label)` order, defining it on first sight.
+#[tracing::instrument(level = "debug", ret)]
 fn intern_state(names: &mut Vec<(String, String)>, id: &str) -> usize {
     if let Some(i) = names.iter().position(|(k, _)| k == id) {
         return i;
@@ -1616,6 +1665,7 @@ fn intern_state(names: &mut Vec<(String, String)>, id: &str) -> usize {
 /// own surface colour over anything beneath it — so the disc goes into `heads`,
 /// which is the only filled-and-unstroked path the renderer has, and the layout
 /// reserves space for it as a block with no box.
+#[tracing::instrument(level = "debug", ret)]
 fn state_diagram(src: &str, kind: &str) -> Result<Diagram, String> {
     // Ids that no author can collide with, because mermaid ids cannot hold a space.
     const START: &str = "[*] start";
@@ -1731,6 +1781,7 @@ fn state_diagram(src: &str, kind: &str) -> Result<Diagram, String> {
 // ---------------------------------------------------------------------------
 
 /// What one end of an ER relationship says about its side's count.
+#[tracing::instrument(level = "debug", ret)]
 fn er_card(tok: &str) -> Option<&'static str> {
     Some(match tok {
         "||" => "1",
@@ -1748,6 +1799,7 @@ fn er_card(tok: &str) -> Option<&'static str> {
 /// dialect rides on plain runs plus captions, and the crow's foot is spelled out
 /// as `0..N` rather than drawn. Spelling it beats a glyph the primitives cannot
 /// make honestly.
+#[tracing::instrument(level = "debug", ret)]
 fn er_diagram(src: &str, kind: &str) -> Result<Diagram, String> {
     let mut boxes: Vec<Compartment> = Vec::new();
     let mut rels: Vec<Rel> = Vec::new();
@@ -1795,6 +1847,7 @@ fn er_diagram(src: &str, kind: &str) -> Result<Diagram, String> {
 /// `CUSTOMER ||--o{ ORDER`: a two-character cardinality, a two-character line
 /// style, another cardinality. The line style is found first and the cardinalities
 /// read off around it, so an entity name containing a single `-` stays a name.
+#[tracing::instrument(level = "debug", skip(boxes))]
 fn er_relation(boxes: &mut Vec<Compartment>, body: &str, label: &str) -> Option<Rel> {
     let chars: Vec<char> = body.chars().collect();
     for i in 2..chars.len().saturating_sub(3) {
@@ -1850,6 +1903,7 @@ const PIE_NAME_MAX: f32 = 170.0;
 /// better. Wedge geometry would also need arcs, which nothing else here relies on.
 /// So each slice becomes a labelled bar whose length is its share — the same
 /// information, in a form the four paths can state honestly.
+#[tracing::instrument(level = "debug", ret)]
 fn pie_chart(src: &str) -> Result<Diagram, String> {
     let mut title = String::new();
     let mut slices: Vec<(String, f32)> = Vec::new();

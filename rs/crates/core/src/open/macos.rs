@@ -10,6 +10,7 @@ use std::process::{Command, Stdio};
 use super::BrowserApp;
 
 /// Spawn detached — we never wait on the child, and we never want its stdio wired to ours.
+#[tracing::instrument(level = "debug", ret)]
 fn spawn(args: &[&str]) -> Result<(), String> {
     Command::new("/usr/bin/open")
         .args(args)
@@ -23,6 +24,7 @@ fn spawn(args: &[&str]) -> Result<(), String> {
 
 /// `open` reads a leading `-` as a flag. Absolute paths can't start with one; a relative
 /// path can, so give it an explicit `./` prefix.
+#[tracing::instrument(level = "debug", ret)]
 fn safe_arg(path: &Path) -> String {
     let s = path.to_string_lossy().to_string();
     if s.starts_with('-') {
@@ -32,10 +34,12 @@ fn safe_arg(path: &Path) -> String {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_url(url: &str) -> Result<(), String> {
     spawn(&[url])
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_url_with(launcher: &str, url: &str) -> Result<(), String> {
     // A launcher with a dot is a bundle id (`com.apple.Safari`); anything else is treated
     // as an application name, which is what a hand-typed override will look like.
@@ -46,10 +50,12 @@ pub fn open_url_with(launcher: &str, url: &str) -> Result<(), String> {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_path(path: &Path) -> Result<(), String> {
     spawn(&[&safe_arg(path)])
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn open_path_with(launcher: &str, path: &Path) -> Result<(), String> {
     let arg = safe_arg(path);
     // Same split as `open_url_with`: a dotted launcher is a bundle id, anything else is a
@@ -61,6 +67,7 @@ pub fn open_path_with(launcher: &str, path: &Path) -> Result<(), String> {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn reveal_path(path: &Path) -> Result<(), String> {
     let arg = safe_arg(path);
     // A folder is what the user asked to open; a file gets selected inside its parent.
@@ -101,6 +108,7 @@ const KNOWN: &[(&str, &str, &str, &str)] = &[
     ("zen", "Zen Browser", "app.zen-browser.zen", "Zen.app"),
 ];
 
+#[tracing::instrument(level = "debug", ret)]
 fn app_dirs() -> Vec<PathBuf> {
     let mut dirs = vec![PathBuf::from("/Applications")];
     if let Ok(home) = std::env::var("HOME") {
@@ -111,6 +119,7 @@ fn app_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn list_browsers() -> Vec<BrowserApp> {
     let dirs = app_dirs();
     KNOWN
@@ -239,6 +248,7 @@ const OWN_UTI: &[(&str, &str)] = &[
 ];
 
 /// Every type identifier that answers for `ext`.
+#[tracing::instrument(level = "debug", ret)]
 fn utis_for(ext: &str) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = OWN_UTI
         .iter()
@@ -254,6 +264,7 @@ fn utis_for(ext: &str) -> Vec<&'static str> {
 /// Every `.app` bundle worth reading: the application roots, plus one level of folders
 /// inside them — `/Applications/Utilities` is where Terminal lives, and people file their
 /// own applications into folders of their own.
+#[tracing::instrument(level = "debug", ret)]
 fn app_bundles() -> Vec<PathBuf> {
     let mut roots = app_dirs();
     roots.push(PathBuf::from("/System/Applications"));
@@ -287,6 +298,7 @@ fn app_bundles() -> Vec<PathBuf> {
 /// parsed here — the format converter ships with the OS and we already depend on
 /// `serde_json` for the far side. One short-lived subprocess per application, once per
 /// run: a hundred-odd applications come in well under a second, measured.
+#[tracing::instrument(level = "debug", ret)]
 fn plist_json(app: &Path) -> Option<serde_json::Value> {
     let out = Command::new("/usr/bin/plutil")
         .args(["-convert", "json", "-o", "-"])
@@ -301,6 +313,7 @@ fn plist_json(app: &Path) -> Option<serde_json::Value> {
     serde_json::from_slice(&out.stdout).ok()
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn strings_at(v: &serde_json::Value, key: &str) -> Vec<String> {
     v.get(key)
         .and_then(|x| x.as_array())
@@ -313,6 +326,7 @@ fn strings_at(v: &serde_json::Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+#[tracing::instrument(level = "debug")]
 fn read_app(app: &Path) -> Option<AppTypes> {
     let v = plist_json(app)?;
     let bundle_id = v.get("CFBundleIdentifier")?.as_str()?.to_string();
@@ -363,6 +377,7 @@ fn read_app(app: &Path) -> Option<AppTypes> {
 /// Built once per run. A newly installed application therefore doesn't appear until the
 /// next launch — the price of never paying the scan twice, and the scan is the only thing
 /// here that costs anything.
+#[tracing::instrument(level = "debug")]
 fn index() -> &'static [AppTypes] {
     static INDEX: std::sync::OnceLock<Vec<AppTypes>> = std::sync::OnceLock::new();
     INDEX.get_or_init(|| {
@@ -377,6 +392,7 @@ fn index() -> &'static [AppTypes] {
     })
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn handlers_for_ext(ext: &str) -> Vec<super::HandlerApp> {
     let utis = utis_for(ext);
     index()

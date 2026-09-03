@@ -23,6 +23,7 @@ use crate::persistence::paths;
 /// Same packaged layouts [`crate::shell_integration::shell_integration_dir`] handles —
 /// exe-relative (which also covers a dev `cargo run`, since `build.rs` stages resources next to
 /// the binary), the macOS `.app` `Contents/Resources`, and the FHS `share`/`lib` prefixes.
+#[tracing::instrument(level = "debug", ret)]
 pub fn source_dir() -> Option<PathBuf> {
     let exe_dir = std::env::current_exe()
         .ok()
@@ -42,6 +43,7 @@ pub fn source_dir() -> Option<PathBuf> {
 /// The directory is created even when nothing ships (a stripped build, a dev binary run from a
 /// tree without its resources): the tab still needs a cwd, and an empty one is a working — if
 /// unhelpful — starting point, which is strictly better than the tab failing to open.
+#[tracing::instrument(level = "debug", ret)]
 pub fn materialize() -> io::Result<PathBuf> {
     let dest = paths::hyperpane_dir();
     fs::create_dir_all(&dest)?;
@@ -54,6 +56,7 @@ pub fn materialize() -> io::Result<PathBuf> {
 /// Recursively copy `src` onto `dest`, overwriting collisions and leaving everything else in
 /// `dest` alone. Errors on individual entries are skipped rather than aborting the walk: a
 /// single unreadable file should not cost the agent its whole skill set.
+#[tracing::instrument(level = "debug", ret)]
 fn copy_over(src: &Path, dest: &Path) -> io::Result<()> {
     for entry in fs::read_dir(src)? {
         let Ok(entry) = entry else { continue };

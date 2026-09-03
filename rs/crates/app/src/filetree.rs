@@ -49,6 +49,7 @@ pub const ROW_DETAIL_EXTRA: f32 = 10.0;
 /// answered "where is this file" with a blank list. Measured here, over the same flattened
 /// rows the view is about to be given, because a `ListView` cannot be asked where a row it
 /// has not yet received would land.
+#[tracing::instrument(level = "debug", ret)]
 pub fn scroll_offset_for(rows: &[FileRow], sel: &Path) -> Option<f32> {
     let mut y = 0.0f32;
     for r in rows {
@@ -120,6 +121,7 @@ pub struct FileRow {
 }
 
 impl FileRow {
+    #[tracing::instrument(level = "debug", skip_all)]
     fn note(text: impl Into<String>) -> Self {
         FileRow {
             depth: 0,
@@ -133,6 +135,7 @@ impl FileRow {
 
     /// Whether clicking this row does anything — a [`KIND_NOTE`] ("no matches", "not a
     /// directory") is a message, not a target, and carries no path to act on.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn activatable(&self) -> bool {
         !self.path.as_os_str().is_empty()
     }
@@ -141,6 +144,7 @@ impl FileRow {
 /// One directory's entries, directories first then files, each group sorted
 /// case-insensitively — the ordering every file explorer uses, and the one a human
 /// scanning for a name expects.
+#[tracing::instrument(level = "debug", ret)]
 fn read_children(dir: &Path) -> Result<Vec<(PathBuf, bool)>, String> {
     let rd = std::fs::read_dir(dir).map_err(|e| e.to_string())?;
     let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
@@ -170,6 +174,7 @@ fn read_children(dir: &Path) -> Result<Vec<(PathBuf, bool)>, String> {
     Ok(dirs)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn name_of(p: &Path) -> String {
     p.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -179,6 +184,7 @@ fn name_of(p: &Path) -> String {
 /// Flatten the tree under `root` into draw order, descending only into directories present
 /// in `expanded`. This is the whole tree model: there is no node graph to keep in sync with
 /// the disk, because the disk is read at the moment the rows are built.
+#[tracing::instrument(level = "debug", ret)]
 pub fn flatten(root: &Path, expanded: &BTreeSet<PathBuf>) -> Vec<FileRow> {
     let mut out = Vec::new();
     walk(root, expanded, 0, &mut out);
@@ -188,6 +194,7 @@ pub fn flatten(root: &Path, expanded: &BTreeSet<PathBuf>) -> Vec<FileRow> {
     out
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn walk(dir: &Path, expanded: &BTreeSet<PathBuf>, depth: i32, out: &mut Vec<FileRow>) {
     if out.len() >= MAX_ROWS {
         return;
@@ -225,6 +232,7 @@ fn walk(dir: &Path, expanded: &BTreeSet<PathBuf>, depth: i32, out: &mut Vec<File
 /// Every ancestor directory of `path` strictly below `root`, so revealing a deep file can
 /// expand exactly the directories that lead to it and no others. Empty when `path` is not
 /// under `root`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn ancestors_within(root: &Path, path: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut cur = path.parent();
@@ -249,6 +257,7 @@ pub fn ancestors_within(root: &Path, path: &Path) -> Vec<PathBuf> {
 /// character starting a path segment or a word is worth more than one in the middle, and a
 /// match inside the file name is worth more than one in the directories above it — typing
 /// `stat` should find `state.rs` before `crates/statusline/thing.rs`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn score(query: &str, cand: &str) -> Option<i32> {
     let q: Vec<char> = query.chars().filter(|c| !c.is_whitespace()).collect();
     if q.is_empty() {
@@ -302,6 +311,7 @@ pub fn score(query: &str, cand: &str) -> Option<i32> {
 ///
 /// Directories match too: "where is the parser crate" is the same question as "where is
 /// `parser.rs`", and an explorer that could only find leaf files would answer half of it.
+#[tracing::instrument(level = "debug", ret)]
 pub fn find(root: &Path, query: &str) -> Vec<FileRow> {
     let q = query.trim();
     if q.is_empty() {

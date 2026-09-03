@@ -50,6 +50,7 @@ pub struct SshSettings {
 }
 
 impl Default for SshSettings {
+    #[tracing::instrument(level = "debug", ret)]
     fn default() -> Self {
         Self {
             enabled: false,
@@ -63,6 +64,7 @@ impl Default for SshSettings {
 }
 
 /// Where [`SshSettings::load`] parks a malformed settings file: `<path>.bad`, next to it.
+#[tracing::instrument(level = "debug", ret)]
 fn bad_sibling(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(".bad");
@@ -77,6 +79,7 @@ impl SshSettings {
     /// one typo from making the SSH server (and the pairing flow) refuse to start at all;
     /// the defaults bind loopback, so the fallback can't widen exposure. Only a true I/O
     /// failure (unreadable file) is still an error.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn load(path: &Path) -> Result<Self, String> {
         match std::fs::read(path) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
@@ -105,6 +108,7 @@ impl SshSettings {
     }
 
     /// Write `path` atomically. Contains no secrets — the host key lives in its own file.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn save(&self, path: &Path) -> Result<(), String> {
         let mut json = serde_json::to_vec_pretty(self)
             .map_err(|e| format!("could not serialize ssh settings: {e}"))?;
@@ -116,6 +120,7 @@ impl SshSettings {
     /// The socket address to listen on, or an explanation of why this configuration is
     /// refused. This is the *only* place a bind address is derived; there is no code path
     /// that reaches a listener without passing through it.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn resolve_bind(&self) -> Result<SocketAddr, String> {
         let ip: IpAddr = self.bind.trim().parse().map_err(|_| {
             format!(
@@ -138,6 +143,7 @@ impl SshSettings {
 
     /// Whether [`resolve_bind`](Self::resolve_bind) would hand out a non-loopback address —
     /// used only to shout about it in `status` output and the startup log.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_remote_exposed(&self) -> bool {
         self.bind
             .trim()
@@ -170,6 +176,7 @@ pub struct SshPaths {
 impl SshPaths {
     /// The real locations: settings + authorized keys in the config dir (user-edited),
     /// host key in the state dir (machine-generated runtime state, like `control.json`).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn from_env() -> Self {
         use hyperpanes_core::persistence::paths;
         let cfg = paths::config_dir();

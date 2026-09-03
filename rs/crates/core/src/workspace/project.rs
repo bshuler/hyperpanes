@@ -69,6 +69,7 @@ pub struct ProjectRoot {
 
 impl ProjectRoot {
     /// The project file this root would hold, whether or not it exists.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn file_path(&self) -> PathBuf {
         project_file_path(&self.dir)
     }
@@ -85,6 +86,7 @@ pub struct ProjectFile {
 }
 
 /// `<dir>/.hyperpanes/project.json`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn project_file_path(dir: &Path) -> PathBuf {
     dir.join(PROJECT_DIR).join(PROJECT_FILE)
 }
@@ -96,6 +98,7 @@ pub fn project_file_path(dir: &Path) -> PathBuf {
 /// `parent()` chain, one existence probe per level — because two different answers to
 /// "which directory is this pane in" is a bug generator. `.git` is probed with `exists`
 /// rather than `is_dir` so a linked worktree (whose `.git` is a file) still counts.
+#[tracing::instrument(level = "debug", ret, skip(start))]
 pub fn find_project_root<P: AsRef<Path>>(start: P) -> Option<ProjectRoot> {
     let mut dir: Option<&Path> = Some(start.as_ref());
     let mut depth = 0usize;
@@ -124,6 +127,7 @@ pub fn find_project_root<P: AsRef<Path>>(start: P) -> Option<ProjectRoot> {
 /// The project file governing `start`, if one exists. `None` when the walk found no
 /// marker, or found a `.git` root that has no project file — both mean "this checkout
 /// does not describe its own windows yet".
+#[tracing::instrument(level = "debug", ret, skip(start))]
 pub fn find_project_file<P: AsRef<Path>>(start: P) -> Option<PathBuf> {
     let path = find_project_root(start)?.file_path();
     path.is_file().then_some(path)
@@ -137,6 +141,7 @@ pub fn find_project_file<P: AsRef<Path>>(start: P) -> Option<PathBuf> {
 /// Relative pane cwds resolve against `root`, **not** against the file's own directory:
 /// a cwd in a repo-local file is written by a human thinking in repo-relative terms, and
 /// `"src"` meaning `<root>/.hyperpanes/src` would be nonsense.
+#[tracing::instrument(level = "debug", ret, skip(root))]
 pub fn read_project_at<P: AsRef<Path>>(root: P) -> Result<Option<ProjectFile>, String> {
     let root = root.as_ref();
     let path = project_file_path(root);
@@ -154,6 +159,7 @@ pub fn read_project_at<P: AsRef<Path>>(root: P) -> Result<Option<ProjectFile>, S
 }
 
 /// Walk up from an opened directory and read whatever project file governs it.
+#[tracing::instrument(level = "debug", ret, skip(start))]
 pub fn discover_project<P: AsRef<Path>>(start: P) -> Result<Option<ProjectFile>, String> {
     match find_project_root(start) {
         Some(root) if root.marker == RootMarker::Hyperpanes => read_project_at(&root.dir),
@@ -171,6 +177,7 @@ pub fn discover_project<P: AsRef<Path>>(start: P) -> Result<Option<ProjectFile>,
 /// control must not reshuffle itself depending on whether the previous writer happened
 /// to know every field. One ordering, every save, is worth more here than matching the
 /// declaration order `io::write_workspace` produces for app-support files.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn write_project<P: AsRef<Path>>(
     root: P,
     workspace: &WorkspaceFile,
@@ -223,6 +230,7 @@ pub enum Source {
 /// down to the panes inside the project — `State::open_project_windows` does exactly
 /// that — hands us `groups: Some(vec![])` when none of them are. Under a shape test that
 /// empty shell wins forever and the repo file can never open while any window is up.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve(live: Option<&WorkspaceFile>, repo: Option<&WorkspaceFile>) -> Source {
     if live.is_some_and(io::describes_panes) {
         Source::Live
@@ -234,6 +242,7 @@ pub fn resolve(live: Option<&WorkspaceFile>, repo: Option<&WorkspaceFile>) -> So
 }
 
 /// [`resolve`], already dereferenced — the layout to open, or `None`.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve_workspace<'a>(
     live: Option<&'a WorkspaceFile>,
     repo: Option<&'a WorkspaceFile>,
@@ -267,6 +276,7 @@ const SECRET_KEY_TAILS: &[&str] = &[
 /// `ai.token_count`, and a guard that deletes ordinary data is a guard people work
 /// around. `claude.api_token`, `api-key` and `session.secret` still go, while
 /// `keychain` and `ai.token_count` stay; the rule is narrow enough to be silent.
+#[tracing::instrument(level = "debug", ret)]
 fn is_secret_meta_key(key: &str) -> bool {
     key.to_ascii_lowercase()
         .rsplit(['.', '_', '-', ':', '/'])
@@ -279,6 +289,7 @@ fn is_secret_meta_key(key: &str) -> bool {
 /// Called on every [`write_project`]. It is the enforceable half of "never a secret
 /// store" — the unenforceable half being that nobody can tell whether a `command` or a
 /// `note` embeds a key.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn scrub_secrets(file: &mut WorkspaceFile) -> usize {
     let mut removed = 0usize;
     for_each_pane_mut(file, |pane| {
@@ -302,6 +313,7 @@ pub fn scrub_secrets(file: &mut WorkspaceFile) -> usize {
 /// otherwise ask to re-attach to whatever `pane-3` happens to be running today. What
 /// belongs here is which windows to open and what they run — a reader with no uid
 /// spawns from the recorded command, which is the right answer in a checkout.
+#[tracing::instrument(level = "debug", skip_all)]
 fn strip_uids(file: &mut WorkspaceFile) {
     for_each_pane_mut(file, |pane| pane.uid = None);
 }
@@ -313,6 +325,7 @@ fn strip_uids(file: &mut WorkspaceFile) {
 /// outside `root` are left verbatim — they are deliberate references to somewhere else.
 /// Separators are normalised to `/`, which every platform's reader accepts and which
 /// keeps a Windows-authored file from churning the diff on macOS.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn relativize_cwds(file: &WorkspaceFile, root: &Path) -> WorkspaceFile {
     let mut out = file.clone();
     for_each_pane_mut(&mut out, |pane| {
@@ -327,6 +340,7 @@ pub fn relativize_cwds(file: &WorkspaceFile, root: &Path) -> WorkspaceFile {
 }
 
 /// Visit every pane at all three nesting levels (top-level, per group, per window).
+#[tracing::instrument(level = "debug", skip_all)]
 fn for_each_pane_mut(file: &mut WorkspaceFile, mut f: impl FnMut(&mut PaneSpec)) {
     if let Some(panes) = file.panes.as_mut() {
         panes.iter_mut().for_each(&mut f);
@@ -378,6 +392,7 @@ const PANE_KEYS: &[&str] = &[
 const BOUNDS_KEYS: &[&str] = &["x", "y", "width", "height", "maximized", "fullscreen"];
 
 /// Copy `old`'s unrecognised keys into `new`, leaving anything `new` already says alone.
+#[tracing::instrument(level = "debug", ret)]
 fn carry_unknown(new: &mut Value, old: &Value, known: &[&str]) {
     let (Some(old_obj), Some(new_obj)) = (old.as_object(), new.as_object_mut()) else {
         return;
@@ -396,6 +411,7 @@ fn carry_unknown(new: &mut Value, old: &Value, known: &[&str]) {
 /// pane that was added or removed would attach a stranger's data to the wrong pane, which
 /// is worse than losing it. A layout edit therefore drops unknown keys; an ordinary save
 /// keeps them.
+#[tracing::instrument(level = "debug", ret)]
 fn carry_seq(new: &mut Value, old: &Value, key: &str, each: fn(&mut Value, &Value)) {
     let Some(old_items) = old.get(key).and_then(Value::as_array) else {
         return;
@@ -411,15 +427,18 @@ fn carry_seq(new: &mut Value, old: &Value, key: &str, each: fn(&mut Value, &Valu
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn carry_pane(new: &mut Value, old: &Value) {
     carry_unknown(new, old, PANE_KEYS);
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn carry_group(new: &mut Value, old: &Value) {
     carry_unknown(new, old, GROUP_KEYS);
     carry_seq(new, old, "panes", carry_pane);
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn carry_window(new: &mut Value, old: &Value) {
     carry_unknown(new, old, WINDOW_KEYS);
     if let (Some(o), Some(n)) = (old.get("bounds"), new.get_mut("bounds")) {
@@ -428,6 +447,7 @@ fn carry_window(new: &mut Value, old: &Value) {
     carry_seq(new, old, "groups", carry_group);
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn carry_workspace(new: &mut Value, old: &Value) {
     carry_unknown(new, old, WORKSPACE_KEYS);
     carry_seq(new, old, "panes", carry_pane);
@@ -438,6 +458,7 @@ fn carry_workspace(new: &mut Value, old: &Value) {
 /// Merge the strangers from the document currently on disk into the one about to
 /// replace it. A bare legacy file (no `format` key) is the workspace payload itself, not
 /// an envelope — treating it as one would hoist `name`/`panes` up beside `version`.
+#[tracing::instrument(level = "debug", ret)]
 fn carry_prior(new: &mut Value, old: &Value) {
     if old.get("format").is_some() {
         carry_unknown(new, old, ENVELOPE_KEYS);

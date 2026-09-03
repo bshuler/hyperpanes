@@ -84,6 +84,7 @@ pub enum Overlay {
 static NEXT_VIEW_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `view-0`, `view-1`, … — pane identity for a pane with no session behind it.
+#[tracing::instrument(level = "debug", ret)]
 fn fresh_view_uid() -> String {
     format!(
         "view-{}",
@@ -94,6 +95,7 @@ fn fresh_view_uid() -> String {
 /// `mgr.kill(uid)` for a pane that actually has a session. A view pane's uid was never
 /// registered with the backend, so killing it would ask the daemon about a session it has
 /// never heard of. Every close/evict path routes through here so the gate is in ONE place.
+#[tracing::instrument(level = "debug", skip_all)]
 fn kill_session_of(mgr: &SessionManager, uid: &str, kind: &PaneKind) {
     if kind.is_pty() {
         tracing::info!(uid, "killing pane session");
@@ -119,6 +121,7 @@ pub struct PaneExit {
 /// answer: what just ended, and how to get it back. Dim so it reads as chrome rather than
 /// as output the program produced, and CRLF-terminated because this is written into a
 /// terminal grid, not to a file.
+#[tracing::instrument(level = "debug", ret)]
 fn exit_banner(program: &str, code: i32) -> String {
     let how = if code == 0 {
         format!("{program} exited")
@@ -211,6 +214,7 @@ pub struct ClosedItem {
 impl ClosedItem {
     /// The live panes this entry is keeping alive (one for a pane, all of them for a tab).
     /// Borrowed as a slice so the kill loops read the same for both variants.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn panes(&self) -> &[DetachedPane] {
         match &self.what {
             ClosedWhat::Pane(p) => std::slice::from_ref(&**p),
@@ -219,6 +223,7 @@ impl ClosedItem {
     }
 
     /// The history row's title.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn label(&self) -> SharedString {
         match &self.what {
             ClosedWhat::Pane(p) => p.title.clone(),
@@ -227,11 +232,13 @@ impl ClosedItem {
     }
 
     /// Whether this entry is a whole tab (drives the row's icon + "N panes" line).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_tab(&self) -> bool {
         matches!(self.what, ClosedWhat::Tab(_))
     }
 
     /// The row's tint — the first pane's pinned accent, if it has one.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn accent(&self) -> Option<Color> {
         self.panes().first().and_then(|p| p.pinned_accent)
     }
@@ -258,6 +265,7 @@ const KBD_FOCUS_TRIES: u8 = 64;
 /// How long ago a history entry was closed, for its row's second line. Coarse on purpose:
 /// the first minute is one bucket ("just now") so a fresh close doesn't re-push the whole
 /// list into Slint once a second (the pump's signature includes this string).
+#[tracing::instrument(level = "debug", ret)]
 pub fn rel_age(now_ms: u64, at_ms: u64) -> String {
     let secs = now_ms.saturating_sub(at_ms) / 1000;
     match secs {
@@ -272,6 +280,7 @@ pub fn rel_age(now_ms: u64, at_ms: u64) -> String {
 /// windows in one process must never mint the same row id.
 static NEXT_CLOSED_ID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(1);
 
+#[tracing::instrument(level = "debug", ret)]
 fn fresh_closed_id() -> i32 {
     NEXT_CLOSED_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -386,6 +395,7 @@ pub const GOAL_FIELDS: usize = 5;
 const GOAL_HISTORY_CAP: usize = 50;
 
 /// Where the goal history persists — sibling of `projects.json` in the app data dir.
+#[tracing::instrument(level = "debug", ret)]
 fn goal_history_path() -> std::path::PathBuf {
     hyperpanes_core::persistence::paths::data_dir().join("goal_history.json")
 }
@@ -393,6 +403,7 @@ fn goal_history_path() -> std::path::PathBuf {
 /// Where the New-goal dialog's last-used model tiers persist — sibling of
 /// `goal_history.json`. Remembering the picks means re-opening the box doesn't reset the
 /// orchestrator/spec/impl tiers to the built-in defaults every time.
+#[tracing::instrument(level = "debug", ret)]
 fn goal_defaults_path() -> std::path::PathBuf {
     hyperpanes_core::persistence::paths::data_dir().join("goal_defaults.json")
 }
@@ -403,6 +414,7 @@ const GOAL_MODEL_SEL_DEFAULT: [usize; 3] = [0, 0, 1];
 
 /// Clamp each remembered tier index into [`crate::command::GOAL_MODELS`] so a stale file
 /// (e.g. written before the model list shrank) can never point past the end.
+#[tracing::instrument(level = "debug", ret)]
 fn clamp_goal_model_sel(sel: [usize; 3]) -> [usize; 3] {
     let max = crate::command::GOAL_MODELS.len() - 1;
     [sel[0].min(max), sel[1].min(max), sel[2].min(max)]
@@ -410,6 +422,7 @@ fn clamp_goal_model_sel(sel: [usize; 3]) -> [usize; 3] {
 
 /// Load the remembered [orchestrator, spec, impl] model-tier indices for the New-goal box
 /// (missing/corrupt file → built-in defaults).
+#[tracing::instrument(level = "debug", ret)]
 fn load_goal_model_defaults() -> [usize; 3] {
     std::fs::read_to_string(goal_defaults_path())
         .ok()
@@ -420,6 +433,7 @@ fn load_goal_model_defaults() -> [usize; 3] {
 
 /// Persist the New-goal box's model tiers (best-effort — a write failure only loses the
 /// remembered defaults, never load-bearing).
+#[tracing::instrument(level = "debug", ret)]
 fn save_goal_model_defaults(sel: &[usize; 3]) {
     if let Ok(json) = serde_json::to_string(sel) {
         let path = goal_defaults_path();
@@ -432,6 +446,7 @@ fn save_goal_model_defaults(sel: &[usize; 3]) {
 
 /// Load the persisted goal history (missing/corrupt file → empty; history is a convenience,
 /// never load-bearing).
+#[tracing::instrument(level = "debug", ret)]
 fn load_goal_history() -> Vec<GoalHistoryEntry> {
     std::fs::read_to_string(goal_history_path())
         .ok()
@@ -441,6 +456,7 @@ fn load_goal_history() -> Vec<GoalHistoryEntry> {
 
 /// A goal intent squeezed into a pane subtitle: first line only, elided past 60 chars (the
 /// header has one secondary line; the full task is in the pane's conversation).
+#[tracing::instrument(level = "debug", ret)]
 fn goal_subtitle(intent: &str) -> String {
     let line = intent.lines().next().unwrap_or("").trim();
     if line.chars().count() <= 60 {
@@ -454,6 +470,7 @@ fn goal_subtitle(intent: &str) -> String {
 /// Index into `projects` of the project containing `cwd` — the project whose non-empty root is
 /// `cwd` itself or a `<root>/…` prefix of it, longest (most specific) winning when roots nest.
 /// `None` when `cwd` sits outside every project. Pure so the New-goal default is unit-testable.
+#[tracing::instrument(level = "debug", ret)]
 fn goal_project_for_cwd(projects: &[sidebar::Project], cwd: &str) -> Option<usize> {
     projects
         .iter()
@@ -466,6 +483,7 @@ fn goal_project_for_cwd(projects: &[sidebar::Project], cwd: &str) -> Option<usiz
 }
 
 /// Persist the goal history (best-effort — a write failure only loses recall convenience).
+#[tracing::instrument(level = "debug", ret)]
 fn save_goal_history(history: &[GoalHistoryEntry]) {
     if let Ok(json) = serde_json::to_string_pretty(history) {
         let path = goal_history_path();
@@ -481,6 +499,7 @@ fn save_goal_history(history: &[GoalHistoryEntry]) {
 /// system rotates `CLAUDE_CONFIG_DIR` across per-account dirs (see `claude_accounts`) whose
 /// `.claude.json` has no user-scoped MCP registrations — the hyperpanes server only lives in the
 /// default `~/.claude.json`, which `claude` ignores once `CLAUDE_CONFIG_DIR` is set.
+#[tracing::instrument(level = "debug", ret)]
 fn goals_mcp_config_json(control_json_path: &str) -> String {
     serde_json::json!({
         "mcpServers": {
@@ -500,6 +519,7 @@ fn goals_mcp_config_json(control_json_path: &str) -> String {
 
 /// Write `goals-mcp.json` into the state dir, returning its path on success. Best-effort — a
 /// write failure must not block a goal spawn; the caller just omits `--mcp-config`.
+#[tracing::instrument(level = "debug", ret)]
 fn write_goals_mcp_config() -> Option<std::path::PathBuf> {
     let control_path = hyperpanes_core::persistence::paths::control_json();
     let json = goals_mcp_config_json(&control_path.to_string_lossy());
@@ -523,6 +543,7 @@ fn write_goals_mcp_config() -> Option<std::path::PathBuf> {
 /// the user's `statusLine`. Spawned agents rotate `CLAUDE_CONFIG_DIR` across per-account dirs
 /// whose `settings.json` has no `statusLine` (it lives only in the default `~/.claude`), so
 /// without this they show Claude's built-in default statusline instead of the user's.
+#[tracing::instrument(level = "debug", ret)]
 fn goals_settings_json(status_line: &serde_json::Value) -> String {
     serde_json::json!({ "statusLine": status_line }).to_string()
 }
@@ -531,6 +552,7 @@ fn goals_settings_json(status_line: &serde_json::Value) -> String {
 /// user's `statusLine` from `~/.claude/settings.json` (the config a manual, no-`CLAUDE_CONFIG_DIR`
 /// launch reads). Returns `None` — and the caller omits `--settings` — when there's no
 /// statusLine to carry or the copy fails; a settings hiccup must never block a goal spawn.
+#[tracing::instrument(level = "debug", ret)]
 fn write_goals_settings_config() -> Option<std::path::PathBuf> {
     let home = std::env::var_os("HOME")?;
     let src = std::path::Path::new(&home)
@@ -668,6 +690,7 @@ static LAUNCH_DIR: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::n
 /// bundle (and a launchd-started process on Linux) reports `/`, which *is* a directory and so
 /// would silently win over `$HOME` in [`State::resolve_new_pane_cwd`] — every new pane would
 /// open on the whole disk. A `None` here simply moves the decision on to the next candidate.
+#[tracing::instrument(level = "debug", ret)]
 pub fn pin_launch_dir() {
     let _ = LAUNCH_DIR.get_or_init(|| {
         std::env::current_dir()
@@ -679,6 +702,7 @@ pub fn pin_launch_dir() {
 
 /// The pinned launch directory, or `None` when it was the filesystem root / unreadable / the
 /// pin never ran (tests, headless tools — the caller then falls through to `$HOME`).
+#[tracing::instrument(level = "debug", ret)]
 fn launch_dir() -> Option<String> {
     LAUNCH_DIR
         .get()
@@ -696,6 +720,7 @@ fn launch_dir() -> Option<String> {
 ///
 /// Empty strings are treated as "not set" because that is how they arrive: Slint string
 /// properties and the workspace JSON both default to `""` rather than to null.
+#[tracing::instrument(level = "debug", ret, skip(candidates))]
 fn first_existing_dir<I, S>(candidates: I) -> Option<String>
 where
     I: IntoIterator<Item = Option<S>>,
@@ -829,6 +854,7 @@ pub struct PrefsDraft {
 
 impl PrefsDraft {
     /// Snapshot the appearance subset of `s`.
+    #[tracing::instrument(level = "debug", ret)]
     fn from_settings(s: &Settings) -> Self {
         PrefsDraft {
             font_family: s.font_family.clone(),
@@ -859,6 +885,7 @@ pub struct AiLine {
 
 impl AiLine {
     /// Set the target summary text; restart the typewriter when it actually changed.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn set_target(&mut self, text: &str) {
         if self.full != text {
             self.full = text.to_string();
@@ -1010,10 +1037,12 @@ pub struct PaneState {
 
 impl PaneState {
     /// Effective frame visibility: the per-pane override if set, else the global pref.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn frame_on(&self, global: bool) -> bool {
         self.show_frame.unwrap_or(global)
     }
     /// Effective dot visibility: the per-pane override if set, else the global pref.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn dot_on(&self, global: bool) -> bool {
         self.show_dot.unwrap_or(global)
     }
@@ -1023,6 +1052,7 @@ impl PaneState {
 /// may overwrite it — never a name the user chose. Mirrors the renderer's `/^(shell|pane \d+)$/i`
 /// test. A bare number (e.g. "42") is NOT treated as default: it's a valid user rename, and
 /// silently overwriting it with the repo name on a cwd change would clobber that choice.
+#[tracing::instrument(level = "debug", ret)]
 fn is_default_label(label: &str) -> bool {
     let l = label.trim();
     if l.eq_ignore_ascii_case("shell") {
@@ -1045,6 +1075,7 @@ fn is_default_label(label: &str) -> bool {
 /// pump may have resized it while the session didn't exist yet — a resize on a missing
 /// uid is a silent no-op, so without the re-apply the pty would stay at its spawn size),
 /// and kills the session if the pane was closed mid-spawn.
+#[tracing::instrument(level = "debug", ret)]
 pub fn spawn_done() -> &'static std::sync::Mutex<Vec<String>> {
     static Q: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
     Q.get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -1054,6 +1085,7 @@ pub fn spawn_done() -> &'static std::sync::Mutex<Vec<String>> {
 /// `powershell.exe`→`powershell`, `cmd.exe`→`cmd`, `bash(.exe)`→`bash`, `wsl.exe`→`wsl`,
 /// plus `nu`/`zsh`/`fish`/`sh`/`dash`/`ash`); anything else falls back to the bare basename
 /// with a trailing `.exe` stripped. An empty/whitespace program yields "".
+#[tracing::instrument(level = "debug", ret)]
 fn shell_label(program: &str) -> String {
     // basename after the last path separator (handles full paths like COMSPEC's cmd.exe).
     let base = program
@@ -1111,6 +1143,7 @@ pub struct Tab {
 }
 
 impl Tab {
+    #[tracing::instrument(level = "debug")]
     fn empty(title: SharedString) -> Self {
         Tab {
             title,
@@ -1129,6 +1162,7 @@ impl Tab {
     /// preserved. Pane LABELS are stable and user-owned, so they're left untouched —
     /// unlike the old build, panes are no longer renumbered 1..N (that was the bare-number
     /// "title" bug). The color VALUE stays assigned even on a clean (frame-off) pane.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn relabel(&mut self, palette: usize) {
         for (i, p) in self.panes.iter_mut().enumerate() {
             p.accent = p
@@ -1138,6 +1172,7 @@ impl Tab {
     }
 
     /// The concrete preset this tab currently tiles with (auto resolved).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn effective(&self) -> Layout {
         effective_layout(self.layout, self.panes.len())
     }
@@ -1476,6 +1511,7 @@ pub enum EscOutcome {
 
 impl State {
     /// Fresh state with a single empty tab; the caller seeds pane 0 via [`Self::add_pane`].
+    #[tracing::instrument(level = "debug", skip(font))]
     pub fn new(font: hyperpanes_terminal_widget::Font) -> Self {
         let mut s = State {
             font,
@@ -1585,6 +1621,7 @@ impl State {
     /// Render the appearance preview (a real, locked terminal) with the drafted font + theme,
     /// returning the freshly-rendered image when anything changed (else `None`). Called by the
     /// pump while Preferences is open; `scale` is the window DPI scale.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn render_preview(&mut self, scale: f32, cursor_on: bool) -> Option<Image> {
         let (font_path, px, theme_idx) = match &self.prefs_draft {
             Some(d) => (
@@ -1628,6 +1665,7 @@ impl State {
     /// Advance the preview's ambient Tetris on its fixed cadence, feeding the new composed
     /// frame into the locked preview terminal so it animates. Called by the pump while
     /// Preferences is open; cheap no-op between frames.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn animate_preview_tetris(&mut self) {
         if self.preview_tetris_last.elapsed() >= std::time::Duration::from_millis(90) {
             self.preview_tetris.step();
@@ -1641,6 +1679,7 @@ impl State {
     /// coloured from the drafted frame palette, then a 2-row HUD (NEXT swatch + the font name
     /// at the drafted size — so the font family/size still preview live). Reflects the
     /// appearance DRAFT while the dialog is open (else the committed settings).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn preview_frame(&self) -> String {
         let (palette_idx, px, font_value) = match &self.prefs_draft {
             Some(d) => (d.frame_palette, d.font_px, d.font_family.as_str()),
@@ -1695,6 +1734,7 @@ impl State {
         s
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     fn fresh_tab(&mut self) -> Tab {
         let title = self.fresh_tab_title();
         Tab::empty(title)
@@ -1711,6 +1751,7 @@ impl State {
     /// Only the *generated* name is deduped. A title the user typed, or one a workspace file
     /// names explicitly, is left exactly as written — silently renaming what someone asked
     /// for is worse than letting two tabs share a name on purpose.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn fresh_tab_title(&mut self) -> SharedString {
         loop {
             self.tab_seq += 1;
@@ -1721,15 +1762,18 @@ impl State {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn active_tab(&self) -> &Tab {
         &self.tabs[self.active]
     }
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn active_tab_mut(&mut self) -> &mut Tab {
         &mut self.tabs[self.active]
     }
 
     /// Locate the (tab, pane) holding session `uid` across *all* tabs (events for
     /// background tabs still need to reach their pane).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn find_pane(&mut self, uid: &str) -> Option<(usize, usize)> {
         for (ti, t) in self.tabs.iter().enumerate() {
             if let Some(pi) = t.panes.iter().position(|p| p.uid == uid) {
@@ -1750,6 +1794,7 @@ impl State {
     /// missing uid is a silent no-op — and (b) kill the session if its pane was closed
     /// mid-spawn (otherwise it would leak). A spawn error just logs: the pane shows a
     /// dead shell, and a restart re-tries.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn spawn_session_async(mgr: &SessionManager, opts: SpawnOptions) {
         let mgr = mgr.clone();
         let uid = opts.uid.clone();
@@ -1779,6 +1824,7 @@ impl State {
     /// before any layout exists (eager first-pane seed, workspace restore into a fresh
     /// window) there is nothing to predict from, so fall back to the classic 80×24 — rows
     /// only ever grow from there, and the first render pump corrects it.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn spawn_cells(&self) -> (u16, u16) {
         let tab = self.active_tab();
         match tab
@@ -1825,6 +1871,7 @@ impl State {
     /// focused terminal happens to be sitting in, so a restored workspace came back showing the
     /// wrong file. Nothing chdirs for a view pane, so there is no pty to protect: its target is
     /// taken exactly as given.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn resolve_new_pane_cwd(&self, kind: &PaneKind, explicit: Option<String>) -> Option<String> {
         let explicit = explicit.filter(|c| !c.is_empty());
         if !kind.is_pty() {
@@ -1844,6 +1891,7 @@ impl State {
         ])
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     fn make_pane(
         &mut self,
         mgr: &SessionManager,
@@ -2024,12 +2072,14 @@ impl State {
     // ---- pane mutations (act on the active tab) ----
 
     /// Spawn a new pane + shell in the active tab and focus it.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn add_pane(&mut self, mgr: &SessionManager) {
         self.add_pane_cwd(mgr, None, None);
     }
 
     /// Spawn a new pane in the active tab with an optional working directory + accent
     /// (used to open a sidebar project cd'd into its repo), and focus it.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn add_pane_cwd(
         &mut self,
         mgr: &SessionManager,
@@ -2051,6 +2101,7 @@ impl State {
     /// Spawn a configured pane in the active tab. Returns the new pane's session `uid`
     /// (`None` if the spawn failed), so callers that need to address the pane later — e.g.
     /// the goals launcher registering its orchestrator — can record it.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn add_pane_opts(&mut self, mgr: &SessionManager, opts: NewPaneOpts) -> Option<String> {
         let idx = self.active_tab().panes.len();
         let ps = self.make_pane(mgr, idx, opts)?;
@@ -2074,6 +2125,7 @@ impl State {
     /// workspace emptied → the caller should close the window). An emptied non-last tab
     /// is dropped. Shared by [`Self::close_pane_in`] (which then kills the session) and
     /// pane re-host (which keeps the session alive to rebind it in another window).
+    #[tracing::instrument(level = "debug", skip(self))]
     fn take_pane_in(&mut self, ti: usize, idx: usize) -> Option<(PaneState, bool)> {
         let taken = self.take_pane_inner(ti, idx);
         if let Some((ps, _)) = taken.as_ref() {
@@ -2087,6 +2139,7 @@ impl State {
 
     /// The removal itself — see [`Self::take_pane_in`], which wraps this to drop the
     /// pane's runtime-only side-map entries on every exit path.
+    #[tracing::instrument(level = "debug", skip(self))]
     fn take_pane_inner(&mut self, ti: usize, idx: usize) -> Option<(PaneState, bool)> {
         if ti >= self.tabs.len() {
             return None;
@@ -2151,6 +2204,7 @@ impl State {
     /// Close pane `idx` of tab `ti`, killing its session. An emptied tab is
     /// dropped; closing the last pane of the last tab returns `false` (caller
     /// quits). Works for background tabs too (used by self-exiting shells).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn close_pane_in(&mut self, ti: usize, idx: usize, mgr: &SessionManager) -> bool {
         match self.take_pane_in(ti, idx) {
             Some((ps, alive)) => {
@@ -2174,6 +2228,7 @@ impl State {
     /// is nowhere to park it: the history lives in this `State` and dies with the window, so
     /// parking would leak the PTY rather than preserve it. That close is the one genuinely
     /// irreversible one, which is why it is also the one always confirmed.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn close_pane_menu(&mut self, ti: usize, idx: usize, mgr: &SessionManager) -> bool {
         if self.ends_window_pane(ti, idx) {
             return self.close_pane_in(ti, idx, mgr);
@@ -2195,6 +2250,7 @@ impl State {
     ///
     /// Never true for the system tab: its last pane is replaced, not fatal (see
     /// [`Self::take_pane_inner`]), so the window does not end and the close is parkable.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn ends_window_pane(&self, ti: usize, idx: usize) -> bool {
         self.tabs.len() <= 1
             && self
@@ -2207,6 +2263,7 @@ impl State {
     /// remove it **without** killing its session (the PTY stays alive centrally),
     /// returning the rebind info + whether this window still has panes. `None` when the
     /// active tab has no panes.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn detach_focused(&mut self, mgr: &SessionManager) -> Option<(DetachedPane, bool)> {
         // Sessions are NOT touched here — that's the whole point of detach. The manager is
         // only for the reseed: a pane torn out of the system tab leaves the tab behind, and
@@ -2236,6 +2293,7 @@ impl State {
     }
 
     /// Re-host a detached session at the end of the active tab (see [`Self::adopt_pane_at`]).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn adopt_pane(&mut self, mgr: &SessionManager, det: DetachedPane) {
         let at = self.active_tab().panes.len();
         self.adopt_pane_at(mgr, det, at);
@@ -2245,6 +2303,7 @@ impl State {
     /// terminal grid, prime it from the session's **replay buffer** (recent scrollback — so
     /// no blank pane and no PTY restart), rebind it to the existing `uid`, and focus it.
     /// `at` is clamped to `0..=len`, so a stitch can insert the pane at a hovered slot.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn adopt_pane_at(&mut self, mgr: &SessionManager, det: DetachedPane, at: usize) {
         let palette = self.settings.frame_palette;
         let (cols, rows) = (80u16, 24u16);
@@ -2328,6 +2387,7 @@ impl State {
 
     /// Re-host a detached session as a **brand-new tab** (dock-as-tab on a tear-off drop):
     /// append a fresh tab, switch to it, and adopt the pane into it.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn adopt_pane_as_tab(&mut self, mgr: &SessionManager, det: DetachedPane) {
         let tab = self.fresh_tab();
         tracing::info!(title = %tab.title, "tab created (pane adopted)");
@@ -2343,6 +2403,7 @@ impl State {
     /// mid-drag (e.g. a spring-load switched tabs). Returns the rebind info + whether this
     /// window still has panes; `None` if the uid isn't here. `take_pane_in` keeps the active
     /// tab pointing at the same tab across the removal.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn detach_uid(&mut self, uid: &str) -> Option<(DetachedPane, bool)> {
         let (ti, idx) = self.find_pane(uid)?;
         let (ps, alive) = self.take_pane_in(ti, idx)?;
@@ -2368,6 +2429,7 @@ impl State {
 
     /// Whether the active tab currently hosts pane `uid` (used to choose reorder-in-place
     /// vs cross-tab move when a pane is dropped in the pane area).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn active_has_uid(&self, uid: &str) -> bool {
         self.active_tab().panes.iter().any(|p| p.uid == uid)
     }
@@ -2375,6 +2437,7 @@ impl State {
     /// Move pane `from` to insertion index `to` within the active tab (in-window reorder),
     /// carrying its split size with it so the layout stays stable. Focus follows the moved
     /// pane. No-op when the move is a no-op or the indices are out of range.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn reorder_pane(&mut self, from: usize, to: usize) {
         self.reorder_pane_in(self.active, from, to);
     }
@@ -2382,6 +2445,7 @@ impl State {
     /// The general form of [`Self::reorder_pane`]: reorder within tab `ti`, which need not be
     /// the active one. The left panel's tree shows every tab at once, so a row can be dragged
     /// into a new position inside a group the window is not currently showing.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn reorder_pane_in(&mut self, ti: usize, from: usize, to: usize) {
         if ti >= self.tabs.len() {
             return;
@@ -2421,6 +2485,7 @@ impl State {
     ///
     /// The active tab travels with the shuffle, so pinning never changes which tab you are
     /// looking at.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pin_system_tab_first(&mut self) {
         let Some(idx) = self.tabs.iter().position(|t| t.system) else {
             return;
@@ -2451,6 +2516,7 @@ impl State {
     /// Returns where the tab actually LANDED, which is not always `to`: a refused or clamped
     /// move ends somewhere else, and the live tab-drag tracks the dragged tab by index. Take
     /// the answer from here rather than assuming, or the rest of the drag moves the wrong tab.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn reorder_tab(&mut self, from: usize, to: usize) -> usize {
         let n = self.tabs.len();
         if from >= n || to > n {
@@ -2490,6 +2556,7 @@ impl State {
 
     /// Every live session uid this window hosts (used to kill them when the window
     /// closes — in Wave 1 each session is referenced by exactly one window).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn session_uids(&self) -> Vec<String> {
         self.tabs
             .iter()
@@ -2517,6 +2584,7 @@ impl State {
     ///
     /// A plain shell keeps closing: there `exit` *is* "close this terminal", and respawning
     /// a shell the user just quit would make the pane impossible to get rid of.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn pane_exited(&mut self, uid: &str, mgr: &SessionManager, code: i32) -> PaneExit {
         tracing::info!(uid, code, "pane exited");
         match self.find_pane(uid) {
@@ -2570,6 +2638,7 @@ impl State {
     /// never from a sniff. A sniff says what the pane happened to be running a moment ago;
     /// falling back to a shell is a decision about what the pane *is for*, and a shell pane
     /// that ran `claude` once must not start refusing to close.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn exited_program(&self, ti: usize, pi: usize) -> Option<String> {
         let p = self.tabs.get(ti)?.panes.get(pi)?;
         if !p.kind.is_pty() {
@@ -2598,6 +2667,7 @@ impl State {
     /// happens to name a different tool must not overwrite it. A title that names no tool
     /// leaves the previous sniff alone — `claude` prints plenty of transient titles, and
     /// the honest downgrade signal is the shell returning to a prompt, not a quiet frame.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn note_pane_title(&mut self, uid: &str, title: &str) {
         let Some((ti, pi)) = self.find_pane(uid) else {
             return;
@@ -2634,6 +2704,7 @@ impl State {
     /// Like every other sniff this may only upgrade a pane whose recorded [`PaneKind`] is
     /// `Terminal`, and it never touches `spawn_command` / `spawn_args` / the persisted
     /// kind — what the pane *relaunches* is not inferred.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn note_pane_foreground(&mut self, uid: &str, name: Option<&str>) {
         let Some(name) = name else {
             return; // no answer — not "nothing is running"
@@ -2657,6 +2728,7 @@ impl State {
     }
 
     /// Record the program's own liveness report (`OSC 9;hp;state=…`).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn note_agent_state(&mut self, uid: &str, state: AgentLiveness) {
         if self.agent_live.get(uid) != Some(&state) {
             self.agent_live.insert(uid.to_string(), state);
@@ -2669,6 +2741,7 @@ impl State {
     /// and the liveness badge both go, so a pane that ran `claude` once does not wear its
     /// mark forever. A pane spawned as a tool is untouched (nothing was ever sniffed for
     /// it), which is exactly right: it relaunches as that tool.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn note_agent_idle(&mut self, uid: &str) {
         if self.agent_live.remove(uid).is_some() | self.sniffed_tool.remove(uid).is_some() {
             self.dirty = true;
@@ -2698,6 +2771,7 @@ impl State {
     /// user into somebody else's conversation.
     ///
     /// Returns whether the mark was taken, so a caller can stop looking.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn adopt_tool_session(&mut self, uid: &str, mark: ToolSessionMark) -> bool {
         let Some((ti, pi)) = self.find_pane(uid) else {
             return false;
@@ -2723,6 +2797,7 @@ impl State {
     /// reason to stop looking: a hook marker names its own directory, so it can be read the
     /// moment the tool starts. Only the scan-and-diff fallback needs a directory to scope
     /// by, and it would rather wait for a real one than search every project on the disk.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn tool_session_wanted(&self, uid: &str) -> Option<(String, Option<String>)> {
         let p = self
             .tabs
@@ -2739,6 +2814,7 @@ impl State {
     /// Drop every runtime-only fact keyed by `uid`. Called wherever a pane leaves this
     /// window (closed, detached, restarted under a new uid) so the maps cannot grow
     /// without bound. Everything here is re-learned from the next title or state marker.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn forget_pane_runtime(&mut self, uid: &str) {
         self.sniffed_tool.remove(uid);
         self.agent_live.remove(uid);
@@ -2752,6 +2828,7 @@ impl State {
     /// The identity a pane is **drawn** with: its own `kind` when it has one, else
     /// whatever the title sniff caught it running. `PaneState.kind` — the thing
     /// persistence writes and a relaunch replays — is never written from a sniff.
+    #[tracing::instrument(level = "debug", ret, skip(self, ps))]
     pub fn effective_kind(&self, ps: &PaneState) -> PaneKind {
         if !matches!(ps.kind, PaneKind::Terminal) {
             return ps.kind.clone();
@@ -2764,6 +2841,7 @@ impl State {
 
     /// The liveness badge code for the UI: 0 none, 1 busy, 2 awaiting input, 3 done,
     /// 4 error. An opaque int like every other code crossing the Slint seam.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn liveness_ui(&self, uid: &str) -> i32 {
         match self.agent_live.get(uid) {
             None => 0,
@@ -2777,10 +2855,12 @@ impl State {
     /// Whether this window hosts session `uid` anywhere — laid out in a tab OR parked as a
     /// reminder. Used by the app's event routing so a parked pane's events still reach the
     /// window that owns it (e.g. its shell exiting drops the reminder).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn hosts_session(&mut self, uid: &str) -> bool {
         self.find_pane(uid).is_some() || self.reminders.iter().any(|r| r.pane.uid == uid)
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn focus_pane(&mut self, idx: usize) {
         // Clicking into a pane cancels any in-progress tab rename.
         if self.editing_tab != -1 {
@@ -2808,6 +2888,7 @@ impl State {
     /// Refuses anything that is not a file browser. A viewer's rows are inert, so the
     /// only way to reach this with the wrong kind is a stale click racing a retarget —
     /// and the honest answer to that is to do nothing.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn view_navigate(&mut self, idx: usize, target: String) {
         let t = self.active_tab_mut();
         let Some(p) = t.panes.get_mut(idx) else {
@@ -2821,6 +2902,7 @@ impl State {
     }
 
     /// Move focus in `dir`. When soloed (zoom, fullscreen, or single), cycle the pane order.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn focus_dir(&mut self, dir: Direction) {
         let fullscreen = self.fullscreen;
         let t = self.active_tab_mut();
@@ -2851,6 +2933,7 @@ impl State {
 
     // ---- layout / zoom ----
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_layout(&mut self, layout: Layout) {
         let t = self.active_tab_mut();
         if t.layout != layout {
@@ -2860,6 +2943,7 @@ impl State {
     }
 
     /// Toggle zoom (maximise-in-tab) of the focused pane.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn toggle_zoom(&mut self) {
         let t = self.active_tab_mut();
         if t.panes.is_empty() {
@@ -2873,6 +2957,7 @@ impl State {
     /// Drag a divider: move the boundary by `delta` (a fraction of the area).
     /// Resizing an `auto` tab promotes it to the concrete preset it was showing,
     /// so the dragged sizes stick (mirrors the React Divider, Q7).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn resize_divider(&mut self, kind: DividerKind, index: i32, delta: f64) {
         let n = self.active_tab().panes.len();
         let eff = self.active_tab().effective();
@@ -2904,12 +2989,14 @@ impl State {
 
     /// Whether the active tab tiles as rows (so a stitch edge band runs along the
     /// vertical axis → top/bottom rather than left/right). Used by the drag hit-test.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn active_is_rows(&self) -> bool {
         self.active_tab().effective() == Layout::Rows
     }
 
     /// The current active tab's draggable dividers (empty when zoomed or fullscreen — both
     /// solo a single pane, so there are no seams to drag).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn dividers(&self) -> Vec<hyperpanes_core::layout::presets::DividerDesc> {
         let t = self.active_tab();
         if t.zoomed.is_some() || self.fullscreen {
@@ -2920,6 +3007,7 @@ impl State {
 
     // ---- tabs ----
 
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn new_tab(&mut self, mgr: &SessionManager) {
         self.new_tab_with(mgr, None, false, NewPaneOpts::default());
     }
@@ -2932,6 +3020,7 @@ impl State {
     /// This is the one place a tab is born, so the control plane's `newTab` (which carries a
     /// title and a cwd) and [`Self::ensure_hyperpane_tab`] (which carries a command) don't
     /// each have to re-do the push/activate/seed dance — and can't get it subtly different.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn new_tab_with(
         &mut self,
         mgr: &SessionManager,
@@ -2967,6 +3056,7 @@ impl State {
     /// and the user can start one by hand.
     ///
     /// [`hyperpane_dir`]: hyperpanes_core::persistence::paths::hyperpane_dir
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn ensure_hyperpane_tab(&mut self, mgr: &SessionManager) -> bool {
         if self.tabs.iter().any(|t| t.system) {
             return false;
@@ -2997,6 +3087,7 @@ impl State {
     /// until [`Self::HYPERPANE_RETRY`] has passed the call returns `None` immediately, so
     /// the app's per-tick retry (which keeps `hyperpane_done` unlatched on failure) is
     /// bounded rather than every 8 ms.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn materialize_hyperpane_dir(&mut self) -> Option<std::path::PathBuf> {
         let now = std::time::Instant::now();
         if self.hyperpane_retry_at.is_some_and(|at| now < at) {
@@ -3033,6 +3124,7 @@ impl State {
     /// The directory is re-materialized each time (the same call the creation uses); if
     /// that fails the shell starts wherever the default cwd lands, because an empty tab is
     /// the one outcome this exists to prevent. Returns whether a pane was added.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn reseed_system_tab(&mut self, mgr: &SessionManager) -> bool {
         let Some(ti) = self
             .tabs
@@ -3066,6 +3158,7 @@ impl State {
     /// The pane the Hyperpane tab runs: the user's coding CLI (`agent`) or a plain shell,
     /// either way in `dir` with the environment the control-API skills need. Shared by
     /// creation ([`Self::ensure_hyperpane_tab`]) and refill ([`Self::reseed_system_tab`]).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn hyperpane_pane_opts(&self, dir: &std::path::Path, agent: bool) -> NewPaneOpts {
         use hyperpanes_core::tools::{detect, registry};
         let picked = self
@@ -3142,6 +3235,7 @@ impl State {
     /// keybinding, the context menu, "close others"/"close to the right", and the control API
     /// alike. The return is `true` ("something remains"), because refusing to close is not a
     /// reason to quit the window.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn close_tab(&mut self, idx: usize, mgr: &SessionManager) -> bool {
         if idx >= self.tabs.len() {
             return true;
@@ -3171,6 +3265,7 @@ impl State {
         true
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn switch_tab(&mut self, idx: usize) {
         if idx < self.tabs.len() && idx != self.active {
             self.active = idx;
@@ -3181,6 +3276,7 @@ impl State {
 
     /// Move the active tab by `delta` (±1), wrapping around — the Ctrl+Tab / Ctrl+Shift+Tab
     /// keybindings. No-op with a single tab.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn cycle_tab(&mut self, delta: i32) {
         let n = self.tabs.len();
         if n < 2 {
@@ -3194,6 +3290,7 @@ impl State {
     /// Ctrl+- font-zoom keybindings (and Ctrl+wheel). Zoom is per-pane (Electron parity): only
     /// the focused pane re-grids; its neighbours keep their own size. The pump reloads the
     /// pane's font at the current DPI scale (via `font_dirty`) and re-flows it.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn font_zoom(&mut self, delta: i32) {
         let f = self.active_tab().focused;
         if let Some(p) = self.active_tab_mut().panes.get_mut(f) {
@@ -3208,6 +3305,7 @@ impl State {
 
     /// Reset the FOCUSED pane's terminal font size to the configured base — the Ctrl+0
     /// keybinding. Only the focused pane is affected (per-pane zoom).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn font_reset(&mut self) {
         let base = self.settings.font_px;
         let f = self.active_tab().focused;
@@ -3223,6 +3321,7 @@ impl State {
     /// Flash the focused pane's current zoom as a `%` indicator in its bottom-right — the same
     /// transient "toast" the widget uses for copy/paste confirmations. Percentage is relative
     /// to the default font size, matching the Electron zoom badge.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn show_zoom_toast(&mut self) {
         let f = self.active_tab().focused;
         if let Some(p) = self.active_tab_mut().panes.get_mut(f) {
@@ -3232,6 +3331,7 @@ impl State {
         self.dirty = true;
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn begin_rename(&mut self, idx: i32) {
         if idx >= 0 && (idx as usize) < self.tabs.len() {
             self.editing_tab = idx;
@@ -3239,6 +3339,7 @@ impl State {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn rename_tab(&mut self, idx: i32, title: &str) {
         if idx >= 0 && (idx as usize) < self.tabs.len() {
             let title = title.trim();
@@ -3252,6 +3353,7 @@ impl State {
 
     /// Begin editing pane `idx`'s label inline (double-click on its header). Cancels any
     /// in-progress tab rename first.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn begin_rename_pane(&mut self, idx: i32) {
         self.editing_tab = -1;
         if idx >= 0 && (idx as usize) < self.active_tab().panes.len() {
@@ -3261,6 +3363,7 @@ impl State {
     }
 
     /// Commit a pane label rename (blank keeps the prior label, mirroring the renderer).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn rename_pane(&mut self, idx: i32, title: &str) {
         if idx >= 0 && (idx as usize) < self.active_tab().panes.len() {
             let title = title.trim();
@@ -3287,6 +3390,7 @@ impl State {
     /// list. The kernel sniff runs on a timer over every pane, so it asks this first and
     /// only pays for the rest on a real `cd` — which is also what keeps a pane's label from
     /// being re-derived on every tick.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_pane_cwd(&mut self, uid: &str, cwd: &str) -> bool {
         let Some((ti, pi)) = self.find_pane(uid) else {
             return false;
@@ -3303,6 +3407,7 @@ impl State {
         true
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn note_pane_cwd(&mut self, uid: &str, cwd: &str) -> Option<AiProjectRef> {
         let root = sidebar::git_root_of(cwd)?;
         let project = projects::upsert_project_by_root(&root.to_string_lossy());
@@ -3332,6 +3437,7 @@ impl State {
 
     /// Apply an ambient-AI subtitle produced by the engine to the pane with session `uid`
     /// (the typewriter reveal restarts when the text changes). No-op for an unknown uid.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_ai_subtitle(&mut self, uid: &str, text: &str) {
         if let Some((ti, pi)) = self.find_pane(uid) {
             self.tabs[ti].panes[pi].ai.set_target(text);
@@ -3341,6 +3447,7 @@ impl State {
     /// The ambient-AI watch list for this window: one entry per pane across all tabs, keyed
     /// by its session uid (used as the stable pane id), carrying the current label + Mute
     /// flag so the engine can summarise unmuted panes and clear muted ones.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn ai_pane_publish(&self) -> Vec<hyperpanes_core::ai::service::AiPanePublish> {
         let mut out = Vec::new();
         for tab in &self.tabs {
@@ -3358,6 +3465,7 @@ impl State {
 
     /// A cheap signature of the AI watch list (uid + label + mute), so the controller only
     /// re-publishes the pane context when something the engine cares about changed.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn ai_context_sig(&self) -> u64 {
         let mut h: u64 = 0xcbf29ce484222325;
         let mut mix = |bytes: &[u8]| {
@@ -3378,6 +3486,7 @@ impl State {
         h
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_fullscreen(&mut self, on: bool) {
         if self.fullscreen != on {
             self.fullscreen = on;
@@ -3388,12 +3497,14 @@ impl State {
     // ---- Wave-2: overlay panels (Seam #3) ----
 
     /// Whether any overlay panel is currently mounted.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn overlay_open(&self) -> bool {
         self.overlay != Overlay::None
     }
 
     /// Close whatever overlay is open. Preferences routes through the appearance
     /// save/discard guard (Esc / scrim click); every other overlay closes immediately.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn close_overlay(&mut self) {
         if self.overlay == Overlay::Prefs {
             self.prefs_request_close();
@@ -3403,6 +3514,7 @@ impl State {
     }
 
     /// Actually tear down the overlay (clears any appearance draft + confirm prompt).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn close_overlay_now(&mut self) {
         if self.overlay != Overlay::None {
             // The New-goal box held keyboard focus in its own scope — hand it back to the
@@ -3430,6 +3542,7 @@ impl State {
     // ---- New Pane dialog ----
 
     /// Open the "New pane" options dialog (Shift+＋ / the menus' "New pane…").
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_new_pane(&mut self) {
         self.overlay = Overlay::NewPane;
         self.dirty = true;
@@ -3442,6 +3555,7 @@ impl State {
     /// the longest path prefix of the focused pane's live cwd. `0` (recency-top) when the focused
     /// pane has no cwd yet or sits outside every remembered project. Used to seed the New-goal
     /// box so a goal defaults to the project the user is actually in, not whatever's most-recent.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn default_goal_project_sel(&self) -> usize {
         let cwd = self
             .active_tab()
@@ -3452,6 +3566,7 @@ impl State {
             .unwrap_or(0)
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_new_goal(&mut self) {
         self.projects = sidebar::list();
         self.goal_draft_images.clear();
@@ -3501,6 +3616,7 @@ impl State {
     /// same place a path clicked in a terminal lands. Only paths that EXIST resolve; anything
     /// else falls through to `open_link` and gets its refusal, which is what keeps a
     /// `javascript:` or `file:///etc/…` href in a downloaded document inert.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn view_link_command(&self, idx: usize, href: &str) -> crate::command::Command {
         use crate::command::Command;
         let open = Command::OpenLink(href.to_string());
@@ -3523,6 +3639,7 @@ impl State {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_link(&mut self, url: &str) -> Result<(), String> {
         if !hyperpanes_core::open::is_openable_url(url) {
             return Err(format!(
@@ -3548,6 +3665,7 @@ impl State {
     /// Answer the [`Overlay::AskBrowser`] chooser: open the held URL in row `idx`, then
     /// close. An out-of-range row closes without opening — the card comes down either way,
     /// so a stale click can never strand it on screen.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pick_browser(&mut self, idx: usize) -> Result<(), String> {
         let url = std::mem::take(&mut self.ask_url);
         let launcher = self.ask_browsers.get(idx).map(|b| b.launcher.clone());
@@ -3560,6 +3678,7 @@ impl State {
 
     /// Hand keyboard focus back to the active pane's terminal `FocusScope` (bumps its
     /// `refocus_seq`). Called when the New-goal box closes so the shell regains the keyboard.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn refocus_active_pane_scope(&mut self) {
         let f = self.active_tab().focused;
         let seq = self.next_refocus();
@@ -3569,6 +3688,7 @@ impl State {
     }
 
     /// The next value for a `refocus_seq`, from the app-wide [`Self::refocus_clock`].
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn next_refocus(&mut self) -> i32 {
         self.refocus_clock = self.refocus_clock.wrapping_add(1);
         self.refocus_clock
@@ -3585,6 +3705,7 @@ impl State {
     /// One guarded check per tick, for the same reason `sync_left_root` is one: the list
     /// of ways focus moves goes stale, a compare against the last-handed-to pane does not.
     /// The quiet tick costs a string compare.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn sync_pane_keyboard_focus(&mut self) {
         // Something else legitimately owns the keyboard: an overlay's own scope, a tab
         // title editor, a pane label editor. Each focuses its own field, and a double
@@ -3634,6 +3755,7 @@ impl State {
     /// Keyed by uid rather than row index because the report is queued by the window and
     /// applied on the next pump (see `Window::focus_acks`): by then the row order may have
     /// moved under it, and a stale index would confirm the hand-off against the wrong pane.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn note_pane_focus(&mut self, uid: &str, on: bool) {
         if on {
             self.kbd_focus_live = Some(uid.to_string());
@@ -3648,6 +3770,7 @@ impl State {
 
     /// New-goal box: set the goal text (the key router's controller-owned mirror). Typing
     /// pulls focus back to the text field and closes any open option list.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_set_text(&mut self, text: String) {
         // The TextInput is the source of truth for editing; this just mirrors it (for submit +
         // history). Editing only happens on the text field, so leave field/options state alone.
@@ -3657,6 +3780,7 @@ impl State {
 
     /// New-goal box: reveal (or, if already open, hide) the option chips — the Ctrl+O affordance.
     /// Opening focuses the first chip and shows its dropdown; closing returns to the text field.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_toggle_options(&mut self) {
         if self.goal_options_open {
             self.goal_collapse();
@@ -3672,6 +3796,7 @@ impl State {
     /// tick so the `gi` TextInput regains the keyboard — without it, collapsing back from a chip
     /// (e.g. Enter to confirm a model tier) leaves the text field visually active but unfocused,
     /// so typing is dropped.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_collapse(&mut self) {
         self.goal_options_open = false;
         self.goal_field = 0;
@@ -3682,6 +3807,7 @@ impl State {
 
     /// New-goal box: Tab / Shift+Tab. From the text field it reveals the options (like Ctrl+O);
     /// with the options open it cycles focus among the chips, each auto-showing its dropdown.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_nav(&mut self, delta: i32) {
         if !self.goal_options_open {
             self.goal_toggle_options();
@@ -3697,6 +3823,7 @@ impl State {
     /// The option rows for the focused field: goal text → history (title = past goal,
     /// subtitle = its project name), project → the project list, model tiers → the model
     /// labels. Empty when there's nothing to offer (no history yet / no projects).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_menu_rows(&self) -> Vec<(String, String)> {
         match self.goal_field {
             0 => self
@@ -3725,6 +3852,7 @@ impl State {
 
     /// New-goal box: open (↓) / close (Esc) the focused field's option list. Opening seeds the
     /// selection on the field's current value; a field with no options stays closed.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_menu_toggle(&mut self, open: bool) {
         if !open {
             self.goal_menu_open = false;
@@ -3747,6 +3875,7 @@ impl State {
     /// New-goal box: move the open option list's selection by `delta`, clamped. For a chip field
     /// the new selection is applied LIVE (project / model tier); the history list (text field)
     /// applies only on pick (Enter).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_menu_nav(&mut self, delta: i32) {
         if !self.goal_menu_open {
             return;
@@ -3764,6 +3893,7 @@ impl State {
     }
 
     /// Apply the current option-list selection to the focused CHIP field (project / model tier).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn apply_goal_menu_sel(&mut self) {
         let sel = self.goal_menu_sel;
         match self.goal_field {
@@ -3778,6 +3908,7 @@ impl State {
     /// New-goal box: apply the option list's selected row. A chip selection applies and leaves the
     /// options open (the dropdown stays visible); a history row (text field) fills the goal text,
     /// re-selects that goal's project, and closes the history list.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_menu_pick(&mut self) {
         if !self.goal_menu_open {
             return;
@@ -3802,6 +3933,7 @@ impl State {
 
     /// New-goal box (mouse): focus a field. Clicking the text field (`i == 0`) returns to it;
     /// clicking a chip reveals the options, focuses it, and shows its dropdown.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_field_click(&mut self, i: usize) {
         if i == 0 {
             self.goal_field = 0;
@@ -3815,6 +3947,7 @@ impl State {
     }
 
     /// New-goal box (mouse): apply option row `i` of the open list.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_menu_click(&mut self, i: usize) {
         if !self.goal_menu_open {
             return;
@@ -3825,6 +3958,7 @@ impl State {
 
     /// The four chip labels under the goal box (project + the three model tiers), reflecting
     /// the current selections.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_chip_labels(&self) -> Vec<String> {
         let proj = self
             .projects
@@ -3850,6 +3984,7 @@ impl State {
     /// the goal in the ↓-history, and hand it to the project's orchestrator via
     /// [`State::submit_new_goal`] (which closes the overlay). No-op while the option list is
     /// open, on empty text, or with no projects.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn goal_submit(&mut self, mgr: &SessionManager) {
         let text = self.goal_text.trim().to_string();
         if text.is_empty() {
@@ -3890,6 +4025,7 @@ impl State {
 
     /// New-goal box Ctrl+V: an image on the clipboard becomes an attachment; otherwise
     /// clipboard text is appended to the goal text.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_paste_clipboard(&mut self) {
         if self.goal_paste_image() {
             return;
@@ -3912,6 +4048,7 @@ impl State {
     /// The active frame palette's 8 swatches (the New Pane dialog's color row). The default
     /// swatch index the dialog seeds is the next palette-rotation slot (mirrors the
     /// renderer's `nextColor(seq)`), computed in the resync from `panes.len()`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn frame_swatches(&self) -> Vec<Color> {
         theme::frame_palette(self.settings.frame_palette)
             .iter()
@@ -3923,6 +4060,7 @@ impl State {
 
     /// Open the palette: snapshot the command registry from current state, reset the
     /// query + selection. Rebuilt every open so pane/layout entries stay fresh.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_palette(&mut self) {
         self.palette_entries = palette::build(self);
         self.palette_query.clear();
@@ -3933,6 +4071,7 @@ impl State {
     }
 
     /// Update the palette query → refilter + re-rank, keeping the selection in range.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn palette_set_query(&mut self, query: &str) {
         self.palette_query = query.to_string();
         self.palette_view = palette::filter(&self.palette_entries, query);
@@ -3941,6 +4080,7 @@ impl State {
     }
 
     /// Move the palette selection by `delta` rows, clamped to the visible results.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn palette_nav(&mut self, delta: i32) {
         let n = self.palette_view.len();
         if n == 0 {
@@ -3955,6 +4095,7 @@ impl State {
     }
 
     /// Set the palette selection to a specific visible row (e.g. a mouse click).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn palette_select(&mut self, idx: usize) {
         if idx < self.palette_view.len() && idx != self.palette_sel {
             self.palette_sel = idx;
@@ -3963,12 +4104,14 @@ impl State {
     }
 
     /// The command for the currently-highlighted palette row (consumed on activate).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn palette_command(&self) -> Option<Command> {
         let entry = self.palette_view.get(self.palette_sel)?;
         self.palette_entries.get(*entry).map(|e| e.command.clone())
     }
 
     /// The visible palette rows as `(title, subtitle)` pairs, in display order.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn palette_rows(&self) -> Vec<(SharedString, SharedString)> {
         self.palette_view
             .iter()
@@ -3979,6 +4122,7 @@ impl State {
 
     // ---- preferences ----
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_prefs(&mut self) {
         self.overlay = Overlay::Prefs;
         // Snapshot the appearance settings into a draft so edits preview without touching
@@ -3991,6 +4135,7 @@ impl State {
 
     /// Font picker: select option `idx` from `prefs::FONT_OPTIONS`, or enter "Custom…" mode
     /// when `idx` is the trailing Custom entry (== `FONT_OPTIONS.len()`). Edits the draft.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn font_select(&mut self, idx: usize) {
         let Some(d) = self.prefs_draft.as_mut() else {
             return;
@@ -4009,6 +4154,7 @@ impl State {
     }
 
     /// Font picker: set the custom font path typed in the "Custom…" field (edits the draft).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn font_custom_value(&mut self, value: String) {
         if let Some(d) = self.prefs_draft.as_mut() {
             d.font_family = value;
@@ -4020,6 +4166,7 @@ impl State {
     /// The appearance values the dialog should display: the draft while Preferences is open,
     /// else the committed settings. Returns `(resolved_font_path, frame_palette, terminal_theme,
     /// ui_palette, font_px, show_frame, show_dot)`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn appearance_view(&self) -> (String, usize, usize, usize, f32, bool, bool) {
         match &self.prefs_draft {
             Some(d) => (
@@ -4045,6 +4192,7 @@ impl State {
 
     /// Edit the appearance **draft** (no live change). Used for the appearance settings while
     /// the dialog is open; a no-op if there's no draft or `s` isn't an appearance setting.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn draft_setting(&mut self, s: Setting) {
         let Some(d) = self.prefs_draft.as_mut() else {
             return;
@@ -4076,6 +4224,7 @@ impl State {
     }
 
     /// Whether the appearance draft differs from the committed settings (un-applied edits).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn prefs_dirty(&self) -> bool {
         match &self.prefs_draft {
             Some(d) => *d != PrefsDraft::from_settings(&self.settings),
@@ -4085,6 +4234,7 @@ impl State {
 
     /// Commit the appearance draft to the live settings (Done / Save): apply each changed
     /// field via [`Self::apply_setting`] so font reload + palette remap happen, then close.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn prefs_done(&mut self) {
         if let Some(d) = self.prefs_draft.take() {
             if d.font_family != self.settings.font_family {
@@ -4117,6 +4267,7 @@ impl State {
 
     /// Esc / scrim click while Preferences is open: prompt to save/discard if there are
     /// un-applied appearance edits, otherwise just close (discarding the empty draft).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn prefs_request_close(&mut self) {
         if self.prefs_dirty() {
             self.prefs_confirm = true;
@@ -4127,6 +4278,7 @@ impl State {
     }
 
     /// Resolve the save/discard prompt: 0 = keep editing · 1 = discard · 2 = save.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn prefs_confirm_resolve(&mut self, action: i32) {
         match action {
             0 => {
@@ -4141,6 +4293,7 @@ impl State {
 
     /// Apply a single preferences edit: mutate the settings, persist the blob, and flag
     /// a resync (font edits additionally request a font reload on the next pump).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn apply_setting(&mut self, s: Setting) {
         match s {
             Setting::FontFamily(path) => {
@@ -4236,6 +4389,7 @@ impl State {
     /// `GET /settings`. Serializing [`Settings`] rather than re-listing its fields means the
     /// published shape follows the struct: a field added there shows up here — and in the key
     /// validation `PATCH /settings` runs against this same blob — with no second edit.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn settings_json(&self) -> serde_json::Value {
         serde_json::to_value(&self.settings).unwrap_or_else(|_| serde_json::json!({}))
     }
@@ -4253,6 +4407,7 @@ impl State {
     /// Returns the keys actually applied, or `Err` if the patch is not an object, names a key
     /// [`Settings`] does not have, or gives one a value of the wrong type — all-or-nothing, so
     /// a typo in one key cannot leave the other half applied.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn patch_settings(&mut self, patch: &serde_json::Value) -> Result<Vec<String>, String> {
         let keys = self.apply_settings_patch(patch)?;
         prefs::save(&self.settings);
@@ -4263,6 +4418,7 @@ impl State {
     /// [`Self::patch_settings`] minus the write to disk: validation, the merge, and every
     /// live effect. Split out so it can be exercised without touching the user's real
     /// `native-settings.json` (there is no data-dir override for tests).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn apply_settings_patch(&mut self, patch: &serde_json::Value) -> Result<Vec<String>, String> {
         let obj = patch
             .as_object()
@@ -4354,6 +4510,7 @@ impl State {
 
     /// Begin capturing a new chord for binding `id`: the editor row grabs focus and shows
     /// "Press a chord…"; the next captured combo rebinds it (or Esc cancels).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn begin_rebind(&mut self, id: &str) {
         self.capturing_binding = Some(id.to_string());
         self.capture_conflict = None;
@@ -4361,6 +4518,7 @@ impl State {
     }
 
     /// Cancel an in-progress chord capture (Esc, or clicking elsewhere).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn cancel_rebind(&mut self) {
         self.capture_conflict = None;
         if self.capturing_binding.take().is_some() {
@@ -4372,6 +4530,7 @@ impl State {
     /// waiting for a real key), and any other combo becomes the binding's override (persisted)
     /// and ends the capture. If the combo is already held by another binding it is **stolen** —
     /// that binding becomes unbound (its row then shows "Unbound"). No-op when not capturing.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn capture_chord(&mut self, ctrl: bool, alt: bool, shift: bool, text: &str) {
         let Some(id) = self.capturing_binding.clone() else {
             return;
@@ -4402,6 +4561,7 @@ impl State {
 
     /// Unbind binding `id` (clear its chord — nothing fires it) and end any capture on it. The
     /// row then shows "Unbound" until rebound or reset to default.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn unbind_binding(&mut self, id: &str) {
         self.keymap.unbind(id);
         if self.capturing_binding.as_deref() == Some(id) {
@@ -4412,6 +4572,7 @@ impl State {
     }
 
     /// Reset binding `id` to its default chord (drop the override/unbind).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn reset_binding(&mut self, id: &str) {
         self.keymap.reset(id);
         if self.capturing_binding.as_deref() == Some(id) {
@@ -4422,6 +4583,7 @@ impl State {
     }
 
     /// Reset every binding to its default (clear all overrides).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn reset_all_bindings(&mut self) {
         self.keymap.reset_all();
         self.capturing_binding = None;
@@ -4433,6 +4595,7 @@ impl State {
     /// current settings at DPI `scale`, forcing every pane to re-grid at the new cell metrics
     /// (resets each pane's `applied`). Called by the pump (which owns the scale) on a DPI
     /// change or when `font_reload` is set (a font-family / base-size pref change).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn reload_font(&mut self, scale: f32) {
         let path = self.settings.font_path();
         self.font = theme::load_font_at(&path, self.settings.font_px, scale);
@@ -4452,6 +4615,7 @@ impl State {
     /// Hover hit-test for a clickable path under the cursor (logical px within the pane
     /// surface). Updates the pane's link-overlay state. No-op (and clears any link) when
     /// clickable paths are disabled. `idx` is an active-tab pane.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_link_moved(&mut self, idx: usize, x: f32, y: f32) {
         let on = self.settings.clickable_paths;
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
@@ -4476,6 +4640,7 @@ impl State {
     }
 
     /// Clear a pane's hover link when the pointer leaves its surface.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_link_exited(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             if p.link.take().is_some() {
@@ -4490,6 +4655,7 @@ impl State {
     /// clickable paths are off, or when a plain click missed a path that exists (a ctrl-click
     /// is ungated: the token a human most wants off their screen is often one that does not
     /// exist yet). `idx` is an active-tab pane.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_link_activate(
         &mut self,
         idx: usize,
@@ -4516,6 +4682,7 @@ impl State {
     /// repository containing the focused pane's live cwd, that cwd if it is in no repo, and
     /// only then the home directory. A tree rooted at `/` is technically the whole disk and
     /// practically useless.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn default_files_root(&self) -> PathBuf {
         if let Some(cwd) = self.focused_cwd() {
             if let Some(root) = crate::sidebar::git_root_of(&cwd) {
@@ -4532,6 +4699,7 @@ impl State {
 
     /// The focused pane's live cwd, or `None` when it has none yet (a pane whose shell has
     /// not reported one — the panel must not root itself on an empty string).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn focused_cwd(&self) -> Option<String> {
         self.active_tab()
             .panes
@@ -4541,6 +4709,7 @@ impl State {
     }
 
     /// The explorer's root, deriving and remembering one on first use.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn files_root(&mut self) -> PathBuf {
         if self.files_root.is_none() {
             self.files_root = Some(self.default_files_root());
@@ -4565,6 +4734,7 @@ impl State {
     /// `git`: it is spawned when the git view is the one on screen, and otherwise left for
     /// [`Command::GitRefresh`](crate::command::Command::GitRefresh), which fires on every
     /// entry into the mode anyway.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn sync_left_root(&mut self, mode: i32) {
         // A commit on screen pins the panel to the repository that commit came from. The
         // anchor otherwise drags the root back to the focused pane the moment the panel is
@@ -4595,6 +4765,7 @@ impl State {
     /// Re-read the tree (or re-run the query) from disk and re-project the rows. Every
     /// method below ends here, and nothing else does — one place reads the filesystem, so
     /// "what the panel shows" and "what is on disk" can only differ for one event.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn rebuild_files(&mut self) {
         let root = self.files_root();
         self.files_rows = if self.files_query.trim().is_empty() {
@@ -4607,6 +4778,7 @@ impl State {
 
     /// Re-root the explorer. Collapsing everything is deliberate: expansions are paths under
     /// the old root and would either vanish or, worse, half-apply.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn files_set_root(&mut self, dir: PathBuf) {
         self.files_root = Some(dir);
         self.files_expanded.clear();
@@ -4616,6 +4788,7 @@ impl State {
 
     /// Root the explorer one directory higher — the tree's only navigation that leaves the
     /// project, and the way out when the derived root guessed too narrowly.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn files_go_up(&mut self) {
         let root = self.files_root();
         if let Some(parent) = root.parent().map(|p| p.to_path_buf()) {
@@ -4630,6 +4803,7 @@ impl State {
     }
 
     /// Open or shut a directory row.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn files_toggle(&mut self, path: &Path) {
         if self.files_expanded.contains(path) {
             self.files_expanded.remove(path);
@@ -4643,6 +4817,7 @@ impl State {
     /// all a click does to a file on purpose — the panel is where the human *chooses* how to
     /// act on the path (double-click to preview, or the row menu for everything else), which
     /// is the whole point of routing a clicked filename here instead of into the OS handler.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn files_click(&mut self, path: &Path) {
         if path.is_dir() {
             self.files_toggle(path);
@@ -4659,6 +4834,7 @@ impl State {
     }
 
     /// Set the finder query. Empty restores the tree.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn files_set_query(&mut self, q: String) {
         if self.files_query == q {
             return;
@@ -4673,6 +4849,7 @@ impl State {
     ///
     /// `line`/`col` come from a `file:line:col` hit in a pane's output and are held for
     /// whichever tool opens the file next — clicking a stack frame should land on the frame.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn reveal_in_files(&mut self, path: &Path, line: Option<u32>, col: Option<u32>) {
         let root = self.files_root();
         if !path.starts_with(&root) {
@@ -4719,6 +4896,7 @@ impl State {
     /// Called after a reveal has rebuilt the rows, so it measures the list the panel is
     /// about to draw. A selection that is not in the rows — a file under a directory the
     /// flatten truncated — leaves the viewport alone rather than guessing at an offset.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn scroll_files_to_selection(&mut self) {
         let Some(sel) = self.files_sel.clone() else {
             return;
@@ -4732,6 +4910,7 @@ impl State {
 
     /// Open the row menu for `path`, anchored at window-logical `(x, y)`. Selecting the row
     /// first is what makes the menu's own "Open in…" rows agree with what is highlighted.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_file_context(&mut self, path: &Path, x: f32, y: f32) {
         if !path.is_dir() && self.files_sel.as_deref() != Some(path) {
             self.files_click(path);
@@ -4752,6 +4931,7 @@ impl State {
     // had walked away from the machine.
 
     /// Re-run `git status` for the current root and store the projection.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn rebuild_git(&mut self) {
         let root = self.files_root();
         self.git = crate::gitpanel::status_for(&root.to_string_lossy()).unwrap_or_default();
@@ -4769,6 +4949,7 @@ impl State {
 
     /// A single click on a git row: select it. Selecting is all a click does, exactly as in
     /// the explorer — the row's verbs live on the double-click (open) and the row menu.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn git_click(&mut self, path: &str) {
         self.git_sel = Some(path.to_string());
         self.dirty = true;
@@ -4777,6 +4958,7 @@ impl State {
     /// The absolute path of a repo-relative git row, or `None` when there is no repo. Every
     /// git row callback goes through here: what the UI holds is git's relative path, and
     /// every command downstream (open, reveal, the file menu) speaks absolute paths.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn git_abs(&self, path: &str) -> Option<PathBuf> {
         // The commit's own root is the fallback, not an alternative: the two agree whenever
         // `git status` succeeded, and when it did not (no git, a broken index) the commit
@@ -4797,6 +4979,7 @@ impl State {
     /// The panel re-roots on the commit's repository on the way in. Clicking a hash printed
     /// by a pane in another project otherwise leaves the header, the file tree and the rows
     /// describing three different places at once.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn show_commit(&mut self, cwd: &str, hash: &str) -> bool {
         let Some(commit) = hyperpanes_core::git::load_commit(std::path::Path::new(cwd), hash)
         else {
@@ -4816,6 +4999,7 @@ impl State {
 
     /// Leave the commit view; the working tree is re-read on the way out because it may well
     /// have moved while the commit was on screen.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn git_commit_close(&mut self) {
         if self.git_commit.take().is_some() {
             self.git_sel = None;
@@ -4827,6 +5011,7 @@ impl State {
 
     /// Show/hide the whole right-edge rail (`Ctrl+Shift+B`, the ☰ menu, the palette).
     /// Persisted like the other appearance prefs; hiding it also collapses the flyout.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn toggle_sidebar(&mut self) {
         self.settings.show_sidebar = !self.settings.show_sidebar;
         if !self.settings.show_sidebar {
@@ -4837,6 +5022,7 @@ impl State {
     }
 
     /// Toggle the projects flyout behind the 📁 icon; refresh the list when opening it.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn toggle_projects(&mut self) {
         self.sidebar_open = !self.sidebar_open;
         if self.sidebar_open {
@@ -4852,6 +5038,7 @@ impl State {
     /// Toggle the left panel; refresh the workspace library when opening it (the same
     /// closed→open refresh the projects flyout does, so a workspace saved from another
     /// window shows up without a restart).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn toggle_left_panel(&mut self) {
         self.left_panel_open = !self.left_panel_open;
         if self.left_panel_open {
@@ -4863,6 +5050,7 @@ impl State {
     /// Focus pane `idx` of tab `ti` from the panel's workspace tree: switch to that tab
     /// first (a tree click on a background tab's pane means "take me there"), then focus.
     /// Out-of-range indices are ignored — they arrive from a UI model snapshot.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn focus_pane_in_tab(&mut self, ti: usize, idx: usize) {
         if ti >= self.tabs.len() || idx >= self.tabs[ti].panes.len() {
             return;
@@ -4881,6 +5069,7 @@ impl State {
     /// bring them back — and leaving them out would offer them in the panel's DETACHED list,
     /// where one click would re-host a session the reopen stack still points at (reopening
     /// the tab afterwards would then duplicate the uid in two panes).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn claimed_uids(&self) -> std::collections::HashSet<String> {
         self.session_uids().into_iter().collect()
     }
@@ -4889,6 +5078,7 @@ impl State {
     /// id. Only laid-out panes count: a closed tab's session is still alive, but "open in a
     /// pane" is a claim about something the human can be taken to, and there is nothing to
     /// take them to until the tab is reopened.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_tool_sessions(&self) -> std::collections::HashSet<String> {
         self.tabs
             .iter()
@@ -4902,6 +5092,7 @@ impl State {
     ///
     /// The ACTIVE tab is searched first, so a session that somehow sits in two panes resolves
     /// to the one already in front rather than yanking the human to another tab.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_in_tool_session(&self, id: &str) -> Option<(usize, usize)> {
         let order =
             std::iter::once(self.active).chain((0..self.tabs.len()).filter(|i| *i != self.active));
@@ -4923,6 +5114,7 @@ impl State {
     /// Save the active tab into the panel's workspace library (no file dialog — that's what
     /// the library is for). Named after the tab; a collision gets a numeric suffix rather
     /// than overwriting the earlier snapshot.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn save_workspace_to_library(&mut self) {
         if self.refuse_saving_system_tab() {
             return;
@@ -4937,6 +5129,7 @@ impl State {
 
     /// Load library row `i` (the panel's LIBRARY list order): read the file and append its
     /// groups as new tabs, exactly as the "Open workspace…" dialog path does.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn open_workspace_from_library(&mut self, i: usize, mgr: &SessionManager) {
         let Some(entry) = crate::leftpanel::library().into_iter().nth(i) else {
             return;
@@ -4964,6 +5157,7 @@ impl State {
     /// on the *display* name, not the slug, so the unique name flows through to the member
     /// filenames too (`save_set_to` stems those from it) and a second save of the same tab
     /// title cannot clobber the first set's members.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn save_set_to_library(&mut self) {
         let dir = paths::sets_dir();
         if std::fs::create_dir_all(&dir).is_err() {
@@ -5000,6 +5194,7 @@ impl State {
 
     /// Open set row `i` (the panel's SETS list order): load every member workspace, each as
     /// its own tab, exactly as the "Open set…" dialog path does.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn open_set_from_library(&mut self, i: usize, mgr: &SessionManager) {
         let Some(entry) = crate::leftpanel::sets_rows().into_iter().nth(i) else {
             return;
@@ -5027,6 +5222,7 @@ impl State {
     /// orphan at the same moment, exactly one of them is granted it and the other returns
     /// here having changed nothing. Losing is silent by design: the winner's claim reaches
     /// this process on the next pushed snapshot and the row simply leaves the DETACHED list.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn adopt_detached_session(&mut self, uid: &str, mgr: &SessionManager) {
         if uid.is_empty() || self.claimed_uids().contains(uid) {
             return;
@@ -5048,12 +5244,14 @@ impl State {
     /// `projects.json` off the UI thread (an MCP `add_project` / rename / recolor / remove,
     /// or a project-opening pane bumping recency). Same refresh seam the in-app project
     /// mutations use; the dirty signal is driven by [`crate::control_host::ControlHost::sync`].
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn refresh_projects(&mut self) {
         self.projects = sidebar::list();
         self.dirty = true;
     }
 
     /// The cached project rows as `(name, color)` for the flyout.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn project_rows(&self) -> Vec<(SharedString, Color)> {
         self.projects
             .iter()
@@ -5064,6 +5262,7 @@ impl State {
     /// Open project `idx` (from the flyout): as the windows the checkout describes for
     /// itself if it describes any, else in a new pane cd'd into its repo, focused.
     /// Collapses the flyout afterwards (mirrors the Electron click behaviour).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn open_project(&mut self, idx: usize, mgr: &SessionManager) {
         let Some(p) = self.projects.get(idx).cloned() else {
             return;
@@ -5083,6 +5282,7 @@ impl State {
     /// screen for this checkout wins, so re-opening a folder you are already working in
     /// can never replace the running panes with a months-old file. Only what is live
     /// *for this project* counts — the rest of the window is somebody else's work.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn open_project_windows(&mut self, root: &str, mgr: &SessionManager) -> bool {
         use hyperpanes_core::workspace::project;
         let repo = match project::discover_project(root) {
@@ -5114,6 +5314,7 @@ impl State {
     /// `.hyperpanes/` yet is where a first save lands — that is the whole point of the
     /// walk stopping at `.git`. Pane cwds under the root are stored relative to it, so
     /// the file still means something on a machine that keeps its checkouts elsewhere.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn save_project(&mut self) {
         use hyperpanes_core::workspace::project;
         if self.refuse_saving_system_tab() {
@@ -5149,6 +5350,7 @@ impl State {
 
     /// Flash a line on the focused pane — the same transient the widget uses for
     /// copy/paste confirmations, for an action with no other visible result.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn toast_active(&mut self, msg: &str) {
         let f = self.active_tab().focused;
         if let Some(p) = self.active_tab_mut().panes.get_mut(f) {
@@ -5162,6 +5364,7 @@ impl State {
     /// project are retinted too (new panes pick the color up via the cwd tint; existing ones
     /// must not be left on the stale accent) — EXCEPT panes the user explicitly recolored
     /// to something other than the project tint, whose pin wins (see [`Self::recolor_pane`]).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_project_color(&mut self, idx: usize, swatch: usize) {
         let Some(p) = self.projects.get(idx) else {
             return;
@@ -5198,6 +5401,7 @@ impl State {
     }
 
     /// Rename project at flyout row `idx` (no-op on an empty/unchanged name).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn rename_project(&mut self, idx: usize, name: &str) {
         let name = name.trim();
         let Some(p) = self.projects.get(idx) else {
@@ -5213,6 +5417,7 @@ impl State {
     }
 
     /// Forget project at flyout row `idx`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn remove_project(&mut self, idx: usize) {
         let Some(p) = self.projects.get(idx) else {
             return;
@@ -5223,6 +5428,7 @@ impl State {
     }
 
     /// Open the "Add project" dialog (the ＋ on the sidebar's PROJECTS header).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_add_project(&mut self) {
         self.add_project_error.clear();
         self.overlay = Overlay::AddProject;
@@ -5233,6 +5439,7 @@ impl State {
     /// directory), then add it explicitly via core (a git repo is NOT required; adding an
     /// already-known dir is a no-op) and refresh the cached list so the flyout picks it up.
     /// On a bad path the dialog stays open with an inline error instead of closing.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn submit_add_project(&mut self, path: &str) {
         let path = path.trim();
         if path.is_empty() {
@@ -5260,6 +5467,7 @@ impl State {
     /// `role`/`project` meta and drives spec agents → impl agents (see the goal-orchestrator skill).
     ///
     /// Returns `false` (with an eprintln) only if the orchestrator persona file can't be found.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn submit_new_goal(
         &mut self,
         mgr: &SessionManager,
@@ -5501,6 +5709,7 @@ impl State {
 
     /// Enqueue a goal for robust delivery into pane `uid` (see [`PendingGoal`] /
     /// `deliver_pending_goals`). Snapshots the current draft images and clears the draft.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn queue_pending_goal(&mut self, uid: String, text: String) {
         self.pending_goals.push(PendingGoal {
             uid,
@@ -5513,6 +5722,7 @@ impl State {
     /// Goals system: open the OS file picker to attach one or more images to the in-progress
     /// goal (step 2 of the New-goal dialog). Held as file paths until submit, when their paths
     /// are written into the goal prompt (Claude reads image files by path).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_attach_images(&mut self) {
         if let Some(paths) = rfd::FileDialog::new()
             .add_filter("Images", &["png", "jpg", "jpeg", "gif", "webp", "bmp"])
@@ -5526,6 +5736,7 @@ impl State {
 
     /// Goals system: capture the current OS-clipboard image (if any) into a temp PNG and attach
     /// it to the in-progress goal. No-op (returns false) when the clipboard holds no image.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_paste_image(&mut self) -> bool {
         let Ok(mut cb) = arboard::Clipboard::new() else {
             return false;
@@ -5551,6 +5762,7 @@ impl State {
     }
 
     /// Goals system: drop one attached image from the in-progress goal (its ✕ chip).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn goal_remove_image(&mut self, idx: usize) {
         if idx < self.goal_draft_images.len() {
             self.goal_draft_images.remove(idx);
@@ -5563,6 +5775,7 @@ impl State {
     /// fullscreen sets [`Self::esc_holding`] (so the hint + its progress fill
     /// appear) and, after [`HOLD`], leaves fullscreen. The repeat tail is
     /// swallowed so the hold doesn't spam the shell with escapes.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn note_esc(&mut self) -> EscOutcome {
         // A gap under this means "still held" (auto-repeat — incl. the OS's
         // initial repeat delay); a longer gap starts a fresh tap.
@@ -5607,6 +5820,7 @@ impl State {
 
     /// Clear the held-Esc state once the auto-repeat stops (no key-release event
     /// reaches us, so we time it out). Returns whether anything changed.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn tick_esc(&mut self) -> bool {
         const RELEASE: std::time::Duration = std::time::Duration::from_millis(250);
         if self.esc_holding && self.esc_last.is_some_and(|l| l.elapsed() >= RELEASE) {
@@ -5628,6 +5842,7 @@ impl State {
     /// Open the pane header menu for active-tab pane `idx`, anchored at window-logical `(x, y)`.
     /// Built fresh so gating + checkmarks reflect the moment of the right-click; never changes
     /// the focused pane or active tab.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_pane_context(&mut self, idx: usize, x: f32, y: f32) {
         if idx < self.active_tab().panes.len() {
             self.ctx = Some(crate::contextmenu::pane_menu(self, idx, x, y, false));
@@ -5637,6 +5852,7 @@ impl State {
 
     /// Open the single-layout taskbar's pane menu for pane `idx` (the `inTaskbar` variant:
     /// a leading Show row, no Maximize), anchored at window-logical `(x, y)`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_taskbar_context(&mut self, idx: usize, x: f32, y: f32) {
         if idx < self.active_tab().panes.len() {
             self.ctx = Some(crate::contextmenu::pane_menu(self, idx, x, y, true));
@@ -5645,12 +5861,14 @@ impl State {
     }
 
     /// Open the application (hamburger) menu, anchored at window-logical `(x, y)`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_app_context(&mut self, x: f32, y: f32) {
         self.ctx = Some(crate::contextmenu::app_menu(self, x, y));
         self.dirty = true;
     }
 
     /// Open the tab-strip menu for tab `idx`, anchored at window-logical `(x, y)`.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_tab_context(&mut self, idx: usize, x: f32, y: f32) {
         if idx < self.tabs.len() {
             self.ctx = Some(crate::contextmenu::tab_menu(self, idx, x, y));
@@ -5659,6 +5877,7 @@ impl State {
     }
 
     /// Dismiss the open context menu (select / Esc / click-away).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn close_context(&mut self) {
         if self.ctx.take().is_some() {
             self.dirty = true;
@@ -5666,6 +5885,7 @@ impl State {
     }
 
     /// Whether a context menu is currently open.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn ctx_open(&self) -> bool {
         self.ctx.is_some()
     }
@@ -5675,6 +5895,7 @@ impl State {
     /// slots; rows at/above [`crate::contextmenu::CTX_CUSTOM_REMIND_BASE`] are not indices
     /// at all — the flyout's Custom input encodes its Rust-parsed minutes through the
     /// frozen `pick(int)` channel as `BASE + minutes` (pane menus only).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn ctx_command(&self, row: usize) -> Option<Command> {
         self.ctx.as_ref().and_then(|c| {
             if row >= crate::contextmenu::CTX_CUSTOM_REMIND_BASE {
@@ -5688,6 +5909,7 @@ impl State {
     }
 
     /// The open menu's target index (pane idx for a pane menu, tab idx for a tab menu).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn ctx_target(&self) -> Option<usize> {
         self.ctx.as_ref().map(|c| c.target)
     }
@@ -5696,6 +5918,7 @@ impl State {
 
     /// Recolor active-tab pane `idx` to swatch `swatch` of the current frame palette: adopt the
     /// color, pin it, and turn the per-pane frame + dot ON (mirrors `ColorSwatches`' pickColor).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn recolor_pane(&mut self, idx: usize, swatch: usize) {
         let palette = self.settings.frame_palette;
         let colors = theme::frame_palette(palette);
@@ -5713,6 +5936,7 @@ impl State {
     }
 
     /// Set pane `idx`'s per-pane frame override.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_pane_frame(&mut self, idx: usize, on: bool) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             p.show_frame = Some(on);
@@ -5721,6 +5945,7 @@ impl State {
     }
 
     /// Set pane `idx`'s per-pane dot override.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_pane_dot(&mut self, idx: usize, on: bool) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             p.show_dot = Some(on);
@@ -5729,6 +5954,7 @@ impl State {
     }
 
     /// Toggle whether pane `idx`'s ambient-AI summary line is muted.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn toggle_mute_ai(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             p.ai_muted = !p.ai_muted;
@@ -5737,6 +5963,7 @@ impl State {
     }
 
     /// Toggle whether pane `idx`'s "talk" (speak new assistant replies aloud) is on.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn toggle_talk(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             p.talk = !p.talk;
@@ -5745,6 +5972,7 @@ impl State {
     }
 
     /// Maximize/restore (zoom-in-tab) pane `idx`. Focuses it first, then toggles its zoom.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn zoom_pane(&mut self, idx: usize) {
         let t = self.active_tab_mut();
         if idx >= t.panes.len() {
@@ -5766,6 +5994,7 @@ impl State {
     /// that widget completely (D3) — opening it there would put the pane into a searching state
     /// with nothing on screen to show for it and no visible way back out. The pane menu already
     /// omits the row; this is the same answer for the keyboard chord.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn open_search(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             if !p.kind.is_pty() {
@@ -5778,6 +6007,7 @@ impl State {
     }
 
     /// Set pane `idx`'s search query (find-as-you-type).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_search_query(&mut self, idx: usize, query: &str) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             p.pane.search_set_query(query);
@@ -5786,6 +6016,7 @@ impl State {
     }
 
     /// Step pane `idx`'s search to the next/previous match.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_search_step(&mut self, idx: usize, forward: bool) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             p.pane.search_step(forward);
@@ -5794,6 +6025,7 @@ impl State {
     }
 
     /// Close pane `idx`'s search box.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_search_close(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             p.pane.search_close();
@@ -5807,6 +6039,7 @@ impl State {
     /// pane has no grid at all (D3), so its selection is a row range on the projection and
     /// the text has to be re-joined from the rows. Both end at the same clipboard, and both
     /// raise the same "Copied …" toast, because from the human's side this is one gesture.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn copy_pane(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             if p.kind.is_pty() {
@@ -5824,6 +6057,7 @@ impl State {
     /// Move a view pane's row selection: plain click replaces it, shift-click stretches it
     /// from the anchor. Lives here rather than in the view because the selection has to
     /// outlive a re-render and be readable by Copy, which is a controller concern.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn view_select(&mut self, idx: usize, row: usize, extend: bool) {
         if let Some(p) = self.active_tab().panes.get(idx) {
             if !p.kind.is_pty() {
@@ -5836,6 +6070,7 @@ impl State {
     /// Copy a Ctrl+clicked link/path into the clipboard via pane `idx`'s own arboard instance,
     /// raising its "Copied …" toast. Replaces the blocking `clip.exe` shell-out (which froze
     /// the UI thread per Ctrl+click and gave no feedback).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn copy_link_text(&mut self, idx: usize, text: &str) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             p.pane.copy_text(text);
@@ -5851,6 +6086,7 @@ impl State {
     ///
     /// Only in the modal (copy-on-select OFF) mode — WT's coupling: with copy-on-select ON the
     /// release already copied, so a modal copy would be redundant and right-click ALWAYS pastes.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn copy_selection_on_right_click(&mut self, idx: usize) -> bool {
         if self.settings.copy_on_select {
             return false;
@@ -5870,6 +6106,7 @@ impl State {
     /// controller owns the transport, so we write the returned text via the manager).
     /// PASTE-OVER: a type-over-eligible selection (single row on the prompt line, main screen)
     /// is erased first — same clamp-safe sequence as typing — so the paste REPLACES it.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn paste_pane(&mut self, idx: usize, mgr: &SessionManager) {
         let payload = self.active_tab_mut().panes.get_mut(idx).and_then(|p| {
             // Nothing to paste INTO on a view pane — there is no pty on the other end (D3).
@@ -5916,6 +6153,7 @@ impl State {
     /// pane's own paste preparation so a TUI that reads bracketed paste treats a drop the
     /// way it treats a paste, and a path with a control character in its name is refused
     /// rather than typed. Returns whether anything reached the pty.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn drop_files(&mut self, idx: usize, paths: &[String], mgr: &SessionManager) -> bool {
         if paths.is_empty() {
             return false;
@@ -5967,6 +6205,7 @@ impl State {
     /// own text paste can't deliver through the pty. Bound to Alt+V, the shortcut Claude Code
     /// documents for "your terminal intercepts Ctrl+V". Unconditional (the user knows there's an
     /// image): the app simply lets the focused program resolve the clipboard.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn paste_image_focused(&mut self, idx: usize, mgr: &SessionManager) {
         if let Some(p) = self
             .active_tab_mut()
@@ -5983,6 +6222,7 @@ impl State {
 
     /// Select all of pane `idx`'s viewport — its grid on a pty pane, every projected row
     /// on a view pane (see [`State::copy_pane`] for why those are two different selections).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn select_all_pane(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             if p.kind.is_pty() {
@@ -6001,6 +6241,7 @@ impl State {
     // which re-projects the selection highlight rects into the pane model each tick.
 
     /// Begin a selection in pane `idx` at the pressed point (logical px within the surface).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_selection_begin(&mut self, idx: usize, x: f32, y: f32) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             let (w, h) = p.surf;
@@ -6010,6 +6251,7 @@ impl State {
     }
 
     /// Extend the in-progress selection in pane `idx` to the dragged point.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn pane_selection_update(&mut self, idx: usize, x: f32, y: f32) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             let (w, h) = p.surf;
@@ -6022,6 +6264,7 @@ impl State {
     /// "Copied …" toast) and keeps its highlight; a stationary click on the shell's input line
     /// moves the caret there, and any other stationary click just clears the zero-size selection
     /// so it doesn't linger or block the next click.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn pane_selection_end(&mut self, idx: usize, mgr: &SessionManager) {
         let copy_on_select = self.settings.copy_on_select;
         let mut caret = None;
@@ -6055,6 +6298,7 @@ impl State {
 
     /// Clear pane `idx`'s screen + scrollback. A view pane's content is a projection of a file,
     /// not a grid the human typed into, so there is nothing here for a clear to mean.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn clear_pane(&mut self, idx: usize) {
         if let Some(p) = self.active_tab_mut().panes.get_mut(idx) {
             if !p.kind.is_pty() {
@@ -6071,11 +6315,13 @@ impl State {
     ///
     /// Returns the `(old_uid, new_uid)` swap so the caller can re-point anything keyed by the
     /// old session uid (the control-plane pane-id alias above all) at the replacement.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn restart_pane(&mut self, idx: usize, mgr: &SessionManager) -> Option<(String, String)> {
         self.restart_pane_at(self.active, idx, mgr, None, None)
     }
 
     /// The Hyperpane tab's own agent pane: the first pty pane of the system tab.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn hyperpane_pane_uid(&self) -> Option<String> {
         self.tabs
             .iter()
@@ -6089,6 +6335,7 @@ impl State {
     /// The panes the restart loop respawns: every tool pane outside the system tab, as
     /// `(tab, pane, uid, tool id)`. The system tab's own agent is the one doing the
     /// monitoring and is left alone.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn monitored_panes(&self) -> Vec<(usize, usize, String, String)> {
         let mut out = Vec::new();
         for (ti, t) in self.tabs.iter().enumerate() {
@@ -6110,6 +6357,7 @@ impl State {
     /// (the pane's Claude session marker, when the hook wrote one) or else the pane's own
     /// tool mark; with neither, the tool is started fresh. Returns the `(old, new)` uid
     /// swap for the caller to re-key, like [`Self::pane_exited`] does.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn restart_monitored_pane(
         &mut self,
         ti: usize,
@@ -6171,6 +6419,7 @@ impl State {
     /// avoids also losing where the user was and what the pane had layered on top.
     ///
     /// Returns the `(old_uid, new_uid)` swap like [`Self::restart_pane`].
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn refresh_env_pane(
         &mut self,
         idx: usize,
@@ -6191,6 +6440,7 @@ impl State {
     /// Returns `(old uid, new uid)` — a restart mints a fresh session, so anything keyed by
     /// the pane's uid outside this `State` (the control plane's stable pane-id alias) has to
     /// be moved across. `None` when there was nothing to restart.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn restart_pane_at(
         &mut self,
         ti: usize,
@@ -6291,12 +6541,14 @@ impl State {
     /// Remove active-tab pane `idx` **without** killing its session, as a [`DetachedPane`] (the
     /// session stays alive centrally for replay-primed re-host). An emptied tab is dropped by
     /// [`Self::take_pane_in`], which also fixes the active index.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn detach_pane_idx(&mut self, idx: usize) -> Option<DetachedPane> {
         self.detach_pane_in(self.active, idx)
     }
 
     /// [`Self::detach_pane_idx`] for an arbitrary tab — the left panel's workspace tree can
     /// drag a pane out of a BACKGROUND tab, which the active-tab-only path can't express.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn detach_pane_in(&mut self, ti: usize, idx: usize) -> Option<DetachedPane> {
         let (ps, _alive) = self.take_pane_in(ti, idx)?;
         Some(DetachedPane {
@@ -6319,6 +6571,7 @@ impl State {
     /// Adopt a detached session at the end of tab `ti` **without** changing the active tab
     /// (re-host into a background tab — replay-primed, no PTY restart). Used by move-to-tab +
     /// reopen-closed.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn adopt_into_tab(&mut self, mgr: &SessionManager, det: DetachedPane, ti: usize) {
         if ti >= self.tabs.len() {
             return;
@@ -6404,6 +6657,7 @@ impl State {
 
     /// Move active-tab pane `idx` into a brand-new tab (the pane menu's "Move to New Tab",
     /// gated to ≥2 panes so the source tab survives), switching to it.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn move_pane_to_new_tab(&mut self, idx: usize, mgr: &SessionManager) {
         if self.active_tab().panes.len() < 2 {
             return;
@@ -6422,6 +6676,7 @@ impl State {
     /// Move active-tab pane `idx` into existing tab `target` (the "Move to Tab" submenu), without
     /// switching away from the current tab. Handles the source tab being dropped when its last
     /// pane leaves (which shifts `target` when the source sat before it).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn move_pane_to_tab(&mut self, idx: usize, target: usize, mgr: &SessionManager) {
         if target >= self.tabs.len() || target == self.active {
             return;
@@ -6454,6 +6709,7 @@ impl State {
     /// Both indices are re-validated here because they arrive from a UI model snapshot: the
     /// tree the user dragged in is whatever `resync` last projected, and a session could
     /// have exited in between.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn move_pane_between_tabs(
         &mut self,
         from: usize,
@@ -6494,6 +6750,7 @@ impl State {
     /// that already exist rather than a third detach path, so the cross-tab rehost keeps
     /// exactly one implementation. `target` is re-resolved across the move because the source
     /// tab is dropped when its last pane leaves, which shifts every tab after it.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn move_pane_between_tabs_at(
         &mut self,
         from: usize,
@@ -6531,6 +6788,7 @@ impl State {
     /// Duplicate tab `idx`: a fresh tab adopting its layout + title with the same number of
     /// (fresh-shell) panes, switched to. (Sessions aren't cloned — the renderer spawns new
     /// shells too.)
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn duplicate_tab(&mut self, idx: usize, mgr: &SessionManager) {
         let Some(src) = self.tabs.get(idx) else {
             return;
@@ -6599,6 +6857,7 @@ impl State {
     /// Park a closed pane or tab on the recently-closed history, capping it. Eviction is the
     /// point where a close finally becomes irreversible, so it is also where the sessions the
     /// entry was keeping alive are killed — the cap is a budget of live off-layout PTYs.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn push_closed(&mut self, what: ClosedWhat, mgr: &SessionManager) {
         self.closed.push(ClosedItem {
             what,
@@ -6621,6 +6880,7 @@ impl State {
     /// New Window", tab drag-out) would either lose the Hyperpane or resurrect it as an
     /// ordinary tab. The one legitimate move — re-homing it when its window closes — goes
     /// through [`Self::take_system_tab`] / [`Self::adopt_system_tab`], which keep the flag.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn detach_tab(&mut self, idx: usize) -> Option<(DetachedTab, bool)> {
         if idx >= self.tabs.len() || self.tabs.len() < 2 {
             return None;
@@ -6637,6 +6897,7 @@ impl State {
     /// window is closing while others survive). `None` when this window does not hold it.
     /// The active tab is fixed up; the window is NOT left empty by this alone unless the
     /// system tab was its only tab — the caller is closing it anyway.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn take_system_tab(&mut self) -> Option<DetachedTab> {
         let idx = self.tabs.iter().position(|t| t.system)?;
         Some(self.detach_tab_unchecked(idx))
@@ -6647,6 +6908,7 @@ impl State {
     /// selected — a window closing elsewhere is no reason to yank them to the Hyperpane.
     /// If this window somehow already has a system tab the incoming one is adopted as an
     /// ordinary tab so two never coexist (its sessions are worth more than the flag).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn adopt_system_tab(&mut self, mgr: &SessionManager, det: DetachedTab) {
         let had_system = self.tabs.iter().any(|t| t.system);
         let was_active = self.active;
@@ -6669,6 +6931,7 @@ impl State {
     }
 
     /// The take half of [`Self::detach_tab`] without its refusals; `idx` must be in range.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn detach_tab_unchecked(&mut self, idx: usize) -> DetachedTab {
         let tab = self.tabs.remove(idx);
         if self.active >= self.tabs.len() {
@@ -6712,6 +6975,7 @@ impl State {
 
     /// Close tab `idx` reopenably: with ≥2 tabs it's parked (sessions alive) on the closed stack;
     /// the last tab is killed for real (returns `false` → the window quits).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn close_tab_menu(&mut self, idx: usize, mgr: &SessionManager) -> bool {
         if self.tabs.get(idx).is_some_and(|t| t.system) {
             return true;
@@ -6728,6 +6992,7 @@ impl State {
 
     /// Close every tab except `idx` (all reopenable). Removes from the highest index down so the
     /// surviving indices stay valid.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn close_other_tabs(&mut self, idx: usize, mgr: &SessionManager) {
         if idx >= self.tabs.len() {
             return;
@@ -6740,6 +7005,7 @@ impl State {
     }
 
     /// Close every tab to the right of `idx` (all reopenable), highest index first.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn close_tabs_to_right(&mut self, idx: usize, mgr: &SessionManager) {
         let mut i = self.tabs.len();
         while i > idx + 1 {
@@ -6750,6 +7016,7 @@ impl State {
 
     /// Re-host a parked tab as a fresh tab, switched to (replay-primed; its sessions were
     /// kept alive). Split out of the reopen command so a history-row click can reach it too.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn reopen_tab(&mut self, mgr: &SessionManager, det: DetachedTab) {
         let mut tab = Tab::empty(det.title.clone());
         tab.layout = det.layout;
@@ -6778,6 +7045,7 @@ impl State {
 
     /// Fill a freshly-spawned window's initial (empty) tab with a detached tab's panes + its
     /// title/layout/sizes (the seed for the tab menu's "Move to New Window"). Replay-primed.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn adopt_tab(&mut self, mgr: &SessionManager, det: DetachedTab) {
         let ti = self.active;
         self.tabs[ti].title = det.title;
@@ -6805,6 +7073,7 @@ impl State {
     }
 
     /// Set tab `idx`'s layout (the tab menu's Layout submenu).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_tab_layout(&mut self, idx: usize, layout: Layout) {
         if let Some(t) = self.tabs.get_mut(idx) {
             if t.layout != layout {
@@ -6820,6 +7089,7 @@ impl State {
     /// `single` preset, has more than one pane, and we're not in fullscreen. (The single
     /// preset renders only the focused pane, so the strip is how the hidden panes stay
     /// reachable — the native port of Electron's `PaneTaskbar` gate.)
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn taskbar_visible(&self) -> bool {
         let t = self.active_tab();
         t.layout == Layout::Single && t.panes.len() > 1 && !self.fullscreen
@@ -6844,6 +7114,7 @@ impl State {
     /// Refuse a "save the active tab" action when that tab is the pinned Hyperpane, saying
     /// why. It is app-owned: it can't be closed and exactly one may exist, so a workspace
     /// file describing it would only ever be a second one waiting to be opened.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn refuse_saving_system_tab(&mut self) -> bool {
         if !self.active_tab().system {
             return false;
@@ -6852,6 +7123,7 @@ impl State {
         true
     }
 
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn to_library_workspace_file(&self) -> WorkspaceFile {
         self.library_workspace_of(self.active_tab())
     }
@@ -6860,6 +7132,7 @@ impl State {
     /// single serializer behind [`Self::to_library_workspace_file`] (the active tab) and
     /// [`Self::save_set`] (every tab), so a set member and a saved workspace are byte-for-byte
     /// the same shape.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn library_workspace_of(&self, t: &Tab) -> WorkspaceFile {
         let base = self.settings.font_px.round() as u32;
         let panes: Vec<PaneSpec> = t
@@ -6906,6 +7179,7 @@ impl State {
     /// describes nothing and must never be written as a set member. The pinned Hyperpane is
     /// skipped for a second reason: it is app-owned, can never be closed, and exactly one may
     /// exist, so a member describing it could only ever append a duplicate on open.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn library_workspace_of_tab(&self, i: usize) -> Option<WorkspaceFile> {
         let t = self
             .tabs
@@ -6931,6 +7205,7 @@ impl State {
     ///     re-attach payoff in `docs/session-daemon-plan.md`).
     /// Per-pane zoom (#14): exactly like the workspace path, a pane whose terminal font
     /// differs from the base size records `font_size`, so zoom survives a plain relaunch.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn to_session_file(&self) -> WorkspaceFile {
         let base = self.settings.font_px.round() as u32;
         // A 0-pane tab can exist transiently while the window is closing (the emptied
@@ -7010,6 +7285,7 @@ impl State {
     /// reader keeps accepting legacy bare `.json`). No-op if the dialog is cancelled.
     /// Save to the remembered [`Self::workspace_path`] when there is one (a silent write-back,
     /// the usual Save semantics), otherwise fall through to [`Self::save_workspace_as`].
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn save_workspace(&mut self) {
         if self.refuse_saving_system_tab() {
             return;
@@ -7025,6 +7301,7 @@ impl State {
     /// and remember it so a subsequent [`Self::save_workspace`] writes back silently. Defaults
     /// into the workspace library ([`paths::workspaces_dir`]) so saved workspaces gather in one
     /// place a set can reference. No-op if the dialog is cancelled.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn save_workspace_as(&mut self) {
         if self.refuse_saving_system_tab() {
             return;
@@ -7052,6 +7329,7 @@ impl State {
 
     /// Write the active tab's **library** snapshot (durable pane uids included) to `path`.
     /// The one place the app writes a workspace file; returns whether it landed.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn write_workspace_to(&mut self, path: &std::path::Path) -> bool {
         let file = self.to_library_workspace_file();
         let ok = write_workspace(path, &file);
@@ -7067,6 +7345,7 @@ impl State {
     /// read + validate it, and load its groups as new tabs (switching to the first).
     /// Non-destructive: existing tabs/sessions are left intact. No-op if cancelled or the
     /// file has no panes.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn open_workspace(&mut self, mgr: &SessionManager) {
         let Some(path) = rfd::FileDialog::new()
             .add_filter("Workspace", &["hyperpanes", "json"])
@@ -7090,6 +7369,7 @@ impl State {
     /// The set file is picked with the native save dialog (its stem names the set) — there is
     /// no text-entry dialog in this UI, and the file name is the name the user is already
     /// typing. No-op if cancelled.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn save_set(&mut self) {
         let dir = paths::sets_dir();
         let _ = std::fs::create_dir_all(&dir);
@@ -7112,6 +7392,7 @@ impl State {
     /// The dialog-free half of [`Self::save_set`] (the tested one). Writes one member
     /// workspace per non-empty tab into `members_dir` and the set index to `set_path`.
     /// Returns the set as written, or `None` if nothing could be saved.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn save_set_to(
         &mut self,
         set_path: &std::path::Path,
@@ -7165,6 +7446,7 @@ impl State {
     /// Each pane goes through the same reattach-or-spawn decision as any other load
     /// ([`SessionManager::pane_load`]), so a member whose panes are still alive in the daemon
     /// is ADOPTED rather than re-run. No-op if cancelled or unreadable.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn open_set(&mut self, mgr: &SessionManager) {
         let dir = paths::sets_dir();
         let _ = std::fs::create_dir_all(&dir);
@@ -7180,6 +7462,7 @@ impl State {
 
     /// The dialog-free half of [`Self::open_set`] (the tested one). Returns how many member
     /// workspaces were loaded.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn open_set_from(&mut self, path: &std::path::Path, mgr: &SessionManager) -> usize {
         let Some(set) = sets::read_set(path) else {
             tracing::warn!(
@@ -7216,6 +7499,7 @@ impl State {
     /// Returns the index of the tab it selected, or `None` when the file described nothing
     /// and no tab was appended — [`Self::open_set_from`] needs that to land a multi-member
     /// set on its FIRST member rather than wherever the last member happened to select.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn load_workspace(&mut self, file: WorkspaceFile, mgr: &SessionManager) -> Option<usize> {
         let windows = windows_of(Some(&file));
         let win = windows.into_iter().next()?;
@@ -7269,6 +7553,7 @@ impl State {
 
     /// Remove every 0-pane tab, keeping `active` pointed at the same tab. Callers must
     /// guarantee at least one non-empty tab remains.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn purge_empty_tabs(&mut self) {
         let mut i = 0;
         while i < self.tabs.len() {
@@ -7288,6 +7573,7 @@ impl State {
 
     /// Attach panes (spawned from specs) into the ACTIVE tab — the `--as panes` routing of
     /// a second-instance hand-off. Sizes re-equalize; specs that spawn nothing are skipped.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn attach_panes_from_specs(&mut self, mgr: &SessionManager, specs: &[PaneSpec]) {
         let palette = self.settings.frame_palette;
         let start = self.active_tab().panes.len();
@@ -7308,6 +7594,7 @@ impl State {
     }
 
     /// Build a tab from a `GroupSpec` (spawning a pane per spec) and append it.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn append_tab_from_group(&mut self, mgr: &SessionManager, g: GroupSpec) {
         // Exactly one Hyperpane may exist — it is app-owned and can never be closed — so a
         // file that describes one while we already have one must not append a second. This is
@@ -7360,6 +7647,7 @@ impl State {
     /// Spawn a pane from a `PaneSpec` (its command/args/cwd/shell), returning the `PaneState`.
     /// A spec with a `color` is treated like a project pane (tinted: frame + dot on, accent
     /// pinned); a colorless spec is a clean pane coloured by slot.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn make_pane_from_spec(
         &mut self,
         mgr: &SessionManager,
@@ -7725,6 +8013,7 @@ impl State {
     /// Park active-tab pane `idx` until `offset` from now: remove it from the layout WITHOUT
     /// killing its session and push a [`Reminder`]. Gated when it's the only pane of the only
     /// tab (parking it would empty the window). The bell list is where it lives meanwhile.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn remind_pane(&mut self, idx: usize, offset: ReminderOffset) {
         if self.tabs.len() <= 1 && self.active_tab().panes.len() < 2 {
             return;
@@ -7753,6 +8042,7 @@ impl State {
 
     /// Toggle the bell's reminder-list panel (collapses the projects flyout — one rail
     /// panel at a time, mirroring how the flyouts behave).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn toggle_reminders(&mut self) {
         self.reminders_open = !self.reminders_open;
         if self.reminders_open {
@@ -7764,6 +8054,7 @@ impl State {
 
     /// Mark any reminder whose due time has passed as `fired` (the bell/list highlight).
     /// Called by the app tick with the current epoch ms; returns whether anything changed.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn tick_reminders(&mut self, now_ms: u64) -> bool {
         let mut changed = false;
         for r in &mut self.reminders {
@@ -7786,6 +8077,7 @@ impl State {
 
     /// The fired-reminder alert toast's × was clicked: hide the toast without restoring the
     /// pane. The reminder itself (and the bell badge) stays until the pane is restored.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn dismiss_reminder_toast(&mut self, uid: &str) {
         if let Some(r) = self.reminders.iter_mut().find(|r| r.pane.uid == uid) {
             if !r.toast_dismissed {
@@ -7798,6 +8090,7 @@ impl State {
     /// A bell-list row was clicked: re-dock the parked pane into the ACTIVE tab's layout
     /// (replay-primed, focused — the standard `adopt_pane` path) and clear its reminder.
     /// Keyed by session uid so a row click can't race a concurrent list change.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn restore_reminder(&mut self, uid: &str, mgr: &SessionManager) {
         let Some(i) = self.reminders.iter().position(|r| r.pane.uid == uid) else {
             return;
@@ -7823,6 +8116,7 @@ impl State {
 
     /// The × on a pane. Puts the confirm card up (and returns `true` — nothing has closed
     /// yet); closes straight through when the card is switched off and the close is undoable.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn request_close_pane(&mut self, ti: usize, idx: usize, mgr: &SessionManager) -> bool {
         let Some(ps) = self.tabs.get(ti).and_then(|t| t.panes.get(idx)) else {
             return true;
@@ -7845,6 +8139,7 @@ impl State {
     }
 
     /// [`Self::request_close_pane`] for the focused pane of the active tab (the keybinding).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn request_close_focused(&mut self, mgr: &SessionManager) -> bool {
         let ti = self.active;
         let idx = self.tabs[ti].focused;
@@ -7852,6 +8147,7 @@ impl State {
     }
 
     /// The × on a tab — same contract as [`Self::request_close_pane`].
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn request_close_tab(&mut self, idx: usize, mgr: &SessionManager) -> bool {
         let Some(t) = self.tabs.get(idx) else {
             return true;
@@ -7880,11 +8176,13 @@ impl State {
 
     /// Whether this close may go through unasked: only when the human turned the card off
     /// AND the close is one the history can undo. A window-ending close always asks.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn skip_confirm(&self, pending: &PendingClose) -> bool {
         !self.settings.confirm_close && !pending.final_close
     }
 
     /// Raise the confirm card over whatever else was open.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn ask_close(&mut self, pending: PendingClose) {
         self.pending_close = Some(pending);
         self.overlay = Overlay::ConfirmClose;
@@ -7894,6 +8192,7 @@ impl State {
     /// The card's "Close" button. Re-resolves the held uid against the CURRENT layout — a
     /// background shell can exit and renumber the tabs while the question is on screen — so a
     /// target that is already gone simply closes the card. Returns whether the window lives.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn confirm_close_go(&mut self, mgr: &SessionManager) -> bool {
         let Some(pending) = self.pending_close.take() else {
             self.close_overlay_now();
@@ -7914,6 +8213,7 @@ impl State {
 
     /// The card's "Don't ask again" checkbox. Persisted with the other prefs; it only ever
     /// governs the undoable closes (see [`Self::skip_confirm`]).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn set_confirm_close(&mut self, on: bool) {
         if self.settings.confirm_close != on {
             self.settings.confirm_close = on;
@@ -7926,6 +8226,7 @@ impl State {
 
     /// Toggle the rail's RECENTLY CLOSED section (collapsing the other two — one panel at a
     /// time, mirroring the bell and the projects flyout).
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn toggle_closed(&mut self) {
         self.closed_open = !self.closed_open;
         if self.closed_open {
@@ -7937,6 +8238,7 @@ impl State {
 
     /// Reopen the most recently closed pane or tab — the keyboard/menu command. No-op on an
     /// empty history.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn reopen_closed(&mut self, mgr: &SessionManager) {
         let Some(item) = self.closed.pop() else {
             return;
@@ -7946,6 +8248,7 @@ impl State {
 
     /// A history-row click. Keyed by the row's id rather than its index so a click can't race
     /// a concurrent close (which pushes) or an eviction (which shifts everything down).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn restore_closed(&mut self, id: i32, mgr: &SessionManager) {
         let Some(i) = self.closed.iter().position(|c| c.id == id) else {
             return;
@@ -7957,6 +8260,7 @@ impl State {
 
     /// Re-host one history entry: a pane re-docks into the ACTIVE tab (the same replay-primed
     /// `adopt_pane` the bell uses), a tab comes back as its own tab, switched to.
+    #[tracing::instrument(level = "debug", skip_all)]
     fn restore_item(&mut self, item: ClosedItem, mgr: &SessionManager) {
         match item.what {
             ClosedWhat::Pane(p) => self.adopt_pane(mgr, *p), // focuses the pane + sets dirty
@@ -7966,6 +8270,7 @@ impl State {
 
     /// The × on a history row: give up on this entry for good, killing the sessions it was
     /// holding open. Same finality as an eviction, just asked for.
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn discard_closed(&mut self, id: i32, mgr: &SessionManager) {
         let Some(i) = self.closed.iter().position(|c| c.id == id) else {
             return;
@@ -7980,11 +8285,13 @@ impl State {
 
 /// Seconds since LOCAL midnight (the wall clock — what "tomorrow 9am" means to the user).
 #[cfg(windows)]
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn local_secs_since_midnight() -> u64 {
     let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
     st.wHour as u64 * 3600 + st.wMinute as u64 * 60 + st.wSecond as u64
 }
 #[cfg(not(windows))]
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn local_secs_since_midnight() -> u64 {
     // `localtime_r` applies the real local offset (incl. DST); the old `epoch % 86400`
     // was UTC, which put every reminder due-time/label off by the timezone offset.
@@ -8000,6 +8307,7 @@ pub(crate) fn local_secs_since_midnight() -> u64 {
 /// Pure H:M:S → seconds-since-midnight (the unix local-clock math, testable with
 /// injected values).
 #[cfg_attr(windows, allow(dead_code))]
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn secs_from_hms(h: u64, m: u64, s: u64) -> u64 {
     h * 3600 + m * 60 + s
 }
@@ -8057,12 +8365,14 @@ mod local_clock_tests {
 }
 
 /// Resolve a quick offset against the local clock: `(delay from now in ms, due label)`.
+#[tracing::instrument(level = "debug", ret)]
 fn reminder_due(offset: ReminderOffset) -> (u64, String) {
     due_for(local_secs_since_midnight(), offset)
 }
 
 /// Pure core of [`reminder_due`], parameterised on the local seconds-since-midnight so the
 /// label arithmetic is testable. A due time that rolls past midnight labels as "tomorrow".
+#[tracing::instrument(level = "debug", ret)]
 fn due_for(since_mid: u64, offset: ReminderOffset) -> (u64, String) {
     const DAY: u64 = 86_400;
     let delay_secs = match offset {
@@ -8088,6 +8398,7 @@ fn due_for(since_mid: u64, offset: ReminderOffset) -> (u64, String) {
 /// cwd. `prefix` is an environment assignment such as `CLAUDE_CONFIG_DIR='…' ` (with its
 /// trailing space) or empty. Shared by the Claude shell-pane arm and the generic tool arm
 /// of `make_pane_from_spec`, so a change to the shape reaches both.
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn resume_startup_line(cwd: Option<&str>, prefix: &str, bin: &str, args: &str) -> String {
     match cwd {
         Some(cwd) => format!("cd '{cwd}' && {prefix}{bin} {args}\r"),
@@ -8098,6 +8409,7 @@ pub(crate) fn resume_startup_line(cwd: Option<&str>, prefix: &str, bin: &str, ar
 /// Does this saved group describe the app-owned Hyperpane tab? The `system` flag is
 /// authoritative; files written before that flag existed carry none, so a group whose panes
 /// all sit in the Hyperpane directory counts too — nothing else opens there by default.
+#[tracing::instrument(level = "debug", ret)]
 fn group_is_hyperpane(g: &GroupSpec) -> bool {
     if g.system == Some(true) {
         return true;
@@ -8109,6 +8421,7 @@ fn group_is_hyperpane(g: &GroupSpec) -> bool {
             .all(|p| p.cwd.as_deref().is_some_and(|c| Path::new(c) == dir))
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn color_hex(c: Color) -> String {
     format!("#{:02x}{:02x}{:02x}", c.red(), c.green(), c.blue())
 }
@@ -8116,12 +8429,14 @@ fn color_hex(c: Color) -> String {
 /// Parse a workspace-file layout token (`"single"`/`"columns"`/… / `"main-stack"`, or a
 /// `"grid-2x3"` shape) back to a [`Layout`], defaulting to `Auto` for an unknown/absent
 /// token — a file written by a newer build must still open here, minus the layout it names.
+#[tracing::instrument(level = "debug", ret)]
 pub fn layout_from_name(name: &str) -> Layout {
     Layout::from_token(name).unwrap_or(Layout::Auto)
 }
 
 /// Encode an `arboard` clipboard image (RGBA8) to PNG bytes. Returns `None` if the encoder
 /// rejects the buffer (e.g. a zero-sized image). Used when attaching a pasted image to a goal.
+#[tracing::instrument(level = "debug", ret)]
 fn image_rgba_to_png(img: &arboard::ImageData) -> Option<Vec<u8>> {
     let mut out = Vec::new();
     {
@@ -8136,6 +8451,7 @@ fn image_rgba_to_png(img: &arboard::ImageData) -> Option<Vec<u8>> {
 
 /// Parse a `#rrggbb` hex string (the project palette format) into a Slint [`Color`],
 /// falling back to the default accent on a malformed value.
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_hex(s: &str) -> Color {
     let h = s.trim_start_matches('#');
     if h.len() == 6 {
@@ -8153,6 +8469,7 @@ pub fn parse_hex(s: &str) -> Color {
 /// Whether a pane `cwd` belongs to the project rooted at `project_path` — the SAME matcher
 /// the cwd tint uses ([`State::note_pane_cwd`]): walk up to the enclosing git root, then
 /// compare by the projects-store dedup key (canonical path, case-insensitive on Windows).
+#[tracing::instrument(level = "debug", ret)]
 fn cwd_in_project(cwd: &str, project_path: &str) -> bool {
     sidebar::git_root_of(cwd).is_some_and(|root| {
         projects::path_key(&root.to_string_lossy()) == projects::path_key(project_path)
@@ -8165,6 +8482,7 @@ fn cwd_in_project(cwd: &str, project_path: &str) -> bool {
 /// project's previous color is the tint, anything else is a user choice and is kept
 /// (the same precedence the cwd tint itself applies — it re-pins on every cwd report,
 /// while a user pin only exists until the next report).
+#[tracing::instrument(level = "debug", ret)]
 fn follows_project_tint(pinned: Option<Color>, old_project_color: Color) -> bool {
     pinned.is_none_or(|c| c == old_project_color)
 }

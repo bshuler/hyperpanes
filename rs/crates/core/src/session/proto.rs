@@ -114,6 +114,7 @@ impl SpawnSpec {
     /// daemon supplies the (possibly freshly-minted) uid here; the integration fields
     /// fold into an [`Integration`] only when non-empty (else a plain shell, the
     /// in-process default).
+    #[tracing::instrument(level = "debug", skip_all)]
     pub fn into_options(self, uid: String) -> SpawnOptions {
         let integration = if self.integration_args.is_empty() && self.integration_env.is_empty() {
             None
@@ -375,6 +376,7 @@ pub enum DaemonMsg {
 
 /// Write one length-prefixed JSON frame: a `u32` LE body length then the JSON body.
 /// Flushes so the peer sees the frame promptly. Errors on serialization or I/O failure.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn write_frame<W: Write>(w: &mut W, msg: &impl Serialize) -> io::Result<()> {
     let body = serde_json::to_vec(msg).map_err(io::Error::other)?;
     let len: u32 = body
@@ -396,6 +398,7 @@ pub fn write_frame<W: Write>(w: &mut W, msg: &impl Serialize) -> io::Result<()> 
 /// a clean EOF *before any byte of a frame* (the peer closed between frames); a partial
 /// frame (EOF mid-length or mid-body) is an `UnexpectedEof` error. `read_exact` transparently
 /// reassembles a frame delivered across multiple reads (partial-read safe).
+#[tracing::instrument(level = "debug", skip(r))]
 pub fn read_frame<R: Read, T: for<'de> Deserialize<'de>>(r: &mut R) -> io::Result<Option<T>> {
     let mut len_buf = [0u8; 4];
     // Distinguish a clean between-frames EOF from a truncated length prefix.
@@ -426,6 +429,7 @@ enum ReadEof {
 /// Like [`Read::read_exact`] but reports a clean EOF *before the first byte* distinctly
 /// from a partial read (EOF after some bytes → `UnexpectedEof`, as a truncated length
 /// prefix is a protocol error, not an orderly shutdown).
+#[tracing::instrument(level = "debug", skip(r))]
 fn read_exact_or_eof<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<ReadEof> {
     let mut filled = 0;
     while filled < buf.len() {

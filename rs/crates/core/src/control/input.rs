@@ -10,6 +10,7 @@
 // LF — to a single CR so "\n" submits exactly as it does on a POSIX pty, where LF
 // is itself a canonical line delimiter. No-op off Windows. The platform is a
 // parameter (the caller passes the real one) so this stays pure and unit-testable.
+#[tracing::instrument(level = "debug", ret)]
 pub fn submit_newlines(data: &str, platform: &str) -> String {
     if platform != "win32" {
         return data.to_string();
@@ -32,6 +33,7 @@ pub const SUBMIT_DELAY_MS: u64 = 40;
 // source of truth — it's pure and unit-tested, and the control server writes its
 // bytes straight to the pty (NO submit_newlines: these are already the exact
 // bytes, e.g. `enter` IS the CR a Windows pty submits on).
+#[tracing::instrument(level = "debug", ret)]
 fn named_key(k: &str) -> Option<&'static str> {
     Some(match k {
         "enter" => "\r",
@@ -73,6 +75,7 @@ fn named_key(k: &str) -> Option<&'static str> {
 // Resolve one named key to its bytes, or None if unknown. Case/space-insensitive.
 // `ctrl+<a-z>` is handled generically (the C0 control code, ctrl+a → 0x01) on top
 // of the explicit table above.
+#[tracing::instrument(level = "debug", ret)]
 pub fn key_to_bytes(key: &str) -> Option<String> {
     let k = key.trim().to_lowercase();
     if let Some(b) = named_key(&k) {
@@ -100,6 +103,7 @@ pub enum KeysResult {
 // Translate a list of named keys into one byte string to write to the pty.
 // Reports EVERY unknown key (not just the first) so a caller fixes them in one
 // round-trip. An empty list is a valid no-op write.
+#[tracing::instrument(level = "debug", ret)]
 pub fn keys_to_bytes(keys: &[&str]) -> KeysResult {
     let mut unknown: Vec<String> = Vec::new();
     let mut bytes = String::new();

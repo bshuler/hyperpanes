@@ -20,6 +20,7 @@ pub const APPLY_STRATEGY: ApplyStrategy = ApplyStrategy::NotifyOnly;
 
 /// Not supported while [`APPLY_STRATEGY`] is `NotifyOnly`; the UI never offers it (the
 /// NotifyOnly branch opens the releases page instead), so this is a defensive backstop.
+#[tracing::instrument(level = "debug", ret)]
 pub fn launch_installer(_path: &Path) -> Result<(), String> {
     Err("in-app install is not supported on macOS — get the new release from GitHub".to_string())
 }

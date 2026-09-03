@@ -462,6 +462,7 @@ const LAYOUT_CYCLE: [Layout; 5] = [
 ];
 
 /// Run `cmd` against `state`. Returns any [`Effect`] the caller must apply.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect {
     // Any action other than renaming itself cancels an in-progress tab rename,
     // so the inline edit box never lingers when you interact elsewhere.
@@ -999,6 +1000,7 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
 }
 
 /// Map a layout menu id (from the Slint picker) to a `SetLayout` command.
+#[tracing::instrument(level = "debug", ret)]
 pub fn set_layout_from_id(id: i32) -> Command {
     Command::SetLayout(theme::layout_from_id(id))
 }
@@ -1008,6 +1010,7 @@ pub fn set_layout_from_id(id: i32) -> Command {
 ///
 /// A shebang beats the table, because the file has said what it wants. Only the first line
 /// is read, and only when it looks like one: a binary's "first line" can be the whole file.
+#[tracing::instrument(level = "debug", ret)]
 pub(crate) fn run_prefix(path: &std::path::Path) -> Option<String> {
     if let Some(line) = shebang(path) {
         return Some(line);
@@ -1034,6 +1037,7 @@ pub(crate) fn run_prefix(path: &std::path::Path) -> Option<String> {
 
 /// The command a file's `#!` line names, without the `#!`. `None` when there isn't one, or
 /// when what follows isn't a plain command line.
+#[tracing::instrument(level = "debug", ret)]
 fn shebang(path: &std::path::Path) -> Option<String> {
     use std::io::Read;
     let mut head = [0u8; 256];
@@ -1054,6 +1058,7 @@ fn shebang(path: &std::path::Path) -> Option<String> {
 /// parentheses and `$` far more often than they contain apostrophes.
 ///
 /// A bare word is left alone so the common case reads as itself in the pane header.
+#[tracing::instrument(level = "debug", ret)]
 fn quote_arg(s: &str) -> String {
     let plain = !s.is_empty()
         && s.chars().all(|c| {

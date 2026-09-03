@@ -128,6 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     app.set_panes(ModelRc::from(model.clone()));
 
     // Build a Slint `[HiRect]` model from controller-reported (x,y,w,h) rects.
+    #[tracing::instrument(level = "debug", ret)]
     fn to_hirects(rects: Vec<(f32, f32, f32, f32)>) -> ModelRc<HiRect> {
         let v: Vec<HiRect> = rects
             .into_iter()

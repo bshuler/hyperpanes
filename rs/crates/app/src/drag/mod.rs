@@ -58,6 +58,7 @@ pub struct DragState {
 }
 
 impl DragState {
+    #[tracing::instrument(level = "debug")]
     pub fn new(source_win: usize, kind: DragKind, origin: (i32, i32)) -> Self {
         DragState {
             source_win,
@@ -67,6 +68,7 @@ impl DragState {
             active: false,
         }
     }
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn is_pane(&self) -> bool {
         matches!(self.kind, DragKind::Pane { .. })
     }
@@ -116,6 +118,7 @@ pub struct Hover {
 /// which is the slot the pane already occupies, so `reorder_pane_in` returned without
 /// moving anything. Splitting at the midpoint means a drop only no-ops when the caret is
 /// genuinely already where the pane sits.
+#[tracing::instrument(level = "debug", ret)]
 pub fn edge_band(pos: f32, size: f32, vertical: bool) -> (usize, u8) {
     let band = (size * EDGE_BAND_FRAC).min(EDGE_BAND_MAX_PX);
     let before = if pos <= band {
@@ -150,6 +153,7 @@ pub fn edge_band(pos: f32, size: f32, vertical: bool) -> (usize, u8) {
 /// full-tile target, in a grid and in a strip alike. The caret model is kept where it is
 /// still the right question: stitching a pane in from another window or another tab, where
 /// there is no "current index" to move away from.
+#[tracing::instrument(level = "debug", ret)]
 pub fn insertion_for(from: usize, dest: usize) -> usize {
     if dest >= from {
         dest + 1
@@ -181,6 +185,7 @@ pub trait GlobalPointer {
 }
 
 /// The platform's global pointer (a static zero-sized provider).
+#[tracing::instrument(level = "debug")]
 pub fn global_pointer() -> &'static dyn GlobalPointer {
     &platform::PlatformPointer
 }

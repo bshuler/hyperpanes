@@ -42,6 +42,7 @@ static HOVER_CURSOR_ON: AtomicBool = AtomicBool::new(false);
 
 /// Borrow the NSWindow back out of the `isize` handle. The pointer stays valid for the
 /// life of the Slint window (winit retains it); `0` = not realized.
+#[tracing::instrument(level = "debug", ret)]
 fn ns_window<'a>(raw: isize) -> Option<&'a NSWindow> {
     if raw == 0 {
         return None;
@@ -53,6 +54,7 @@ fn ns_window<'a>(raw: isize) -> Option<&'a NSWindow> {
 /// Pull the native NSWindow (as isize) out of a Slint window. The AppKit raw handle
 /// only carries the NSView; hop to its window. 0 until the native window is realized
 /// by the event loop (callers retry).
+#[tracing::instrument(level = "debug", ret, skip(win))]
 pub fn hwnd_of(win: &slint::Window) -> isize {
     if MainThreadMarker::new().is_none() {
         return 0;
@@ -75,6 +77,7 @@ pub fn hwnd_of(win: &slint::Window) -> isize {
 
 /// Hidden-titlebar treatment: transparent titlebar + hidden title + content under the
 /// titlebar. Keeps the native traffic lights overlaid top-left.
+#[tracing::instrument(level = "debug", ret)]
 pub fn make_frameless(raw: isize) {
     let Some(w) = ns_window(raw) else { return };
     unsafe {
@@ -97,6 +100,7 @@ pub fn make_frameless(raw: isize) {
 /// answer NO on that class (one class shared by every window — replacing twice is
 /// harmless). Dragging the bar still works: the empty trailing area asks for it explicitly
 /// with `performWindowDragWithEvent:` (see [`start_drag`]), which never consults this.
+#[tracing::instrument(level = "debug", ret)]
 fn refuse_implicit_window_drag(w: &NSWindow) {
     let Some(view) = w.contentView() else {
         return;
@@ -129,6 +133,7 @@ fn refuse_implicit_window_drag(w: &NSWindow) {
 /// teleported the window on drag). AppKit only reads the event's `locationInWindow` +
 /// `windowNumber` to compute the drag anchor, so a minimal synthetic left-mouse-down at
 /// the cursor anchors the drag exactly under the pointer.
+#[tracing::instrument(level = "debug", ret)]
 pub fn start_drag(raw: isize) {
     let Some(w) = ns_window(raw) else { return };
     if MainThreadMarker::new().is_none() {
@@ -158,6 +163,7 @@ pub fn start_drag(raw: isize) {
 /// Begin forcing the tear-off drag cursor (closed hand). No mouse capture exists on
 /// macOS (none is needed: the pump reads global state), so this is cursor-only; the
 /// pump re-asserts it each poll (see [`reassert_drag_cursor`]).
+#[tracing::instrument(level = "debug", ret)]
 pub fn begin_drag_cursor(_raw: isize) {
     DRAG_CURSOR_ON.store(true, Ordering::Relaxed);
     if MainThreadMarker::new().is_some() {
@@ -168,6 +174,7 @@ pub fn begin_drag_cursor(_raw: isize) {
 }
 
 /// Stop forcing the drag cursor (drop / cancel).
+#[tracing::instrument(level = "debug", ret)]
 pub fn end_drag_cursor(_raw: isize) {
     if DRAG_CURSOR_ON.swap(false, Ordering::Relaxed) && MainThreadMarker::new().is_some() {
         unsafe {
@@ -179,6 +186,7 @@ pub fn end_drag_cursor(_raw: isize) {
 /// Re-assert the closed-hand cursor mid-drag (winit/Slint re-apply their own cursor on
 /// every pointer move, clobbering ours). Called from the drag pump's `poll()` — i.e. at
 /// the pump cadence, same trick as the Win32 subclass's `WM_MOUSEMOVE` re-assert.
+#[tracing::instrument(level = "debug", ret)]
 pub fn reassert_drag_cursor() {
     if DRAG_CURSOR_ON.load(Ordering::Relaxed) && MainThreadMarker::new().is_some() {
         unsafe {
@@ -189,6 +197,7 @@ pub fn reassert_drag_cursor() {
 
 /// Show / hide the open-hand "grab" cursor while pressing a drag handle (not yet
 /// dragging). Transition-gated: the pump calls `set_hover_cursor(false)` every idle tick.
+#[tracing::instrument(level = "debug", ret)]
 pub fn set_hover_cursor(on: bool) {
     if MainThreadMarker::new().is_none() {
         return;
@@ -206,6 +215,7 @@ pub fn set_hover_cursor(on: bool) {
     }
 }
 
+#[tracing::instrument(level = "debug", ret)]
 pub fn minimize(raw: isize) {
     if let Some(w) = ns_window(raw) {
         w.miniaturize(None);
@@ -214,6 +224,7 @@ pub fn minimize(raw: isize) {
 
 /// Zoom (the macOS maximize): toggles between the user frame and the screen-filling
 /// standard frame.
+#[tracing::instrument(level = "debug", ret)]
 pub fn toggle_max(raw: isize) {
     if let Some(w) = ns_window(raw) {
         w.zoom(None);
@@ -221,6 +232,7 @@ pub fn toggle_max(raw: isize) {
 }
 
 /// Whether the window is currently zoomed (drives the restore-vs-maximize icon).
+#[tracing::instrument(level = "debug", ret)]
 pub fn is_maximized(raw: isize) -> bool {
     ns_window(raw).map(|w| w.isZoomed()).unwrap_or(false)
 }
@@ -228,6 +240,7 @@ pub fn is_maximized(raw: isize) -> bool {
 /// Close the window. Unused by the managed multi-window close path (which flags the
 /// window for reaping), kept for completeness of the AppKit glue.
 #[allow(dead_code)]
+#[tracing::instrument(level = "debug", ret)]
 pub fn close(raw: isize) {
     if let Some(w) = ns_window(raw) {
         w.close();
@@ -240,6 +253,7 @@ pub fn close(raw: isize) {
 /// All three steps are needed. `makeKeyAndOrderFront:` alone raises the window WITHIN
 /// Hyperpanes but leaves another app frontmost, and a miniaturized window ignores it
 /// entirely — so a "take me to that pane" click would silently do nothing visible.
+#[tracing::instrument(level = "debug", ret)]
 pub fn raise(raw: isize) {
     let Some(w) = ns_window(raw) else { return };
     let Some(mtm) = MainThreadMarker::new() else {
@@ -257,6 +271,7 @@ pub fn raise(raw: isize) {
 
 /// Enter native fullscreen (own Space). AppKit remembers the prior frame itself, so the
 /// returned placement is a unit marker.
+#[tracing::instrument(level = "debug", ret)]
 pub fn enter_fullscreen(raw: isize) -> Option<SavedPlacement> {
     let w = ns_window(raw)?;
     if !w.styleMask().contains(NSWindowStyleMask::FullScreen) {
@@ -266,6 +281,7 @@ pub fn enter_fullscreen(raw: isize) -> Option<SavedPlacement> {
 }
 
 /// Leave native fullscreen (no-op if the user already left via the green button / Esc).
+#[tracing::instrument(level = "debug", ret)]
 pub fn exit_fullscreen(raw: isize, _saved: SavedPlacement) {
     let Some(w) = ns_window(raw) else { return };
     if w.styleMask().contains(NSWindowStyleMask::FullScreen) {
@@ -287,6 +303,7 @@ pub fn exit_fullscreen(raw: isize, _saved: SavedPlacement) {
 ///
 /// Off the main thread, or before AppKit is up, the answer is an empty vec: the caller
 /// reads that as "do not clamp", which is strictly better than clamping against a guess.
+#[tracing::instrument(level = "debug", ret)]
 pub fn displays() -> Vec<(i32, i32, i32, i32)> {
     let Some(mtm) = MainThreadMarker::new() else {
         return Vec::new();

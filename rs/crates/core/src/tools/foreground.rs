@@ -63,11 +63,13 @@ const MAX_INTERPRETER_HOPS: usize = 4;
 /// A login shell is exec'd with `argv[0]` set to `-zsh` by convention, which is why the
 /// dash is stripped here and not treated as a flag: at position zero it is a marker, not
 /// an option.
+#[tracing::instrument(level = "debug", ret)]
 fn base_name(arg: &str) -> &str {
     let cut = arg.rsplit(['/', '\\']).next().unwrap_or(arg);
     cut.strip_prefix('-').unwrap_or(cut)
 }
 
+#[tracing::instrument(level = "debug", ret)]
 fn strip_script_suffix(name: &str) -> &str {
     for suffix in SCRIPT_SUFFIXES {
         if name.len() > suffix.len() && name.to_ascii_lowercase().ends_with(suffix) {
@@ -78,6 +80,7 @@ fn strip_script_suffix(name: &str) -> &str {
 }
 
 /// The program an argv names, lowercased — descending through interpreter wrappers.
+#[tracing::instrument(level = "debug", ret)]
 fn program_from_argv(argv: &[&str]) -> Option<String> {
     let mut idx = 0usize;
     for _ in 0..MAX_INTERPRETER_HOPS {
@@ -106,6 +109,7 @@ fn program_from_argv(argv: &[&str]) -> Option<String> {
 /// split exactly, so a program under a path containing spaces survives; a plain string
 /// with no NUL is split on whitespace as a convenience for logs and hand-written callers,
 /// which is lossy in exactly that one case and is why the OS side never uses it.
+#[tracing::instrument(level = "debug", ret)]
 pub fn program_name(raw: &str) -> Option<String> {
     let argv: Vec<&str> = if raw.contains('\0') {
         raw.split('\0').filter(|s| !s.is_empty()).collect()
@@ -120,6 +124,7 @@ pub fn program_name(raw: &str) -> Option<String> {
 /// Only consulted after an exact match fails, and only for names long enough to have
 /// *been* truncated. Ambiguity answers `None` for the same reason [`registry::by_title`]
 /// does: a prefix that fits two tools is evidence for neither.
+#[tracing::instrument(level = "debug", ret)]
 fn by_truncated_bin(name: &str) -> Option<&'static ToolDef> {
     if name.len() < TRUNCATION_FLOOR {
         return None;
@@ -144,6 +149,7 @@ fn by_truncated_bin(name: &str) -> Option<&'static ToolDef> {
 /// `raw` may be a bare executable name, an absolute path, a whole argv, or a truncated
 /// `comm`. Everything that is not a registered binary answers `None`, including the
 /// overwhelmingly common case of a plain login shell.
+#[tracing::instrument(level = "debug", ret)]
 pub fn tool_for_foreground_name(raw: &str) -> Option<&'static ToolDef> {
     let name = program_name(raw)?;
     registry::by_bin(&name).or_else(|| by_truncated_bin(&name))
@@ -161,6 +167,7 @@ pub fn tool_for_foreground_name(raw: &str) -> Option<&'static ToolDef> {
 /// pseudoconsole handle rather than by attaching a console of its own, so there is
 /// nothing to ask. A Windows pane keeps the title-and-command inference it has today;
 /// this module declines rather than guessing.
+#[tracing::instrument(level = "debug", ret)]
 pub fn foreground_pgrp(fd: PtyFd) -> Option<i32> {
     #[cfg(unix)]
     {
@@ -186,6 +193,7 @@ pub fn foreground_pgrp(fd: PtyFd) -> Option<i32> {
 /// `~/.local/share/claude/versions/2.1.251`, and the basename of that names nothing at
 /// all. Only argv remembers what the human actually ran.
 #[cfg(target_os = "macos")]
+#[tracing::instrument(level = "debug", ret)]
 fn exec_path(pid: i32) -> Option<String> {
     // PROC_PIDPATHINFO_MAXSIZE. Kept as a literal because libc exposes the function but
     // not the constant.
@@ -210,6 +218,7 @@ fn exec_path(pid: i32) -> Option<String> {
 /// the only way to get the layout the header describes, and the region is a handful of
 /// pages, not the megabyte `KERN_ARGMAX` allows for.
 #[cfg(target_os = "macos")]
+#[tracing::instrument(level = "debug", ret)]
 fn exec_argv(pid: i32) -> Option<String> {
     use std::ptr;
 
@@ -288,6 +297,7 @@ fn exec_argv(pid: i32) -> Option<String> {
 /// give. The truncation is still handled in [`by_truncated_bin`] — Linux's `comm`
 /// fallback reaches it, and a caller may hand us a name from anywhere.
 #[cfg(target_os = "macos")]
+#[tracing::instrument(level = "debug", ret)]
 fn foreground_command(pid: i32) -> Option<String> {
     exec_argv(pid).or_else(|| exec_path(pid))
 }
@@ -299,6 +309,7 @@ fn foreground_command(pid: i32) -> Option<String> {
 /// `comm` is the fallback for the cases `cmdline` leaves empty — a kernel thread, or a
 /// process that has exited into a zombie — and pays for it with 15 characters.
 #[cfg(target_os = "linux")]
+#[tracing::instrument(level = "debug", ret)]
 fn foreground_command(pid: i32) -> Option<String> {
     if let Ok(raw) = std::fs::read(format!("/proc/{pid}/cmdline")) {
         let text = String::from_utf8_lossy(&raw)
@@ -317,6 +328,7 @@ fn foreground_command(pid: i32) -> Option<String> {
 /// pgrp is still readable, but turning a pid into a name is per-kernel work we have no
 /// machine to verify against, and a wrong name is worse than none.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+#[tracing::instrument(level = "debug", ret)]
 fn foreground_command(_pid: i32) -> Option<String> {
     None
 }
@@ -329,6 +341,7 @@ fn foreground_command(_pid: i32) -> Option<String> {
 ///
 /// Cheap enough for a UI tick by construction — syscalls and reads only, never a
 /// subprocess, never a wait.
+#[tracing::instrument(level = "debug", ret)]
 pub fn foreground_name(fd: PtyFd) -> Option<String> {
     #[cfg(unix)]
     {
@@ -347,6 +360,7 @@ pub fn foreground_name(fd: PtyFd) -> Option<String> {
 /// a shell at its prompt, `git`, `make`, a platform with no answer — and per §D5 that is
 /// a reason to leave a pane's chrome alone or return it to `Terminal`, never a reason to
 /// touch what the pane would relaunch.
+#[tracing::instrument(level = "debug", ret)]
 pub fn foreground_tool(fd: PtyFd) -> Option<&'static ToolDef> {
     #[cfg(unix)]
     {
@@ -368,6 +382,7 @@ pub fn foreground_tool(fd: PtyFd) -> Option<&'static ToolDef> {
 /// workaround in `libc`; it is one contiguous 1024-byte NUL-terminated buffer, which is
 /// why it is read here as a flat byte slice.
 #[cfg(target_os = "macos")]
+#[tracing::instrument(level = "debug", ret)]
 fn process_cwd(pid: i32) -> Option<String> {
     // SAFETY: `proc_vnodepathinfo` is plain POD — every field is an integer or a byte
     // array — so an all-zero value is a valid one to hand the kernel as an out-param.
@@ -402,6 +417,7 @@ fn process_cwd(pid: i32) -> Option<String> {
 
 /// The current working directory of `pid`, from `/proc`.
 #[cfg(target_os = "linux")]
+#[tracing::instrument(level = "debug", ret)]
 fn process_cwd(pid: i32) -> Option<String> {
     let link = std::fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
     let path = link.to_str()?;
@@ -412,6 +428,7 @@ fn process_cwd(pid: i32) -> Option<String> {
 /// wrong directory is worse than none, and re-rooting a file panel on one would be
 /// visibly wrong.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
+#[tracing::instrument(level = "debug", ret)]
 fn process_cwd(_pid: i32) -> Option<String> {
     None
 }
@@ -429,6 +446,7 @@ fn process_cwd(_pid: i32) -> Option<String> {
 /// directory reported `None` forever. The kernel always knows.
 ///
 /// Cheap enough for a UI tick, like its neighbours: two syscalls, no subprocess, no wait.
+#[tracing::instrument(level = "debug", ret)]
 pub fn foreground_cwd(fd: PtyFd) -> Option<String> {
     #[cfg(unix)]
     {

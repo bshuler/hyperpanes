@@ -88,17 +88,20 @@ pub struct Bridge {
 
 impl Bridge {
     /// Feed a `ChannelMsg::Data` payload to the pane. Returns false once the bridge is gone.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn input(&self, data: &[u8]) -> bool {
         self.input.send(data.to_vec()).is_ok()
     }
 
     /// Feed a window-change. Returns false once the bridge is gone.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn resize(&self, cols: u16, rows: u16) -> bool {
         self.resize.send((cols, rows)).is_ok()
     }
 }
 
 /// Start the bridge for one channel. Never blocks the caller.
+#[tracing::instrument(level = "debug")]
 pub fn spawn(params: BridgeParams, handle: Handle, channel: ChannelId) -> Bridge {
     let (input_tx, input_rx) = mpsc::channel::<Vec<u8>>();
     let (resize_tx, resize_rx) = mpsc::channel::<(u16, u16)>();
@@ -156,6 +159,7 @@ pub fn spawn(params: BridgeParams, handle: Handle, channel: ChannelId) -> Bridge
 }
 
 /// The blocking half: connect, choose a pane, attach, pump. Returns the SSH exit status.
+#[tracing::instrument(level = "debug", ret, skip(sink))]
 fn attach_main(
     params: &BridgeParams,
     sink: &mut ChannelSink,
@@ -276,6 +280,7 @@ fn attach_main(
 }
 
 /// Turn the query (or its absence) into one uid. `Ok(None)` means the user cancelled.
+#[tracing::instrument(level = "debug", ret, skip(sink))]
 fn pick(
     sessions: &[SessionMeta],
     query: Option<&str>,
@@ -327,6 +332,7 @@ fn pick(
 ///
 /// The client is in raw mode (it asked for a pty), so there is no line discipline on either
 /// side — this is the whole of it: echo, backspace, cancel.
+#[tracing::instrument(level = "debug", ret, skip(sink))]
 fn read_line(rx: &Receiver<Vec<u8>>, sink: &mut ChannelSink) -> Result<Option<String>, String> {
     let mut line = String::new();
     loop {
@@ -358,6 +364,7 @@ fn read_line(rx: &Receiver<Vec<u8>>, sink: &mut ChannelSink) -> Result<Option<St
 }
 
 /// The session table, CRLF-terminated for a raw-mode channel.
+#[tracing::instrument(level = "debug", ret)]
 fn render_list(sessions: &[SessionMeta]) -> String {
     if sessions.is_empty() {
         return "No live hyperpanes sessions.\r\n".to_string();
@@ -390,6 +397,7 @@ struct ChannelSink {
 }
 
 impl ChannelSink {
+    #[tracing::instrument(level = "debug")]
     fn new(tx: tokio::sync::mpsc::Sender<Out>) -> Self {
         Self {
             tx,
@@ -399,6 +407,7 @@ impl ChannelSink {
 }
 
 impl Write for ChannelSink {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         self.buf.extend_from_slice(data);
         if self.buf.len() >= SINK_CHUNK {
@@ -407,6 +416,7 @@ impl Write for ChannelSink {
         Ok(data.len())
     }
 
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn flush(&mut self) -> io::Result<()> {
         if self.buf.is_empty() {
             return Ok(());
@@ -428,6 +438,7 @@ struct ChannelReader {
 }
 
 impl ChannelReader {
+    #[tracing::instrument(level = "debug")]
     fn new(rx: Receiver<Vec<u8>>) -> Self {
         Self {
             rx,
@@ -438,6 +449,7 @@ impl ChannelReader {
 }
 
 impl Read for ChannelReader {
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);

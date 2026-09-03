@@ -16,6 +16,7 @@ use std::path::Path;
 
 use hyperpanes_core::persistence::{control_settings, paths};
 
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn wants_pair(argv: &[String]) -> bool {
     argv.get(1).map(|a| a == "pair").unwrap_or(false)
 }
@@ -36,6 +37,7 @@ impl PairOpts {
     /// `hyperpanes pair [--device <label>] [--ttl <30d|12h|90m|<ms>>] [--ssh-key <key|path>]`.
     /// Label defaults to the machine hostname; TTL omitted = never expires (the master-token
     /// guarantee).
+    #[tracing::instrument(level = "debug", skip_all)]
     fn parse(argv: &[String]) -> Result<Self, String> {
         let mut label: Option<String> = None;
         let mut ttl_ms: Option<i64> = None;
@@ -75,6 +77,7 @@ impl PairOpts {
 /// rather than at the server means a typo is a usage error at the terminal instead of a device
 /// that silently cannot log in — and it guarantees only real key material is ever persisted.
 #[cfg(unix)]
+#[tracing::instrument(level = "debug", skip_all)]
 fn normalize_ssh_key(spec: &str) -> Result<String, String> {
     let key = crate::ssh::keys::parse_public_key(spec).map_err(|e| format!("--ssh-key: {e}"))?;
     key.to_openssh()
@@ -84,12 +87,14 @@ fn normalize_ssh_key(spec: &str) -> Result<String, String> {
 /// Windows has no embedded SSH server (see `ssh/mod.rs`), so pairing a key would store a
 /// credential nothing reads. Say so instead of accepting it.
 #[cfg(not(unix))]
+#[tracing::instrument(level = "debug", skip_all)]
 fn normalize_ssh_key(_spec: &str) -> Result<String, String> {
     Err("--ssh-key: the embedded SSH server is not available on Windows".to_string())
 }
 
 /// Mint a per-device token by POSTing to the running server's `/devices` (master-authenticated),
 /// so the master token itself never travels to the phone. Returns the new device token.
+#[tracing::instrument(level = "debug", skip_all)]
 fn mint_device(
     port: u16,
     bind_address: Option<&str>,
@@ -126,6 +131,7 @@ fn mint_device(
         .ok_or_else(|| "response missing token".to_string())
 }
 
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn run(argv: &[String]) -> std::io::Result<()> {
     let opts = match PairOpts::parse(argv) {
         Ok(o) => o,
@@ -209,6 +215,7 @@ pub fn run(argv: &[String]) -> std::io::Result<()> {
 
 /// After pairing a key, say what it is now good for: the SSH front door, on its own port, which
 /// has to be switched on separately. `hyperpanes revoke <label>` still takes both away at once.
+#[tracing::instrument(level = "debug", skip_all)]
 fn print_ssh_hint(hosts: &[String], label: &str) {
     let host = hosts.first().map(String::as_str).unwrap_or("127.0.0.1");
     let port =
@@ -225,6 +232,7 @@ fn print_ssh_hint(hosts: &[String], label: &str) {
 }
 
 /// `{ port, token }` from control.json, or `None` when missing/corrupt.
+#[tracing::instrument(level = "debug", skip_all)]
 fn read_discovery(path: &Path) -> Option<(u16, String)> {
     let raw = std::fs::read_to_string(path).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -237,6 +245,7 @@ fn read_discovery(path: &Path) -> Option<(u16, String)> {
 }
 
 /// The pairing URL the mobile app parses (keep in sync with `mobile/…/pairing.dart`).
+#[tracing::instrument(level = "debug", skip_all)]
 fn pairing_url(host: &str, port: u16, token: &str) -> String {
     let h = if host.contains(':') {
         format!("[{host}]") // IPv6 literal
@@ -250,6 +259,7 @@ fn pairing_url(host: &str, port: u16, token: &str) -> String {
 /// outright (that's the only address the server listens on); an unspecified bind
 /// (`0.0.0.0`) or no config falls back to discovering this machine's Tailscale +
 /// default-route IPs.
+#[tracing::instrument(level = "debug", skip_all)]
 fn candidate_hosts(bind_address: Option<&str>) -> Vec<String> {
     if let Some(addr) = bind_address {
         if let Ok(ip) = addr.parse::<std::net::IpAddr>() {
@@ -279,6 +289,7 @@ fn candidate_hosts(bind_address: Option<&str>) -> Vec<String> {
 }
 
 /// The local address the OS would use to reach `target` — connected-UDP trick, no I/O.
+#[tracing::instrument(level = "debug", skip_all)]
 fn local_ip_toward(target: &str) -> Option<String> {
     let sock = UdpSocket::bind("0.0.0.0:0").ok()?;
     sock.connect(target).ok()?;
@@ -286,6 +297,7 @@ fn local_ip_toward(target: &str) -> Option<String> {
 }
 
 /// Render `data` as a terminal QR (quiet zone + half-block cells, dark-on-light).
+#[tracing::instrument(level = "debug", skip_all)]
 fn qr_text(data: &str) -> Option<String> {
     let code = qrcode::QrCode::new(data.as_bytes()).ok()?;
     Some(

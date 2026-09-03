@@ -14,6 +14,7 @@ use std::path::Path;
 
 /// What to load on launch, parameterized by `argv` + `cwd` (so it also serves the
 /// `second-instance` event). Relative cwds resolve against `cwd`.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve_launch_workspace(argv: &[String], cwd: &str) -> Option<WorkspaceFile> {
     resolve_launch_workspace_with(argv, cwd, &paths::last_workspace_json())
 }
@@ -23,6 +24,7 @@ pub fn resolve_launch_workspace(argv: &[String], cwd: &str) -> Option<WorkspaceF
 /// bootstrap uses this (argv-only); the native GUI uses [`resolve_launch_workspace`] so a
 /// plain relaunch restores the last session (#14 — the GUI writes `last-workspace.json`
 /// when its final window closes). Relative cwds resolve against `cwd`.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn resolve_cli_workspace(argv: &[String], cwd: &str) -> Option<WorkspaceFile> {
     let parsed = parse_cli(argv);
     if let Some(ws) = parsed.workspace {
@@ -36,6 +38,7 @@ pub fn resolve_cli_workspace(argv: &[String], cwd: &str) -> Option<WorkspaceFile
 
 /// The launch resolution with the last-session path injected (for testability). Inline / explicit
 /// `.json` (via [`resolve_cli_workspace`]) win; otherwise fall back to the last session.
+#[tracing::instrument(level = "debug", skip_all)]
 fn resolve_launch_workspace_with(
     argv: &[String],
     cwd: &str,
@@ -52,6 +55,7 @@ fn resolve_launch_workspace_with(
 }
 
 /// What to load on launch from this process's own argv + cwd.
+#[tracing::instrument(level = "debug", skip_all)]
 pub fn get_initial_workspace() -> Option<WorkspaceFile> {
     let argv: Vec<String> = std::env::args().collect();
     let cwd = std::env::current_dir()
@@ -61,6 +65,7 @@ pub fn get_initial_workspace() -> Option<WorkspaceFile> {
 }
 
 /// The window list to open on first launch (last-session restore included).
+#[tracing::instrument(level = "debug", ret)]
 pub fn get_initial_windows() -> Vec<WindowSpec> {
     io::windows_of(get_initial_workspace().as_ref())
 }

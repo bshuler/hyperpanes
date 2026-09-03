@@ -34,6 +34,7 @@ const AUTHORIZED_MODE_MASK: u32 = 0o022;
 ///
 /// Returns the key plus `true` when it was freshly generated (so the caller can tell the
 /// operator to expect a first-connection fingerprint prompt).
+#[tracing::instrument(level = "debug", ret)]
 pub fn load_or_create_host_key(path: &Path) -> Result<(PrivateKey, bool), String> {
     // Two attempts: if a concurrent process wins the `create_new` race we fall back to
     // reading what it wrote rather than failing the start-up.
@@ -84,6 +85,7 @@ enum GenerateError {
 }
 
 /// Create a new ed25519 host key at `path` with mode 0600, failing if it already exists.
+#[tracing::instrument(level = "debug")]
 fn generate_host_key(path: &Path) -> Result<PrivateKey, GenerateError> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(dir)
@@ -143,6 +145,7 @@ fn generate_host_key(path: &Path) -> Result<PrivateKey, GenerateError> {
 
 /// Refuse a key file whose mode lets anyone but the owner at it — the same check OpenSSH
 /// makes, and for the same reason.
+#[tracing::instrument(level = "debug", ret)]
 fn check_mode(path: &Path, mode: u32, mask: u32, what: &str) -> Result<(), String> {
     if mode & mask != 0 {
         return Err(format!(
@@ -162,17 +165,20 @@ fn check_mode(path: &Path, mode: u32, mask: u32, what: &str) -> Result<(), Strin
 }
 
 /// `SHA256:…` fingerprint of a public key — the only thing about a key that is ever printed.
+#[tracing::instrument(level = "debug", ret)]
 pub fn fingerprint(key: &PublicKey) -> String {
     key.fingerprint(HashAlg::Sha256).to_string()
 }
 
 /// Fingerprint of a private key's public half.
+#[tracing::instrument(level = "debug", ret)]
 pub fn host_fingerprint(key: &PrivateKey) -> String {
     fingerprint(key.public_key())
 }
 
 /// A human label for a key: its `authorized_keys` comment when it has one, else its
 /// fingerprint. Used in logs and in `hyperpanes ssh keys`.
+#[tracing::instrument(level = "debug", ret)]
 pub fn label_for(key: &PublicKey) -> String {
     let comment = key.comment().as_str_lossy().trim().to_string();
     if comment.is_empty() {
@@ -198,6 +204,7 @@ impl AuthorizedKeySet {
     /// Compares [`PublicKey::key_data`] — the actual key material — so a client that reordered
     /// or dropped the trailing comment still matches, and a comment alone can never authorize
     /// anything.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn authorize(&self, offered: &PublicKey) -> Option<String> {
         self.keys
             .iter()
@@ -221,6 +228,7 @@ impl AuthorizedKeySet {
 
 /// Read `authorized_keys`. A missing file is an **empty** set, not an error: that is the
 /// fail-closed state (nobody can authenticate) and it is what a fresh install looks like.
+#[tracing::instrument(level = "debug", ret)]
 pub fn load_authorized(path: &Path) -> Result<AuthorizedKeySet, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -239,6 +247,7 @@ pub fn load_authorized(path: &Path) -> Result<AuthorizedKeySet, String> {
 
 /// Parse `authorized_keys` text. Split out from [`load_authorized`] so it is testable without
 /// a filesystem.
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_authorized(text: &str) -> AuthorizedKeySet {
     let mut set = AuthorizedKeySet::default();
     // `AuthorizedKeys` skips blanks and `#` comments itself, but it stops at the first bad
@@ -266,6 +275,7 @@ pub fn parse_authorized(text: &str) -> AuthorizedKeySet {
 ///
 /// Returns `false` when the key was already present (idempotent, so re-pairing a phone is
 /// harmless). `label`, when given, replaces the key's comment.
+#[tracing::instrument(level = "debug", ret)]
 pub fn authorize_key(path: &Path, key_text: &str, label: Option<&str>) -> Result<bool, String> {
     let mut key = parse_public_key(key_text)?;
     if let Some(label) = label {
@@ -292,6 +302,7 @@ pub fn authorize_key(path: &Path, key_text: &str, label: Option<&str>) -> Result
 }
 
 /// Drop every key whose label or fingerprint matches `needle`. Returns how many went.
+#[tracing::instrument(level = "debug", ret)]
 pub fn revoke_key(path: &Path, needle: &str) -> Result<usize, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -338,6 +349,7 @@ pub fn revoke_key(path: &Path, needle: &str) -> Result<usize, String> {
 
 /// Accept either an `authorized_keys` line, a whole `id_ed25519.pub` file's contents, or a
 /// path to one.
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_public_key(input: &str) -> Result<PublicKey, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
@@ -373,6 +385,7 @@ pub enum KeySource {
 
 impl KeySource {
     /// One word for `hyperpanes ssh keys` / `status`.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn as_str(self) -> &'static str {
         match self {
             KeySource::File => "file",
@@ -397,11 +410,13 @@ impl AuthorizedEntry {
     /// Whether a paired device's TTL has run out at `now_ms`. Inclusive at the instant, matching
     /// [`hyperpanes_core::persistence::device_tokens::DeviceRecord::is_expired`] so the SSH door
     /// and the control-API door shut at exactly the same millisecond.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_expired(&self, now_ms: i64) -> bool {
         matches!(self.expires_at, Some(exp) if exp <= now_ms)
     }
 
     /// `label (source)` — how a key is named in output and in the audit line on a successful auth.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn describe(&self) -> String {
         format!("{} ({})", self.label, self.source.as_str())
     }
@@ -424,6 +439,7 @@ pub struct Authorizer {
 
 impl Authorizer {
     /// Read both sources: `ssh-authorized-keys` and the `sshKey` column of `device-tokens.json`.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn load(paths: &super::config::SshPaths) -> Result<Self, String> {
         let file = load_authorized(&paths.authorized_keys)?;
         let mut out = Self {
@@ -448,6 +464,7 @@ impl Authorizer {
     /// which is already the fail-closed answer. What is checked here is the file mode: anything
     /// group- or other-writable is a way for another account to append its own key, so it is
     /// refused outright, exactly as `authorized_keys` is.
+    #[tracing::instrument(level = "debug", ret)]
     fn load_devices(&mut self, path: &Path) -> Result<(), String> {
         match std::fs::metadata(path) {
             Ok(meta) => check_mode(
@@ -484,6 +501,7 @@ impl Authorizer {
     /// Compares [`PublicKey::key_data`] — the actual key material — so a client that reordered or
     /// dropped the trailing comment still matches, and a comment alone can never authorize
     /// anything. An expired device pairing matches nothing.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn authorize(&self, offered: &PublicKey, now_ms: i64) -> Option<&AuthorizedEntry> {
         self.entries
             .iter()
@@ -491,6 +509,7 @@ impl Authorizer {
     }
 
     /// How many keys could open the door right now (expired pairings excluded).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn live_len(&self, now_ms: i64) -> usize {
         self.entries
             .iter()
@@ -500,6 +519,7 @@ impl Authorizer {
 }
 
 /// Wall clock in ms since the epoch — the same clock the control server stamps device TTLs with.
+#[tracing::instrument(level = "debug", ret)]
 pub fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

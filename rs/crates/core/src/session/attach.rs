@@ -94,6 +94,7 @@ pub enum PumpEnd {
 ///
 /// The endpoint is derived by [`transport::endpoint_for`] — the same salt→address function
 /// the GUI and the daemon use, so the hash is never re-derived here.
+#[tracing::instrument(level = "debug", ret)]
 pub fn connect(salt: &str) -> io::Result<Conn> {
     let endpoint = transport::endpoint_for(salt);
     transport::connect(&endpoint).map_err(|e| match e.kind() {
@@ -115,6 +116,7 @@ pub fn connect(salt: &str) -> io::Result<Conn> {
 /// lifetime; an attach client does not, and killing a daemon full of someone's live shells
 /// because a CLI is a build behind would be the worst possible failure mode. The caller
 /// warns and proceeds.
+#[tracing::instrument(level = "debug", ret)]
 pub fn handshake(conn: &Conn) -> io::Result<u32> {
     let mut w = transport::try_clone(conn)?;
     write_frame(
@@ -141,6 +143,7 @@ pub fn handshake(conn: &Conn) -> io::Result<u32> {
 
 /// Ask the daemon for every live session (→ [`DaemonMsg::Sessions`]). Used by the chooser
 /// and by uid resolution.
+#[tracing::instrument(level = "debug", ret)]
 pub fn list_sessions(conn: &Conn) -> io::Result<Vec<SessionMeta>> {
     let mut w = transport::try_clone(conn)?;
     write_frame(&mut w, &ClientMsg::ListSessions)?;
@@ -177,6 +180,7 @@ pub enum UidMatch {
 /// a prefix of another. A rung that matches several is reported as
 /// [`Ambiguous`](UidMatch::Ambiguous) rather than silently picking one: attaching to the
 /// wrong live shell is worse than an error message.
+#[tracing::instrument(level = "debug", ret)]
 pub fn resolve_uid(sessions: &[SessionMeta], query: &str) -> UidMatch {
     let query = query.trim();
     if query.is_empty() {
@@ -208,6 +212,7 @@ pub fn resolve_uid(sessions: &[SessionMeta], query: &str) -> UidMatch {
 /// This is the letterbox test: `true` means the pane occupies the top-left of the terminal
 /// and the rest is blank; `false` means the local terminal is too small and absolute cursor
 /// addressing will be clamped, which no amount of escape-sequence forwarding can fix.
+#[tracing::instrument(level = "debug", ret)]
 pub fn fits(terminal: (u16, u16), session: (Option<u16>, Option<u16>)) -> Option<bool> {
     match session {
         (Some(cols), Some(rows)) => Some(terminal.0 >= cols && terminal.1 >= rows),
@@ -250,6 +255,7 @@ impl Attachment {
     /// `Attach` to `uid` and return the attachment plus its **replay seed** — the daemon's
     /// rolling buffer for that session, to be written to the terminal once before the live
     /// stream starts. Empty when the session has produced nothing yet.
+    #[tracing::instrument(level = "debug")]
     pub fn open(conn: Conn, uid: &str) -> io::Result<(Self, String)> {
         let read = transport::try_clone(&conn)?;
         let write = Arc::new(Mutex::new(conn));
@@ -302,17 +308,20 @@ impl Attachment {
     }
 
     /// The uid this attachment follows.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn uid(&self) -> &str {
         &self.uid
     }
 
     /// Bytes to emit before a repaint's replay seed (typically a clear-screen sequence).
+    #[tracing::instrument(level = "debug", ret, skip(self, prefix))]
     pub fn set_repaint_prefix(&mut self, prefix: impl Into<Vec<u8>>) {
         self.repaint_prefix = prefix.into();
     }
 
     /// A cloneable handle for the input direction (keystrokes, resizes, detach). Safe to
     /// move to another thread while [`pump_output`](Self::pump_output) owns the read half.
+    #[tracing::instrument(level = "debug", skip(self))]
     pub fn writer(&self) -> AttachWriter {
         AttachWriter {
             conn: Arc::clone(&self.write),
@@ -326,6 +335,7 @@ impl Attachment {
     /// Events for other uids are ignored — the daemon only forwards uids this connection
     /// attached to, but the filter keeps the contract local. Non-`Data` events (cwd, OSC 133
     /// markers, agent state) carry no bytes for a dumb terminal and are dropped.
+    #[tracing::instrument(level = "debug", ret, skip(self, out))]
     pub fn pump_output<W: Write>(&mut self, out: &mut W) -> io::Result<PumpEnd> {
         while let Some(ev) = self.pending.pop_front() {
             if let Some(end) = self.write_event(ev, out)? {
@@ -378,6 +388,7 @@ impl Attachment {
     /// `Data` already covered by the seed is dropped — see [`seed_cursor`](Self::seed_cursor).
     /// Non-`Data` events (cwd, OSC 133 markers, agent state) carry no bytes for a dumb
     /// terminal.
+    #[tracing::instrument(level = "debug", ret, skip(self, out))]
     fn write_event<W: Write>(
         &mut self,
         ev: SessionEvent,
@@ -410,6 +421,7 @@ impl Attachment {
 }
 
 /// Whether an I/O error means "the connection is gone" rather than a real fault.
+#[tracing::instrument(level = "debug", ret)]
 fn is_disconnect(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -431,6 +443,7 @@ pub struct AttachWriter {
 
 impl AttachWriter {
     /// Forward decoded keyboard text to the session's pty.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn send_input(&self, data: &str) -> io::Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -448,6 +461,7 @@ impl AttachWriter {
     /// Ask the daemon to resize the session. **Only** called under
     /// [`ResizePolicy::Request`] — see the module docs; this reflows the pane for every
     /// viewer, the desktop included.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn request_resize(&self, cols: u16, rows: u16) -> io::Result<()> {
         let mut w = self.conn.lock().expect("attach write half");
         write_frame(
@@ -466,6 +480,7 @@ impl AttachWriter {
     ///
     /// This is what a `SIGWINCH` does under [`ResizePolicy::Observe`]: the local terminal
     /// changed, the pane did not, so we redraw instead of reflowing.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn request_repaint(&self) -> io::Result<()> {
         let mut w = self.conn.lock().expect("attach write half");
         write_frame(
@@ -480,6 +495,7 @@ impl AttachWriter {
     /// blocking read returns. The **session keeps running** — no `Kill`, no `Shutdown` is
     /// ever sent from the attach client.
     #[cfg(unix)]
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn disconnect(&self) {
         use std::net::Shutdown;
         if let Ok(w) = self.conn.lock() {
@@ -492,6 +508,7 @@ impl AttachWriter {
     /// SSH channel closes its own transport; this keeps `core` compiling for the
     /// windows-latest leg without pretending to a capability the handle lacks.
     #[cfg(windows)]
+    #[tracing::instrument(level = "debug", ret)]
     pub fn disconnect(&self) {}
 }
 
@@ -512,6 +529,7 @@ pub const DEFAULT_DETACH_PREFIX: u8 = 0x1C;
 /// Accepts `C-x`, `c-x`, `ctrl-x`, `^x` and a bare single character (which must already be a
 /// control byte). The key must be a control byte: a printable detach key would eat a
 /// character the shell needs on every keystroke.
+#[tracing::instrument(level = "debug", ret)]
 pub fn parse_detach_key(spec: &str) -> Result<u8, String> {
     let spec = spec.trim();
     if spec.is_empty() {
@@ -551,6 +569,7 @@ pub fn parse_detach_key(spec: &str) -> Result<u8, String> {
 }
 
 /// Render a control byte back as a `C-x` spec, for help text and the attach banner.
+#[tracing::instrument(level = "debug", ret)]
 pub fn detach_key_label(key: u8) -> String {
     if key < 0x20 {
         format!("C-{}", (key | 0x40) as char)
@@ -586,6 +605,7 @@ pub struct DetachFilter {
 
 impl DetachFilter {
     /// A filter watching for `prefix`.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new(prefix: u8) -> Self {
         Self {
             prefix,
@@ -594,11 +614,13 @@ impl DetachFilter {
     }
 
     /// Whether the prefix has been seen and the machine is waiting for the command key.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn armed(&self) -> bool {
         self.armed
     }
 
     /// Classify one chunk of raw keyboard bytes.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn feed(&mut self, buf: &[u8]) -> FilterOut {
         let mut forward = Vec::with_capacity(buf.len());
         for &b in buf {
@@ -633,6 +655,7 @@ impl DetachFilter {
 /// Bytes are UTF-8 **stream**-decoded before being put on the wire ([`ClientMsg::Write`]
 /// carries a `String`), so a multi-byte character split across two `read`s is not corrupted
 /// into replacement characters — the same decoder the pty read path uses.
+#[tracing::instrument(level = "debug", ret, skip(input, writer))]
 pub fn pump_input<R: Read>(
     mut input: R,
     writer: &AttachWriter,

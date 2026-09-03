@@ -29,11 +29,13 @@ pub struct Replay {
 
 impl Replay {
     /// A replay buffer with the default [`REPLAY_BUFFER_SIZE`] cap.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn new() -> Self {
         Self::with_capacity(REPLAY_BUFFER_SIZE)
     }
 
     /// A replay buffer with an explicit UTF-16 cap (used by tests).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn with_capacity(cap: usize) -> Self {
         Self {
             buf: String::new(),
@@ -44,6 +46,7 @@ impl Replay {
 
     /// Append a flushed chunk, evicting oldest output so the retained length stays at
     /// or below the cap (UTF-16 units). Mirrors `(replay + data).slice(-N)`.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn append(&mut self, data: &str) {
         self.buf.push_str(data);
         self.len_u16 += data.encode_utf16().count();
@@ -68,16 +71,19 @@ impl Replay {
     }
 
     /// The retained recent output, replayed into a re-attaching terminal.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn get(&self) -> &str {
         &self.buf
     }
 
     /// Retained length in UTF-16 code units (what `control::output::sliceSince` treats
     /// as `replay.length`).
+    #[tracing::instrument(level = "debug", ret)]
     pub fn len_utf16(&self) -> usize {
         self.len_u16
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     pub fn is_empty(&self) -> bool {
         self.buf.is_empty()
     }

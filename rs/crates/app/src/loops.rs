@@ -52,6 +52,7 @@ pub enum LoopKind {
 }
 
 impl LoopKind {
+    #[tracing::instrument(level = "debug", ret)]
     pub fn name(self) -> &'static str {
         match self {
             LoopKind::Status => "status",
@@ -73,6 +74,7 @@ pub struct LoopSchedule {
 impl LoopSchedule {
     /// Read the schedule from `path`; a missing or unreadable file is an empty schedule
     /// (every loop is scheduled afresh from now) — never a reason not to start the app.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn load_from(path: &Path) -> Self {
         match std::fs::read_to_string(path) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_else(|e| {
@@ -89,6 +91,7 @@ impl LoopSchedule {
 
     /// Write the schedule to `path` atomically. A failure is logged, not fatal: the loops
     /// still run this session and are merely rescheduled from scratch after a restart.
+    #[tracing::instrument(level = "debug", ret)]
     pub fn save_to(&self, path: &Path) {
         let json = match serde_json::to_vec_pretty(self) {
             Ok(j) => j,
@@ -105,6 +108,7 @@ impl LoopSchedule {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     fn next(&self, kind: LoopKind) -> Option<u64> {
         match kind {
             LoopKind::Status => self.status_next,
@@ -112,6 +116,7 @@ impl LoopSchedule {
         }
     }
 
+    #[tracing::instrument(level = "debug", ret)]
     fn set_next(&mut self, kind: LoopKind, next: Option<u64>) {
         match kind {
             LoopKind::Status => self.status_next = next,
@@ -121,6 +126,7 @@ impl LoopSchedule {
 }
 
 /// Where the schedule lives: `loops.json` beside the rest of the app's state.
+#[tracing::instrument(level = "debug", ret)]
 pub fn schedule_file() -> PathBuf {
     paths::state_dir().join("loops.json")
 }
@@ -146,6 +152,7 @@ pub enum Decision {
 /// falls back into its rhythm — not once per missed interval. A `next` further than one
 /// interval ahead (the interval was shortened in Preferences) is pulled in to one interval
 /// from now, so a change to the setting takes effect without waiting out the old one.
+#[tracing::instrument(level = "debug", ret)]
 pub fn decide(now: u64, interval: u64, next: Option<u64>) -> Decision {
     if interval == 0 {
         return Decision::Off;
@@ -178,11 +185,13 @@ pub struct Loops {
 
 impl Loops {
     /// Load the schedule from the default state file.
+    #[tracing::instrument(level = "debug")]
     pub fn new() -> Self {
         Self::at(schedule_file())
     }
 
     /// Load the schedule from `path` (tests point this at a scratch file).
+    #[tracing::instrument(level = "debug")]
     pub fn at(path: PathBuf) -> Self {
         let schedule = LoopSchedule::load_from(&path);
         tracing::info!(
@@ -198,7 +207,9 @@ impl Loops {
         }
     }
 
-    /// A read-only view of the current schedule.
+    /// A read-only view of the current schedule (tests only; the app reads
+    /// the persisted file instead).
+    #[cfg(test)]
     pub fn schedule(&self) -> LoopSchedule {
         self.schedule.borrow().clone()
     }
@@ -207,6 +218,7 @@ impl Loops {
     /// in seconds (`0` = off). Throttled to once a second and silent until the startup grace
     /// has passed; every schedule change is persisted before this returns, so a crash between
     /// the decision and the work does not replay the firing.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn poll(&self, status_secs: u64, restart_secs: u64) -> Vec<LoopKind> {
         let now_i = Instant::now();
         if now_i.duration_since(self.started) < STARTUP_GRACE {
@@ -224,6 +236,7 @@ impl Loops {
     }
 
     /// [`Self::poll`] without the throttle or grace, at an explicit clock — the testable core.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn poll_at(&self, now: u64, status_secs: u64, restart_secs: u64) -> Vec<LoopKind> {
         let mut fired = Vec::new();
         let mut changed = false;
@@ -264,6 +277,7 @@ impl Loops {
 }
 
 impl Default for Loops {
+    #[tracing::instrument(level = "debug")]
     fn default() -> Self {
         Self::new()
     }
@@ -271,6 +285,7 @@ impl Default for Loops {
 
 /// Seconds since the Unix epoch; `0` on a clock set before 1970, which only ever delays
 /// the loops (nothing fires in the past).
+#[tracing::instrument(level = "debug", ret)]
 pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -286,6 +301,7 @@ pub fn unix_now() -> u64 {
 /// or empty; `session` is the tool's own resume key when one is known. A tool whose resume
 /// shape [`hyperpanes_core::tools::resume_args`] does not vouch for starts fresh rather
 /// than with a guessed flag.
+#[tracing::instrument(level = "debug", ret)]
 pub fn restart_line(
     tool_id: &str,
     bin: &str,
