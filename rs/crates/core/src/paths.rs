@@ -593,4 +593,155 @@ mod tests {
             OpenPlan::OsDefault
         );
     }
+
+    // ---- `editorCommand`: the decision, not just the formatting -----------------------------
+    // The three tests above cover the template's SHAPE. These cover what the setting DECIDES:
+    // an unset (or blank) `editorCommand` must fall back rather than launch nothing, a
+    // configured one must win, and a path with spaces or shell metacharacters must survive the
+    // trip through `sh -c` as one argument.
+
+    #[test]
+    fn a_blank_editor_command_falls_back_instead_of_spawning_nothing() {
+        // "unset" reaches here as `""`, but a value typed into Preferences — or PATCHed
+        // through the control plane — can be all whitespace, and `.trim()` is the only thing
+        // standing between that and a launch of the empty command line.
+        for blank in ["", " ", "\t", "  \n ", "\t \r\n"] {
+            assert_eq!(
+                plan_open(false, "/x/y.ts", Some(3), Some(2), blank, None),
+                OpenPlan::OsDefault,
+                "blank {blank:?} must not take the Editor branch"
+            );
+            // With `code` on PATH the fallback is VS Code, still not the blank template.
+            assert_eq!(
+                plan_open(
+                    false,
+                    "/x/y.ts",
+                    Some(3),
+                    Some(2),
+                    blank,
+                    Some("/usr/bin/code")
+                ),
+                OpenPlan::VsCode {
+                    target: "/x/y.ts:3:2".into()
+                },
+                "blank {blank:?} must fall through to VS Code"
+            );
+            // Belt and braces: even if the branch were reached, the template builds nothing,
+            // and `run_editor_template` refuses to launch an empty command line.
+            assert_eq!(editor_command_line(blank, "/x/y.ts", Some(3), Some(2)), "");
+        }
+    }
+
+    #[test]
+    fn a_configured_editor_wins_over_vscode_and_over_the_executable_guard() {
+        // `code` on PATH loses to an explicit preference — otherwise configuring an editor
+        // would do nothing on the machines that need it least.
+        assert_eq!(
+            plan_open(
+                false,
+                "/x/y.ts",
+                Some(9),
+                Some(4),
+                "subl {path}:{line}:{col}",
+                Some("/usr/bin/code")
+            ),
+            OpenPlan::Editor
+        );
+        // And it stays trusted for an executable extension even with VS Code present: the
+        // guard exists for the OS handler (which would EXECUTE the file), not for an editor.
+        assert_eq!(
+            plan_open(
+                false,
+                "/tmp/danger.sh",
+                None,
+                None,
+                "subl {path}",
+                Some("/usr/bin/code")
+            ),
+            OpenPlan::Editor
+        );
+        // A directory is still the platform opener — a configured editor does not claim it.
+        assert_eq!(
+            plan_open(true, "/x/dir", None, None, "subl {path}", None),
+            OpenPlan::OsDefault
+        );
+    }
+
+    #[test]
+    fn a_template_padded_with_whitespace_is_still_a_configured_editor() {
+        // A settings round trip (Preferences text field, `PATCH /settings`) preserves whatever
+        // the human typed, padding included. It must not change the decision or the argv.
+        assert_eq!(
+            plan_open(
+                false,
+                "/x/y.ts",
+                Some(7),
+                None,
+                "  subl   {path}:{line}  ",
+                None
+            ),
+            OpenPlan::Editor
+        );
+        assert_eq!(
+            editor_command_line("  subl   {path}:{line}  ", "/x/y.ts", Some(7), None),
+            format!("{} {}", quote("subl"), quote("/x/y.ts:7"))
+        );
+    }
+
+    #[test]
+    fn a_placeholder_standing_alone_disappears_when_there_is_no_line() {
+        // `{line}` as its own argument (the `code -g file 12` style) collapses to nothing
+        // rather than passing an empty argument the editor would read as a filename.
+        assert_eq!(
+            editor_command_line("code -g {path} {line}", "/x/y.ts", None, None),
+            format!("{} {} {}", quote("code"), quote("-g"), quote("/x/y.ts"))
+        );
+        assert_eq!(
+            editor_command_line("code -g {path} {line}", "/x/y.ts", Some(12), None),
+            format!(
+                "{} {} {} {}",
+                quote("code"),
+                quote("-g"),
+                quote("/x/y.ts"),
+                quote("12")
+            )
+        );
+        // A template with no `{path}` at all is the human's business — it runs verbatim
+        // rather than having the path appended behind their back.
+        assert_eq!(
+            editor_command_line("open-my-editor", "/x/y.ts", Some(1), Some(1)),
+            quote("open-my-editor")
+        );
+    }
+
+    #[test]
+    fn a_column_without_a_line_leaves_the_doubled_colon_it_was_written_with() {
+        // RECORDED, not endorsed: only a TRAILING `:` is tidied, so a col with no line yields
+        // `path::4`. Unreachable from the link extractor (a `:col` only ever comes attached to
+        // a `:line`), which is why it is pinned here rather than changed — the fix would alter
+        // what a hand-built call to a public function produces.
+        assert_eq!(
+            editor_command_line("subl {path}:{line}:{col}", "/x/y.ts", None, Some(4)),
+            format!("{} {}", quote("subl"), quote("/x/y.ts::4"))
+        );
+    }
+
+    #[test]
+    fn a_spaced_path_reaches_the_editor_as_exactly_one_argument() {
+        // `editor_template_keeps_spaced_path_as_one_arg` compares against `quote`, which
+        // cannot catch a quoting scheme that is wrong the same way twice. So run the built
+        // line through the same `sh -c` that `launch` uses, with `printf` standing in for the
+        // editor: it prints its format once per argument, so a path that got split shows up as
+        // two lines — and a path carrying `;` proves it never reached the shell as a command.
+        if cfg!(windows) {
+            return; // there `launch` goes through `cmd /C`; the quoting is asserted above.
+        }
+        let nasty = "/tmp/a b/x'; echo boom; '.ts";
+        let cmd = editor_command_line("printf %s\\n {path}", nasty, None, None);
+        let out = Command::new("sh").args(["-c", &cmd]).output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert_eq!(stdout, format!("{nasty}\n"));
+        // The injected `echo` never ran: its output would be a line of its own.
+        assert!(!stdout.contains("boom\n"));
+    }
 }

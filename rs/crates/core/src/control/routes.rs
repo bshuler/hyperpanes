@@ -2269,6 +2269,7 @@ mod golden {
     use super::router;
     use crate::control::readmodel::{PaneInfo, PaneStatus, TabInfo, WindowInfo};
     use crate::control::server::Shared;
+    use crate::control::uiops::UiOp;
     use crate::session_manager::SessionManager;
     use std::sync::atomic::Ordering;
     use std::sync::Arc;
@@ -3523,6 +3524,324 @@ mod golden {
         assert_eq!(
             denied.text().await.unwrap(),
             r#"{"error":"queue out of scope","queue":"deploy"}"#
+        );
+    }
+
+    // ---- /settings: `keepAlive` + `editorCommand` -------------------------------------------
+    // Both settings are global and both are wired end to end, but the seam between the store,
+    // this route and the behavior they drive had no test. `keepAlive`'s own effect lives in the
+    // app crate (the quit path reads the persisted preference), so what is testable HERE is the
+    // route contract: a valid value round-trips into `GET /settings`, a malformed one is a 400
+    // rather than a silent no-op, and neither reaches the settings at all without a root token.
+
+    /// Publish the blob a GUI would publish each sync tick. `PATCH /settings` validates its
+    /// keys against exactly this, so the fixture IS the contract the route enforces.
+    fn publish_settings(s: &Server, v: Value) {
+        *s.shared.settings.lock().unwrap() = Some(v);
+    }
+
+    fn settings_fixture() -> Value {
+        json!({ "keepAlive": true, "editorCommand": "", "clickablePaths": true })
+    }
+
+    fn json_type(v: &Value) -> &'static str {
+        match v {
+            Value::Null => "null",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::String(_) => "string",
+            Value::Array(_) => "array",
+            Value::Object(_) => "object",
+        }
+    }
+
+    /// The GUI's `State::apply_settings_patch`, in miniature: merge onto the published blob and
+    /// refuse a value whose JSON type is not the one that key already holds — which is what
+    /// serde does when the real patch is deserialized back into `Settings`.
+    fn merge_published_settings(shared: &Arc<Shared>, patch: &Value) -> Result<(), String> {
+        let Some(mut blob) = shared.settings.lock().unwrap().clone() else {
+            return Err("settings unavailable".to_string());
+        };
+        let obj = patch
+            .as_object()
+            .ok_or_else(|| "settings patch must be a JSON object".to_string())?;
+        {
+            let dst = blob
+                .as_object_mut()
+                .ok_or_else(|| "settings are not an object".to_string())?;
+            for (k, v) in obj {
+                let cur = dst
+                    .get(k)
+                    .ok_or_else(|| format!("unknown setting: {k}"))?
+                    .clone();
+                if json_type(&cur) != json_type(v) {
+                    return Err(format!(
+                        "bad settings patch: {k} expects a {}",
+                        json_type(&cur)
+                    ));
+                }
+                dst.insert(k.clone(), v.clone());
+            }
+        }
+        *shared.settings.lock().unwrap() = Some(blob);
+        Ok(())
+    }
+
+    /// Stand in for the GUI's UI thread: drain `ui_ops`, apply each `PatchSettings`, and answer
+    /// the reply handle the route is waiting on. Without a drainer every patch times out into
+    /// the headless `202 queued` and nothing would be asserted about the outcome.
+    fn spawn_gui_settings_thread(s: &Server) {
+        let shared = Arc::clone(&s.shared);
+        tokio::spawn(async move {
+            loop {
+                let ops = shared.ui_ops.lock().unwrap().drain();
+                for op in ops {
+                    if let UiOp::PatchSettings { patch, reply } = op {
+                        let outcome = merge_published_settings(&shared, &patch);
+                        if let Some(reply) = reply {
+                            reply.send(outcome);
+                        }
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+            }
+        });
+    }
+
+    async fn patch_settings(s: &Server, token: &str, body: &str) -> (u16, Value) {
+        let r = client()
+            .patch(format!("{}/settings", s.base))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        (status, r.json().await.unwrap())
+    }
+
+    async fn get_settings(s: &Server, token: &str) -> (u16, Value) {
+        let r = client()
+            .get(format!("{}/settings", s.base))
+            .header("authorization", format!("Bearer {token}"))
+            .send()
+            .await
+            .unwrap();
+        let status = r.status().as_u16();
+        (status, r.json().await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn a_keep_alive_patch_is_applied_and_shows_up_in_the_next_settings_get() {
+        let s = boot(true).await;
+        publish_settings(&s, settings_fixture());
+        spawn_gui_settings_thread(&s);
+
+        let (status, body) = patch_settings(&s, &s.token, r#"{"keepAlive":false}"#).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body,
+            json!({ "ok": true, "applied": true, "keys": ["keepAlive"] })
+        );
+
+        // The answer is the OUTCOME, not an acknowledgement: the read side agrees with it.
+        let (status, body) = get_settings(&s, &s.token).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["settings"]["keepAlive"], json!(false));
+
+        // And back on, so the round trip is not a one-way latch.
+        let (status, _) = patch_settings(&s, &s.token, r#"{"keepAlive":true}"#).await;
+        assert_eq!(status, 200);
+        let (_, body) = get_settings(&s, &s.token).await;
+        assert_eq!(body["settings"]["keepAlive"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn a_malformed_keep_alive_is_400_rather_than_silently_ignored() {
+        let s = boot(true).await;
+        publish_settings(&s, settings_fixture());
+        spawn_gui_settings_thread(&s);
+
+        // A string where a bool belongs: the preferences layer refuses it, and the route
+        // reports that refusal instead of answering `ok` for a value it threw away.
+        let (status, body) = patch_settings(&s, &s.token, r#"{"keepAlive":"yes"}"#).await;
+        assert_eq!(status, 400);
+        assert_eq!(body["keys"], json!(["keepAlive"]));
+        assert!(body["error"].as_str().unwrap().contains("keepAlive"));
+        // …and the live value is untouched.
+        let (_, body) = get_settings(&s, &s.token).await;
+        assert_eq!(body["settings"]["keepAlive"], json!(true));
+
+        for bad in [r#"{"keepAlive":1}"#, r#"{"keepAlive":null}"#] {
+            let (status, _) = patch_settings(&s, &s.token, bad).await;
+            assert_eq!(status, 400, "{bad} must not be accepted as a boolean");
+        }
+        // A misspelled key is refused up front, naming the key — a typo that quietly does
+        // nothing is the failure this route exists to prevent.
+        let (status, body) = patch_settings(&s, &s.token, r#"{"keepalive":false}"#).await;
+        assert_eq!(status, 400);
+        assert_eq!(
+            body,
+            json!({ "error": "unknown settings", "keys": ["keepalive"] })
+        );
+        // Not-an-object bodies never reach the queue either.
+        for bad in [r#"["keepAlive"]"#, "{}", "not json at all"] {
+            let (status, _) = patch_settings(&s, &s.token, bad).await;
+            assert_eq!(status, 400, "{bad} must be refused");
+        }
+        let (_, body) = get_settings(&s, &s.token).await;
+        assert_eq!(body["settings"]["keepAlive"], json!(true));
+    }
+
+    #[tokio::test]
+    async fn an_editor_command_round_trips_and_the_stored_value_drives_the_open_plan() {
+        let s = boot(true).await;
+        publish_settings(&s, settings_fixture());
+        spawn_gui_settings_thread(&s);
+
+        let (status, body) = patch_settings(
+            &s,
+            &s.token,
+            r#"{"editorCommand":"subl {path}:{line}:{col}"}"#,
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body,
+            json!({ "ok": true, "applied": true, "keys": ["editorCommand"] })
+        );
+
+        let (_, body) = get_settings(&s, &s.token).await;
+        let stored = body["settings"]["editorCommand"].as_str().unwrap();
+        assert_eq!(stored, "subl {path}:{line}:{col}");
+
+        // The value that came back out is the value the open path consumes — the seam this
+        // test exists for. It wins over a VS Code that is on PATH…
+        let code = Some("/usr/bin/code");
+        assert_eq!(
+            crate::paths::plan_open(false, "/a b/c.ts", Some(12), Some(4), stored, code),
+            crate::paths::OpenPlan::Editor
+        );
+        // …and builds the argv with the spaced path kept whole.
+        assert_eq!(
+            crate::paths::editor_command_line(stored, "/a b/c.ts", Some(12), Some(4)),
+            format!(
+                "{} {}",
+                crate::paths::quote("subl"),
+                crate::paths::quote("/a b/c.ts:12:4")
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_blank_editor_command_round_trips_and_still_falls_back() {
+        let s = boot(true).await;
+        publish_settings(&s, settings_fixture());
+        spawn_gui_settings_thread(&s);
+
+        // Blank is a legitimate value (it MEANS "auto-detect"), so the route stores it — the
+        // fallback is decided at open time, not by refusing the setting.
+        let (status, _) = patch_settings(&s, &s.token, r#"{"editorCommand":"   "}"#).await;
+        assert_eq!(status, 200);
+        let (_, body) = get_settings(&s, &s.token).await;
+        let stored = body["settings"]["editorCommand"].as_str().unwrap();
+        assert_eq!(stored, "   ");
+        assert_eq!(
+            crate::paths::plan_open(false, "/x/y.ts", None, None, stored, None),
+            crate::paths::OpenPlan::OsDefault
+        );
+        assert_eq!(
+            crate::paths::editor_command_line(stored, "/x/y.ts", None, None),
+            ""
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_string_editor_command_is_400_and_leaves_the_setting_alone() {
+        let s = boot(true).await;
+        publish_settings(&s, settings_fixture());
+        spawn_gui_settings_thread(&s);
+
+        for bad in [
+            r#"{"editorCommand":42}"#,
+            r#"{"editorCommand":true}"#,
+            r#"{"editorCommand":["subl","{path}"]}"#,
+        ] {
+            let (status, body) = patch_settings(&s, &s.token, bad).await;
+            assert_eq!(status, 400, "{bad} must be refused");
+            assert_eq!(body["keys"], json!(["editorCommand"]));
+        }
+        let (_, body) = get_settings(&s, &s.token).await;
+        assert_eq!(body["settings"]["editorCommand"], json!(""));
+    }
+
+    #[tokio::test]
+    async fn settings_reads_need_auth_and_writes_need_a_root_token() {
+        let s = boot(true).await;
+        publish_settings(&s, settings_fixture());
+        spawn_gui_settings_thread(&s);
+
+        // No token at all: both verbs are 401, byte-exact like every other route.
+        let r = client()
+            .get(format!("{}/settings", s.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+        assert_eq!(r.text().await.unwrap(), r#"{"error":"unauthorized"}"#);
+        let r = client()
+            .patch(format!("{}/settings", s.base))
+            .header("content-type", "application/json")
+            .body(r#"{"keepAlive":false}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+        assert_eq!(r.text().await.unwrap(), r#"{"error":"unauthorized"}"#);
+
+        // A scoped token may READ the preferences…
+        let minted: Value = post(&s, "/tokens", &s.token, r#"{"scope":{"tabIds":["t1"]}}"#)
+            .await
+            .json()
+            .await
+            .unwrap();
+        let scoped = minted["token"].as_str().unwrap().to_string();
+        let (status, body) = get_settings(&s, &scoped).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["settings"]["keepAlive"], json!(true));
+
+        // …but not write them: a scope is a grant over named panes, and `keepAlive` changes
+        // what happens to every pane in the app.
+        let (status, body) = patch_settings(&s, &scoped, r#"{"keepAlive":false}"#).await;
+        assert_eq!(status, 403);
+        assert_eq!(body, json!({ "error": "settings needs a root token" }));
+        let (status, body) = patch_settings(&s, &scoped, r#"{"editorCommand":"subl"}"#).await;
+        assert_eq!(status, 403);
+        assert_eq!(body, json!({ "error": "settings needs a root token" }));
+
+        // The refusals changed nothing.
+        let (_, body) = get_settings(&s, &s.token).await;
+        assert_eq!(body["settings"]["keepAlive"], json!(true));
+        assert_eq!(body["settings"]["editorCommand"], json!(""));
+    }
+
+    #[tokio::test]
+    async fn settings_with_no_gui_attached_are_503_rather_than_an_invented_default() {
+        // Nothing published: `keepAlive` has a default in the app, but answering with it here
+        // would describe a GUI that isn't there — and a PATCH would have nowhere to land.
+        let s = boot(true).await;
+        let (status, body) = get_settings(&s, &s.token).await;
+        assert_eq!(status, 503);
+        assert_eq!(
+            body,
+            json!({ "error": "settings unavailable (no GUI attached)" })
+        );
+        let (status, body) = patch_settings(&s, &s.token, r#"{"keepAlive":false}"#).await;
+        assert_eq!(status, 503);
+        assert_eq!(
+            body,
+            json!({ "error": "settings unavailable (no GUI attached)" })
         );
     }
 }
