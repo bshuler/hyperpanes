@@ -1081,6 +1081,162 @@ pub fn spawn_done() -> &'static std::sync::Mutex<Vec<String>> {
     Q.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
+/// Uids with a currently-live "last write to this pane failed" flag, set by
+/// [`note_pane_write`]. A dead backend fails every keystroke after the first, so this
+/// is a dedup registry, not a log: it exists to answer "is this failure NEW" so callers
+/// log and surface it exactly once per outage instead of once per keypress. Cleared by a
+/// later successful write to the same uid, so a pane that recovers (or is torn down and
+/// its uid retired — see [`State::forget_pane_runtime`]) can fail loudly again later.
+#[tracing::instrument(level = "debug", ret)]
+fn pane_write_failures() -> &'static std::sync::Mutex<BTreeSet<String>> {
+    static Q: std::sync::OnceLock<std::sync::Mutex<BTreeSet<String>>> = std::sync::OnceLock::new();
+    Q.get_or_init(|| std::sync::Mutex::new(BTreeSet::new()))
+}
+
+/// Records the outcome of a write to `uid` against the dedup registry in
+/// [`pane_write_failures`] and reports whether THIS call is the one that should be
+/// acted on: a fresh failure (log it, surface it) or a fresh recovery (nothing to do,
+/// but the registry needed clearing so the next failure isn't suppressed). Repeats of
+/// the same outcome are deliberately silent — see [`pane_write_failures`] for why.
+///
+/// Split out from [`pane_write`] so the decision logic is testable without a real
+/// session or pty: every case here is exercised directly against a bare uid string in
+/// `mod pane_write_tests` below.
+#[tracing::instrument(level = "debug", ret)]
+fn note_pane_write(uid: &str, ok: bool) -> bool {
+    let mut failed = pane_write_failures().lock().expect("pane_write_failures lock");
+    if ok {
+        // `remove` reports whether the uid was present, i.e. whether this write is the
+        // one that ends an outage. A success on a uid with no prior failure is the
+        // overwhelmingly common case and is not newsworthy.
+        failed.remove(uid)
+    } else {
+        // `insert` reports whether the uid is NEW to the set, i.e. whether this is the
+        // first failure of the current outage rather than the 40th repeat of it.
+        failed.insert(uid.to_string())
+    }
+}
+
+/// Uids whose most recent write just failed FOR THE FIRST TIME (per [`note_pane_write`]'s
+/// dedup). `App::tick` drains this each tick, on the UI thread, and marks each pane
+/// [`AgentLiveness::Error`] via `State::note_agent_state` — the same mechanism a stalled
+/// or crashed agent already uses to put a red dot on a pane. Mirrors [`spawn_done`]:
+/// callers of [`pane_write`] run on both the UI thread and background threads (queued
+/// prompt/goal delivery, status polling), and `State` is `!Send`, so a write failure
+/// discovered off the UI thread has no `State` to mark directly — it drops its uid here
+/// instead and lets the next tick do the marking.
+#[tracing::instrument(level = "debug", ret)]
+pub fn pane_write_failed_uids() -> &'static std::sync::Mutex<Vec<String>> {
+    static Q: std::sync::OnceLock<std::sync::Mutex<Vec<String>>> = std::sync::OnceLock::new();
+    Q.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// The one path every GUI-side pane write should go through, replacing a bare
+/// `let _ = mgr.write(...)`. Forwards to [`SessionManager::write`] and, on failure,
+/// dedups (see [`pane_write_failures`]), logs, and queues the pane for a visible
+/// `AgentLiveness::Error` mark (see [`pane_write_failed_uids`]) — but only on the
+/// FIRST failure of an outage. A dead session daemon fails every subsequent keystroke
+/// too; logging or re-marking each one would bury the one useful signal (that the
+/// backend died) under noise proportional to how much the user kept typing into a
+/// pane that looked alive. `op` is a short static tag (`"keystroke"`, `"paste"`, ...)
+/// naming what kind of write this was, for the warn log — never the data itself.
+///
+/// `skip_all` and no `ret`: `data` is exactly what the user typed or pasted, up to and
+/// including secrets like `ANTHROPIC_API_KEY`. Neither the entry log nor a return value
+/// may ever carry it — see the same treatment on `persist_last_session` and
+/// `embed_claude_sessions` in `app.rs`.
+#[tracing::instrument(level = "debug", skip_all)]
+pub fn pane_write(mgr: &SessionManager, uid: &str, data: &str, op: &str) {
+    let ok = mgr.write(uid, data).is_ok();
+    if note_pane_write(uid, ok) && !ok {
+        tracing::warn!(uid = %uid, op, "pane write failed; backend is gone, further writes to this pane will be suppressed until it recovers or is closed");
+        pane_write_failed_uids().lock().expect("pane_write_failed_uids lock").push(uid.to_string());
+    }
+}
+
+#[cfg(test)]
+mod pane_write_tests {
+    use super::*;
+
+    /// A bare uid with no session ever created behind it: `SessionManager::write`
+    /// returns `Err(NotFound)` synchronously for it, no pty or tokio runtime involved
+    /// (unlike `State::add_pane`, which does need `#[tokio::test]`  — see
+    /// `hyperpane_uniqueness_tests::mgr` below).
+    fn dead_mgr() -> SessionManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionManager::new(tx)
+    }
+
+    /// Each test claims its own uid so the shared, process-global registries in
+    /// `pane_write_failures`/`pane_write_failed_uids` can't leak state between tests
+    /// run concurrently by the same test binary.
+    fn unique_uid(tag: &str) -> String {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("pane-write-test-{tag}-{n}")
+    }
+
+    #[test]
+    fn a_first_failed_write_is_reported_and_queued() {
+        let uid = unique_uid("first-failure");
+        let m = dead_mgr();
+        pane_write(&m, &uid, "hello", "keystroke");
+        assert!(
+            pane_write_failed_uids().lock().unwrap().contains(&uid),
+            "pane_write must queue the uid for a UI mark on its first failure"
+        );
+    }
+
+    #[test]
+    fn a_repeat_failure_on_the_same_pane_is_suppressed() {
+        let uid = unique_uid("repeat-failure");
+        assert!(note_pane_write(&uid, false), "first failure is new");
+        assert!(
+            !note_pane_write(&uid, false),
+            "a second failure on the same uid must be suppressed, or a dead backend \
+             would log/queue once per keystroke instead of once per outage"
+        );
+
+        pane_write_failed_uids().lock().unwrap().clear();
+        let m = dead_mgr();
+        pane_write(&m, &uid, "a", "keystroke");
+        pane_write(&m, &uid, "b", "keystroke");
+        let queued: Vec<_> = pane_write_failed_uids()
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|q| **q == uid)
+            .cloned()
+            .collect();
+        assert_eq!(queued.len(), 0, "an already-failed uid must not be re-queued");
+    }
+
+    #[test]
+    fn a_success_after_failure_clears_the_dedup_state_so_the_next_failure_logs_again() {
+        let uid = unique_uid("recovers");
+        assert!(note_pane_write(&uid, false), "first failure is new");
+        assert!(!note_pane_write(&uid, false), "repeat is suppressed");
+
+        assert!(
+            note_pane_write(&uid, true),
+            "a success must clear the dedup entry (reported as 'this ended an outage')"
+        );
+        assert!(
+            note_pane_write(&uid, false),
+            "after a recovery, a new failure must be treated as new again"
+        );
+    }
+
+    #[test]
+    fn a_success_with_no_prior_failure_is_not_newsworthy() {
+        let uid = unique_uid("always-fine");
+        assert!(
+            !note_pane_write(&uid, true),
+            "a success on a uid that never failed must not be reported"
+        );
+    }
+}
+
 /// Maps the common shells to a canonical lowercase label (`pwsh.exe`→`pwsh`,
 /// `powershell.exe`→`powershell`, `cmd.exe`→`cmd`, `bash(.exe)`→`bash`, `wsl.exe`→`wsl`,
 /// plus `nu`/`zsh`/`fish`/`sh`/`dash`/`ash`); anything else falls back to the bare basename
@@ -6126,9 +6282,9 @@ impl State {
         });
         if let Some((uid, erase, text)) = payload {
             if let Some(erase) = erase {
-                let _ = mgr.write(&uid, &String::from_utf8_lossy(&erase));
+                pane_write(mgr, &uid, &String::from_utf8_lossy(&erase), "paste-erase");
             }
-            let _ = mgr.write(&uid, &text);
+            pane_write(mgr, &uid, &text, "paste");
             self.dirty = true;
             return;
         }
@@ -6141,7 +6297,7 @@ impl State {
             if p.kind.is_pty() && p.pane.clipboard_has_image() {
                 let uid = p.uid.clone();
                 p.pane.set_toast("Pasting image…");
-                let _ = mgr.write(&uid, "\u{16}");
+                pane_write(mgr, &uid, "\u{16}", "paste-image-ctrl-v");
                 self.dirty = true;
             }
         }
@@ -6193,7 +6349,7 @@ impl State {
         self.dirty = true;
         match payload {
             Some((uid, wire)) => {
-                let _ = mgr.write(&uid, &wire);
+                pane_write(mgr, &uid, &wire, "drop-files");
                 true
             }
             None => false,
@@ -6215,7 +6371,7 @@ impl State {
         {
             let uid = p.uid.clone();
             p.pane.set_toast("Pasting image…");
-            let _ = mgr.write(&uid, "\u{16}");
+            pane_write(mgr, &uid, "\u{16}", "paste-image-ctrl-v");
             self.dirty = true;
         }
     }
@@ -6292,7 +6448,7 @@ impl State {
             self.dirty = true;
         }
         if let Some((uid, bytes)) = caret {
-            let _ = mgr.write(&uid, &String::from_utf8_lossy(&bytes));
+            pane_write(mgr, &uid, &String::from_utf8_lossy(&bytes), "click-move-cursor");
         }
     }
 

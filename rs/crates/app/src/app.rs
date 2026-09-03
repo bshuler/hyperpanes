@@ -662,11 +662,11 @@ impl App {
             let uid_for_thread = uid.clone();
             std::thread::spawn(move || {
                 for p in pending {
-                    let _ = mgr.write(&uid_for_thread, &p.text);
+                    crate::state::pane_write(&mgr, &uid_for_thread, &p.text, "queued-prompt");
                     std::thread::sleep(Duration::from_millis(250));
-                    let _ = mgr.write(&uid_for_thread, "\r");
+                    crate::state::pane_write(&mgr, &uid_for_thread, "\r", "queued-prompt-enter");
                     std::thread::sleep(Duration::from_millis(600));
-                    let _ = mgr.write(&uid_for_thread, "\r");
+                    crate::state::pane_write(&mgr, &uid_for_thread, "\r", "queued-prompt-enter");
                     std::thread::sleep(Duration::from_millis(400));
                 }
             });
@@ -740,11 +740,11 @@ impl App {
                 std::thread::spawn(move || {
                     // Text via the proven resume-queue cadence (bracketed-paste TUIs need the gap
                     // + an insurance CR — the now-submitted line makes the second CR a no-op).
-                    let _ = mgr.write(&g.uid, &g.text);
+                    crate::state::pane_write(&mgr, &g.uid, &g.text, "pending-goal");
                     std::thread::sleep(Duration::from_millis(250));
-                    let _ = mgr.write(&g.uid, "\r");
+                    crate::state::pane_write(&mgr, &g.uid, "\r", "pending-goal-enter");
                     std::thread::sleep(Duration::from_millis(600));
-                    let _ = mgr.write(&g.uid, "\r");
+                    crate::state::pane_write(&mgr, &g.uid, "\r", "pending-goal-enter");
                     std::thread::sleep(Duration::from_millis(400));
                     // Best-effort image re-paste: set the OS clipboard to each image, then Ctrl+V.
                     // The paths are already in the text above, so this is additive — if Claude's
@@ -752,9 +752,9 @@ impl App {
                     for img in &g.images {
                         if set_clipboard_image_from_file(img) {
                             std::thread::sleep(Duration::from_millis(150));
-                            let _ = mgr.write(&g.uid, "\u{16}"); // Ctrl+V
+                            crate::state::pane_write(&mgr, &g.uid, "\u{16}", "pending-goal-image-ctrl-v"); // Ctrl+V
                             std::thread::sleep(Duration::from_millis(700));
-                            let _ = mgr.write(&g.uid, "\r");
+                            crate::state::pane_write(&mgr, &g.uid, "\r", "pending-goal-enter");
                             std::thread::sleep(Duration::from_millis(400));
                         }
                     }
@@ -844,11 +844,11 @@ impl App {
         let mgr = self.mgr.clone();
         let text = prompt.to_string();
         std::thread::spawn(move || {
-            let _ = mgr.write(&uid, &text);
+            crate::state::pane_write(&mgr, &uid, &text, "status-loop-prompt");
             std::thread::sleep(Duration::from_millis(250));
-            let _ = mgr.write(&uid, "\r");
+            crate::state::pane_write(&mgr, &uid, "\r", "status-loop-enter");
             std::thread::sleep(Duration::from_millis(600));
-            let _ = mgr.write(&uid, "\r");
+            crate::state::pane_write(&mgr, &uid, "\r", "status-loop-enter");
         });
     }
 
@@ -1366,6 +1366,29 @@ impl App {
             }
         }
 
+        // 1c. Panes whose most recent write just failed for the first time (see
+        //    `state::pane_write`): mark each one `AgentLiveness::Error` so a dead backend is
+        //    VISIBLE instead of a silent no-op — the whole point of this drain, since a dead
+        //    session used to look identical to a working one from the GUI's side. Same
+        //    cross-thread shape as 1b: writers run on both the UI thread and background
+        //    threads (queued prompts/goals, status polling), `State` is `!Send`, so a failure
+        //    discovered off the UI thread queues its uid instead of marking directly, and this
+        //    tick does the marking. No corresponding "clear on success" here: the mark is
+        //    superseded the normal way, by whatever `note_agent_state`/`note_agent_idle` call
+        //    the pane's next real activity produces (command start/end, prompt-ready, a fresh
+        //    agent-state event) or by the pane/uid going away entirely on restart.
+        let failed: Vec<String> = {
+            let mut q = crate::state::pane_write_failed_uids().lock().unwrap();
+            std::mem::take(&mut *q)
+        };
+        for uid in failed {
+            if let Some(w) = find_window(&windows, &uid) {
+                w.state
+                    .borrow_mut()
+                    .note_agent_state(&uid, AgentLiveness::Error);
+            }
+        }
+
         // 2. Drain the ONE shared event channel, routing each event to its window. Each event
         //    is teed to the control server (live `/events` WS frames + model cwd/exit) before
         //    the GUI consumes it — a cheap no-op when the server is stopped.
@@ -1656,12 +1679,17 @@ impl App {
                     fed = data.len();
                     let replies = pc.pane.take_replies();
                     if !replies.is_empty() {
-                        let _ = self.mgr.write(&uid, &String::from_utf8_lossy(&replies));
+                        crate::state::pane_write(
+                            &self.mgr,
+                            &uid,
+                            &String::from_utf8_lossy(&replies),
+                            "terminal-auto-reply",
+                        );
                     }
                     if !pc.started {
                         pc.started = true;
                         if let Some(cmd) = pc.startup.take() {
-                            let _ = self.mgr.write(&uid, &cmd);
+                            crate::state::pane_write(&self.mgr, &uid, &cmd, "startup-command");
                         }
                     }
                 }
@@ -2403,7 +2431,12 @@ impl App {
                             || crate::is_key(&msg.text, Key::Delete));
                     if keys::is_printable(&msg.text, ctrl, msg.alt) || line_delete {
                         if let Some(erase) = ps.pane.type_over_selection() {
-                            let _ = self.mgr.write(&ps.uid, &String::from_utf8_lossy(&erase));
+                            crate::state::pane_write(
+                                &self.mgr,
+                                &ps.uid,
+                                &String::from_utf8_lossy(&erase),
+                                "type-over-erase",
+                            );
                             if line_delete {
                                 ps.pane.scroll_to_bottom();
                                 return;
@@ -2416,12 +2449,20 @@ impl App {
                 // user sees their input echoed at the prompt even after scrolling up to read
                 // history (a no-op when already at the bottom).
                 ps.pane.scroll_to_bottom();
-                // Ignored on purpose, here and at every other GUI write. `write` reports a dead
-                // session now, but there is nothing useful to do with that news one keystroke at
-                // a time: the pane is gone, and the read model's reconciler notices within half a
-                // second and flips the row to `exited`, which is what the user actually needs to
-                // see. Failing loudly per keypress would only add noise to the same fact.
-                let _ = self.mgr.write(&ps.uid, &String::from_utf8_lossy(&bytes));
+                // Routed through `pane_write`, here and at every other GUI write. A dead backend
+                // used to fail this silently: the keystroke vanished, the pane LOOKED alive (the
+                // read model's reconciler only flips the *control-plane* row to `exited`, which
+                // nothing in this GUI process was watching), and the user's only symptom was
+                // "my keystrokes do nothing." `pane_write` logs and marks the pane
+                // `AgentLiveness::Error` on the first failure of an outage and stays quiet on
+                // every repeat — see its doc comment in `state.rs` for why per-keystroke noise
+                // would bury the one signal that matters.
+                crate::state::pane_write(
+                    &self.mgr,
+                    &ps.uid,
+                    &String::from_utf8_lossy(&bytes),
+                    "keystroke",
+                );
             }
         }
     }
@@ -3361,7 +3402,12 @@ impl App {
                         })
                     };
                     if let Some((uid, bytes)) = forward {
-                        let _ = app.mgr.write(&uid, &String::from_utf8_lossy(&bytes));
+                        crate::state::pane_write(
+                            &app.mgr,
+                            &uid,
+                            &String::from_utf8_lossy(&bytes),
+                            "wheel-report",
+                        );
                     }
                 }
             });
@@ -3386,7 +3432,12 @@ impl App {
                             })
                         };
                         if let Some((uid, bytes)) = forward {
-                            let _ = app.mgr.write(&uid, &String::from_utf8_lossy(&bytes));
+                            crate::state::pane_write(
+                                &app.mgr,
+                                &uid,
+                                &String::from_utf8_lossy(&bytes),
+                                "mouse-report",
+                            );
                         }
                     }
                 });
