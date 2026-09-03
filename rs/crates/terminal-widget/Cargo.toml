@@ -42,6 +42,7 @@ swash = "0.2"
 etagere = "0.2"
 # Plain-old-data casts for instance/vertex buffers.
 bytemuck = { version = "1", features = ["derive"] }
+# Error type for the fallible font loaders (src/font.rs) and the verification examples.
 anyhow = "1.0.102"
 # Log macros + `#[instrument]`; the subscriber is installed by the host process.
 tracing = "0.1"
@@ -50,12 +51,17 @@ tracing = "0.1"
 arboard = "3"
 
 # Drives the SessionManager (its per-session async driver tasks + batch timers). Match
-# core's feature set so the runtime has time/sync/macros available.
+# core's feature set so the runtime has time/sync/macros available. Only `src/bin/demo.rs`
+# builds the runtime, but a bin target cannot draw on [dev-dependencies], so this stays a
+# regular dependency — it is not dead weight, it is what makes `cargo run --bin demo` work.
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "macros"] }
 
 [dev-dependencies]
-# PNG encode for the headless font-fallback before/after verification bin only.
-png = "0.17"
+# PNG encode for the headless verification examples (fallback_check, cursor_underline_check).
+# 0.18 to match the app crate: 0.18 was already in this lockfile transitively, so pinning
+# 0.17 here was compiling a second copy of the crate for nothing. Only png's *decoder* API
+# broke in 0.18; the Encoder path these examples use is unchanged.
+png = "0.18"
 # Headless Slint platform for pointer-dispatch regression tests (tests/pointer_press.rs):
 # pins that the pane's FocusScope can't swallow the first press. Same upstream rev as `slint`.
 i-slint-backend-testing = { git = "https://github.com/slint-ui/slint", rev = "9463a107aeb5f5021c162e82c55977c5333229ae" }

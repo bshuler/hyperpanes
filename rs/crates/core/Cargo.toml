@@ -34,7 +34,10 @@ uuid = { version = "1", features = ["v4"] }
 axum = { version = "0.8", features = ["ws"] }
 futures-util = "0.3"
 subtle = "2"      # constant-time master-token compare (timingSafeEqual parity)
-rand = "0.8"      # 32-random-byte hex master token
+# 32-random-byte hex master token. 0.10 to match the app crate (rs/crates/app) — one
+# `rand` in the graph instead of a 0.8 here and a 0.10 there. `thread_rng` is the feature
+# behind `rand::rng()`, the OS-seeded ChaCha CSPRNG the token draws from.
+rand = { version = "0.10", default-features = false, features = ["std", "sys_rng", "thread_rng"] }
 # --- Phase 2: durable work queue (control/work.rs) ---
 # SQLite-with-WAL is the design's chosen store (atomic competing-consumers claim,
 # indexed visibility-timeout reap, count-by-state); `bundled` compiles the

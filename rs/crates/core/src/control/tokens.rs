@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use rand::RngCore;
+use rand::Rng;
 use subtle::ConstantTimeEq;
 
 use crate::control::scope::Scope;
@@ -35,7 +35,11 @@ pub struct TokenInfo {
 #[tracing::instrument(level = "debug", skip_all)]
 pub fn random_token() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    // `rand::rng()` is the rand 0.10 spelling of 0.8's `thread_rng()`: the same per-thread,
+    // OS-seeded, periodically-reseeded ChaCha CSPRNG. Not `OsRng` — the security property
+    // we are keeping is "CSPRNG seeded from OS entropy", byte-for-byte what TS's
+    // `randomBytes(32)` promises.
+    rand::rng().fill_bytes(&mut bytes);
     to_hex(&bytes)
 }
 
