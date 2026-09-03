@@ -252,8 +252,9 @@ impl DaemonSessionManager {
         let mut forced_build_upgrade = false;
         for attempt in 0..3 {
             let stream = connect_or_spawn(&endpoint, salt)?;
-            match probe_daemon_identity(&stream)? {
-                ProtoCheck::Match => return Self::from_stream(stream, events),
+            let (check, hello) = probe_daemon_identity(&stream)?;
+            match check {
+                ProtoCheck::Match => return Self::from_stream_with_hello(stream, events, hello),
                 ProtoCheck::BuildMismatch { daemon_build } if policy == VersionPolicy::Tolerant => {
                     // The pty-host being an older build is the whole point of `Tolerant`:
                     // it holds live ConPTYs that Windows gives us no way to move. A build
@@ -261,14 +262,14 @@ impl DaemonSessionManager {
                     tracing::info!("pty-host build skew (client {}, host {daemon_build}); proceeding — \
                          the host surface is version-stable by contract",
                         build_id::build_id());
-                    return Self::from_stream(stream, events);
+                    return Self::from_stream_with_hello(stream, events, hello);
                 }
                 ProtoCheck::BuildMismatch { daemon_build } if forced_build_upgrade => {
                     tracing::info!("daemon is build {daemon_build}, not ours ({}), after we already \
                          handed it over once; another client wants it that way — driving \
                          it rather than starting a takeover fight",
                         build_id::build_id());
-                    return Self::from_stream(stream, events);
+                    return Self::from_stream_with_hello(stream, events, hello);
                 }
                 ProtoCheck::BuildMismatch { daemon_build } => {
                     // Same protocol, different binary: a rebuild, a new install, or the
@@ -300,7 +301,7 @@ impl DaemonSessionManager {
                     // `VersionPolicy::Tolerant`), so an older host is safe to drive.
                     tracing::info!("pty-host proto skew (client {PROTO_VER}, host {daemon_ver}); \
                          proceeding — the host surface is version-stable by contract");
-                    return Self::from_stream(stream, events);
+                    return Self::from_stream_with_hello(stream, events, hello);
                 }
                 ProtoCheck::Mismatch { daemon_ver } => {
                     // The daemon is a stale version of our own binary. Prefer the LIVE UPGRADE
@@ -358,8 +359,28 @@ impl DaemonSessionManager {
     /// Build a manager over an already-connected socket — the seam tests use with an
     /// in-process daemon on a temp socket (no spawn/discovery). Sends the `Hello`
     /// handshake, starts the reader, and seeds the shadow from a `ListSessions`.
+    ///
+    /// Public callers never have a `HelloAnswer` to hand in (they haven't probed), so this
+    /// always pays for its own round-trip; [`new_with_policy`](Self::new_with_policy) is the
+    /// caller that has one, and uses [`from_stream_with_hello`](Self::from_stream_with_hello)
+    /// directly instead.
     #[tracing::instrument(level = "debug")]
     pub fn from_stream(stream: Conn, events: UnboundedSender<SessionEvent>) -> io::Result<Self> {
+        Self::from_stream_with_hello(stream, events, None)
+    }
+
+    /// The real body of [`from_stream`](Self::from_stream). `hello` is the answer
+    /// [`probe_daemon_identity`] already got on this exact stream, if the caller has one —
+    /// reusing it instead of sending a second `Hello` is the whole point: every `Hello` makes
+    /// the daemon re-broadcast its claim table and full session snapshot to every open
+    /// connection (see [`HelloAnswer`]), so a launch that used to send up to three of these
+    /// on one socket (probe, a fire-and-forget, then a round-trip) now sends at most one.
+    #[tracing::instrument(level = "debug", skip(hello))]
+    fn from_stream_with_hello(
+        stream: Conn,
+        events: UnboundedSender<SessionEvent>,
+        hello: Option<HelloAnswer>,
+    ) -> io::Result<Self> {
         let read_half = transport::try_clone(&stream)?;
         let write_half = stream;
 
@@ -397,25 +418,30 @@ impl DaemonSessionManager {
             _reader: reader,
         };
 
-        // Handshake (M1 transports the version; M3 enforces it) — drains the `Hello` reply
-        // so it doesn't sit in front of a later request/response.
-        mgr.send(&ClientMsg::Hello {
-            proto_ver: PROTO_VER,
-        })?;
-        // The second `Hello` is the one whose reply we read — and (M7) that reply carries
-        // the connection id the daemon minted for this socket, which is how we later tell
-        // our own claims apart from another process's. It also carries the daemon's own
-        // proto version, which is NOT necessarily ours: the stale-daemon rule keeps us
+        // (M1 transports the version; M3 enforces it.) If the caller already has a `Hello`
+        // reply for THIS stream, use it — that reply carries the same two things a fresh
+        // round-trip would: (M7) the connection id the daemon minted for this socket, which
+        // is how we later tell our own claims apart from another process's, and the daemon's
+        // own proto version, which is NOT necessarily ours (the stale-daemon rule keeps us
         // driving an older daemon that holds live terminals, and claim traffic must stay off
-        // the wire when it does (see `daemon_ver`).
-        if let Some(DaemonMsg::Hello {
-            conn_id, proto_ver, ..
-        }) = mgr.request(
-            ClientMsg::Hello {
-                proto_ver: PROTO_VER,
-            },
-            |m| matches!(m, DaemonMsg::Hello { .. }),
-        ) {
+        // the wire when it does — see `daemon_ver`). Otherwise do the one round-trip
+        // ourselves — still just the one `Hello`, never a fire-and-forget send plus a
+        // separate request for the same answer.
+        let answer = hello.or_else(|| {
+            if let Some(DaemonMsg::Hello {
+                conn_id, proto_ver, ..
+            }) = mgr.request(
+                ClientMsg::Hello {
+                    proto_ver: PROTO_VER,
+                },
+                |m| matches!(m, DaemonMsg::Hello { .. }),
+            ) {
+                Some(HelloAnswer { conn_id, proto_ver })
+            } else {
+                None
+            }
+        });
+        if let Some(HelloAnswer { conn_id, proto_ver }) = answer {
             mgr.conn_id.store(conn_id, Ordering::SeqCst);
             mgr.daemon_ver.store(proto_ver as u64, Ordering::SeqCst);
         }
@@ -431,10 +457,18 @@ impl DaemonSessionManager {
 
     /// Send one request frame (fire-and-forget at this layer). Used directly for the
     /// no-reply mutators; [`request`](Self::request) wraps it for round-trips.
+    ///
+    /// Every sender in this file funnels through here, which is deliberate: a failed write
+    /// means the same thing regardless of which caller made it (`BrokenPipe` is the daemon
+    /// gone, arriving from our end instead of the reader's), so the bookkeeping belongs at
+    /// this one choke point rather than repeated — and occasionally forgotten — at each call
+    /// site. `write()` used to be the only sender that remembered; `create()` and the
+    /// fire-and-forget mutators did not, which left a client that believed it was still
+    /// connected after a create it never delivered.
     #[tracing::instrument(level = "debug", skip_all)]
     fn send(&self, msg: &ClientMsg) -> io::Result<()> {
         let mut w = self.write_half.lock().unwrap();
-        write_frame(&mut *w, msg)
+        write_frame(&mut *w, msg).inspect_err(|_| self.note_disconnected())
     }
 
     /// Send a request and block (holding the reply-channel lock, which serializes
@@ -703,11 +737,12 @@ impl DaemonSessionManager {
         if !self.is_connected() {
             return Err(Self::gone());
         }
+        // `send()` itself now marks the connection dead on a failed write; no need to repeat
+        // that here.
         self.send(&ClientMsg::Write {
             uid: uid.to_string(),
             data: data.to_string(),
         })
-        .inspect_err(|_| self.note_disconnected())
     }
 
     /// Resize the pane — fire-and-forget.
@@ -1152,6 +1187,20 @@ enum ProtoCheck {
     Mismatch { daemon_ver: u32 },
 }
 
+/// The daemon's reply to the probe's `Hello`, carried back so a caller that keeps the same
+/// stream never has to ask again. Every `Hello` makes the daemon re-broadcast its claim
+/// table and full session snapshot to EVERY open connection (see the daemon's `Hello` arm),
+/// so the cost of a redundant one is not flat — it's quadratic in how many clients are
+/// already connected. A single launch used to pay for up to four: one here, one more as a
+/// fire-and-forget before `from_stream`'s own round-trip, and (on the fallback path) one on
+/// `live_session_count`'s own short-lived connection. This struct is what lets
+/// `from_stream_with_hello` collapse the first two into the one the probe already did.
+#[derive(Clone, Copy)]
+struct HelloAnswer {
+    conn_id: ConnId,
+    proto_ver: u32,
+}
+
 /// How long the version probe waits for the daemon's `Hello` before giving up.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -1171,7 +1220,7 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 /// never hard-block launch over a slow or odd handshake — the worst case is talking to a
 /// daemon we couldn't confirm, which is harmless.
 #[tracing::instrument(level = "debug")]
-fn probe_daemon_identity(stream: &Conn) -> io::Result<ProtoCheck> {
+fn probe_daemon_identity(stream: &Conn) -> io::Result<(ProtoCheck, Option<HelloAnswer>)> {
     let mut w = transport::try_clone(stream)?;
     let send = write_frame(
         &mut w,
@@ -1180,7 +1229,7 @@ fn probe_daemon_identity(stream: &Conn) -> io::Result<ProtoCheck> {
         },
     );
     if send.is_err() {
-        return Ok(ProtoCheck::Match);
+        return Ok((ProtoCheck::Match, None));
     }
     // Read until the `Hello` reply, skipping frames that are not it. An M7 daemon answers a
     // `Hello` by *also* broadcasting its claim and session snapshots (see the daemon's Hello
@@ -1194,33 +1243,42 @@ fn probe_daemon_identity(stream: &Conn) -> io::Result<ProtoCheck> {
             Ok(Some(DaemonMsg::Hello {
                 proto_ver,
                 build_id: daemon_build,
+                conn_id,
                 ..
             })) => {
+                // Captured regardless of which `ProtoCheck` this turns out to be: a caller
+                // that keeps this same stream (the ordinary case) hands `hello` straight to
+                // `from_stream_with_hello` instead of sending a second `Hello` to learn what
+                // this reply already told us.
+                let hello = Some(HelloAnswer { conn_id, proto_ver });
                 if proto_ver != PROTO_VER {
-                    return Ok(ProtoCheck::Mismatch {
-                        daemon_ver: proto_ver,
-                    });
+                    return Ok((
+                        ProtoCheck::Mismatch {
+                            daemon_ver: proto_ver,
+                        },
+                        hello,
+                    ));
                 }
                 // Same protocol. The build id is the finer question: is this daemon the
                 // binary the user just launched, or a different build of it? An empty id is
                 // a daemon from before the field existed — unknown, and unknown is never a
                 // reason to move anything.
-                return Ok(if build_id::differs(&daemon_build) {
+                let check = if build_id::differs(&daemon_build) {
                     ProtoCheck::BuildMismatch { daemon_build }
                 } else {
                     ProtoCheck::Match
-                });
+                };
+                return Ok((check, hello));
             }
             // Unsolicited push traffic (M7) or an unrelated reply — keep looking.
             Ok(Some(_)) => continue,
             // EOF or a (timed-out) read: don't block launch over an unconfirmed handshake —
-            // proceed as a match. NB: `from_stream` re-runs its own Hello round-trip,
-            // draining the daemon's (second) reply, so this probe's `Hello` reply does not
-            // desync the stream the manager later owns.
+            // proceed as a match. No `Hello` reply was seen, so there is nothing to hand a
+            // caller — `from_stream_with_hello` falls back to its own single round-trip.
             Ok(None) | Err(_) => break,
         }
     }
-    Ok(ProtoCheck::Match)
+    Ok((ProtoCheck::Match, None))
 }
 
 /// How long to wait for a spawned successor to take the incumbent's sessions and start
@@ -1253,7 +1311,7 @@ fn hand_over_stale_daemon(salt: &str, endpoint: &Endpoint) -> bool {
         // Only a version MATCH proves the successor won: while the incumbent still holds the
         // endpoint, connecting succeeds and reports the stale version.
         if let Ok(stream) = transport::connect(endpoint) {
-            if matches!(probe_daemon_identity(&stream), Ok(ProtoCheck::Match)) {
+            if matches!(probe_daemon_identity(&stream), Ok((ProtoCheck::Match, _))) {
                 return true;
             }
         }
@@ -1427,7 +1485,7 @@ fn spawn_daemon_detached(salt: &str) -> io::Result<()> {
 
     let exe = std::env::current_exe()?;
     if let Some(sr) = systemd_run_path() {
-        let ok = Command::new(sr)
+        let spawned = Command::new(sr)
             .args(["--user", "--quiet", "--collect", "--scope", "--"])
             .arg(&exe)
             .arg("--session-daemon")
@@ -1435,9 +1493,16 @@ fn spawn_daemon_detached(salt: &str) -> io::Result<()> {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn()
-            .is_ok();
-        if ok {
+            .spawn();
+        if let Ok(child) = spawned {
+            // `systemd-run`'s own pid, not the daemon's — it re-execs into its transient
+            // scope and we never see the daemon's real pid on this path. Still worth a
+            // support-log record: it is the thing a stuck-launch report needs first, "did a
+            // spawn even happen".
+            tracing::info!(
+                pid = child.id(),
+                "spawned session daemon via systemd-run --scope"
+            );
             return Ok(());
         }
         // systemd-run present but the spawn failed — fall through to the setsid path rather
@@ -1476,7 +1541,9 @@ fn spawn_daemon_setsid(exe: &std::path::Path, salt: &str) -> io::Result<()> {
             Ok(())
         });
     }
-    cmd.spawn().map(|_child| ())
+    let child = cmd.spawn()?;
+    tracing::info!(pid = child.id(), "spawned session daemon via setsid");
+    Ok(())
 }
 
 /// Windows: launch `current_exe --session-daemon <salt>` detached from this process.
@@ -1498,15 +1565,16 @@ fn spawn_daemon_detached(salt: &str) -> io::Result<()> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
     let exe = std::env::current_exe()?;
-    Command::new(exe)
+    let child = Command::new(exe)
         .arg("--session-daemon")
         .arg(salt)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW)
-        .spawn()
-        .map(|_child| ())
+        .spawn()?;
+    tracing::info!(pid = child.id(), "spawned session daemon");
+    Ok(())
 }
 
 #[cfg(all(unix, test))]
@@ -2549,17 +2617,16 @@ mod tests {
         let _daemon = spawn_in_process(&socket).expect("daemon binds");
 
         let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect");
-        assert!(
-            matches!(
-                probe_daemon_identity(&stream).expect("probe"),
-                ProtoCheck::Match
-            ),
-            "a same-version daemon must match"
-        );
-        // Build the manager on the SAME stream (as `new` does after a Match) and drive it —
-        // proves no desync + blocking reads restored (the reader thread must not time out).
+        let (check, hello) = probe_daemon_identity(&stream).expect("probe");
+        assert!(matches!(check, ProtoCheck::Match), "a same-version daemon must match");
+        assert!(hello.is_some(), "a real daemon answers the probe's Hello");
+        // Build the manager on the SAME stream, reusing the probe's `Hello` answer — as
+        // `new_with_policy` does after a Match — and drive it: proves no desync + blocking
+        // reads restored (the reader thread must not time out) even when the manager sends
+        // no `Hello` of its own on this socket.
         let (etx, mut rx) = unbounded_channel::<SessionEvent>();
-        let mgr = DaemonSessionManager::from_stream(stream, etx).expect("manager after probe");
+        let mgr = DaemonSessionManager::from_stream_with_hello(stream, etx, hello)
+            .expect("manager after probe");
         mgr.create(SpawnOptions {
             uid: "pm".into(),
             shell: Some("/bin/sh".into()),
@@ -2608,7 +2675,7 @@ mod tests {
         });
 
         let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect fake");
-        let check = probe_daemon_identity(&stream).expect("probe");
+        let (check, _hello) = probe_daemon_identity(&stream).expect("probe");
         assert!(
             matches!(check, ProtoCheck::Mismatch { daemon_ver } if daemon_ver == PROTO_VER + 1),
             "a different-version daemon must be a Mismatch carrying the daemon's version"
@@ -2644,7 +2711,7 @@ mod tests {
         });
 
         let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect fake");
-        let check = probe_daemon_identity(&stream).expect("probe");
+        let (check, _hello) = probe_daemon_identity(&stream).expect("probe");
         assert!(
             matches!(&check, ProtoCheck::BuildMismatch { daemon_build } if daemon_build == "0.0.0+deadbeefdeadbeef"),
             "a same-proto, other-build daemon must be a BuildMismatch carrying its build id"
@@ -2681,15 +2748,93 @@ mod tests {
         });
 
         let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect fake");
+        let (check, _hello) = probe_daemon_identity(&stream).expect("probe");
         assert!(
-            matches!(
-                probe_daemon_identity(&stream).expect("probe"),
-                ProtoCheck::Match
-            ),
+            matches!(check, ProtoCheck::Match),
             "an unknown build must never look like a build worth upgrading to"
         );
         drop(stream);
         let _ = server.join();
+    }
+
+    // The Hello storm this task exists to collapse: a single connect used to send up to
+    // three Hellos on ONE stream (the probe's, then `from_stream`'s own fire-and-forget
+    // `send`, then its `request`) — and every one makes the daemon re-broadcast its claim
+    // table and full session snapshot to every OTHER open connection, so the cost is
+    // quadratic in how many clients are already up. Drive the exact production sequence
+    // (`probe_daemon_identity` then `from_stream_with_hello` on the same socket, as
+    // `new_with_policy`'s Match arm does) against a fake daemon that records every frame,
+    // and assert the daemon saw exactly one.
+    #[test]
+    fn connect_sends_exactly_one_hello_on_the_probed_stream() {
+        let socket = temp_socket("one-hello");
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("fake bind");
+
+        let seen: Arc<Mutex<Vec<ClientMsg>>> = Arc::default();
+        let seen_srv = Arc::clone(&seen);
+        let server = std::thread::spawn(move || {
+            let Ok((conn, _)) = listener.accept() else {
+                return;
+            };
+            let mut r = conn.try_clone().expect("clone");
+            let mut w = conn;
+            while let Ok(Some(msg)) = read_frame::<_, ClientMsg>(&mut r) {
+                seen_srv.lock().unwrap().push(msg.clone());
+                match msg {
+                    ClientMsg::Hello { .. } => {
+                        let _ = write_frame(
+                            &mut w,
+                            &DaemonMsg::Hello {
+                                proto_ver: PROTO_VER,
+                                daemon_pid: 4321,
+                                conn_id: 99,
+                                build_id: build_id::build_id().to_string(),
+                            },
+                        );
+                    }
+                    ClientMsg::ListSessions => {
+                        let _ = write_frame(&mut w, &DaemonMsg::Sessions(Vec::new()));
+                    }
+                    ClientMsg::Ping => break, // the test's end-of-stream barrier
+                    _ => {}
+                }
+            }
+        });
+
+        let stream = std::os::unix::net::UnixStream::connect(&socket).expect("connect fake");
+        let (check, hello) = probe_daemon_identity(&stream).expect("probe");
+        assert!(matches!(check, ProtoCheck::Match), "same proto, same build");
+        let hello = hello.expect("the fake daemon answered the probe's Hello");
+        assert_eq!(hello.conn_id, 99, "the probe captured the daemon's conn_id");
+
+        // Mirrors `new_with_policy`'s Match arm exactly: build the manager on the SAME
+        // stream, handing in the probe's answer instead of asking again.
+        let (etx, _erx) = unbounded_channel::<SessionEvent>();
+        let mgr = DaemonSessionManager::from_stream_with_hello(stream, etx, Some(hello))
+            .expect("manager");
+
+        assert_eq!(
+            mgr.conn_id(),
+            99,
+            "the manager's conn_id came from the reused probe answer, not a second Hello"
+        );
+
+        // The barrier: every frame the manager was going to send is already queued behind
+        // it, so once the fake has read this one it has read them all.
+        mgr.send(&ClientMsg::Ping).expect("barrier ping");
+        let _ = server.join();
+        drop(mgr);
+
+        let seen = seen.lock().unwrap();
+        let hello_count = seen
+            .iter()
+            .filter(|m| matches!(m, ClientMsg::Hello { .. }))
+            .count();
+        assert_eq!(
+            hello_count, 1,
+            "exactly one Hello should reach the daemon per connect; got {seen:?}"
+        );
     }
 
     // ============== stale-daemon fallback: terminals outrank the upgrade ==============
@@ -2957,6 +3102,47 @@ mod tests {
             .write("g", "x")
             .expect_err("a write to a gone daemon is an error, not a silent success");
         assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    // `write()` was the only sender that called `note_disconnected()` on a failed send;
+    // `create()` and the rest did not, so a failed create left the client believing it was
+    // still connected. The fix moved the call into `send()` itself, so every sender gets it
+    // for free — this proves it for `create()` specifically, and does so WITHOUT a reader
+    // thread in the picture (a hand-built manager over a socket shut down for writing) so
+    // the assertion is on `send()`'s own bookkeeping, not a race against the reader's
+    // independent EOF detection (that race is what
+    // `a_dead_socket_empties_has_and_uids_and_fails_writes` already covers).
+    #[test]
+    fn a_failed_create_marks_the_connection_disconnected_like_a_failed_write() {
+        let (write_half, _peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        write_half
+            .shutdown(std::net::Shutdown::Both)
+            .expect("shut the write side down before the manager ever sends anything");
+
+        let (_reply_tx, replies) = std::sync::mpsc::channel::<DaemonMsg>();
+        let mgr = DaemonSessionManager {
+            write_half: Mutex::new(write_half),
+            shadows: Arc::default(),
+            replies: Mutex::new(replies),
+            claims: Arc::default(),
+            conn_id: AtomicU64::new(0),
+            daemon_ver: AtomicU64::new(0),
+            connected: Arc::new(AtomicBool::new(true)),
+            // No reader thread is exercised by this test — `send()`'s own disconnect
+            // bookkeeping is what's under test, so the field just needs a live handle.
+            _reader: std::thread::spawn(|| {}),
+        };
+
+        assert!(mgr.is_connected(), "starts out believing it is connected");
+        let err = mgr.create(SpawnOptions {
+            uid: "doomed".into(),
+            ..Default::default()
+        });
+        assert!(err.is_err(), "a send on a shut-down socket must fail");
+        assert!(
+            !mgr.is_connected(),
+            "create()'s failed send must mark the connection disconnected, the same as              write()'s always has"
+        );
     }
 
     #[test]
