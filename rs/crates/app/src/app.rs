@@ -798,6 +798,11 @@ impl App {
                 }
             }
         }
+        // Hand the control plane the schedule as it now stands, for `GET /loops` and
+        // `hyperpanes ctl loops`. After the poll so this tick's firing is already visible,
+        // and outside the `for` so it also refreshes while the startup grace is holding the
+        // loops back and nothing has fired at all.
+        self.loops.publish(status_secs, restart_secs);
     }
 
     /// The status loop: put the status prompt to the Hyperpane pane's agent. Through the

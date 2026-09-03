@@ -614,6 +614,11 @@ impl ControlHost {
 
             // 3. Republish the (now-updated) live GUI tree into the read-model.
             let republished = self.publish(&mut model, windows, mgr);
+
+            // 3b. And the two GUI-owned loops. `Loops` lives on the UI thread behind an `Rc`
+            //     and never meets `sync`, so it leaves a snapshot for us to pick up here —
+            //     without it `/loops` answers defaults forever, which reads as "never ran".
+            model.set_loops(crate::loops::published());
             (reconciled || healed || ui_op_changed, republished)
         };
 

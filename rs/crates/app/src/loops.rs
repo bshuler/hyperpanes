@@ -14,6 +14,11 @@
 //! grace so a relaunch first gets its panes and their tools back before anything is typed
 //! into them or restarted again.
 //!
+//! Each loop also records *when it last actually fired*, in the same file. That is the only
+//! way to answer "did the restart loop run last night?" after the fact — a schedule alone
+//! says when the next one is due, not whether the previous one happened — and it is what
+//! [`Loops::publish`] puts on `GET /loops` and `hyperpanes ctl loops` for a headless check.
+//!
 //! This module owns the *when*: [`Loops::poll`] is called from the app tick and answers
 //! which loops are due. The *what* — prompting the Hyperpane pane, restarting the monitored
 //! panes — lives in the app, which has the windows, the session manager and the control
@@ -24,8 +29,10 @@
 
 use std::cell::{Cell, RefCell};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use hyperpanes_core::control::readmodel::{LoopInfo, LoopsInfo};
 use hyperpanes_core::persistence::paths;
 use serde::{Deserialize, Serialize};
 
@@ -61,14 +68,35 @@ impl LoopKind {
     }
 }
 
-/// The persisted schedule: the next firing time of each loop, in seconds since the Unix
-/// epoch. `None` = not scheduled (the loop is off, or has not been scheduled yet).
+/// The persisted schedule: the next firing time of each loop, and when each last actually
+/// fired, in seconds since the Unix epoch — the same `Option<u64>` epoch-seconds convention
+/// the rest of the app persists timestamps in (`Project::last_opened_at`,
+/// `PaneRow::last_output_at`). Seconds, not a `SystemTime` or an `Instant`: only an absolute
+/// wall-clock stamp survives both a JSON round trip and the process exiting, and a stamp the
+/// clock has since jumped past only ever reads as "longer ago than it was", never as a
+/// firing that has to be replayed.
+///
+/// `None` = never (the loop is off, or has not been scheduled / has not yet fired).
+///
+/// **Compatibility.** Unknown fields are ignored, and a missing known field defaults to
+/// `None`, so a `loops.json` written by an older or newer build still loads and the loops
+/// keep their rhythm across a downgrade. A known field of the *wrong type* fails the parse
+/// and [`Self::load_from`] falls back to an empty schedule — the same whole-file-reject
+/// behaviour `prefs::load` has for `settings.json`, and harmless here because the only cost
+/// is that both loops are scheduled afresh from now.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopSchedule {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status_next: Option<u64>,
+    /// When the status loop last actually fired. Kept when the loop is switched off — it is
+    /// a fact about the past, not a schedule nobody will run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_last: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restart_next: Option<u64>,
+    /// When the restart loop last actually fired. See [`Self::status_last`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restart_last: Option<u64>,
 }
 
 impl LoopSchedule {
@@ -121,6 +149,22 @@ impl LoopSchedule {
         match kind {
             LoopKind::Status => self.status_next = next,
             LoopKind::Restart => self.restart_next = next,
+        }
+    }
+
+    #[tracing::instrument(level = "debug", ret)]
+    fn last(&self, kind: LoopKind) -> Option<u64> {
+        match kind {
+            LoopKind::Status => self.status_last,
+            LoopKind::Restart => self.restart_last,
+        }
+    }
+
+    #[tracing::instrument(level = "debug", ret)]
+    fn set_last(&mut self, kind: LoopKind, last: Option<u64>) {
+        match kind {
+            LoopKind::Status => self.status_last = last,
+            LoopKind::Restart => self.restart_last = last,
         }
     }
 }
@@ -196,7 +240,9 @@ impl Loops {
         let schedule = LoopSchedule::load_from(&path);
         tracing::info!(
             status_next = ?schedule.status_next,
+            status_last = ?schedule.status_last,
             restart_next = ?schedule.restart_next,
+            restart_last = ?schedule.restart_last,
             "loop schedule loaded"
         );
         Loops {
@@ -247,6 +293,7 @@ impl Loops {
                 (LoopKind::Restart, restart_secs),
             ] {
                 let before = sched.next(kind);
+                let before_last = sched.last(kind);
                 match decide(now, interval, before) {
                     Decision::Off => sched.set_next(kind, None),
                     Decision::Wait => {}
@@ -259,14 +306,19 @@ impl Loops {
                             loop_ = kind.name(),
                             due = ?before,
                             late_secs = now.saturating_sub(before.unwrap_or(now)),
+                            last = ?before_last,
                             next,
                             "loop firing"
                         );
                         sched.set_next(kind, Some(next));
+                        // Recorded here, with the reschedule, so the stamp is persisted in the
+                        // same write: a crash between deciding and doing loses the work, not
+                        // the record that this slot was consumed.
+                        sched.set_last(kind, Some(now));
                         fired.push(kind);
                     }
                 }
-                changed |= sched.next(kind) != before;
+                changed |= sched.next(kind) != before || sched.last(kind) != before_last;
             }
         }
         if changed {
@@ -274,6 +326,75 @@ impl Loops {
         }
         fired
     }
+
+    /// The schedule as `GET /loops` describes it, at the configured intervals (`0` = off).
+    /// Pure: it reads the schedule and computes nothing about the clock, so it is the same
+    /// answer during the startup grace as after it — a restored `next_fire_at` already in the
+    /// past reads as "due, waiting on the grace", which is the truth.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
+    pub fn info(&self, status_secs: u64, restart_secs: u64) -> LoopsInfo {
+        let sched = self.schedule.borrow();
+        LoopsInfo {
+            status: loop_info(status_secs, sched.status_next, sched.status_last),
+            restart: loop_info(restart_secs, sched.restart_next, sched.restart_last),
+        }
+    }
+
+    /// Publish [`Self::info`] where the control plane can pick it up without the app crate
+    /// having to hand it a `ReadModel` (see [`published`]). Called from the app tick, so it
+    /// also refreshes during the startup grace, when nothing has polled yet.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
+    pub fn publish(&self, status_secs: u64, restart_secs: u64) {
+        let info = self.info(status_secs, restart_secs);
+        let mut cur = PUBLISHED.lock().unwrap_or_else(PoisonError::into_inner);
+        if *cur != info {
+            *cur = info;
+        }
+    }
+}
+
+/// One loop's published status. A loop with an interval of `0` is off, and advertises no next
+/// firing even if a stale one is still in `loops.json` — but keeps `last_fired_at`, which is
+/// history rather than a schedule.
+#[tracing::instrument(level = "debug", ret)]
+fn loop_info(interval: u64, next: Option<u64>, last: Option<u64>) -> LoopInfo {
+    LoopInfo {
+        enabled: interval > 0,
+        interval_secs: interval,
+        last_fired_at: last,
+        next_fire_at: if interval == 0 { None } else { next },
+    }
+}
+
+/// The starting value of [`PUBLISHED`]: both loops off and never fired, the same honest
+/// default `ReadModel` itself carries before anything publishes. Spelled out rather than
+/// `LoopsInfo::default()` because a `static` initializer must be `const`.
+const NOTHING_PUBLISHED: LoopsInfo = LoopsInfo {
+    status: LoopInfo {
+        enabled: false,
+        interval_secs: 0,
+        last_fired_at: None,
+        next_fire_at: None,
+    },
+    restart: LoopInfo {
+        enabled: false,
+        interval_secs: 0,
+        last_fired_at: None,
+        next_fire_at: None,
+    },
+};
+
+/// The schedule as last published by the app tick, for the control host to copy into the
+/// read-model. A process global and not a field on anything because the two ends never meet:
+/// `Loops` lives on the GUI-thread `App` behind an `Rc`, and the read-model is republished
+/// from `ControlHost::sync`, which is handed only the windows and the session manager.
+static PUBLISHED: Mutex<LoopsInfo> = Mutex::new(NOTHING_PUBLISHED);
+
+/// What the app last published about its loops. `NOTHING_PUBLISHED` until the first tick,
+/// so a caller before then sees the same defaults as a build with no publisher at all.
+#[tracing::instrument(level = "debug", ret)]
+pub fn published() -> LoopsInfo {
+    *PUBLISHED.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 impl Default for Loops {
@@ -391,12 +512,79 @@ mod tests {
         assert_eq!(LoopSchedule::load_from(&path), LoopSchedule::default());
         let s = LoopSchedule {
             status_next: Some(42),
+            status_last: Some(7),
             restart_next: None,
+            restart_last: None,
         };
         s.save_to(&path);
         assert_eq!(LoopSchedule::load_from(&path), s);
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(LoopSchedule::load_from(&path), LoopSchedule::default());
+    }
+
+    #[test]
+    fn a_schedule_with_an_unknown_field_still_loads() {
+        // Written by a newer build that grew a third loop. The two fields this build knows
+        // must survive — dropping them would restart both countdowns on every downgrade.
+        let dir = Scratch::new("unknown-field");
+        let path = dir.file();
+        std::fs::write(
+            &path,
+            r#"{"status_next":1900,"status_last":1000,"restart_next":87400,"digest_next":5,
+                "digest": {"nested": [1, 2, 3]}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            LoopSchedule::load_from(&path),
+            LoopSchedule {
+                status_next: Some(1900),
+                status_last: Some(1000),
+                restart_next: Some(87_400),
+                restart_last: None,
+            }
+        );
+    }
+
+    #[test]
+    fn a_schedule_missing_a_known_field_defaults_it_to_unscheduled() {
+        // Written by the build before `*_last` existed: the loops keep their rhythm and
+        // merely report "never fired" until they next do.
+        let dir = Scratch::new("missing-field");
+        let path = dir.file();
+        std::fs::write(&path, r#"{"status_next":1900,"restart_next":87400}"#).unwrap();
+        assert_eq!(
+            LoopSchedule::load_from(&path),
+            LoopSchedule {
+                status_next: Some(1900),
+                status_last: None,
+                restart_next: Some(87_400),
+                restart_last: None,
+            }
+        );
+        // Every field missing is the empty schedule, not an error.
+        std::fs::write(&path, "{}").unwrap();
+        assert_eq!(LoopSchedule::load_from(&path), LoopSchedule::default());
+    }
+
+    #[test]
+    fn a_schedule_with_a_malformed_known_field_starts_the_loops_afresh() {
+        // Whole-file reject, matching `prefs::load` on a bad `settings.json`. Never a panic,
+        // and never a partial schedule: both loops are simply scheduled again from now.
+        let dir = Scratch::new("malformed-field");
+        let path = dir.file();
+        for bad in [
+            r#"{"status_next":"soon","restart_next":87400}"#,
+            r#"{"status_last":-1}"#,
+            r#"{"status_next":[1900]}"#,
+            "[]",
+        ] {
+            std::fs::write(&path, bad).unwrap();
+            assert_eq!(
+                LoopSchedule::load_from(&path),
+                LoopSchedule::default(),
+                "{bad}"
+            );
+        }
     }
 
     #[test]
@@ -410,7 +598,9 @@ mod tests {
             first.schedule(),
             LoopSchedule {
                 status_next: Some(1900),
-                restart_next: Some(87_400)
+                status_last: None,
+                restart_next: Some(87_400),
+                restart_last: None,
             }
         );
         drop(first);
@@ -423,9 +613,97 @@ mod tests {
             second.schedule(),
             LoopSchedule {
                 status_next: Some(2800),
-                restart_next: Some(87_400)
+                status_last: Some(2000),
+                restart_next: Some(87_400),
+                restart_last: None,
             }
         );
+    }
+
+    #[test]
+    fn a_firing_records_when_it_happened_and_that_survives_a_relaunch() {
+        let dir = Scratch::new("last-fired");
+        let path = dir.file();
+        let first = Loops::at(path.clone());
+        first.poll_at(1000, 60, 0);
+        assert_eq!(first.schedule().status_last, None, "scheduling is not firing");
+        assert_eq!(first.poll_at(1100, 60, 0), vec![LoopKind::Status]);
+        assert_eq!(first.schedule().status_last, Some(1100));
+        drop(first);
+        // The stamp is on disk, not merely in memory: a relaunch still knows when it fired.
+        let second = Loops::at(path);
+        assert_eq!(second.schedule().status_last, Some(1100));
+        // …and the startup grace does not disturb it: `poll` is silent for the first minute,
+        // so nothing overwrites the restored stamp before the loop is genuinely due again.
+        assert!(second.poll(60, 0).is_empty());
+        assert_eq!(second.schedule().status_last, Some(1100));
+    }
+
+    #[test]
+    fn a_loop_switched_off_forgets_its_next_firing_but_not_its_last() {
+        let dir = Scratch::new("off-keeps-last");
+        let l = Loops::at(dir.file());
+        l.poll_at(1000, 60, 0);
+        l.poll_at(1100, 60, 0);
+        l.poll_at(1101, 0, 0);
+        assert_eq!(l.schedule().status_next, None);
+        assert_eq!(l.schedule().status_last, Some(1100), "history is not a schedule");
+    }
+
+    #[test]
+    fn the_published_schedule_reports_the_interval_the_last_firing_and_the_next() {
+        let dir = Scratch::new("info");
+        let l = Loops::at(dir.file());
+        l.poll_at(1000, 60, 86_400);
+        l.poll_at(1100, 60, 86_400);
+        let info = l.info(60, 86_400);
+        assert_eq!(
+            info.status,
+            LoopInfo {
+                enabled: true,
+                interval_secs: 60,
+                last_fired_at: Some(1100),
+                next_fire_at: Some(1120),
+            }
+        );
+        assert_eq!(
+            info.restart,
+            LoopInfo {
+                enabled: true,
+                interval_secs: 86_400,
+                last_fired_at: None,
+                next_fire_at: Some(87_400),
+            }
+        );
+    }
+
+    #[test]
+    fn a_disabled_loop_publishes_no_next_firing_even_with_a_stale_one_on_disk() {
+        let dir = Scratch::new("info-off");
+        let path = dir.file();
+        // A schedule left behind by a build where the loop was still on — nothing has polled
+        // yet this run, so `status_next` is still set while the interval says off.
+        std::fs::write(&path, r#"{"status_next":1900,"status_last":1000}"#).unwrap();
+        let l = Loops::at(path);
+        let status = l.info(0, 0).status;
+        assert!(!status.enabled);
+        assert_eq!(status.interval_secs, 0);
+        assert_eq!(status.next_fire_at, None);
+        assert_eq!(status.last_fired_at, Some(1000));
+    }
+
+    #[test]
+    fn publishing_hands_the_control_plane_the_current_schedule() {
+        let dir = Scratch::new("publish");
+        let l = Loops::at(dir.file());
+        l.poll_at(1000, 900, 0);
+        l.poll_at(1900, 900, 0);
+        l.publish(900, 0);
+        let p = published();
+        assert_eq!(p.status.last_fired_at, Some(1900));
+        assert_eq!(p.status.next_fire_at, Some(2800));
+        assert!(p.status.enabled);
+        assert!(!p.restart.enabled);
     }
 
     #[test]

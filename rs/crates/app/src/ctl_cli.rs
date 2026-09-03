@@ -34,6 +34,7 @@ usage: hyperpanes ctl <verb> [args]
     tabs                            that tree as an outline, one line per tab and pane
     panes                           one line per pane: id, tab, status, label
     settings                        the app's preferences, as JSON
+    loops                           the status / restart schedules: on, every, last, next
 
   Terminals
     read <pane> [--tail N] [--raw] [--screen] [--wait]
@@ -91,6 +92,7 @@ pub fn run(argv: &[String]) -> std::io::Result<()> {
         "settings" => print_json(get(&conn, "/settings")?),
         "tabs" => print_outline(&get(&conn, "/state")?),
         "panes" => print_panes(&get(&conn, "/state")?),
+        "loops" => print_loops(&get(&conn, "/loops")?),
 
         // ---- terminals ----
         "read" => {
@@ -418,6 +420,71 @@ fn print_panes(state: &Value) {
     }
 }
 
+/// The two scheduler loops, one line each. The verb exists because the alternative to
+/// "when did the restart loop last run" is reading the log or waiting out the clock: an
+/// agent inside a pane, or a human over ssh with no GUI, can answer it in one command.
+/// Times are shown relative to now — the absolute epoch seconds are in `ctl get /loops` for
+/// anything that wants to compute with them.
+#[tracing::instrument(level = "debug", ret)]
+fn print_loops(v: &Value) {
+    let now = crate::loops::unix_now();
+    let null = Value::Null;
+    println!(
+        "{:<9}{:<5}{:<7}{:<13}{}",
+        "loop", "on", "every", "last fired", "next fire"
+    );
+    for name in ["status", "restart"] {
+        let l = v.get(name).unwrap_or(&null);
+        let enabled = l.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        let interval = l.get("intervalSecs").and_then(Value::as_u64).unwrap_or(0);
+        let last = l.get("lastFiredAt").and_then(Value::as_u64);
+        let next = l.get("nextFireAt").and_then(Value::as_u64);
+        println!(
+            "{:<9}{:<5}{:<7}{:<13}{}",
+            name,
+            if enabled { "yes" } else { "no" },
+            if interval == 0 {
+                "-".to_string()
+            } else {
+                span(interval)
+            },
+            relative(last, now),
+            match next {
+                Some(_) => relative(next, now),
+                // A loop that is on but has not been scheduled yet (the app is still inside
+                // its 60s startup grace) is "soon", not "never".
+                None if enabled => "soon".to_string(),
+                None => "-".to_string(),
+            },
+        );
+    }
+}
+
+/// A duration in seconds as one coarse unit — `45s`, `15m`, `24h`, `3d`. Coarse on purpose:
+/// this column answers "roughly when", and a loop's whole point is that its exact second
+/// does not matter.
+#[tracing::instrument(level = "debug", ret)]
+fn span(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3_600 => format!("{}m", s / 60),
+        s if s < 86_400 => format!("{}h", s / 3_600),
+        s => format!("{}d", s / 86_400),
+    }
+}
+
+/// A unix timestamp read against `now`: `in 13m` ahead, `8m ago` behind, `never` for `None`.
+/// A time that is already past while the loop is still armed reads `0s ago` rather than
+/// going negative — that is the honest picture of a firing that is due and has not landed.
+#[tracing::instrument(level = "debug", ret)]
+fn relative(at: Option<u64>, now: u64) -> String {
+    match at {
+        None => "never".to_string(),
+        Some(t) if t > now => format!("in {}", span(t - now)),
+        Some(t) => format!("{} ago", span(now - t)),
+    }
+}
+
 // ---- argument plumbing ---------------------------------------------------------------------
 
 fn usage(msg: &str) -> ! {
@@ -541,6 +608,25 @@ mod tests {
         // `--cmd "--version"` is a real thing to want to run.
         let (_, flags) = split_flags_optional(&s(&["--cmd", "--version"]));
         assert_eq!(flags.get("cmd").map(String::as_str), Some("--version"));
+    }
+
+    #[test]
+    fn a_span_is_shown_in_one_coarse_unit() {
+        assert_eq!(span(0), "0s");
+        assert_eq!(span(59), "59s");
+        assert_eq!(span(900), "15m");
+        assert_eq!(span(3_599), "59m");
+        assert_eq!(span(86_400), "1d");
+        assert_eq!(span(7_200), "2h");
+    }
+
+    #[test]
+    fn a_loop_time_reads_relative_to_now_and_never_goes_negative() {
+        assert_eq!(relative(None, 1_000), "never");
+        assert_eq!(relative(Some(1_780), 1_000), "in 13m");
+        assert_eq!(relative(Some(520), 1_000), "8m ago");
+        // Due but not yet fired: past, not a negative future.
+        assert_eq!(relative(Some(1_000), 1_000), "0s ago");
     }
 
     #[test]

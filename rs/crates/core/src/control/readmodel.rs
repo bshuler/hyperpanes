@@ -154,7 +154,9 @@ pub struct WindowInfo {
 pub struct LoopInfo {
     /// Whether the loop is armed at all (`Settings::status_loop_minutes` /
     /// `restart_loop_hours` above zero) — a loop can be disabled entirely, in which case
-    /// `last_fired_at`/`next_fire_at` are `None` rather than a schedule nobody will run.
+    /// `next_fire_at` is `None` rather than a schedule nobody will run. `last_fired_at`
+    /// survives being switched off: it is a fact about the past, and "off, last fired 3h
+    /// ago" answers the crash question better than "off, never fired".
     pub enabled: bool,
     /// The configured period, in seconds, regardless of whether the loop is enabled — so a
     /// client can show "every 15m" even while it's off.
