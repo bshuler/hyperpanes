@@ -22,6 +22,14 @@ use crate::control::scope::{pane_in_scope, PaneCoords, Scope, ScopeTree};
 use crate::tools::PaneKind;
 
 /// Process liveness of a pane's pty.
+///
+/// Deliberately two variants, not three. A caller that cannot confirm a pane's session is
+/// still there — the backend check races a debounce window, a daemon socket is mid-close, the
+/// session simply isn't known — has to report SOMETHING, and there is no `Unknown` to fall
+/// back on. It reports `Exited`. That is an asymmetric choice: a false `Exited` costs a caller
+/// one wasted `ctl restart` on a pane that was fine; a false `Running` is the crash mode this
+/// whole lane exists to close — an agent sends keystrokes into a dead pty, is told `200 ok`
+/// (or here, sees `running`), and has no way to learn otherwise. When in doubt, report dead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneStatus {
     Running,
@@ -131,6 +139,44 @@ pub struct WindowInfo {
     pub keyboard_focus_pane: Option<String>,
 }
 
+/// One app-owned scheduler loop's status (see `hyperpanes::loops::Loops` — the app crate this
+/// crate does not depend on), as published for `GET /loops`.
+///
+/// Additive and default-empty on purpose: this lane defines the shape and the route so the
+/// crash mode ("did the restart loop actually run today?") is checkable from outside without
+/// waiting on the clock, but nothing here schedules a loop — that stays entirely in the app's
+/// `loops.rs`. The next lane wires the GUI publisher to call [`ReadModel::set_loops`] each
+/// sync tick, the same way [`WindowInfo`] is republished; until it does, `/loops` answers
+/// truthfully that both loops are disabled and have never fired, rather than 404ing or
+/// inventing a schedule nobody configured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopInfo {
+    /// Whether the loop is armed at all (`Settings::status_loop_minutes` /
+    /// `restart_loop_hours` above zero) — a loop can be disabled entirely, in which case
+    /// `last_fired_at`/`next_fire_at` are `None` rather than a schedule nobody will run.
+    pub enabled: bool,
+    /// The configured period, in seconds, regardless of whether the loop is enabled — so a
+    /// client can show "every 15m" even while it's off.
+    pub interval_secs: u64,
+    /// Unix seconds of the loop's last confirmed firing, or `None` if it has never fired
+    /// (fresh install, or not yet reached since the app started).
+    pub last_fired_at: Option<u64>,
+    /// Unix seconds of the loop's next scheduled firing, or `None` if disabled.
+    pub next_fire_at: Option<u64>,
+}
+
+/// The two app-owned scheduler loops, keyed by name so a new loop can be added without
+/// reshaping `/loops` into a map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoopsInfo {
+    /// The 15-minute-default status-check loop.
+    pub status: LoopInfo,
+    /// The daily-default monitored-agent restart loop.
+    pub restart: LoopInfo,
+}
+
 /// A lightweight projection of a pane for the activity ticker / event fan-out.
 #[derive(Debug, Clone)]
 pub struct PaneRef {
@@ -153,6 +199,10 @@ pub struct ReadModel {
     focused_pane: Option<String>,
     /// A `focusPane` waiting for the GUI to mirror it — see [`Self::focus_pane`].
     pending_focus: Option<String>,
+    /// The two app-owned scheduler loops, published for `GET /loops`. Default-empty (both
+    /// disabled, never fired) until a GUI publisher calls [`Self::set_loops`] — see
+    /// [`LoopsInfo`] for why that is the deliberate stopping point here.
+    loops: LoopsInfo,
 }
 
 impl ReadModel {
@@ -649,6 +699,24 @@ impl ReadModel {
         }
     }
 
+    // ---- loops (`GET /loops`) ---------------------------------------------------------------
+
+    /// Replace the published loop schedule wholesale — the shape the GUI's per-tick publisher
+    /// (a later lane) calls, mirroring how [`Self::publish_replace`] republishes the pane tree
+    /// rather than patching it field by field.
+    #[tracing::instrument(level = "debug", ret)]
+    pub fn set_loops(&mut self, loops: LoopsInfo) {
+        self.loops = loops;
+    }
+
+    /// The current loop schedule for `GET /loops`. Cheap `Copy`, so callers under the model's
+    /// lock can grab it and drop the lock immediately rather than holding it through
+    /// serialization.
+    #[tracing::instrument(level = "debug", ret)]
+    pub fn loops(&self) -> LoopsInfo {
+        self.loops
+    }
+
     // ---- serialization (`GET /state`) -----------------------------------------------------
 
     /// Serialize `/state` filtered to `scope` (None = master = everything verbatim). `activity`
@@ -1112,6 +1180,60 @@ mod tests {
         let mut m = seeded();
         assert!(!m.focus_pane("nope"));
         assert_eq!(m.take_pending_focus(), None);
+    }
+
+    #[test]
+    fn loops_default_to_disabled_and_never_fired() {
+        // The stopping point for this lane: no GUI publisher exists yet, so a fresh model
+        // must answer honestly ("off, never fired") rather than 404 or a fabricated schedule.
+        let m = ReadModel::new();
+        assert_eq!(m.loops(), LoopsInfo::default());
+        assert!(!m.loops().status.enabled);
+        assert!(!m.loops().restart.enabled);
+        assert_eq!(m.loops().status.last_fired_at, None);
+        assert_eq!(m.loops().restart.next_fire_at, None);
+    }
+
+    #[test]
+    fn set_loops_replaces_the_published_schedule() {
+        let mut m = ReadModel::new();
+        let loops = LoopsInfo {
+            status: LoopInfo {
+                enabled: true,
+                interval_secs: 900,
+                last_fired_at: Some(1_000),
+                next_fire_at: Some(1_900),
+            },
+            restart: LoopInfo {
+                enabled: false,
+                interval_secs: 86_400,
+                last_fired_at: None,
+                next_fire_at: None,
+            },
+        };
+        m.set_loops(loops);
+        assert_eq!(m.loops(), loops);
+    }
+
+    #[test]
+    fn loops_serialize_camel_case_with_both_loops_named() {
+        let mut m = ReadModel::new();
+        m.set_loops(LoopsInfo {
+            status: LoopInfo {
+                enabled: true,
+                interval_secs: 900,
+                last_fired_at: Some(1_000),
+                next_fire_at: Some(1_900),
+            },
+            restart: LoopInfo::default(),
+        });
+        let v = serde_json::to_value(m.loops()).unwrap();
+        assert_eq!(v["status"]["enabled"], json!(true));
+        assert_eq!(v["status"]["intervalSecs"], json!(900));
+        assert_eq!(v["status"]["lastFiredAt"], json!(1000));
+        assert_eq!(v["status"]["nextFireAt"], json!(1900));
+        assert_eq!(v["restart"]["enabled"], json!(false));
+        assert_eq!(v["restart"]["lastFiredAt"], json!(null));
     }
 
     #[test]

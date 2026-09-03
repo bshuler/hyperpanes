@@ -706,7 +706,19 @@ impl ControlHost {
                     args: None,
                     cwd: None,
                     shell: None,
-                    status: PaneStatus::Running,
+                    // Same reasoning as `talk` above: the healed pane's status died with its
+                    // read-model entry, and re-inserting it with a rubber-stamped `Running`
+                    // is exactly the bug this lane closes. `lost_control_panes` only offered
+                    // this uid because `mgr.has` said it was alive, but that check ran on a
+                    // debounce cycle or more ago (`HEAL_DEBOUNCE`) — long enough for the
+                    // session to have died in the meantime. Ask again, now, rather than trust
+                    // the earlier snapshot; see `PaneStatus`'s doc comment for why an
+                    // unconfirmed pane reports `Exited` rather than a third "unknown" state.
+                    status: if mgr.has(&uid) {
+                        PaneStatus::Running
+                    } else {
+                        PaneStatus::Exited
+                    },
                     exit_code: None,
                     meta: Some(meta),
                     // Same reasoning as `talk` above: the healed pane's kind died with its

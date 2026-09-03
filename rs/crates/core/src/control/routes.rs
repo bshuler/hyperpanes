@@ -54,6 +54,7 @@ pub fn router(shared: Arc<Shared>) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/state", get(state))
+        .route("/loops", get(loops_get))
         .route("/tokens", post(tokens))
         .route(
             "/devices",
@@ -267,6 +268,24 @@ async fn state(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respons
             recording_panes: dictation.recording_panes,
         },
     })
+}
+
+// ---- /loops ---------------------------------------------------------------------------------
+
+/// GET /loops — the two app-owned scheduler loops (status-check, monitored-agent restart):
+/// whether each is enabled, its configured interval, and when it last/next fires.
+///
+/// Unlike `/settings`, this never 503s for a missing GUI: the read-model's default is an
+/// honest "disabled, never fired" ([`LoopsInfo::default`]), which is a real answer, not a
+/// placeholder. No scope check either — loops are app-wide, not per-pane, so there is nothing
+/// for a scoped token to be excluded from. A later lane wires a GUI publisher to
+/// `ReadModel::set_loops`; until then every caller sees the same honest default.
+#[tracing::instrument(level = "debug", skip_all)]
+async fn loops_get(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Response {
+    if let Err(e) = authorize(&shared, &headers) {
+        return e;
+    }
+    ok_json(shared.model.lock().unwrap().loops())
 }
 
 // ---- /tokens ------------------------------------------------------------------------------
@@ -2623,6 +2642,36 @@ mod golden {
         assert_eq!(body["dictation"]["recordingPanes"], json!([]));
     }
 
+    #[tokio::test]
+    async fn loops_with_no_gui_publisher_is_honest_defaults_not_503() {
+        // Unlike `/settings`, a missing GUI publisher is not an error here — nobody has called
+        // `ReadModel::set_loops` yet (that wiring is a later lane), and "both loops disabled,
+        // never fired" is the truthful answer to give, not a 503.
+        let s = boot(true).await;
+        let r = client()
+            .get(format!("{}/loops", s.base))
+            .header("authorization", format!("Bearer {}", s.token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(
+            r.text().await.unwrap(),
+            r#"{"status":{"enabled":false,"intervalSecs":0,"lastFiredAt":null,"nextFireAt":null},"restart":{"enabled":false,"intervalSecs":0,"lastFiredAt":null,"nextFireAt":null}}"#
+        );
+    }
+
+    #[tokio::test]
+    async fn loops_needs_auth() {
+        let s = boot(true).await;
+        let r = client()
+            .get(format!("{}/loops", s.base))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 401);
+    }
+
     // ---- dictation ------------------------------------------------------------------------
 
     async fn dictate(s: &Server, ty: &str, pane: &str) -> (u16, Value) {
@@ -2843,6 +2892,37 @@ mod golden {
         assert_eq!(
             r.json::<serde_json::Value>().await.unwrap()["error"],
             "input not delivered"
+        );
+    }
+
+    #[tokio::test]
+    async fn output_of_an_exited_pane_reports_exited_not_running() {
+        // Companion to the two 409 tests above, on the read side of the same crash mode. Those
+        // cover a *write* to a dead pane no longer lying `200 ok`; this covers a *read*: once
+        // something upstream — `heal_lost_panes`'s re-check, or the activity ticker's
+        // `reconcile_exits` — has recorded a pane as `Exited` because its session is gone, the
+        // API has to actually say so, byte for byte, rather than a stale `running` surviving the
+        // trip through `pane_status_str` and `PaneOut` serialization. No live session exists
+        // behind `u1` here either, matching the two tests above — the difference under test is
+        // only which status the model already holds.
+        let s = boot(true).await;
+        s.shared.model.lock().unwrap().insert_pane(
+            1,
+            PaneInfo {
+                status: PaneStatus::Exited,
+                ..pane("p1", "u1")
+            },
+        );
+        let r = client()
+            .get(format!("{}/panes/p1/output", s.base))
+            .header("authorization", format!("Bearer {}", s.token))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status().as_u16(), 200);
+        assert_eq!(
+            r.text().await.unwrap(),
+            r#"{"cursor":0,"output":"","paneId":"p1","status":"exited","stripped":false}"#
         );
     }
 
