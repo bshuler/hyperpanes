@@ -122,7 +122,11 @@ fn authorize(shared: &Arc<Shared>, headers: &HeaderMap) -> Result<TokenInfo, Res
         .lock()
         .unwrap()
         .resolve(token.as_deref(), now_ms())
-        .ok_or_else(|| jstatus(401, json!({ "error": "unauthorized" })))
+        .ok_or_else(|| {
+            // The token value is a secret: log only whether one was presented at all.
+            tracing::warn!(bearer_present = token.is_some(), "request rejected: unauthorized");
+            jstatus(401, json!({ "error": "unauthorized" }))
+        })
 }
 
 /// A resolved, in-scope pane: its session uid plus the canonical pane id (the caller may have
@@ -1955,15 +1959,29 @@ async fn settings_patch(
     if !unknown.is_empty() {
         return jstatus(400, json!({ "error": "unknown settings", "keys": unknown }));
     }
-    let keys: Vec<&String> = obj.keys().collect();
-    let body = json!({ "ok": true, "queued": true, "keys": keys });
-    queue_ui_op(
-        &shared,
-        UiOp::PatchSettings {
-            patch: patch.clone(),
-        },
-        body,
-    )
+    let keys: Vec<String> = obj.keys().cloned().collect();
+    // Unlike the tab ops, a settings patch is answered with its OUTCOME: the preferences
+    // layer validates values (palette index, effect token, log level, ...) on the UI thread,
+    // and a caller told `ok` for a value that was then thrown away has no way to find out.
+    // So queue the op with a reply handle and wait — bounded, so a headless embedder (nothing
+    // drains the queue) still gets the historical `202 queued` instead of hanging.
+    let (reply, rx) = crate::control::uiops::PatchReply::new();
+    let queued = shared.ui_ops.lock().unwrap().push(UiOp::PatchSettings {
+        patch: patch.clone(),
+        reply: Some(reply),
+    });
+    if !queued {
+        return jstatus(
+            503,
+            json!({ "error": "the UI op queue is full — is the app running?" }),
+        );
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(5), rx).await {
+        Ok(Ok(Ok(()))) => ok_json(json!({ "ok": true, "applied": true, "keys": keys })),
+        Ok(Ok(Err(e))) => jstatus(400, json!({ "error": e, "keys": keys })),
+        // The host dropped the handle without answering, or nothing drained the queue in time.
+        _ => jstatus(202, json!({ "ok": true, "queued": true, "keys": keys })),
+    }
 }
 
 // ---- /projects ----------------------------------------------------------------------------

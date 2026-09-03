@@ -250,6 +250,13 @@ pub fn workspaces_dir() -> PathBuf {
     data_dir().join("workspaces")
 }
 
+/// Where the per-process log files live (`hyperpanes-app.log`, `hyperpanes-daemon.log`,
+/// `hyperpanes-cli.log` and their `.1`…`.N` rolled predecessors — see `crate::logging`).
+/// Runtime state, not user data: [`state_dir`], so on Linux it lands in `$XDG_STATE_HOME`.
+pub fn logs_dir() -> PathBuf {
+    state_dir().join("logs")
+}
+
 /// The always-on **Hyperpane** tab's working directory: the app-managed home of the skills and
 /// notes its agent works from.
 ///

@@ -41,8 +41,6 @@ use hyperpanes_core::session::proto::SessionMeta;
 use russh::server::Handle;
 use russh::ChannelId;
 
-use crate::dbg_log;
-
 /// Home the cursor and clear screen + scrollback before painting a replay buffer, so a
 /// repaint does not stack on the previous copy. Same sequence `attach_cli` uses.
 pub const CLEAR_SCREEN: &[u8] = b"\x1b[H\x1b[2J\x1b[3J";
@@ -136,7 +134,7 @@ pub fn spawn(params: BridgeParams, handle: Handle, channel: ChannelId) -> Bridge
             let code = match attach_main(&params, &mut sink, input_rx, resize_rx) {
                 Ok(code) => code,
                 Err(msg) => {
-                    dbg_log(&format!("ssh: channel failed: {msg}"));
+                    tracing::debug!("ssh: channel failed: {msg}");
                     let _ = sink.write_all(format!("\r\nhyperpanes: {msg}\r\n").as_bytes());
                     let _ = sink.flush();
                     1
@@ -148,7 +146,7 @@ pub fn spawn(params: BridgeParams, handle: Handle, channel: ChannelId) -> Bridge
             let _ = out_tx.blocking_send(Out::Done(code));
         });
     if let Err(e) = spawned {
-        dbg_log(&format!("ssh: could not start the attach thread: {e}"));
+        tracing::debug!("ssh: could not start the attach thread: {e}");
     }
 
     Bridge {
@@ -168,7 +166,7 @@ fn attach_main(
     // A protocol-version mismatch is worth a log line but not a refusal: the daemon and this
     // binary are the same install, and `attach` already tolerates additive drift.
     if let Err(e) = attach::handshake(&conn) {
-        dbg_log(&format!("ssh: daemon handshake: {e}"));
+        tracing::debug!("ssh: daemon handshake: {e}");
     }
     let sessions = attach::list_sessions(&conn).map_err(|e| e.to_string())?;
 

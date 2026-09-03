@@ -72,7 +72,6 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use crate::session::claims::{ClaimRegistry, ConnId as ClaimConnId};
 #[cfg(unix)]
-use crate::session::daemon_client::dbg;
 #[cfg(unix)]
 use crate::session::handoff::{recv_with_fds, send_with_fds, MAX_FDS_PER_MSG};
 #[cfg(unix)]
@@ -153,9 +152,12 @@ pub fn run(salt: &str) -> io::Result<()> {
 
     // Sessions inherited from an incumbent daemon (M1), adopted once the runtime is up.
     let mut inherited: Vec<(SessionSnapshot, OwnedFd)> = Vec::new();
+    let mut took_over = false;
+    let mut serving_without_flock = false;
     match lock.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
+            took_over = true;
             // Another daemon already serves this salt. Historically we bailed out here and
             // the client tore that daemon down — killing every session. Instead, TAKE IT
             // OVER: it hands us its pty masters and exits, and the shells never notice
@@ -166,9 +168,7 @@ pub fn run(salt: &str) -> io::Result<()> {
                     // A pre-takeover incumbent (proto < 2 drops the connection), or one that
                     // is wedged. Report the old error so the client's tear-down path still
                     // resolves the upgrade, at the old cost.
-                    dbg(&format!(
-                        "takeover declined ({e}); leaving the incumbent alone"
-                    ));
+                    tracing::info!(error = %e, "takeover declined; leaving the incumbent alone");
                     return Err(io::Error::new(
                         io::ErrorKind::AddrInUse,
                         "a daemon already holds this salt",
@@ -201,10 +201,10 @@ pub fn run(salt: &str) -> io::Result<()> {
                 // excludes a COMPETING daemon, and the incumbent has already surrendered its
                 // sessions, so a lock we cannot take is worth strictly less than the user's
                 // terminals. Serve without it and say so.
-                dbg(
+                serving_without_flock = true;
+                tracing::warn!(sessions = inherited.len(),
                     "takeover: the incumbent handed over but never released the flock; \
-                     serving without it rather than dropping live sessions",
-                );
+                     serving without it rather than dropping live sessions");
             }
         }
         Err(std::fs::TryLockError::Error(e)) => return Err(e),
@@ -229,6 +229,14 @@ pub fn run(salt: &str) -> io::Result<()> {
     // path unlinks it). The idle monitor watches it; `serve`'s accept loop checks it.
     let lifecycle = Arc::new(Lifecycle::new(names.socket.clone()));
     let daemon = Daemon::new(Arc::clone(&lifecycle));
+    tracing::info!(
+        pid = std::process::id(),
+        socket = %names.socket.display(),
+        took_over,
+        serving_without_flock,
+        inherited = inherited.len(),
+        "session daemon started"
+    );
     // Re-create the incumbent's sessions around the descriptors it handed us, BEFORE the
     // idle monitor starts — a daemon that looked idle for a beat here would arm its exit
     // countdown against sessions it is in the middle of adopting.
@@ -273,11 +281,9 @@ fn bind_with_retry(
             // log once a second — a daemon stuck retrying a bind is recoverable by hand,
             // a closed master is not.
             Err(e) => {
-                if tries % 20 == 0 {
-                    dbg(&format!(
-                        "bind retry after {e} ({}s, holding handed-over sessions)",
-                        tries / 20
-                    ));
+                if tries.is_multiple_of(20) {
+                    tracing::debug!("bind retry after {e} ({}s, holding handed-over sessions)",
+                        tries / 20);
                 }
                 tries += 1;
                 let _ = std::fs::remove_file(socket);
@@ -323,10 +329,8 @@ fn take_over(socket: &Path) -> io::Result<Vec<(SessionSnapshot, OwnedFd)>> {
             Ok(Some(m)) => m,
             Ok(None) => break, // clean EOF: the incumbent sent everything
             Err(e) => {
-                dbg(&format!(
-                    "takeover: handoff read failed after {} session(s): {e}",
-                    out.len()
-                ));
+                tracing::warn!(sessions = out.len(), error = %e,
+                    "takeover: handoff read failed part way through");
                 break;
             }
         };
@@ -334,7 +338,7 @@ fn take_over(socket: &Path) -> io::Result<Vec<(SessionSnapshot, OwnedFd)>> {
         let batch: HandoffPayload = match serde_json::from_slice(&payload) {
             Ok(b) => b,
             Err(e) => {
-                dbg(&format!("takeover: undecodable batch dropped: {e}"));
+                tracing::warn!(error = %e, "takeover: undecodable batch dropped");
                 break;
             }
         };
@@ -344,22 +348,19 @@ fn take_over(socket: &Path) -> io::Result<Vec<(SessionSnapshot, OwnedFd)>> {
         for snap in batch.snapshots {
             match fds.get_mut(snap.fd_index).and_then(Option::take) {
                 Some(fd) => out.push((snap, fd)),
-                None => dbg(&format!(
-                    "takeover: session {} claims descriptor {} of {}; skipped",
-                    snap.uid,
-                    snap.fd_index,
-                    fds.len()
-                )),
+                None => tracing::warn!(uid = %snap.uid, fd_index = snap.fd_index,
+                    fds = fds.len(), "takeover: session claims a descriptor that was not sent; skipped"),
             }
         }
     }
+    tracing::info!(sessions = out.len(), messages, "took over the incumbent's sessions");
     if messages == 0 {
         return Err(io::Error::new(
             io::ErrorKind::ConnectionAborted,
             "the daemon holding this salt did not answer the takeover",
         ));
     }
-    dbg(&format!("takeover: adopted {} session(s)", out.len()));
+    tracing::debug!("takeover: adopted {} session(s)", out.len());
     Ok(out)
 }
 
@@ -472,6 +473,7 @@ impl Lifecycle {
                 TeardownMode::FlagOnly => return,
             }
         }
+        tracing::info!(socket = %self.socket.display(), "session daemon shutting down");
         kill_sessions();
         let _ = std::fs::remove_file(&self.socket);
         match self.mode {
@@ -565,6 +567,7 @@ pub fn kill_daemon(salt: &str) -> io::Result<bool> {
         }
         Err(e) => return Err(e),
     };
+    tracing::info!(socket = %socket.display(), "asking the session daemon to shut down");
     write_frame(&mut stream, &ClientMsg::Shutdown)?;
     // Wait for the daemon to exit (it unlinks the socket). Bounded so the CLI never hangs.
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -747,6 +750,8 @@ impl Daemon {
     /// A session that fails to adopt is dropped with a log line rather than failing startup —
     /// losing one pane to a bad descriptor must not cost the user every other pane.
     fn adopt_all(&self, inherited: Vec<(SessionSnapshot, OwnedFd)>) {
+        let total = inherited.len();
+        let mut adopted = 0usize;
         for (snap, fd) in inherited {
             let pgrp = snap.pgrp;
             let sink_result = self.registry.adopt(&snap, move |sink| {
@@ -754,14 +759,19 @@ impl Daemon {
             });
             match sink_result {
                 Ok(()) => {
+                    adopted += 1;
                     // Carry the cwd cache too, so a `ListSessions` right after the upgrade
                     // reports what it reported before it (the registry does not track cwd).
                     if let Some(cwd) = snap.cwd {
                         self.cwds.lock().unwrap().insert(snap.uid, cwd);
                     }
                 }
-                Err(e) => dbg(&format!("takeover: adopting {} failed: {e}", snap.uid)),
+                Err(e) => tracing::warn!(uid = %snap.uid, error = %e,
+                    "takeover: adopting an inherited session failed"),
             }
+        }
+        if total > 0 {
+            tracing::info!(adopted, total, "inherited sessions adopted");
         }
         // The session set is now whatever we inherited; tell anyone already connected (M7).
         // Claims are deliberately NOT inherited: the incumbent's clients were connected to
@@ -801,6 +811,8 @@ impl Daemon {
                             // Idle through the whole grace → exit. No sessions to kill (idle).
                             // In production `shutdown` never returns (process exit); under
                             // test it flags + returns, so we `break` to stop the monitor.
+                            tracing::info!(idle_ms = since.elapsed().as_millis() as u64,
+                                "no sessions and no clients through the idle grace; shutting down");
                             lifecycle.shutdown(|| {});
                             break;
                         }
@@ -859,6 +871,7 @@ impl Daemon {
         // M7: this connection's identity for the claim table, assigned by us rather than
         // asserted by the client.
         let conn_id = self.claims.next_conn_id();
+        tracing::info!(conn = conn_id, "client connected");
         /// Runs on EVERY exit path out of `handle_connection` — clean close, malformed
         /// frame, panic — and, crucially, on the path taken when the peer *process* dies:
         /// the kernel closes its socket, the read loop sees EOF, and we unwind through
@@ -937,6 +950,7 @@ impl Daemon {
                     // Handled out here rather than in `dispatch`: the descriptor handoff needs
                     // the socket ITSELF (`sendmsg` with ancillary data), and it must be the
                     // only thing on it — so the writer thread is wound down first, below.
+                    tracing::info!(conn = conn_id, "takeover requested by a successor daemon");
                     takeover = true;
                     break;
                 }
@@ -946,9 +960,14 @@ impl Daemon {
                     }
                 }
                 Ok(None) => break, // client closed cleanly
-                Err(_) => break,   // malformed frame / socket error → drop the connection
+                Err(e) => {
+                    // Malformed frame / socket error → drop the connection.
+                    tracing::debug!(conn = conn_id, error = %e, "connection read failed");
+                    break;
+                }
             }
         }
+        tracing::info!(conn = conn_id, takeover, "client disconnected");
 
         // Dropping `out_tx` ends the writer's reply drain; it then exits on its next bus
         // poll. Best-effort join so the thread is reaped.
@@ -983,10 +1002,7 @@ impl Daemon {
     fn hand_over(&self, sock: &std::os::unix::net::UnixStream) {
         let handed = self.registry.hand_off();
         let cwds = self.cwds.lock().unwrap().clone();
-        dbg(&format!(
-            "takeover: handing over {} session(s)",
-            handed.len()
-        ));
+        tracing::info!(sessions = handed.len(), "handing sessions over to the successor");
 
         // `chunks` on an empty slice yields nothing, so the empty case is sent explicitly.
         let batches: Vec<&[(SessionSnapshot, std::os::fd::RawFd)]> = if handed.is_empty() {
@@ -1009,7 +1025,7 @@ impl Daemon {
             let payload = match serde_json::to_vec(&HandoffPayload { snapshots }) {
                 Ok(p) => p,
                 Err(e) => {
-                    dbg(&format!("takeover: payload encode failed: {e}"));
+                    tracing::warn!(error = %e, "takeover: payload encode failed");
                     break;
                 }
             };
@@ -1018,7 +1034,7 @@ impl Daemon {
                 // registry and their ptys relinquished, so there is nothing to roll back to —
                 // exiting is still right, and the shells stay alive, parented to init, for the
                 // next daemon to discover.
-                dbg(&format!("takeover: send failed: {e}"));
+                tracing::warn!(error = %e, "takeover: descriptor send failed");
                 break;
             }
         }
@@ -1116,6 +1132,11 @@ impl Daemon {
                 let _guard = self.rt.enter();
                 let created = self.registry.create(opts);
                 drop(_guard);
+                match &created {
+                    Ok(_) => tracing::info!(conn = conn_id, uid = %uid, "create ok"),
+                    Err(e) => tracing::warn!(conn = conn_id, uid = %uid, error = %e,
+                        "create failed; synthetic exit injected"),
+                }
                 let _ = out.send(DaemonMsg::Created { uid: uid.clone() });
                 // Every OTHER client's uid shadow learns about this session here — the M5
                 // residual where a session created after a window connected stayed invisible
@@ -1134,11 +1155,12 @@ impl Daemon {
             // reported; see `DaemonSessionManager::write`.
             ClientMsg::Write { uid, data } => {
                 if let Err(e) = self.registry.write(&uid, &data) {
-                    dbg(&format!("write to {uid} failed: {e}"));
+                    tracing::debug!("write to {uid} failed: {e}");
                 }
             }
             ClientMsg::Resize { uid, cols, rows } => self.registry.resize(&uid, cols, rows),
             ClientMsg::Kill { uid } => {
+                tracing::info!(conn = conn_id, uid = %uid, "kill requested");
                 self.registry.kill(&uid);
                 self.cwds.lock().unwrap().remove(&uid);
                 // A manual kill is deliberately SILENT on the event bus (no `Exit`), so the
@@ -1150,6 +1172,7 @@ impl Daemon {
                 self.broadcast_sessions();
             }
             ClientMsg::KillAll => {
+                tracing::info!(conn = conn_id, "kill-all requested");
                 self.registry.kill_all();
                 self.cwds.lock().unwrap().clear();
                 if self.claims.clear() {
@@ -1190,6 +1213,7 @@ impl Daemon {
                 // dispatch, because the handoff needs the socket itself. Reaching here would
                 // mean the interception was bypassed — close the connection rather than
                 // silently ignoring a request that the peer is waiting on.
+                tracing::warn!(conn = conn_id, "takeover reached dispatch; closing the connection");
                 return false;
             }
             ClientMsg::Shutdown => {
@@ -1199,6 +1223,7 @@ impl Daemon {
                 // as the acknowledgement (no reply frame is sent). Under test it only flags;
                 // returning `false` closes this connection promptly. Routed through the shared
                 // `Lifecycle` so a `Shutdown` racing the idle monitor still tears down once.
+                tracing::info!(conn = conn_id, "shutdown requested by a client");
                 let registry = self.registry.clone();
                 self.lifecycle.shutdown(move || registry.kill_all());
                 return false;
@@ -1263,7 +1288,7 @@ fn writer_loop(
     notices_on: &std::sync::atomic::AtomicBool,
     attached: Arc<Mutex<HashSet<String>>>,
 ) {
-    use std::sync::mpsc::TryRecvError;
+    use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
     use tokio::sync::broadcast::error::TryRecvError as BusErr;
 
     loop {
@@ -1340,11 +1365,21 @@ fn writer_loop(
         if reader_gone && bus_idle && notices_idle {
             return;
         }
-        // Nothing to do this pass → brief sleep so we don't spin (M0 is a simple poll; a
-        // future version could block on a unified async select). Short enough that
-        // event/echo latency stays well under a frame.
-        if bus_idle {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        // Nothing to do this pass → park on the reply channel for a beat rather than
+        // sleeping blind: a reply the client is awaiting wakes us at once, while the bus and
+        // notice channels (which have no blocking receive we can share a wait with) are
+        // re-polled within the same 2 ms the old sleep gave them. `reader_gone` is already
+        // true here if the channel was found disconnected above, so only a live channel
+        // gets waited on.
+        if bus_idle && !reader_gone {
+            match out_rx.recv_timeout(std::time::Duration::from_millis(2)) {
+                Ok(reply) => {
+                    if write_frame(&mut write_half, &reply).is_err() {
+                        return; // client went away
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => {}
+            }
         }
     }
 }

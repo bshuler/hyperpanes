@@ -10,6 +10,7 @@
 //! Then run the MCP with the same `HYPERPANES_CONTROL_FILE`.
 
 fn main() {
+    hyperpanes_core::logging::init("headless", hyperpanes_core::logging::DEFAULT_LEVEL);
     let runtime = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {

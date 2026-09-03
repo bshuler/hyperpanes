@@ -16,7 +16,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const TIMELINE_CAP: usize = 200;
@@ -261,27 +261,23 @@ impl AiMemoryStore {
         self.write_now();
     }
 
-    // Atomic write: serialize to a temp sibling, then rename over the target so a
-    // reader never sees a half-written file.
+    // Atomic write via the shared `write_atomic` (temp sibling + rename), so a reader never
+    // sees a half-written file and every persisted blob takes the same path to disk.
     fn write_now(&mut self) {
         self.data.version = 1;
-        let tmp = with_tmp_suffix(&self.file_path);
-        let result = (|| -> std::io::Result<()> {
-            if let Some(parent) = self.file_path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let json = serde_json::to_string_pretty(&self.data).map_err(std::io::Error::other)?;
-            std::fs::write(&tmp, json)?;
-            std::fs::rename(&tmp, &self.file_path)?;
-            Ok(())
-        })();
+        let result = serde_json::to_string_pretty(&self.data)
+            .map_err(std::io::Error::other)
+            .and_then(|json| {
+                crate::persistence::paths::write_atomic(&self.file_path, json.as_bytes())
+            });
         if let Err(err) = result {
-            eprintln!("failed to write ai-memory.json: {err}");
+            tracing::warn!("failed to write ai-memory.json: {err}");
         }
     }
 }
 
-fn with_tmp_suffix(path: &Path) -> PathBuf {
+#[cfg(test)]
+fn with_tmp_suffix(path: &std::path::Path) -> PathBuf {
     let mut s = path.as_os_str().to_os_string();
     s.push(".tmp");
     PathBuf::from(s)

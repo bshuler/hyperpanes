@@ -167,7 +167,7 @@ pub fn read_set<P: AsRef<Path>>(path: P) -> Option<WorkspaceSet> {
     let set = match parse_set_str(&raw) {
         Ok(set) => set,
         Err(e) => {
-            eprintln!("[hyperpanes] {}: {e}", path.display());
+            tracing::warn!("{}: {e}", path.display());
             return None;
         }
     };
@@ -226,8 +226,8 @@ pub fn load_members(set: &WorkspaceSet) -> Vec<WorkspaceFile> {
         .filter_map(|m| match io::read_workspace(&m.path) {
             Some(f) => Some(f),
             None => {
-                eprintln!(
-                    "[hyperpanes] set {:?}: member {:?} is not a valid workspace — skipped",
+                tracing::warn!(
+                    "set {:?}: member {:?} is not a valid workspace — skipped",
                     set.name, m.path
                 );
                 None

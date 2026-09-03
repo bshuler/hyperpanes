@@ -318,7 +318,7 @@ mod tests {
             "shrunk to fit: {c:?}"
         );
         assert!(x >= LAPTOP.x && x + w <= LAPTOP.x + LAPTOP.width, "{c:?}");
-        assert!(y >= LAPTOP.y && y < LAPTOP.y + LAPTOP.height, "{c:?}");
+        assert!((LAPTOP.y..LAPTOP.y + LAPTOP.height).contains(&y), "{c:?}");
     }
 
     #[test]
@@ -341,7 +341,7 @@ mod tests {
         let g = frame(200, -600, 1280, 800);
         let c = g.clamp_to_displays(&[LAPTOP]);
         let (x, y) = c.position().unwrap();
-        assert!(y >= LAPTOP.y && y < LAPTOP.y + LAPTOP.height, "{c:?}");
+        assert!((LAPTOP.y..LAPTOP.y + LAPTOP.height).contains(&y), "{c:?}");
         assert!(x >= LAPTOP.x, "{c:?}");
     }
 

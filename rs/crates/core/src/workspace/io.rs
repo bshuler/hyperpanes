@@ -216,7 +216,7 @@ pub fn read_workspace<P: AsRef<Path>>(path: P) -> Option<WorkspaceFile> {
     let file = match parse_workspace_str(&raw) {
         Ok(file) => file,
         Err(e) => {
-            eprintln!("[hyperpanes] {}: {e}", path.display());
+            tracing::warn!("{}: {e}", path.display());
             return None;
         }
     };

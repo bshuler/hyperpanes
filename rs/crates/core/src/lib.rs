@@ -19,6 +19,7 @@ pub mod control;
 pub mod git;
 pub mod hyperpane;
 pub mod layout;
+pub mod logging;
 pub mod open;
 pub mod paths;
 pub mod permissions;

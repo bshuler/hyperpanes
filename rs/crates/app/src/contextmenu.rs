@@ -606,6 +606,9 @@ pub fn tab_menu(state: &State, idx: usize, x: f32, y: f32) -> CtxMenu {
     let only = state.tabs.len() < 2;
     let is_last = idx + 1 >= state.tabs.len();
     let no_closed = state.closed.is_empty();
+    // The system tab (the always-on "Hyperpane") is pinned to this window: `State::detach_tab`
+    // refuses it, so the row is greyed rather than offered as a click that does nothing.
+    let system = state.tabs.get(idx).is_some_and(|t| t.system);
 
     let new_sc = state.keymap.label_for("tab.new").unwrap_or_default();
 
@@ -628,7 +631,7 @@ pub fn tab_menu(state: &State, idx: usize, x: f32, y: f32) -> CtxMenu {
         0,
         false,
         false,
-        only,
+        only || system,
         false,
         sub::NONE,
         Some(Command::MoveTabToNewWindow(idx)),

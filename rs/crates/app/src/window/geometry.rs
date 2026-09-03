@@ -80,9 +80,7 @@ pub fn restore_geometry(id: usize, aw: &crate::AppWindow) {
     let saved = window_geometry::load();
     let clamped = saved.clamp_to_displays(&displays());
     if clamped != saved {
-        crate::dbg_log(&format!(
-            "geometry: remembered frame {saved:?} is off the attached displays; using {clamped:?}"
-        ));
+        tracing::debug!("geometry: remembered frame {saved:?} is off the attached displays; using {clamped:?}");
     }
     // Size FIRST: it is the call that pins the adapter's `has_explicit_size`, and until
     // that is set the first show would resize the window to the .slint preferred size and
@@ -183,7 +181,7 @@ pub fn flush_geometry() {
     if let Err(e) = window_geometry::save(&g) {
         // Never fatal: a window that cannot be remembered is a papercut, a failed launch or
         // a failed quit is not.
-        crate::dbg_log(&format!("geometry: save failed: {e}"));
+        tracing::debug!("geometry: save failed: {e}");
     }
 }
 

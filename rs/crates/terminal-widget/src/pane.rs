@@ -175,13 +175,41 @@ pub enum LinkAction {
     ShowCommit { cwd: String, hash: String },
 }
 
+/// What [`TerminalPane::locate`] found under the pointer: the resolved token, its `line` /
+/// `col` suffixes, the grid `(line, start col, end col)` it spans, and the surface x/y it was
+/// hit at.
+type Located = (ResolveResult, Option<u32>, Option<u32>, usize, usize, usize, f32, f32);
+
 impl TerminalPane {
     /// Create a pane of `cols`×`rows` cells driving the given renderer. Use
     /// [`crate::render::SoftwareRenderer`] (always available) or
     /// [`crate::render::GpuRenderer`] (when a wgpu device is in hand).
     pub fn new(cols: usize, rows: usize, renderer: Box<dyn PaneRenderer>) -> Self {
+        Self::with_scrollback(cols, rows, TermGrid::DEFAULT_SCROLLBACK, renderer)
+    }
+
+    /// Change how many lines of history the pane keeps (the app's `scrollback` preference
+    /// applied live). Shrinking drops the oldest lines; a no-op when unchanged.
+    pub fn set_scrollback(&mut self, scrollback: usize) {
+        self.grid.set_scrollback(scrollback);
+    }
+
+    /// The scrollback depth the pane is configured with.
+    pub fn scrollback_capacity(&self) -> usize {
+        self.grid.scrollback_capacity()
+    }
+
+    /// [`Self::new`] with an explicit scrollback depth (lines of history kept above the
+    /// viewport) — the hook for the app's `scrollback` preference. Use
+    /// [`Self::set_scrollback`] to change it on a live pane.
+    pub fn with_scrollback(
+        cols: usize,
+        rows: usize,
+        scrollback: usize,
+        renderer: Box<dyn PaneRenderer>,
+    ) -> Self {
         Self {
-            grid: TermGrid::new(cols, rows),
+            grid: TermGrid::with_scrollback(cols, rows, scrollback),
             renderer,
             cwd: None,
             verified: HashMap::new(),
@@ -397,16 +425,7 @@ impl TerminalPane {
         surf_w: f32,
         surf_h: f32,
         require_exists: bool,
-    ) -> Option<(
-        ResolveResult,
-        Option<u32>,
-        Option<u32>,
-        usize,
-        usize,
-        usize,
-        f32,
-        f32,
-    )> {
+    ) -> Option<Located> {
         let (cell_w, cell_h, cols, rows) = self.cell_logical(surf_w, surf_h)?;
         if x < 0.0 || y < 0.0 {
             return None;
@@ -1135,17 +1154,24 @@ impl TerminalPane {
         if cols == 0 {
             return None;
         }
-        // Same wrapped-line test as `type_over_selection`: every grid line from the upper of the
-        // two to (exclusive) the lower must carry the WRAPLINE continuation flag, so a soft-wrapped
-        // input is one editable line while genuinely separate rows are not.
         let (lo, hi) = (target.line.min(cline), target.line.max(cline));
-        if (lo..hi).any(|r| !self.grid.line_wraps(r)) {
-            return None;
-        }
-        // Linear cell offsets within the wrapped line — a wrapped row is always `cols` wide and the
-        // editor's arrows walk straight through the wrap, so this arithmetic holds across rows.
-        let lin = |line: i32, col: usize| line * cols as i32 + col as i32;
-        let steps = lin(target.line, target.col) - lin(cline, self.grid.cursor_col());
+        // Soft-wrapped input (the shell's own line wrapped by the terminal): every grid line
+        // from the upper of the two to (exclusive) the lower carries the WRAPLINE continuation
+        // flag, so the whole thing is one editable line `cols` cells wide per row and the
+        // editor's arrows walk straight through the wrap. Same test as `type_over_selection`.
+        let steps = if (lo..hi).all(|r| self.grid.line_wraps(r)) {
+            let lin = |line: i32, col: usize| line * cols as i32 + col as i32;
+            lin(target.line, target.col) - lin(cline, self.grid.cursor_col())
+        } else {
+            // Hard rows: a TUI input box (Claude Code's `│ > … │` prompt, a `>`-marked
+            // continuation) laid out over several rows by the application itself — a
+            // Shift+Enter newline, or the box wrapping a long line on its own. The arrows still
+            // walk the caret through the text as one buffer, so the walk is counted row by row
+            // from the rows' visible text rather than assuming `cols` cells each.
+            let rows = self.hard_input_rows(lo, hi)?;
+            hard_row_offset(&rows, lo, target.line, target.col)
+                - hard_row_offset(&rows, lo, cline, self.grid.cursor_col())
+        };
         if steps == 0 {
             return None; // clicked the caret's own cell: nothing to send
         }
@@ -1157,6 +1183,46 @@ impl TerminalPane {
             bytes.extend_from_slice(seq);
         }
         Some(bytes)
+    }
+
+    /// The per-row text extents of a multi-row TUI input spanning grid rows `lo..=hi`, or
+    /// `None` when those rows do not look like one input box.
+    ///
+    /// The rows qualify when every one of them is framed by a box border (`│` / `║`) — the
+    /// Claude Code prompt — or when at least one of them carries a `>` / `❯` prompt marker (a
+    /// `>`-continued multi-line input without a frame). Plain output rows above a bare shell
+    /// prompt match neither, so a click there keeps declining as before.
+    ///
+    /// Text on every row starts at the block's shared margin: the leftmost text column after
+    /// the decoration, which is the marker row's own text column (continuation rows are indented
+    /// under it). That margin, not each row's first non-blank cell, is the row's start, so a
+    /// deliberately indented line keeps its leading spaces in the count.
+    fn hard_input_rows(&self, lo: i32, hi: i32) -> Option<Vec<HardRow>> {
+        let (cols, _) = self.grid_size();
+        let mut rows = Vec::with_capacity((hi - lo + 1) as usize);
+        let mut any_marker = false;
+        let mut all_bordered = true;
+        for r in lo..=hi {
+            let text: Vec<char> = self.grid.line_text(r)?.chars().collect();
+            let shape = HardRowShape::of(&text, cols);
+            any_marker |= shape.marker;
+            all_bordered &= shape.bordered;
+            rows.push(HardRow {
+                shape,
+                wraps: self.grid.line_wraps(r),
+                start: 0,
+                end: 0,
+            });
+        }
+        if !all_bordered && !any_marker {
+            return None;
+        }
+        let margin = rows.iter().map(|r| r.shape.text_start).min().unwrap_or(0);
+        for r in &mut rows {
+            r.start = margin;
+            r.end = r.shape.text_end.max(margin);
+        }
+        Some(rows)
     }
 
     /// Highlight rectangles (logical px) for the active *dragged* selection over a surface of
@@ -1692,6 +1758,99 @@ fn prepare_paste(text: &str, bracketed: bool) -> String {
     } else {
         normalized
     }
+}
+
+/// One row of a multi-row TUI input, see [`TerminalPane::hard_input_rows`].
+#[derive(Debug, Clone, PartialEq)]
+struct HardRow {
+    shape: HardRowShape,
+    /// The terminal soft-wrapped this row into the next (WRAPLINE).
+    wraps: bool,
+    /// Block margin: the column the row's text starts at.
+    start: usize,
+    /// One past the row's last text cell (never below `start`).
+    end: usize,
+}
+
+/// What a grid row looks like once its decoration is stripped: box border, prompt marker, and
+/// where the text itself begins and ends.
+#[derive(Debug, Clone, PartialEq)]
+struct HardRowShape {
+    bordered: bool,
+    marker: bool,
+    text_start: usize,
+    text_end: usize,
+    /// The column the text may run up to: the closing border, or the grid width.
+    right_limit: usize,
+}
+
+impl HardRowShape {
+    fn of(text: &[char], cols: usize) -> Self {
+        const BORDERS: [char; 2] = ['│', '║'];
+        const MARKERS: [char; 2] = ['>', '❯'];
+        let mut i = text.iter().position(|c| *c != ' ').unwrap_or(text.len());
+        let bordered = text.get(i).is_some_and(|c| BORDERS.contains(c));
+        if bordered {
+            i += 1;
+            while text.get(i) == Some(&' ') {
+                i += 1;
+            }
+        }
+        let marker = text.get(i).is_some_and(|c| MARKERS.contains(c))
+            && matches!(text.get(i + 1), Some(' ') | None);
+        if marker {
+            i += 1;
+            while text.get(i) == Some(&' ') {
+                i += 1;
+            }
+        }
+        // Trailing decoration: spaces, then an optional closing border, then spaces again.
+        let mut end = text.len();
+        while end > i && text[end - 1] == ' ' {
+            end -= 1;
+        }
+        let mut right_limit = cols;
+        if bordered && end > i && BORDERS.contains(&text[end - 1]) {
+            right_limit = end - 1;
+            end -= 1;
+            while end > i && text[end - 1] == ' ' {
+                end -= 1;
+            }
+        }
+        HardRowShape {
+            bordered,
+            marker,
+            text_start: i.min(text.len()),
+            text_end: end.max(i.min(text.len())),
+            right_limit,
+        }
+    }
+}
+
+/// Character offset of `(line, col)` within the input made of `rows` (whose first row is grid
+/// row `lo`), counting each earlier row's text plus one newline — unless that row is a wrap:
+/// the terminal's own (WRAPLINE), or the box's, which shows as text running to the row's
+/// right limit. `col` is clamped into the row's text so a click on the decoration or past the
+/// end lands at the nearest end of that row.
+fn hard_row_offset(rows: &[HardRow], lo: i32, line: i32, col: usize) -> i32 {
+    let idx = (line - lo) as usize;
+    let mut acc: i32 = 0;
+    for (k, r) in rows.iter().enumerate().take(idx) {
+        // A terminal soft-wrap continues at column 0 of the next row.
+        let start = if k > 0 && rows[k - 1].wraps { 0 } else { r.start };
+        if r.wraps {
+            acc += (r.shape.right_limit.max(start) - start) as i32;
+        } else {
+            acc += (r.end.max(start) - start) as i32;
+            let box_wrapped = r.end + 1 >= r.shape.right_limit;
+            if !box_wrapped {
+                acc += 1;
+            }
+        }
+    }
+    let r = &rows[idx];
+    let start = if idx > 0 && rows[idx - 1].wraps { 0 } else { r.start };
+    acc + (col.clamp(start, r.end.max(start)) - start) as i32
 }
 
 #[cfg(test)]
@@ -2539,6 +2698,61 @@ mod tests {
         p.feed("\x1b[?1049h");
         click(&mut p, 2, 2, w, h);
         assert_eq!(p.click_move_cursor(), None);
+    }
+
+    /// A Claude Code prompt box, 20 cols: the caret sits after "world" on the second text row.
+    fn boxed_prompt_pane() -> (TerminalPane, f32, f32) {
+        let mut p = unit_pane(20, 5);
+        p.feed("╭──────────────────╮\r\n│ > hello          │\r\n│   world          │\r\n╰──────────────────╯");
+        p.feed("\x1b[3;10H"); // row 2, col 9 (after "world")
+        assert_eq!(p.grid.cursor_row(), Some(2));
+        assert_eq!(p.grid.cursor_col(), 9);
+        (p, 200.0, 50.0)
+    }
+
+    #[test]
+    fn a_click_on_the_row_above_a_shift_enter_newline_walks_back_through_it() {
+        // "hello⏎world" with the caret at the end (offset 11); the "e" of hello is offset 1.
+        let (mut p, w, h) = boxed_prompt_pane();
+        click(&mut p, 5, 1, w, h);
+        assert_eq!(p.click_move_cursor(), Some(b"\x1b[D".repeat(10)));
+    }
+
+    #[test]
+    fn a_click_on_the_row_below_walks_forward_through_the_newline() {
+        let (mut p, w, h) = boxed_prompt_pane();
+        p.feed("\x1b[2;5H"); // caret on "h" of hello (offset 0)
+        click(&mut p, 6, 2, w, h); // "r" of world = offset 8
+        assert_eq!(p.click_move_cursor(), Some(b"\x1b[C".repeat(8)));
+    }
+
+    #[test]
+    fn a_click_on_the_box_decoration_lands_at_the_nearest_end_of_that_row() {
+        // Past the end of "hello" (still on its row) → the end of hello, offset 5: 6 lefts.
+        let (mut p, w, h) = boxed_prompt_pane();
+        click(&mut p, 15, 1, w, h);
+        assert_eq!(p.click_move_cursor(), Some(b"\x1b[D".repeat(6)));
+    }
+
+    #[test]
+    fn a_marked_multi_line_input_without_a_frame_still_walks() {
+        let mut p = unit_pane(20, 5);
+        p.feed("> first\r\n  second");
+        p.feed("\x1b[2;9H"); // after "second"
+        click(&mut p, 2, 0, 200.0, 50.0); // "f" of first = offset 0; caret = 12
+        assert_eq!(p.click_move_cursor(), Some(b"\x1b[D".repeat(12)));
+    }
+
+    #[test]
+    fn hard_row_shape_strips_border_and_marker() {
+        let s = HardRowShape::of(&"│ > hello   │".chars().collect::<Vec<_>>(), 13);
+        assert_eq!(
+            s,
+            HardRowShape { bordered: true, marker: true, text_start: 4, text_end: 9, right_limit: 12 }
+        );
+        let s = HardRowShape::of(&"  plain".chars().collect::<Vec<_>>(), 7);
+        assert!(!s.bordered && !s.marker);
+        assert_eq!((s.text_start, s.text_end, s.right_limit), (2, 7, 7));
     }
 
     #[test]

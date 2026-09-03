@@ -111,26 +111,66 @@ pub struct TermGrid {
     resp_rx: Receiver<Vec<u8>>,
     palette: [Rgb; 256],
     size: TermSize,
+    /// Lines of history the grid keeps (alacritty's `scrolling_history`), remembered here
+    /// because `Term` doesn't hand its config back.
+    scrollback: usize,
     dirty: bool,
 }
 
 impl TermGrid {
-    /// A fresh grid sized to `cols`×`rows` (each clamped to ≥1).
+    /// The scrollback depth a grid gets when none is asked for (alacritty's own default).
+    pub const DEFAULT_SCROLLBACK: usize = 10_000;
+
+    /// A fresh grid sized to `cols`×`rows` (each clamped to ≥1) with
+    /// [`Self::DEFAULT_SCROLLBACK`] lines of history.
     pub fn new(cols: usize, rows: usize) -> Self {
+        Self::with_scrollback(cols, rows, Self::DEFAULT_SCROLLBACK)
+    }
+
+    /// A fresh grid sized to `cols`×`rows` (each clamped to ≥1) keeping up to `scrollback`
+    /// lines of history above the live viewport. This is where the app's `scrollback`
+    /// preference lands; alacritty clamps the value to its own ceiling.
+    pub fn with_scrollback(cols: usize, rows: usize, scrollback: usize) -> Self {
         let size = TermSize {
             cols: cols.max(1),
             rows: rows.max(1),
         };
+        let config = Config {
+            scrolling_history: scrollback,
+            ..Config::default()
+        };
         let (resp_tx, resp_rx) = channel::<Vec<u8>>();
-        let term = Term::new(Config::default(), &size, ProxyListener { tx: resp_tx });
+        let term = Term::new(config, &size, ProxyListener { tx: resp_tx });
         TermGrid {
             term,
             parser: Processor::new(),
             resp_rx,
             palette: default_palette(),
             size,
+            scrollback,
             dirty: true,
         }
+    }
+
+    /// Change the scrollback depth of a live grid. Shrinking drops the oldest history;
+    /// growing keeps everything. A no-op when the depth is unchanged, so it is safe to call
+    /// on every settings apply.
+    pub fn set_scrollback(&mut self, scrollback: usize) {
+        if self.scrollback == scrollback {
+            return;
+        }
+        let config = Config {
+            scrolling_history: scrollback,
+            ..Config::default()
+        };
+        self.term.set_options(config);
+        self.scrollback = scrollback;
+        self.dirty = true;
+    }
+
+    /// The configured scrollback depth (lines of history the grid will keep).
+    pub fn scrollback_capacity(&self) -> usize {
+        self.scrollback
     }
 
     /// Apply a colour theme by overriding the 16 base ANSI colours (indices 0–15; index 0 is
@@ -612,6 +652,35 @@ mod tests {
         let snap = g.snapshot();
         assert_eq!(snap.cell(0, 0).ch, 'h');
         assert_eq!(snap.cell(1, 0).ch, 'i');
+    }
+
+    #[test]
+    fn scrollback_depth_is_configurable_and_bounds_the_kept_history() {
+        assert_eq!(TermGrid::new(20, 4).scrollback_capacity(), TermGrid::DEFAULT_SCROLLBACK);
+        let mut g = TermGrid::with_scrollback(20, 4, 3);
+        assert_eq!(g.scrollback_capacity(), 3);
+        // `history_lines` also lists the live viewport (absolute line >= 0); count history only.
+        let history = |g: &TermGrid| g.history_lines().iter().filter(|(l, _)| *l < 0).count();
+        // 10 lines through a 4-row viewport leaves 6 to scroll off; only 3 may be kept.
+        for i in 0..10 {
+            g.feed(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(history(&g), 3, "history must be capped at the configured depth");
+        // Growing the depth keeps what is there and admits more.
+        g.set_scrollback(8);
+        assert_eq!(g.scrollback_capacity(), 8);
+        for i in 10..20 {
+            g.feed(format!("line{i}\r\n").as_bytes());
+        }
+        assert_eq!(history(&g), 8);
+        // Shrinking drops the oldest lines.
+        g.take_dirty();
+        g.set_scrollback(2);
+        assert!(g.take_dirty(), "a depth change must repaint");
+        assert_eq!(history(&g), 2);
+        // Same depth again is a no-op that does not dirty the grid.
+        g.set_scrollback(2);
+        assert!(!g.take_dirty());
     }
 
     #[test]

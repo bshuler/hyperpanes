@@ -28,8 +28,6 @@ use russh::keys::ssh_key::PublicKey;
 use russh::server::{self, Auth, Handle, Msg, Session};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, Pty};
 use tokio::net::TcpListener;
-
-use crate::dbg_log;
 use crate::ssh::bridge::{self, Bridge, BridgeParams};
 use crate::ssh::config::{SshPaths, SshSettings};
 use crate::ssh::keys;
@@ -104,7 +102,7 @@ pub fn serve_blocking(paths: &SshPaths, salt: &str, verbose: bool) -> Result<(),
         if verbose {
             eprintln!("{msg}");
         }
-        dbg_log(&msg);
+        tracing::debug!("{}", &msg);
     }
     if live == 0 {
         // Not fatal: the operator may be about to authorize a key, and the running server
@@ -115,7 +113,7 @@ pub fn serve_blocking(paths: &SshPaths, salt: &str, verbose: bool) -> Result<(),
         if verbose {
             eprintln!("{msg}");
         }
-        dbg_log(msg);
+        tracing::debug!("{}", msg);
     }
 
     let banner = format!(
@@ -127,7 +125,7 @@ pub fn serve_blocking(paths: &SshPaths, salt: &str, verbose: bool) -> Result<(),
             ResizePolicy::Observe => "clients letterbox",
         }
     );
-    dbg_log(&banner);
+    tracing::debug!("{}", &banner);
     if verbose {
         println!("{banner}");
         if settings.is_remote_exposed() {
@@ -197,7 +195,7 @@ impl server::Server for SshServer {
 
     fn handle_session_error(&mut self, error: russh::Error) {
         // Includes ordinary disconnects; only ever a debug-log line.
-        dbg_log(&format!("ssh: session ended: {error}"));
+        tracing::debug!("ssh: session ended: {error}");
     }
 }
 
@@ -263,10 +261,8 @@ impl SshHandler {
             detach: self.opts.detach,
             peer: self.peer.clone(),
         };
-        dbg_log(&format!(
-            "ssh: {} ({}) opening a channel (query {:?}, list {list})",
-            self.peer, self.key_label, query
-        ));
+        tracing::debug!("ssh: {} ({}) opening a channel (query {:?}, list {list})",
+            self.peer, self.key_label, query);
         state.bridge = Some(bridge::spawn(params, handle, channel));
         let _ = session.channel_success(channel);
     }
@@ -287,10 +283,8 @@ impl server::Handler for SshHandler {
     /// checks one, and adding one would put a guessable credential in front of every
     /// terminal on the machine.
     async fn auth_password(&mut self, user: &str, _password: &str) -> Result<Auth, Self::Error> {
-        dbg_log(&format!(
-            "ssh: {} tried password auth as {user:?} — refused (publickey only)",
-            self.peer
-        ));
+        tracing::debug!("ssh: {} tried password auth as {user:?} — refused (publickey only)",
+            self.peer);
         Ok(reject())
     }
 
@@ -343,19 +337,15 @@ impl server::Handler for SshHandler {
             Some(label) => {
                 self.user = user.to_string();
                 self.key_label = label.clone();
-                dbg_log(&format!(
-                    "ssh: {} authenticated as {user:?} with {} ({label})",
+                tracing::debug!("ssh: {} authenticated as {user:?} with {} ({label})",
                     self.peer,
-                    keys::fingerprint(public_key)
-                ));
+                    keys::fingerprint(public_key));
                 Ok(Auth::Accept)
             }
             None => {
-                dbg_log(&format!(
-                    "ssh: {} REJECTED — {} is not authorized",
+                tracing::debug!("ssh: {} REJECTED — {} is not authorized",
                     self.peer,
-                    keys::fingerprint(public_key)
-                ));
+                    keys::fingerprint(public_key));
                 Ok(reject())
             }
         }
@@ -438,10 +428,8 @@ impl server::Handler for SshHandler {
         name: &str,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        dbg_log(&format!(
-            "ssh: {} asked for subsystem {name:?} — refused",
-            self.peer
-        ));
+        tracing::debug!("ssh: {} asked for subsystem {name:?} — refused",
+            self.peer);
         session.channel_failure(channel)?;
         Ok(())
     }
@@ -514,7 +502,7 @@ impl SshHandler {
             Err(e) => {
                 // Fail CLOSED. An unreadable or wrong-mode key file rejects everyone rather
                 // than admitting them.
-                dbg_log(&format!("ssh: refusing everyone — {e}"));
+                tracing::debug!("ssh: refusing everyone — {e}");
                 None
             }
         }

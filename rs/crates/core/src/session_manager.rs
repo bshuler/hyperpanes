@@ -364,7 +364,10 @@ pub(crate) type SpawnFn = Box<dyn FnOnce(&PtySpec, EventSink) -> io::Result<Box<
 /// One live session: the pty handle plus the shared read state. The driver task runs
 /// detached; dropping the `Session` drops the pty (closing its handles).
 struct Session {
-    pty: Box<dyn Pty>,
+    /// `Arc` rather than `Box` so `write`/`resize` can clone the handle out of the map and
+    /// release the registry lock BEFORE touching the pty: a blocking pty write must not
+    /// stall every other session's reads and events behind it.
+    pty: Arc<dyn Pty>,
     shared: Arc<Shared>,
 }
 
@@ -426,7 +429,14 @@ impl SessionRegistry {
         let sink: EventSink = Arc::new(move |ev| {
             let _ = ptx.send(ev);
         });
-        let pty = factory(&spec, sink)?;
+        let pty = match factory(&spec, sink) {
+            Ok(pty) => pty,
+            Err(e) => {
+                tracing::warn!(uid = %opts.uid, command = %spec.file, error = %e, "session spawn failed");
+                return Err(e);
+            }
+        };
+        tracing::info!(uid = %opts.uid, command = %spec.file, "session created");
 
         self.install(opts.uid, Shared::fresh(spec.cols, spec.rows), pty, prx);
         Ok(())
@@ -450,7 +460,7 @@ impl SessionRegistry {
         self.sessions
             .lock()
             .unwrap()
-            .insert(uid, Session { pty, shared });
+            .insert(uid, Session { pty: Arc::from(pty), shared });
     }
 
     /// Re-create a session around a pty **inherited from a predecessor process** — the
@@ -561,10 +571,14 @@ impl SessionRegistry {
                 },
                 info.master_fd,
             ));
-            // Last: the descriptor above is only valid while the pty lives, and `relinquish`
-            // keeps it alive (by leaking the handle) rather than closing it.
-            session.pty.relinquish();
+            // Last: the descriptor above is only valid while the pty lives, so the handle is
+            // leaked rather than closed — the same move as [`Pty::relinquish`], done on the
+            // `Arc` since the shared handle cannot be unwrapped back into a `Box`. Forgetting
+            // this strong count guarantees the pty's destructor never runs (and never types
+            // EOT into the shell), even if a concurrent `write` still holds a clone.
+            std::mem::forget(session.pty);
         }
+        tracing::info!(sessions = out.len(), "sessions handed off");
         out
     }
 
@@ -690,8 +704,9 @@ impl SessionRegistry {
     /// was told about is gone, and answering nothing let the control API report success for
     /// input that reached no process at all.
     pub fn write(&self, uid: &str, data: &str) -> io::Result<()> {
-        let map = self.sessions.lock().unwrap();
-        let Some(s) = map.get(uid) else {
+        // Clone the handles out and drop the registry guard before the (possibly blocking)
+        // pty write, so a wedged pty never stalls every other session behind the map lock.
+        let Some((pty, shared)) = self.handles(uid) else {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no live session {uid}"),
@@ -699,8 +714,15 @@ impl SessionRegistry {
         };
         // Phase 4: input was just sent → optimistically clear `prompt_ready` so the
         // busy edge is reported immediately (a real prompt re-asserts it on its `133;A`).
-        s.shared.note_write();
-        s.pty.write(data.as_bytes()).map(|_| ())
+        shared.note_write();
+        pty.write(data.as_bytes()).map(|_| ())
+    }
+
+    /// The pty handle and shared state for `uid`, cloned out from under the registry lock.
+    fn handles(&self, uid: &str) -> Option<(Arc<dyn Pty>, Arc<Shared>)> {
+        let map = self.sessions.lock().unwrap();
+        map.get(uid)
+            .map(|s| (Arc::clone(&s.pty), Arc::clone(&s.shared)))
     }
 
     /// Snapshot a session's phase-4 liveness mirror, or `None` if the uid is unknown.
@@ -713,14 +735,14 @@ impl SessionRegistry {
     pub fn resize(&self, uid: &str, cols: u16, rows: u16) {
         let cols = cols.max(1);
         let rows = rows.max(1);
-        let map = self.sessions.lock().unwrap();
-        if let Some(s) = map.get(uid) {
-            let _ = s.pty.resize(cols, rows);
+        // Same discipline as `write`: never hold the registry lock across a pty call.
+        if let Some((pty, shared)) = self.handles(uid) {
+            let _ = pty.resize(cols, rows);
             // Apply any buffered output to the screen BEFORE reflowing, so the resize
             // reflows the real content rather than reflowing an empty grid and then
             // advancing post-resize (which would wrap at the new width inconsistently).
-            s.shared.sync_screen();
-            s.shared.screen.lock().unwrap().resize(cols, rows);
+            shared.sync_screen();
+            shared.screen.lock().unwrap().resize(cols, rows);
         }
     }
 
@@ -730,7 +752,10 @@ impl SessionRegistry {
         let removed = self.sessions.lock().unwrap().remove(uid);
         if let Some(s) = removed {
             s.shared.killed.store(true, Ordering::SeqCst);
+            tracing::info!(uid, "session killed");
             let _ = s.pty.kill();
+        } else {
+            tracing::debug!(uid, "kill of unknown session ignored");
         }
     }
 
@@ -740,6 +765,7 @@ impl SessionRegistry {
             let mut map = self.sessions.lock().unwrap();
             map.drain().map(|(_, s)| s).collect()
         };
+        tracing::info!(sessions = drained.len(), "killing all sessions");
         for s in drained {
             s.shared.killed.store(true, Ordering::SeqCst);
             let _ = s.pty.kill();
@@ -1274,12 +1300,16 @@ async fn drive_session(
                         }
                     }
                     Some(PtyEvent::Exit(code)) => {
+                        tracing::info!(uid = %uid, code, "session exited");
                         for ev in pipeline.on_exit(code, epoch_ms()) {
                             let _ = events.send(ev);
                         }
                         break;
                     }
-                    None => break, // pty sink dropped
+                    None => {
+                        tracing::debug!(uid = %uid, "session pty sink dropped");
+                        break;
+                    }
                 }
             }
             _ = async { tokio::time::sleep(sleep_for.unwrap()).await }, if sleep_for.is_some() => {
@@ -1890,6 +1920,75 @@ mod tests {
             "a session that cannot cross must be killed, not stranded in a dying process"
         );
         assert!(reg.uids().is_empty());
+    }
+
+    /// A pty whose `write` blocks (a wedged child that stopped draining its input) must not
+    /// wedge the registry: every other accessor takes the map lock, so a write that held it
+    /// across the pty call would stall reads, resizes and exits for every session at once.
+    #[tokio::test]
+    async fn a_blocking_pty_write_does_not_hold_the_registry_lock() {
+        use std::sync::mpsc::{channel, Receiver, Sender};
+        struct StuckPty {
+            entered: Sender<()>,
+            release: Mutex<Option<Receiver<()>>>,
+        }
+        impl Pty for StuckPty {
+            fn write(&self, _data: &[u8]) -> io::Result<()> {
+                let release = self.release.lock().unwrap().take().expect("a single write");
+                let _ = self.entered.send(());
+                let _ = release.recv();
+                Ok(())
+            }
+            fn resize(&self, _cols: u16, _rows: u16) -> io::Result<()> {
+                Ok(())
+            }
+            fn kill(&self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (etx, _erx) = unbounded_channel::<SessionEvent>();
+        let reg = SessionRegistry::new(etx);
+        let (entered_tx, entered_rx) = channel::<()>();
+        let (release_tx, release_rx) = channel::<()>();
+        let factory: SpawnFn = Box::new(move |_spec, _sink| {
+            Ok(Box::new(StuckPty {
+                entered: entered_tx,
+                release: Mutex::new(Some(release_rx)),
+            }) as Box<dyn Pty>)
+        });
+        reg.create_with(
+            SpawnOptions {
+                uid: "stuck".into(),
+                ..Default::default()
+            },
+            factory,
+        )
+        .expect("create");
+
+        let writer = {
+            let reg = reg.clone();
+            std::thread::spawn(move || reg.write("stuck", "x"))
+        };
+        entered_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the write reached the pty");
+
+        // The write is parked inside the pty. The registry must still answer.
+        let (probe_tx, probe_rx) = channel::<Vec<String>>();
+        {
+            let reg = reg.clone();
+            std::thread::spawn(move || {
+                let _ = probe_tx.send(reg.uids());
+            });
+        }
+        let uids = probe_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the registry lock is free while a pty write blocks");
+        assert_eq!(uids, vec!["stuck".to_string()]);
+
+        release_tx.send(()).expect("release the pty");
+        writer.join().expect("writer thread").expect("write ok");
     }
 
     /// `foreground_name` answers `None` for both "no such session" and "this pty exposes no

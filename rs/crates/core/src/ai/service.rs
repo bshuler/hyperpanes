@@ -353,7 +353,7 @@ impl<S: Summarizer> AiService<S> {
             self.settings.max_staleness_sec = max_staleness_sec;
         }
         if let Some(concurrency) = patch.concurrency {
-            self.settings.concurrency = concurrency;
+            self.settings.concurrency = valid_concurrency(concurrency);
         }
         self.save_settings();
         self.client_configure();
@@ -708,7 +708,7 @@ impl<S: Summarizer> AiService<S> {
                     settings.max_staleness_sec = v;
                 }
                 if let Some(v) = parsed.concurrency {
-                    settings.concurrency = v;
+                    settings.concurrency = valid_concurrency(v);
                 }
             }
         }
@@ -717,10 +717,24 @@ impl<S: Summarizer> AiService<S> {
 
     fn save_settings(&self) {
         if let Ok(json) = serde_json::to_string_pretty(&self.settings) {
-            if let Err(err) = std::fs::write(&self.settings_path, json) {
-                eprintln!("failed to write ai-settings.json: {err}");
+            if let Err(err) =
+                crate::persistence::paths::write_atomic(&self.settings_path, json.as_bytes())
+            {
+                tracing::warn!("failed to write ai-settings.json: {err}");
             }
         }
+    }
+}
+
+/// The concurrency cap a caller asked for, made usable. `0` would mean "run no jobs at all":
+/// the scheduler's dispatch loop admits a job only while `in_flight < concurrency`, so a zero
+/// parks every pane in the queue forever with no error anywhere. Clamp it to 1 and say so.
+fn valid_concurrency(requested: usize) -> usize {
+    if requested == 0 {
+        tracing::warn!("ai concurrency 0 would stall summarization; using 1");
+        1
+    } else {
+        requested
     }
 }
 
@@ -1075,5 +1089,31 @@ mod tests {
         publish(&mut svc, 1, "u2", "p2", true);
         svc.tick(2000);
         assert_eq!(svc.next_due(), None, "a muted pane must never be scheduled");
+    }
+
+    #[test]
+    fn a_zero_concurrency_is_clamped_to_one_on_load_and_on_configure() {
+        let tp = TempPaths::new();
+        std::fs::write(tp.settings(), r#"{ "concurrency": 0, "settleMs": 700 }"#).unwrap();
+        let (mut svc, _meta) = build(&tp, Fake::ok("x"));
+        svc.init();
+        assert_eq!(svc.settings.concurrency, 1, "a persisted 0 must not stall the scheduler");
+        assert_eq!(svc.settings.settle_ms, 700, "the rest of the file still loads");
+
+        svc.configure(AiSettingsPatch {
+            concurrency: Some(0),
+            ..Default::default()
+        });
+        assert_eq!(svc.settings.concurrency, 1, "a live patch of 0 is clamped too");
+        // And the clamped value is what got persisted, atomically, in place of the bad one.
+        let saved = std::fs::read_to_string(tp.settings()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&saved).unwrap();
+        assert_eq!(v["concurrency"], 1);
+
+        svc.configure(AiSettingsPatch {
+            concurrency: Some(3),
+            ..Default::default()
+        });
+        assert_eq!(svc.settings.concurrency, 3, "a real cap is kept as asked");
     }
 }

@@ -172,8 +172,8 @@ pub struct Settings {
     /// Command template used to open a clicked path ("" = auto-detect VS Code, else the OS
     /// default handler). Placeholders: `{path}` `{line}` `{col}`. Mirrors `editorCommand`.
     pub editor_command: String,
-    /// Per-pane scrollback (history lines). Persisted for forward-compat with the
-    /// renderer blob; the native terminal grid currently keeps a fixed buffer.
+    /// Per-pane scrollback (history lines). Sizes every new terminal grid and re-sizes the
+    /// live ones when patched (`ctl set scrollback N`). Capped at [`MAX_SCROLLBACK`].
     pub scrollback: u32,
     /// Whether the right-edge sidebar rail (quick-pane + git-projects history) is
     /// shown. Hidden in fullscreen regardless of this. Mirrors `useSettings.showSidebar`.
@@ -228,6 +228,21 @@ pub struct Settings {
     /// Turning it off only silences the *undoable* closes — the last pane of the last tab
     /// ends the window and nothing can bring it back, so that one asks regardless.
     pub confirm_close: bool,
+    /// Log verbosity for every hyperpanes process: one of `error|warn|info|debug|trace`
+    /// (see `hyperpanes_core::logging::LEVELS`). `debug` logs the entry and exit of every
+    /// instrumented function with its parameters and return value. Read at process start;
+    /// `HYPERPANES_LOG`/`HYPERPANES_DEBUG` in the environment override it for one launch.
+    pub log_level: String,
+    /// Minutes between firings of the Hyperpane **status loop** (the system tab's agent is
+    /// asked to check every pane and recover the stuck ones). `0` disables it.
+    pub status_loop_minutes: u32,
+    /// Hours between firings of the **restart-all-monitored-agents loop** (every tool pane
+    /// is respawned into the same session). `0` disables it.
+    pub restart_loop_hours: u32,
+    /// What the status loop types into the Hyperpane pane's agent on every firing. Empty =
+    /// the built-in prompt ([`crate::loops::DEFAULT_STATUS_PROMPT`]); a single line, since it
+    /// is submitted with one Enter. Capped at [`MAX_STATUS_LOOP_PROMPT`] chars.
+    pub status_loop_prompt: String,
 }
 
 /// [`Settings::browser_mode`] — hand the URL to the OS default handler.
@@ -263,6 +278,10 @@ impl Default for Settings {
             browser_mode: String::from(BROWSER_MODE_DEFAULT),
             browser_app: String::new(),
             confirm_close: true,
+            log_level: hyperpanes_core::logging::DEFAULT_LEVEL.to_string(),
+            status_loop_minutes: 15,
+            restart_loop_hours: 24,
+            status_loop_prompt: String::new(),
         }
     }
 }
@@ -316,6 +335,101 @@ impl Settings {
     pub fn browser_asks(&self) -> bool {
         self.browser_mode == BROWSER_MODE_ASK
     }
+
+    /// Check every token-valued and range-bound field against what the app can actually
+    /// consume, naming the first offender. The consumers are forgiving on READ (an unknown
+    /// effect token paints as firefly, an out-of-range palette index wraps to the default),
+    /// which is right for an old file — but it also means a bad value written by a script
+    /// would persist silently and take effect as something other than what was asked. So
+    /// [`save`] (and the control plane's settings patch) refuse a blob that fails this.
+    pub fn validate(&self) -> Result<(), String> {
+        let palettes = crate::theme::UI_PALETTES.len();
+        if self.ui_palette >= palettes {
+            return Err(format!(
+                "uiPalette {} is out of range (0..{palettes})",
+                self.ui_palette
+            ));
+        }
+        let effects = crate::glow::IdleEffect::OPTIONS;
+        if !effects.iter().any(|(t, _)| *t == self.idle_effect) {
+            return Err(format!(
+                "idleEffect {:?} is not one of {}",
+                self.idle_effect,
+                join_tokens(effects.iter().map(|(t, _)| *t))
+            ));
+        }
+        let modes = [BROWSER_MODE_DEFAULT, BROWSER_MODE_APP, BROWSER_MODE_ASK];
+        if !modes.contains(&self.browser_mode.as_str()) {
+            return Err(format!(
+                "browserMode {:?} is not one of {}",
+                self.browser_mode,
+                join_tokens(modes.iter().copied())
+            ));
+        }
+        if !self.default_shell.is_empty()
+            && !SHELL_OPTIONS
+                .iter()
+                .any(|(_, t)| *t == self.default_shell)
+        {
+            return Err(format!(
+                "defaultShell {:?} is not one of {} (\"\" = the system shell)",
+                self.default_shell,
+                join_tokens(SHELL_OPTIONS.iter().map(|(_, t)| *t).filter(|t| !t.is_empty()))
+            ));
+        }
+        if !hyperpanes_core::logging::valid_level(&self.log_level) {
+            return Err(format!(
+                "logLevel {:?} is not one of {}",
+                self.log_level,
+                join_tokens(hyperpanes_core::logging::LEVELS.iter().copied())
+            ));
+        }
+        if self.status_loop_minutes > MAX_STATUS_LOOP_MINUTES {
+            return Err(format!(
+                "statusLoopMinutes {} is out of range (0 = off, else 1..={MAX_STATUS_LOOP_MINUTES})",
+                self.status_loop_minutes
+            ));
+        }
+        if self.restart_loop_hours > MAX_RESTART_LOOP_HOURS {
+            return Err(format!(
+                "restartLoopHours {} is out of range (0 = off, else 1..={MAX_RESTART_LOOP_HOURS})",
+                self.restart_loop_hours
+            ));
+        }
+        if self.scrollback > MAX_SCROLLBACK {
+            return Err(format!(
+                "scrollback {} is out of range (0..={MAX_SCROLLBACK})",
+                self.scrollback
+            ));
+        }
+        if self.status_loop_prompt.chars().count() > MAX_STATUS_LOOP_PROMPT {
+            return Err(format!(
+                "statusLoopPrompt is longer than {MAX_STATUS_LOOP_PROMPT} chars"
+            ));
+        }
+        if self.status_loop_prompt.contains(['\n', '\r']) {
+            return Err(String::from("statusLoopPrompt must be a single line"));
+        }
+        Ok(())
+    }
+}
+
+/// Upper bound for [`Settings::status_loop_minutes`] (a week); `0` means off.
+pub const MAX_STATUS_LOOP_MINUTES: u32 = 10_080;
+/// Upper bound for [`Settings::scrollback`]: alacritty's own ceiling on history lines.
+pub const MAX_SCROLLBACK: u32 = 100_000;
+/// Upper bound for [`Settings::status_loop_prompt`] in chars; one Enter submits it, so a
+/// paragraph is plenty.
+pub const MAX_STATUS_LOOP_PROMPT: usize = 4000;
+/// Upper bound for [`Settings::restart_loop_hours`] (thirty days); `0` means off.
+pub const MAX_RESTART_LOOP_HOURS: u32 = 720;
+
+/// `"a", "b", "c"` — the accepted-values list in a validation message.
+fn join_tokens<'a>(tokens: impl Iterator<Item = &'a str>) -> String {
+    tokens
+        .map(|t| format!("{t:?}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Resolve a saved font value to an actually-loadable font path. Handles the value shapes:
@@ -348,17 +462,23 @@ pub fn load() -> Settings {
 }
 
 /// Persist `settings` atomically. Errors are swallowed (a settings write failing must
-/// never take down the UI) but logged via the debug log.
+/// never take down the UI) but logged — a blob that fails [`Settings::validate`] is
+/// refused and logged at `warn`, since that one is a caller's bug rather than the disk's.
 pub fn save(settings: &Settings) {
-    let path = paths::user_data_dir().join("native-settings.json");
-    match serde_json::to_string_pretty(settings) {
-        Ok(json) => {
-            if let Err(e) = paths::write_atomic(&path, json.as_bytes()) {
-                crate::dbg_log(&format!("settings save failed: {e}"));
-            }
-        }
-        Err(e) => crate::dbg_log(&format!("settings serialize failed: {e}")),
+    if let Err(e) = try_save(settings) {
+        tracing::warn!("settings not saved: {e}");
     }
+}
+
+/// [`save`] with the outcome: `Err` names the invalid field (nothing was written) or the
+/// I/O failure. For callers that can relay the reason — the control plane's `PATCH
+/// /settings` and the preferences dialog.
+pub fn try_save(settings: &Settings) -> Result<(), String> {
+    settings.validate()?;
+    let path = paths::user_data_dir().join("native-settings.json");
+    let json = serde_json::to_string_pretty(settings)
+        .map_err(|e| format!("settings serialize failed: {e}"))?;
+    paths::write_atomic(&path, json.as_bytes()).map_err(|e| format!("settings save failed: {e}"))
 }
 
 #[cfg(test)]
@@ -450,6 +570,10 @@ mod tests {
             browser_mode: BROWSER_MODE_ASK.into(),
             browser_app: "com.google.Chrome".into(),
             confirm_close: false, // non-default (defaults to true)
+            log_level: "debug".into(),
+            status_loop_minutes: 5,
+            restart_loop_hours: 6,
+            status_loop_prompt: String::from("status please"),
         }
     }
 
@@ -484,5 +608,73 @@ mod tests {
         // …and outright corruption fails to parse (load() then returns defaults).
         assert!(serde_json::from_str::<Settings>("not json").is_err());
         assert!(serde_json::from_str::<Settings>("{\"fontPx\": \"big\"}").is_err());
+    }
+
+    #[test]
+    fn validate_accepts_the_defaults_and_every_listed_token() {
+        assert_eq!(Settings::default().validate(), Ok(()));
+        let mut s = Settings::default();
+        for i in 0..crate::theme::UI_PALETTES.len() {
+            s.ui_palette = i;
+            assert_eq!(s.validate(), Ok(()), "uiPalette {i}");
+        }
+        for (tok, _) in crate::glow::IdleEffect::OPTIONS {
+            s.idle_effect = tok.into();
+            assert_eq!(s.validate(), Ok(()), "idleEffect {tok}");
+        }
+        for mode in [BROWSER_MODE_DEFAULT, BROWSER_MODE_APP, BROWSER_MODE_ASK] {
+            s.browser_mode = mode.into();
+            assert_eq!(s.validate(), Ok(()), "browserMode {mode}");
+        }
+        for (_, tok) in SHELL_OPTIONS {
+            s.default_shell = tok.into();
+            assert_eq!(s.validate(), Ok(()), "defaultShell {tok:?}");
+        }
+        for level in hyperpanes_core::logging::LEVELS {
+            s.log_level = level.into();
+            assert_eq!(s.validate(), Ok(()), "logLevel {level}");
+        }
+        // Case-insensitive, like the logger itself.
+        s.log_level = "DEBUG".into();
+        assert_eq!(s.validate(), Ok(()));
+        // Both loop bounds, and off.
+        for m in [0, 1, MAX_STATUS_LOOP_MINUTES] {
+            s.status_loop_minutes = m;
+            assert_eq!(s.validate(), Ok(()), "statusLoopMinutes {m}");
+        }
+        for h in [0, 1, MAX_RESTART_LOOP_HOURS] {
+            s.restart_loop_hours = h;
+            assert_eq!(s.validate(), Ok(()), "restartLoopHours {h}");
+        }
+    }
+
+    #[test]
+    fn validate_names_the_offending_field() {
+        fn err_of(mutate: impl FnOnce(&mut Settings)) -> String {
+            let mut s = Settings::default();
+            mutate(&mut s);
+            s.validate().expect_err("must be rejected")
+        }
+        let n = crate::theme::UI_PALETTES.len();
+        assert!(err_of(|s| s.ui_palette = n).starts_with("uiPalette"));
+        assert!(err_of(|s| s.idle_effect = "strobe".into()).starts_with("idleEffect"));
+        assert!(err_of(|s| s.idle_effect = String::new()).starts_with("idleEffect"));
+        assert!(err_of(|s| s.browser_mode = "chrome".into()).starts_with("browserMode"));
+        assert!(err_of(|s| s.default_shell = "/bin/nope".into()).starts_with("defaultShell"));
+        assert!(err_of(|s| s.log_level = "verbose".into()).starts_with("logLevel"));
+        assert!(err_of(|s| s.status_loop_minutes = MAX_STATUS_LOOP_MINUTES + 1)
+            .starts_with("statusLoopMinutes"));
+        assert!(err_of(|s| s.restart_loop_hours = MAX_RESTART_LOOP_HOURS + 1)
+            .starts_with("restartLoopHours"));
+        // The message carries the bad value, so a script author can see what was sent.
+        assert!(err_of(|s| s.idle_effect = "strobe".into()).contains("\"strobe\""));
+    }
+
+    #[test]
+    fn try_save_refuses_an_invalid_blob_before_touching_the_disk() {
+        let mut s = Settings::default();
+        s.log_level = "loud".into();
+        let err = try_save(&s).expect_err("an invalid blob must not be persisted");
+        assert!(err.starts_with("logLevel"), "{err}");
     }
 }

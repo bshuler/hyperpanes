@@ -253,7 +253,7 @@ async fn ai_loop(
                     match ai.prepare_job(&uid) {
                         // Skip/dedup decided synchronously — report straight back.
                         JobStep::Done(result) => {
-                            crate::dbg_log(&format!("[ai] job uid={uid} -> {result:?} (no call)"));
+                            tracing::debug!("[ai] job uid={uid} -> {result:?} (no call)");
                             ai.complete_job(&uid, result);
                         }
                         // Real Ollama call: run it off-loop and report via `done_rx`. The

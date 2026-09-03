@@ -780,8 +780,7 @@ pub fn resync(
 
     // dividers
     let divs = build_dividers(state, area);
-    crate::dbg_log(&format!(
-        "resync: active={} layout={:?} panes={} dividers={} {:?}",
+    tracing::debug!("resync: active={} layout={:?} panes={} dividers={} {:?}",
         state.active,
         state.active_tab().layout,
         state.active_tab().panes.len(),
@@ -791,8 +790,7 @@ pub fn resync(
                 "(x={:.0},y={:.0},w={:.0},h={:.0},vert={})",
                 d.x, d.y, d.w, d.h, d.vertical
             ))
-            .collect::<Vec<_>>()
-    ));
+            .collect::<Vec<_>>());
     sync_model(&ui.dividers, divs);
 
     // scalars

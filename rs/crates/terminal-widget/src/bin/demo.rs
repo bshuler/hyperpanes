@@ -228,13 +228,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     })
                 };
                 if let (Some(text), Some(uid)) = (text, uids.get(idx)) {
-                    mgr.write(uid, &text);
+                    let _ = mgr.write(uid, &text);
                 }
                 return; // paste is never forwarded to the shell as a Ctrl+V byte
             }
             if let Some(bytes) = encode_key(&msg.text, msg.control, msg.alt, msg.shift) {
                 if let Some(uid) = uids.get(idx) {
-                    mgr.write(uid, &String::from_utf8_lossy(&bytes));
+                    let _ = mgr.write(uid, &String::from_utf8_lossy(&bytes));
                 }
             }
         });
@@ -420,7 +420,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 })
             };
             if let (Some(text), Some(uid)) = (text, uids.get(idx)) {
-                mgr.write(uid, &text);
+                let _ = mgr.write(uid, &text);
             }
         });
     }
@@ -590,13 +590,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 pc.pane.feed(&data);
                                 let replies = pc.pane.take_replies();
                                 if !replies.is_empty() {
-                                    mgr.write(&uid, &String::from_utf8_lossy(&replies));
+                                    let _ = mgr.write(&uid, &String::from_utf8_lossy(&replies));
                                 }
                                 // First output → the shell is alive; send the demo command.
                                 if !pc.started {
                                     pc.started = true;
                                     if let Some(cmd) = pc.startup.take() {
-                                        mgr.write(&uid, &cmd);
+                                        let _ = mgr.write(&uid, &cmd);
                                     }
                                 }
                             }

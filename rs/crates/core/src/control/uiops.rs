@@ -23,6 +23,43 @@
 //! nobody reads must not grow without bound.
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::oneshot;
+
+/// The answer to a [`UiOp::PatchSettings`]: `Ok` once every window has applied the patch,
+/// `Err(reason)` when the preferences layer rejected it. Settings are the one queued op whose
+/// outcome the caller must see — a rejected value would otherwise be reported as `ok` and
+/// silently left unapplied — so the route holds the receiving end and waits (bounded) for
+/// this to be answered on the UI thread. Cloneable and comparable so [`UiOp`] can stay
+/// `Clone + PartialEq`; two handles are equal only when they are the same channel.
+#[derive(Clone, Debug)]
+pub struct PatchReply(Arc<Mutex<Option<PatchSender>>>);
+
+/// The sending half a [`PatchReply`] gives up on its first `send`.
+type PatchSender = oneshot::Sender<Result<(), String>>;
+
+impl PatchReply {
+    /// A fresh channel: the handle to queue with the op, and the receiver the route awaits.
+    pub fn new() -> (Self, oneshot::Receiver<Result<(), String>>) {
+        let (tx, rx) = oneshot::channel();
+        (PatchReply(Arc::new(Mutex::new(Some(tx)))), rx)
+    }
+
+    /// Answer the waiting route. Only the first call delivers; later calls are no-ops, and a
+    /// receiver that already gave up (timed out) is ignored rather than an error.
+    pub fn send(&self, result: Result<(), String>) {
+        if let Some(tx) = self.0.lock().unwrap().take() {
+            let _ = tx.send(result);
+        }
+    }
+}
+
+impl PartialEq for PatchReply {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
 
 /// One queued edit to the GUI's tabs or preferences.
 #[derive(Debug, Clone, PartialEq)]
@@ -45,8 +82,13 @@ pub enum UiOp {
     /// GUI's `publish` rebuilds every tab from its own state each tick and would snap the layout
     /// back — so the visible change has to be made on the UI thread as well.
     SetTabLayout { tab_id: String, layout: String },
-    /// Merge a camelCase JSON object into the app preferences and apply it live.
-    PatchSettings { patch: serde_json::Value },
+    /// Merge a camelCase JSON object into the app preferences and apply it live. `reply`, when
+    /// present, is answered by the GUI host with the outcome (see [`PatchReply`]); a `None`
+    /// is fire-and-forget.
+    PatchSettings {
+        patch: serde_json::Value,
+        reply: Option<PatchReply>,
+    },
 }
 
 /// FIFO of pending [`UiOp`]s, drained once per GUI sync tick.

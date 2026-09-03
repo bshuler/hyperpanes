@@ -254,20 +254,16 @@ impl DaemonSessionManager {
                     // The pty-host being an older build is the whole point of `Tolerant`:
                     // it holds live ConPTYs that Windows gives us no way to move. A build
                     // difference there is expected, not stale.
-                    dbg(&format!(
-                        "pty-host build skew (client {}, host {daemon_build}); proceeding — \
+                    tracing::info!("pty-host build skew (client {}, host {daemon_build}); proceeding — \
                          the host surface is version-stable by contract",
-                        build_id::build_id()
-                    ));
+                        build_id::build_id());
                     return Self::from_stream(stream, events);
                 }
                 ProtoCheck::BuildMismatch { daemon_build } if forced_build_upgrade => {
-                    dbg(&format!(
-                        "daemon is build {daemon_build}, not ours ({}), after we already \
+                    tracing::info!("daemon is build {daemon_build}, not ours ({}), after we already \
                          handed it over once; another client wants it that way — driving \
                          it rather than starting a takeover fight",
-                        build_id::build_id()
-                    ));
+                        build_id::build_id());
                     return Self::from_stream(stream, events);
                 }
                 ProtoCheck::BuildMismatch { daemon_build } => {
@@ -276,11 +272,9 @@ impl DaemonSessionManager {
                     // means its backend to serve. Take the sessions over rather than kill
                     // anything — the descriptors move, the shells never notice, and that is
                     // what makes upgrading (or rolling back) either side free.
-                    dbg(&format!(
-                        "daemon build mismatch (client {}, daemon {daemon_build}); \
+                    tracing::info!("daemon build mismatch (client {}, daemon {daemon_build}); \
                          attempting live takeover (attempt {attempt})",
-                        build_id::build_id()
-                    ));
+                        build_id::build_id());
                     forced_build_upgrade = true;
                     drop(stream);
                     if !hand_over_stale_daemon(salt, &endpoint) {
@@ -289,10 +283,8 @@ impl DaemonSessionManager {
                         // salt and its terminals; we just work with the build that is there.
                         // (Unlike a proto mismatch, there is never a reason to tear this
                         // one down — an upgrade we merely prefer is not worth a session.)
-                        dbg(&format!(
-                            "build takeover failed against daemon {daemon_build}; driving it \
-                             as-is — the terminals matter more than the upgrade"
-                        ));
+                        tracing::info!("build takeover failed against daemon {daemon_build}; driving it \
+                             as-is — the terminals matter more than the upgrade");
                         let stream = connect_or_spawn(&endpoint, salt)?;
                         return Self::from_stream(stream, events);
                     }
@@ -302,10 +294,8 @@ impl DaemonSessionManager {
                     // live ConPTYs. Replacing it is exactly what we must NOT do — every
                     // terminal in it would die. The host surface is frozen (see
                     // `VersionPolicy::Tolerant`), so an older host is safe to drive.
-                    dbg(&format!(
-                        "pty-host proto skew (client {PROTO_VER}, host {daemon_ver}); \
-                         proceeding — the host surface is version-stable by contract"
-                    ));
+                    tracing::info!("pty-host proto skew (client {PROTO_VER}, host {daemon_ver}); \
+                         proceeding — the host surface is version-stable by contract");
                     return Self::from_stream(stream, events);
                 }
                 ProtoCheck::Mismatch { daemon_ver } => {
@@ -315,10 +305,8 @@ impl DaemonSessionManager {
                     // survives. Only if that does not produce a matching daemon (the incumbent
                     // predates takeover, or is wedged) do we fall back to the old tear-down,
                     // which kills every session.
-                    dbg(&format!(
-                        "daemon proto-version mismatch (client {PROTO_VER}, daemon {daemon_ver}); \
-                         attempting live takeover (attempt {attempt})"
-                    ));
+                    tracing::info!("daemon proto-version mismatch (client {PROTO_VER}, daemon {daemon_ver}); \
+                         attempting live takeover (attempt {attempt})");
                     drop(stream);
                     if !hand_over_stale_daemon(salt, &endpoint) {
                         // The takeover did not produce a matching daemon: the incumbent
@@ -330,24 +318,20 @@ impl DaemonSessionManager {
                         // next time it is empty.
                         match stale_daemon_fallback(&endpoint, daemon_ver) {
                             StaleFallback::TearDown => {
-                                dbg("takeover failed on an EMPTY daemon; tearing down");
+                                tracing::info!("takeover failed on an EMPTY daemon; tearing down");
                                 tear_down_stale_daemon(&endpoint, salt);
                             }
                             StaleFallback::Drive => {
-                                dbg(&format!(
-                                    "takeover failed against a daemon holding live sessions \
+                                tracing::info!("takeover failed against a daemon holding live sessions \
                                      (daemon {daemon_ver}, client {PROTO_VER}); driving it \
-                                     as-is — the terminals matter more than the upgrade"
-                                ));
+                                     as-is — the terminals matter more than the upgrade");
                                 let stream = connect_or_spawn(&endpoint, salt)?;
                                 return Self::from_stream(stream, events);
                             }
                             StaleFallback::Refuse => {
-                                dbg(&format!(
-                                    "daemon {daemon_ver} is below the drivable floor \
+                                tracing::info!("daemon {daemon_ver} is below the drivable floor \
                                      {MIN_DRIVABLE_DAEMON_VER} and holds live sessions; \
-                                     leaving it alone"
-                                ));
+                                     leaving it alone");
                                 return Err(io::Error::new(
                                     io::ErrorKind::Unsupported,
                                     "a daemon too old to drive holds live sessions for this \
@@ -880,17 +864,16 @@ fn reader_loop(
             // `cursor` is for a mirror-less client splicing the live stream onto the seed
             // (`session::attach`); the GUI has its own shadow and instead refuses to seed a
             // non-empty one, which covers the same overlap.
-            Ok(Some(DaemonMsg::Replay { uid, data, .. })) => {
+            Ok(Some(DaemonMsg::Replay { uid, data, cursor })) => {
                 // The one-shot replay seed from an `Attach`: prime the mirror from the
-                // daemon's retained buffer so a re-attaching view restores history. Only
-                // seed when the local mirror is still empty (a fresh/just-reconnected
-                // shadow) — never clobber output already mirrored live.
+                // daemon's retained buffer so a re-attaching view restores history. A `Data`
+                // chunk can race ahead of this frame (the daemon attaches before it snapshots
+                // the buffer), so the splice keeps whatever the mirror appended past
+                // `cursor` and puts the replay in front of it.
                 if !data.is_empty() {
                     let mut shadows = shadows.lock().unwrap();
                     let shadow = shadows.entry(uid).or_insert_with(Shadow::new);
-                    if shadow.replay.get().is_empty() {
-                        shadow.replay.append(&data);
-                    }
+                    splice_replay(shadow, cursor, &data);
                 }
             }
             // **M7 push traffic.** `Claims` and `SessionsChanged` are *unsolicited* full
@@ -920,12 +903,53 @@ fn reader_loop(
             // Deliberately not set on the two breaks above: those mean OUR end went away
             // (the GUI dropped the event receiver, the manager was dropped), which says
             // nothing about the daemon.
-            Ok(None) | Err(_) => {
+            Ok(None) => {
+                tracing::warn!("session daemon connection closed");
+                connected.store(false, Ordering::SeqCst);
+                break;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "session daemon connection lost");
                 connected.store(false, Ordering::SeqCst);
                 break;
             }
         }
     }
+}
+
+/// Seed a shadow's mirror from an `Attach` replay whose retained text ends at output
+/// position `cursor` (UTF-16 units). Any output the mirror already holds BEYOND `cursor`
+/// arrived live, racing ahead of the replay frame, and must survive: the result is the
+/// replay followed by exactly that tail. Output at or before `cursor` is covered by the
+/// replay and is replaced, so a chunk that was mirrored twice never renders twice.
+fn splice_replay(shadow: &mut Shadow, cursor: u64, data: &str) {
+    let ahead = shadow.output_bytes.saturating_sub(cursor) as usize;
+    let tail = if ahead == 0 {
+        ""
+    } else {
+        utf16_tail(shadow.replay.get(), ahead)
+    };
+    let mut merged = Replay::new();
+    merged.append(data);
+    merged.append(tail);
+    shadow.replay = merged;
+    shadow.output_bytes = shadow.output_bytes.max(cursor);
+}
+
+/// The suffix of `s` holding at most `units` UTF-16 code units, cut on a char boundary (a
+/// 2-unit char that straddles the cut is dropped, never split).
+fn utf16_tail(s: &str, units: usize) -> &str {
+    let mut have = 0;
+    let mut start = s.len();
+    for (idx, ch) in s.char_indices().rev() {
+        let u = ch.len_utf16();
+        if have + u > units {
+            break;
+        }
+        have += u;
+        start = idx;
+    }
+    &s[start..]
 }
 
 /// Fold an unsolicited **full session snapshot** (`DaemonMsg::SessionsChanged`) into the
@@ -1174,7 +1198,9 @@ const TAKEOVER_BUDGET: Duration = Duration::from_secs(8);
 /// declines to fight for the endpoint. The caller then asks [`stale_daemon_fallback`] what to
 /// do, which tears the incumbent down ONLY if it holds no live session.
 fn hand_over_stale_daemon(salt: &str, endpoint: &Endpoint) -> bool {
-    if spawn_daemon_detached(salt).is_err() {
+    tracing::info!("spawning a successor daemon to take the sessions over");
+    if let Err(e) = spawn_daemon_detached(salt) {
+        tracing::warn!(error = %e, "could not spawn a successor daemon");
         return false;
     }
     let deadline = Instant::now() + TAKEOVER_BUDGET;
@@ -1276,6 +1302,7 @@ fn live_session_count(endpoint: &Endpoint) -> Option<usize> {
 /// unused today (the endpoint is enough) but kept for symmetry with the spawn side.
 fn tear_down_stale_daemon(endpoint: &Endpoint, _salt: &str) {
     if let Ok(stream) = transport::connect(endpoint) {
+        tracing::info!("shutting down the stale session daemon");
         let mut w = stream;
         let _ = write_frame(&mut w, &ClientMsg::Shutdown);
         // Wait for the daemon to exit. Bounded so a wedged daemon doesn't hang launch; the
@@ -1287,23 +1314,6 @@ fn tear_down_stale_daemon(endpoint: &Endpoint, _salt: &str) {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-    }
-}
-
-/// Append a line to the daemon debug log when `HYPERPANES_DEBUG` is set (mirrors the app's
-/// `dbg_log`; core has no logger of its own). Inert otherwise.
-pub(crate) fn dbg(msg: &str) {
-    use std::io::Write;
-    if std::env::var_os("HYPERPANES_DEBUG").is_none() {
-        return;
-    }
-    let path = std::env::temp_dir().join("hyperpanes-debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(f, "[daemon-client] {msg}");
     }
 }
 
@@ -1320,6 +1330,7 @@ fn connect_or_spawn(endpoint: &Endpoint, salt: &str) -> io::Result<Conn> {
     // None listening → spawn it detached. The daemon is a mode of THIS binary
     // (`current_exe --session-daemon <salt>`), launched so it outlives us and never touches
     // our console (the survival contract — see the plan's "Spawn" note).
+    tracing::info!("no session daemon listening; spawning one");
     spawn_daemon_detached(salt)?;
 
     // Retry-connect with a short, growing backoff until the daemon binds (cold start +
@@ -1582,6 +1593,49 @@ mod tests {
         stale.output_bytes = 2;
         reconcile_snapshot(&s, &[stale]);
         assert_eq!(s.lock().unwrap().get("u1").unwrap().output_bytes, 4);
+    }
+
+    /// A `Data` chunk that races ahead of the `Replay` frame must not be thrown away, and
+    /// the part of the mirror the replay already covers must not be doubled.
+    #[test]
+    fn replay_splice_keeps_the_live_tail_past_the_cursor() {
+        let mut sh = Shadow::new();
+        // Live output mirrored before the replay landed: "cd" at positions 2..4.
+        sh.output_bytes = 2;
+        sh.replay.append("cd");
+        sh.output_bytes = 4;
+        // The daemon's retained buffer through position 3: "abc".
+        splice_replay(&mut sh, 3, "abc");
+        assert_eq!(sh.replay.get(), "abcd");
+        assert_eq!(sh.output_bytes, 4);
+    }
+
+    #[test]
+    fn replay_splice_replaces_a_fully_covered_mirror() {
+        let mut sh = Shadow::new();
+        sh.replay.append("bc");
+        sh.output_bytes = 3;
+        // The replay reaches past everything mirrored so far.
+        splice_replay(&mut sh, 5, "abcde");
+        assert_eq!(sh.replay.get(), "abcde");
+        assert_eq!(sh.output_bytes, 5, "the cursor advances to the replay's end");
+    }
+
+    #[test]
+    fn replay_splice_seeds_an_empty_mirror() {
+        let mut sh = Shadow::new();
+        splice_replay(&mut sh, 3, "abc");
+        assert_eq!(sh.replay.get(), "abc");
+        assert_eq!(sh.output_bytes, 3);
+    }
+
+    #[test]
+    fn utf16_tail_never_splits_a_surrogate_pair() {
+        assert_eq!(utf16_tail("ab😀", 2), "😀");
+        assert_eq!(utf16_tail("ab😀", 1), "", "one unit cannot hold a 2-unit char");
+        assert_eq!(utf16_tail("ab😀", 3), "b😀");
+        assert_eq!(utf16_tail("abc", 10), "abc");
+        assert_eq!(utf16_tail("abc", 0), "");
     }
 
     #[test]

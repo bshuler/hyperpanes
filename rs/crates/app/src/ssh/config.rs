@@ -62,14 +62,43 @@ impl Default for SshSettings {
     }
 }
 
+/// Where [`SshSettings::load`] parks a malformed settings file: `<path>.bad`, next to it.
+fn bad_sibling(path: &Path) -> PathBuf {
+    let mut s = path.as_os_str().to_os_string();
+    s.push(".bad");
+    PathBuf::from(s)
+}
+
 impl SshSettings {
-    /// Read `path`, falling back to [`Default`] when it does not exist. A *malformed* file is
-    /// an error, not a silent default: silently falling back would quietly change the bind
-    /// address, and an operator who typo'd their config deserves to be told.
+    /// Read `path`, falling back to [`Default`] when it does not exist. A *malformed* file
+    /// also yields the defaults — but not silently: it is logged at `warn` and the bad file
+    /// is moved aside to `<path>.bad` so the operator can inspect what they wrote, and so the
+    /// next save doesn't clobber the only copy of it. Falling back rather than failing keeps
+    /// one typo from making the SSH server (and the pairing flow) refuse to start at all;
+    /// the defaults bind loopback, so the fallback can't widen exposure. Only a true I/O
+    /// failure (unreadable file) is still an error.
     pub fn load(path: &Path) -> Result<Self, String> {
         match std::fs::read(path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| format!("{}: malformed ssh settings: {e}", path.display())),
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(s) => Ok(s),
+                Err(e) => {
+                    let aside = bad_sibling(path);
+                    match std::fs::rename(path, &aside) {
+                        Ok(()) => tracing::warn!(
+                            "{}: malformed ssh settings ({e}); using defaults and keeping the \
+                             file as {}",
+                            path.display(),
+                            aside.display()
+                        ),
+                        Err(re) => tracing::warn!(
+                            "{}: malformed ssh settings ({e}); using defaults (could not move \
+                             the file aside: {re})",
+                            path.display()
+                        ),
+                    }
+                    Ok(Self::default())
+                }
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
@@ -257,13 +286,17 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_file_is_an_error_not_a_silent_default() {
+    fn a_malformed_file_falls_back_to_defaults_and_is_kept_aside() {
         let dir = super::super::testutil::tmpdir("cfg");
         let p = dir.path().join("ssh-settings.json");
         std::fs::write(&p, b"{ not json").unwrap();
-        assert!(SshSettings::load(&p).is_err());
-        std::fs::remove_file(&p).unwrap();
-        // Absent is fine, though.
         assert_eq!(SshSettings::load(&p).unwrap(), SshSettings::default());
+        // The bad file was moved out of the way — not deleted, not left to be overwritten.
+        assert!(!p.exists(), "the malformed file must not stay under its live name");
+        let aside = bad_sibling(&p);
+        assert_eq!(std::fs::read(&aside).unwrap(), b"{ not json");
+        // And with it gone, the next load is a plain "absent" default too.
+        assert_eq!(SshSettings::load(&p).unwrap(), SshSettings::default());
+        std::fs::remove_file(&aside).unwrap();
     }
 }

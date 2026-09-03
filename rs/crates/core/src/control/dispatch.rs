@@ -51,6 +51,54 @@ pub struct DispatchResult {
     pub projects_dirty: bool,
 }
 
+/// Why a command could not run, carrying the HTTP status it maps to. `exec` and its helpers
+/// used to answer a bare `String` that `handle_command` turned into a blanket 500, which made
+/// a caller's typo (`unknown command type`), a missing field and a pane that no longer exists
+/// indistinguishable from a genuine server fault. Plain `String`/`&str` errors still convert
+/// (via `From`) into `Internal`, so helpers that have no better classification keep working.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchError {
+    /// The request itself is malformed: unknown command type, missing/ill-typed field → 400.
+    BadRequest(String),
+    /// The command names a pane/window that does not exist → 404.
+    NotFound(String),
+    /// Everything else (spawn failure, I/O, screen unavailable) → 500.
+    Internal(String),
+}
+
+impl DispatchError {
+    fn status(&self) -> u16 {
+        match self {
+            DispatchError::BadRequest(_) => 400,
+            DispatchError::NotFound(_) => 404,
+            DispatchError::Internal(_) => 500,
+        }
+    }
+    fn message(&self) -> &str {
+        match self {
+            DispatchError::BadRequest(m) | DispatchError::NotFound(m) | DispatchError::Internal(m) => m,
+        }
+    }
+    fn no_such_pane(pane_id: &str) -> Self {
+        DispatchError::NotFound(format!("no such pane: {pane_id}"))
+    }
+    fn window_not_found(window_id: i64) -> Self {
+        DispatchError::NotFound(format!("window not found: {window_id}"))
+    }
+}
+
+impl From<String> for DispatchError {
+    fn from(m: String) -> Self {
+        DispatchError::Internal(m)
+    }
+}
+
+impl From<&str> for DispatchError {
+    fn from(m: &str) -> Self {
+        DispatchError::Internal(m.to_string())
+    }
+}
+
 impl DispatchResult {
     fn err(status: u16, message: &str) -> Self {
         DispatchResult {
@@ -79,6 +127,27 @@ impl DispatchResult {
 /// `build_env` when a scoped token rides in the spec's env). `speech` is the shared
 /// per-pane "talk" service (settings + engine) for the `setSpeech*` commands below.
 pub fn handle_command(
+    model: &mut ReadModel,
+    sessions: &SessionManager,
+    control_file: Option<&str>,
+    scope: Option<&Scope>,
+    cmd: &Value,
+    speech: &SpeechService,
+) -> DispatchResult {
+    let r = handle_command_inner(model, sessions, control_file, scope, cmd, speech);
+    if r.status != 200 {
+        let ty = cmd.get("type").and_then(Value::as_str).unwrap_or("<missing>");
+        let reason = r.body["error"].as_str().unwrap_or("");
+        if r.status >= 500 {
+            tracing::error!(command = ty, status = r.status, reason, "command failed");
+        } else {
+            tracing::warn!(command = ty, status = r.status, reason, "command rejected");
+        }
+    }
+    r
+}
+
+fn handle_command_inner(
     model: &mut ReadModel,
     sessions: &SessionManager,
     control_file: Option<&str>,
@@ -185,12 +254,12 @@ pub fn handle_command(
             }
             r
         }
-        Err(message) => DispatchResult::err(500, &message),
+        Err(e) => DispatchResult::err(e.status(), e.message()),
     }
 }
 
-/// Run one command against the live model. Returns (command result, structural?) or an error
-/// string (→ 500). Result `None` ⇒ a result-less command (`{ ok: true }`).
+/// Run one command against the live model. Returns (command result, structural?) or a
+/// [`DispatchError`] carrying its status. Result `None` ⇒ a result-less command (`{ ok: true }`).
 fn exec(
     ty: &str,
     cmd: &Value,
@@ -198,7 +267,7 @@ fn exec(
     sessions: &SessionManager,
     control_file: Option<&str>,
     window_id: i64,
-) -> Result<(Option<Value>, bool), String> {
+) -> Result<(Option<Value>, bool), DispatchError> {
     match ty {
         "newPane" => {
             let mut spec = cmd.get("pane").cloned().unwrap_or_else(|| json!({}));
@@ -210,7 +279,7 @@ fn exec(
             let pane = spawn_pane(sessions, control_file, &spec)?;
             let pane_id = pane.id.clone();
             if !model.insert_pane(window_id, pane) {
-                return Err(format!("window not found: {window_id}"));
+                return Err(DispatchError::window_not_found(window_id));
             }
             Ok((Some(Value::String(pane_id)), true))
         }
@@ -229,7 +298,7 @@ fn exec(
                             let pane = spawn_pane(sessions, control_file, ps)?;
                             pane_ids.push(Value::String(pane.id.clone()));
                             if !model.insert_pane(window_id, pane) {
-                                return Err(format!("window not found: {window_id}"));
+                                return Err(DispatchError::window_not_found(window_id));
                             }
                         }
                     }
@@ -263,7 +332,7 @@ fn exec(
                         system: false,
                     };
                     if !model.insert_tab(window_id, tab) {
-                        return Err(format!("window not found: {window_id}"));
+                        return Err(DispatchError::window_not_found(window_id));
                     }
                     tab_ids.push(Value::String(tab_id));
                 }
@@ -282,7 +351,7 @@ fn exec(
             let pane = model
                 .pane(&pane_id)
                 .cloned()
-                .ok_or_else(|| format!("no such pane: {pane_id}"))?;
+                .ok_or_else(|| DispatchError::no_such_pane(&pane_id))?;
             // `resume:true`: after the respawn, type `cd + claude --resume` for the
             // conversation this pane was hosting, per its SessionStart marker — read
             // BEFORE the kill (SessionEnd may remove it). An agent may target its OWN
@@ -336,7 +405,7 @@ fn exec(
             let pane = model
                 .pane(&pane_id)
                 .cloned()
-                .ok_or_else(|| format!("no such pane: {pane_id}"))?;
+                .ok_or_else(|| DispatchError::no_such_pane(&pane_id))?;
             let action = cmd
                 .get("action")
                 .and_then(Value::as_str)
@@ -348,7 +417,9 @@ fn exec(
                     recover_resume(model, sessions, control_file, &pane, cmd)?;
                     Ok((None, true))
                 }
-                other => Err(format!("unknown recoverPane action: {other}")),
+                other => Err(DispatchError::BadRequest(format!(
+                    "unknown recoverPane action: {other}"
+                ))),
             }
         }
         "setLayout" => {
@@ -412,10 +483,10 @@ fn exec(
             let pane_id = str_field(cmd, "paneId")?;
             let pane = model
                 .pane(&pane_id)
-                .ok_or_else(|| format!("no such pane: {pane_id}"))?;
+                .ok_or_else(|| DispatchError::no_such_pane(&pane_id))?;
             match sessions.render_screen(&pane.session_uid) {
                 Some(text) => Ok((Some(Value::String(text)), false)),
-                None => Err("screen unavailable".to_string()),
+                None => Err(DispatchError::Internal("screen unavailable".to_string())),
             }
         }
         "setTalk" => {
@@ -423,13 +494,17 @@ fn exec(
             let enabled = cmd
                 .get("enabled")
                 .and_then(Value::as_bool)
-                .ok_or("missing boolean field: enabled")?;
+                .ok_or_else(|| {
+                    DispatchError::BadRequest("missing boolean field: enabled".to_string())
+                })?;
             if !model.set_talk(&pane_id, enabled) {
-                return Err(format!("no such pane: {pane_id}"));
+                return Err(DispatchError::no_such_pane(&pane_id));
             }
             Ok((None, false))
         }
-        other => Err(format!("unknown command type: {other}")),
+        other => Err(DispatchError::BadRequest(format!(
+            "unknown command type: {other}"
+        ))),
     }
 }
 
@@ -1024,11 +1099,11 @@ pub fn command_scope_error(
     Some("a scoped token needs a paneId, tabId, or windowId on the command".to_string())
 }
 
-fn str_field(cmd: &Value, key: &str) -> Result<String, String> {
+fn str_field(cmd: &Value, key: &str) -> Result<String, DispatchError> {
     cmd.get(key)
         .and_then(Value::as_str)
         .map(str::to_string)
-        .ok_or_else(|| format!("missing string field: {key}"))
+        .ok_or_else(|| DispatchError::BadRequest(format!("missing string field: {key}")))
 }
 
 /// Read `windowId` from a command, accepting either a JSON number OR a numeric string. Clients
@@ -1293,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn set_talk_unknown_pane_is_500() {
+    fn set_talk_unknown_pane_is_404() {
         let mut m = model_one_window();
         let s = sessions();
         // An explicit windowId gets past the generic "needs a paneId or windowId" gate
@@ -1301,18 +1376,58 @@ mod tests {
         // setTalk's own "no such pane" check inside `exec`.
         let cmd = json!({ "type": "setTalk", "windowId": 1, "paneId": "ghost", "enabled": true });
         let r = handle_command(&mut m, &s, None, None, &cmd, &speech());
-        assert_eq!(r.status, 500);
+        assert_eq!(r.status, 404);
         assert_eq!(r.body["error"], json!("no such pane: ghost"));
     }
 
     #[test]
-    fn set_talk_missing_enabled_is_500() {
+    fn set_talk_missing_enabled_is_400() {
         let mut m = model_one_window();
         let s = sessions();
         let cmd = json!({ "type": "setTalk", "windowId": 1, "paneId": "p" });
         let r = handle_command(&mut m, &s, None, None, &cmd, &speech());
-        assert_eq!(r.status, 500);
+        assert_eq!(r.status, 400);
         assert_eq!(r.body["error"], json!("missing boolean field: enabled"));
+    }
+
+    #[test]
+    fn unknown_command_type_is_400() {
+        let mut m = model_one_window();
+        let s = sessions();
+        let cmd = json!({ "type": "frobnicate", "windowId": 1 });
+        let r = handle_command(&mut m, &s, None, None, &cmd, &speech());
+        assert_eq!(r.status, 400);
+        assert_eq!(r.body["error"], json!("unknown command type: frobnicate"));
+    }
+
+    #[test]
+    fn missing_string_field_is_400() {
+        let mut m = model_one_window();
+        let s = sessions();
+        let cmd = json!({ "type": "setLayout", "windowId": 1, "tabId": "t1" });
+        let r = handle_command(&mut m, &s, None, None, &cmd, &speech());
+        assert_eq!(r.status, 400);
+        assert_eq!(r.body["error"], json!("missing string field: layout"));
+    }
+
+    #[test]
+    fn read_screen_unknown_pane_is_404() {
+        let mut m = model_one_window();
+        let s = sessions();
+        let cmd = json!({ "type": "readScreen", "windowId": 1, "paneId": "ghost" });
+        let r = handle_command(&mut m, &s, None, None, &cmd, &speech());
+        assert_eq!(r.status, 404);
+        assert_eq!(r.body["error"], json!("no such pane: ghost"));
+    }
+
+    #[test]
+    fn dispatch_error_status_mapping() {
+        assert_eq!(DispatchError::BadRequest("x".into()).status(), 400);
+        assert_eq!(DispatchError::NotFound("x".into()).status(), 404);
+        assert_eq!(DispatchError::Internal("x".into()).status(), 500);
+        // Untyped helper errors stay 500, exactly as before.
+        assert_eq!(DispatchError::from("boom".to_string()).status(), 500);
+        assert_eq!(DispatchError::from("boom").message(), "boom");
     }
 
     #[test]

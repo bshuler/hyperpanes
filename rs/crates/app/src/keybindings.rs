@@ -528,10 +528,10 @@ impl Keymap {
         match serde_json::to_string_pretty(&map) {
             Ok(json) => {
                 if let Err(e) = paths::write_atomic(&path, json.as_bytes()) {
-                    crate::dbg_log(&format!("keybindings save failed: {e}"));
+                    tracing::debug!("keybindings save failed: {e}");
                 }
             }
-            Err(e) => crate::dbg_log(&format!("keybindings serialize failed: {e}")),
+            Err(e) => tracing::debug!("keybindings serialize failed: {e}"),
         }
     }
 

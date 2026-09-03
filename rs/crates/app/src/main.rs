@@ -38,6 +38,7 @@ mod glow;
 mod history_scan;
 mod keybindings;
 mod leftpanel;
+mod loops;
 mod mermaid;
 mod pair;
 mod palette;
@@ -78,20 +79,22 @@ slint::include_modules!();
 pub static GUI_RESTARTING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Append a line to the debug log when `HYPERPANES_DEBUG` is set. The path is
-/// printed once at startup. Used to trace the divider/command paths.
-pub fn dbg_log(msg: &str) {
-    use std::io::Write;
-    if std::env::var_os("HYPERPANES_DEBUG").is_none() {
-        return;
+/// The log-file role for this invocation (`hyperpanes-<role>.log`, see
+/// `hyperpanes_core::logging`): the GUI, the session daemon, the crash dialog and the
+/// pipeable/worker command lines each get their own file so a `ctl` burst cannot roll the
+/// GUI's log out from under a bug report.
+fn log_role(argv: &[String]) -> &'static str {
+    if session_daemon_salt(argv).is_some() {
+        return "daemon";
     }
-    let path = std::env::temp_dir().join("hyperpanes-debug.log");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(f, "{msg}");
+    if argv.iter().any(|a| a == "--crash-report") {
+        return "crash";
+    }
+    match argv.get(1).map(String::as_str) {
+        Some("worker") => "worker",
+        Some(_) if pipeable_cli(argv) || wants_kill_daemon(argv) => "cli",
+        Some("--control-mode") => "cli",
+        _ => "app",
     }
 }
 
@@ -343,6 +346,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             None => {}
         }
+
+        // Logging: one subscriber per process, file per role, level from the persisted
+        // `logLevel` setting unless `HYPERPANES_LOG` / `HYPERPANES_DEBUG` override it.
+        let level = prefs::load().log_level;
+        hyperpanes_core::logging::init(log_role(&argv), &level);
+        tracing::debug!(argv = ?argv, "process start");
     }
 
     // Crash-reporter mode: a fresh process spawned by the panic hook (or by the next launch when a
@@ -371,6 +380,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // reporter from a fresh process (this one is unwinding) — see `crate::crash`.
     std::panic::set_hook(Box::new(|info| {
         use std::io::Write;
+        tracing::error!(panic = %info, "panic");
         let path = std::env::temp_dir().join("hyperpanes-crash.log");
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
@@ -400,7 +410,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // is just the entry. It builds its own Tokio runtime and blocks until the daemon exits.
     let argv0: Vec<String> = std::env::args().collect();
     if let Some(salt) = session_daemon_salt(&argv0) {
-        dbg_log(&format!("session-daemon: starting for salt {salt:?}"));
+        tracing::debug!("session-daemon: starting for salt {salt:?}");
         // The SSH front door (M3) rides along with the daemon: the daemon process is the one
         // that outlives every GUI window, and the server is just another client of its
         // socket. Off unless the user enabled it, and never fatal to the daemon.
@@ -419,9 +429,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .to_string_lossy()
             .into_owned();
         match hyperpanes_core::session::daemon::kill_daemon(&salt) {
-            Ok(true) => dbg_log("kill-daemon: shut the running daemon down"),
-            Ok(false) => dbg_log("kill-daemon: no daemon was running (no-op)"),
-            Err(e) => dbg_log(&format!("kill-daemon: error {e}")),
+            Ok(true) => tracing::debug!("kill-daemon: shut the running daemon down"),
+            Ok(false) => tracing::debug!("kill-daemon: no daemon was running (no-op)"),
+            Err(e) => tracing::debug!("kill-daemon: error {e}"),
         }
         return Ok(());
     }
@@ -508,10 +518,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut handoff_primary = None;
     match hyperpanes_core::single_instance::acquire(&salt) {
         Ok(hyperpanes_core::single_instance::Instance::Secondary(sec)) => {
-            dbg_log("single-instance: secondary, forwarding argv");
+            tracing::debug!("single-instance: secondary, forwarding argv");
             let msg = hyperpanes_core::single_instance::HandoffMessage { argv, cwd };
             let fwd = rt.block_on(async move { sec.forward(&msg).await });
-            dbg_log(&format!("single-instance: forward -> {fwd:?}"));
+            tracing::debug!("single-instance: forward -> {fwd:?}");
             // Don't wait for the runtime's worker threads on the way out — the hand-off
             // is flushed; exit like Electron's second instance does.
             drop(_guard);
@@ -520,12 +530,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         Ok(hyperpanes_core::single_instance::Instance::Primary(primary)) => {
-            dbg_log("single-instance: primary, serving hand-offs");
+            tracing::debug!("single-instance: primary, serving hand-offs");
             handoff_primary = Some(primary);
         }
         Err(e) => {
             // Gate unavailable on this platform/setup → run standalone.
-            dbg_log(&format!("single-instance: gate unavailable ({e})"));
+            tracing::debug!("single-instance: gate unavailable ({e})");
         }
     }
 
@@ -547,7 +557,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mgr = Arc::new(if want_daemon {
         match SessionManager::new_daemon(etx.clone(), &salt) {
             Ok(m) => {
-                dbg_log("session-backend: daemon");
+                tracing::debug!("session-backend: daemon");
                 m
             }
             Err(e) => {
@@ -559,9 +569,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "hyperpanes: session daemon unavailable ({e}); running ptys in-process \
                      — terminals will NOT survive restarting the app"
                 );
-                dbg_log(&format!(
-                    "session-backend: daemon unavailable ({e}); falling back to in-process"
-                ));
+                tracing::debug!("session-backend: daemon unavailable ({e}); falling back to in-process");
                 SessionManager::new(etx)
             }
         }
@@ -673,9 +681,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let keep_alive = prefs::load().keep_alive;
     if mgr.is_daemon() {
         if keep_alive || GUI_RESTARTING.load(std::sync::atomic::Ordering::SeqCst) {
-            dbg_log("quit: keep-alive ON (or GUI restart) — leaving the daemon + sessions running");
+            tracing::debug!("quit: keep-alive ON (or GUI restart) — leaving the daemon + sessions running");
         } else {
-            dbg_log("quit: keep-alive OFF — shutting the daemon down");
+            tracing::debug!("quit: keep-alive OFF — shutting the daemon down");
             mgr.shutdown_daemon();
         }
     } else {

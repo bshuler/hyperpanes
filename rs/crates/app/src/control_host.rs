@@ -693,8 +693,8 @@ impl ControlHost {
                 },
             );
             if inserted {
-                eprintln!(
-                    "[hyperpanes] self-heal: restored control pane {pane_id} (session {uid}) to the read-model"
+                tracing::warn!(
+                    "self-heal: restored control pane {pane_id} (session {uid}) to the read-model"
                 );
                 healed = true;
             }
@@ -1023,13 +1023,28 @@ impl ControlHost {
                         changed = true;
                     }
                 }
-                UiOp::PatchSettings { patch } => {
+                UiOp::PatchSettings { patch, reply } => {
                     // Settings are app-wide but held per-window; patch every window so a second
-                    // window doesn't keep painting itself with the old theme.
+                    // window doesn't keep painting itself with the old theme. The first
+                    // rejection is what the route reports back as a 400 — every window runs
+                    // the same validation, so a second one would only repeat it.
+                    let mut result: Result<(), String> = if windows.is_empty() {
+                        Err("no window is open to apply the settings to".to_string())
+                    } else {
+                        Ok(())
+                    };
                     for w in windows {
-                        let _ = w.state.borrow_mut().patch_settings(&patch);
+                        if let Err(e) = w.state.borrow_mut().patch_settings(&patch) {
+                            tracing::warn!("settings patch rejected: {e}");
+                            if result.is_ok() {
+                                result = Err(e);
+                            }
+                        }
                     }
                     changed = !windows.is_empty();
+                    if let Some(reply) = reply {
+                        reply.send(result);
+                    }
                 }
             }
         }
@@ -1160,8 +1175,8 @@ impl ControlHost {
         let drop_windows: Vec<i64> = self.prev_windows.borrow_mut().drain(..).collect();
         let carried = model.publish_replace(&drop_windows, tree, &last_published);
         for id in &carried {
-            eprintln!(
-                "[hyperpanes] control pane {id} carried over the GUI republish (not yet adopted)"
+            tracing::info!(
+                "control pane {id} carried over the GUI republish (not yet adopted)"
             );
         }
 

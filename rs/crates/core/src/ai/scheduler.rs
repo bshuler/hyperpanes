@@ -241,7 +241,10 @@ impl SummaryScheduler {
     fn pump(&mut self) {
         loop {
             if self.running && self.backoff_timer.is_none() {
-                while self.in_flight.len() < self.cfg.concurrency && !self.queue.is_empty() {
+                // A cap of 0 would never admit a job and park every pane in the queue
+                // forever; the service already refuses it, but the loop guards itself too.
+                let cap = self.cfg.concurrency.max(1);
+                while self.in_flight.len() < cap && !self.queue.is_empty() {
                     let uid = self.queue.pop_front().unwrap();
                     self.queued.remove(&uid);
                     self.in_flight.insert(uid.clone());
@@ -381,6 +384,27 @@ mod tests {
         assert_eq!(s.in_flight_count(), 2);
         s.complete("b", JobResult::Ok);
         assert_eq!(s.in_flight_count(), 2);
+        s.stop();
+    }
+
+    #[test]
+    fn a_zero_concurrency_cap_still_runs_one_job_instead_of_stalling() {
+        let mut s = SummaryScheduler::new(
+            SchedulerConfig {
+                settle_ms: 10,
+                max_staleness_sec: 9999,
+                concurrency: 0,
+            },
+            |_uid| JobStart::InFlight,
+            no_status(),
+        );
+        s.start();
+        s.note_output("a");
+        s.note_output("b");
+        s.advance(10);
+        assert_eq!(s.in_flight_count(), 1, "0 must behave as 1, not as 'never'");
+        s.complete("a", JobResult::Ok);
+        assert_eq!(s.in_flight_count(), 1, "the next queued pane must be admitted");
         s.stop();
     }
 

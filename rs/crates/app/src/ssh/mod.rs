@@ -341,7 +341,7 @@ pub fn spawn_with_daemon(salt: &str) {
     let settings = match config::SshSettings::load(&paths.settings) {
         Ok(s) => s,
         Err(e) => {
-            crate::dbg_log(&format!("ssh: {e} — not starting the SSH server"));
+            tracing::debug!("ssh: {e} — not starting the SSH server");
             return;
         }
     };
@@ -353,11 +353,11 @@ pub fn spawn_with_daemon(salt: &str) {
         .name("hp-ssh".into())
         .spawn(move || {
             if let Err(e) = server::serve_blocking(&paths, &salt, false) {
-                crate::dbg_log(&format!("ssh: server stopped: {e}"));
+                tracing::debug!("ssh: server stopped: {e}");
             }
         });
     if let Err(e) = spawned {
-        crate::dbg_log(&format!("ssh: could not start the server thread: {e}"));
+        tracing::debug!("ssh: could not start the server thread: {e}");
     }
 }
 

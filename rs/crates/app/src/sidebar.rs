@@ -113,7 +113,7 @@ fn parse_porcelain(out: &str) -> Vec<WorktreeRow> {
     let mut prunable = false;
 
     // Flush the record accumulated so far (if any) into a row.
-    let mut flush = |path: &mut Option<String>,
+    let flush = |path: &mut Option<String>,
                      head: &mut Option<String>,
                      branch: &mut Option<String>,
                      detached: &mut bool,

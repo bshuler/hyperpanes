@@ -96,6 +96,7 @@ fn fresh_view_uid() -> String {
 /// never heard of. Every close/evict path routes through here so the gate is in ONE place.
 fn kill_session_of(mgr: &SessionManager, uid: &str, kind: &PaneKind) {
     if kind.is_pty() {
+        tracing::info!(uid, "killing pane session");
         mgr.kill(uid);
     }
 }
@@ -505,14 +506,14 @@ fn write_goals_mcp_config() -> Option<std::path::PathBuf> {
     let path = hyperpanes_core::persistence::paths::state_dir().join("goals-mcp.json");
     if let Some(dir) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("[goals] failed to create state dir for goals-mcp.json: {e}; spawning without --mcp-config");
+            tracing::warn!("failed to create state dir for goals-mcp.json: {e}; spawning without --mcp-config");
             return None;
         }
     }
     match std::fs::write(&path, json) {
         Ok(()) => Some(path),
         Err(e) => {
-            eprintln!("[goals] failed to write goals-mcp.json: {e}; spawning without --mcp-config");
+            tracing::warn!("failed to write goals-mcp.json: {e}; spawning without --mcp-config");
             None
         }
     }
@@ -542,15 +543,15 @@ fn write_goals_settings_config() -> Option<std::path::PathBuf> {
     let path = hyperpanes_core::persistence::paths::state_dir().join("goals-settings.json");
     if let Some(dir) = path.parent() {
         if let Err(e) = std::fs::create_dir_all(dir) {
-            eprintln!("[goals] failed to create state dir for goals-settings.json: {e}; spawning without --settings");
+            tracing::warn!("failed to create state dir for goals-settings.json: {e}; spawning without --settings");
             return None;
         }
     }
     match std::fs::write(&path, json) {
         Ok(()) => Some(path),
         Err(e) => {
-            eprintln!(
-                "[goals] failed to write goals-settings.json: {e}; spawning without --settings"
+            tracing::warn!(
+                "failed to write goals-settings.json: {e}; spawning without --settings"
             );
             None
         }
@@ -1153,6 +1154,9 @@ pub struct State {
     pub tabs: Vec<Tab>,
     pub active: usize,
     tab_seq: usize,
+    /// Set when preparing the Hyperpane directory failed; creation/reseed is not retried
+    /// before this instant. See [`Self::materialize_hyperpane_dir`].
+    hyperpane_retry_at: Option<std::time::Instant>,
     pub fullscreen: bool,
     /// Index of the tab whose title is being edited inline (-1 = none).
     pub editing_tab: i32,
@@ -1479,6 +1483,7 @@ impl State {
             tabs: Vec::new(),
             active: 0,
             tab_seq: 0,
+            hyperpane_retry_at: None,
             fullscreen: false,
             editing_tab: -1,
             editing_pane: -1,
@@ -1756,12 +1761,12 @@ impl State {
             .spawn(move || {
                 let _guard = rt.enter();
                 if let Err(e) = mgr.create(opts) {
-                    eprintln!("[hyperpanes] failed to spawn {uid}: {e}");
+                    tracing::error!("failed to spawn {uid}: {e}");
                 }
                 spawn_done().lock().unwrap().push(uid);
             });
         if let Err(e) = res {
-            eprintln!("[hyperpanes] failed to start spawn thread: {e}");
+            tracing::error!("failed to start spawn thread: {e}");
         }
     }
 
@@ -1937,9 +1942,10 @@ impl State {
                 },
             );
         }
-        let mut pane = TerminalPane::new(
+        let mut pane = TerminalPane::with_scrollback(
             cols as usize,
             rows as usize,
+            self.settings.scrollback as usize,
             Box::new(SoftwareRenderer::new()),
         );
         pane.set_palette(theme::terminal_theme(self.settings.terminal_theme));
@@ -1960,6 +1966,7 @@ impl State {
         // Each pane owns its font (per-pane zoom); start at the configured base size.
         let font_px = self.settings.font_px;
         let font = theme::load_font_at(&self.settings.font_path(), font_px, self.last_scale);
+        tracing::info!(uid = %uid, label = %label, "pane spawned");
         Some(PaneState {
             uid,
             title: label.into(),
@@ -2002,10 +2009,7 @@ impl State {
             // The resolved shell program → its short header badge (computed once here).
             // Only a pty pane gets one: a file browser never spawned a shell, and a header
             // reading "notes.md  zsh" claims a process that does not exist.
-            shell_label: kind
-                .is_pty()
-                .then(|| shell_label(&shell_path))
-                .unwrap_or_default(),
+            shell_label: if kind.is_pty() { shell_label(&shell_path) } else { String::new() },
             // Remember the spawn spec so the relaunch snapshot can re-run this program. A New
             // Pane dialog carries no argv, so `spawn_args` stays None. A view pane never ran a
             // program, so it records none — the snapshot restores it from its `kind` alone.
@@ -2101,6 +2105,19 @@ impl State {
         };
         self.dirty = true;
         if t.panes.is_empty() {
+            if t.system {
+                // The system tab (the always-on "Hyperpane") outlives its panes: it is never
+                // dropped and never quits the window. It is left EMPTY here — this path has
+                // no `SessionManager` to spawn with — and refilled by
+                // [`Self::reseed_system_tab`], which every caller that owns a manager runs
+                // right after the take, and which the app's tick runs as a backstop for the
+                // callers that don't (cross-window drag, reminders).
+                t.focused = 0;
+                t.zoomed = None;
+                t.sizes.clear();
+                self.editing_tab = -1;
+                return Some((ps, true));
+            }
             if self.tabs.len() <= 1 {
                 // Last pane of the last tab → workspace emptied. Leave the empty tab in
                 // place (the window is about to close).
@@ -2137,7 +2154,12 @@ impl State {
     pub fn close_pane_in(&mut self, ti: usize, idx: usize, mgr: &SessionManager) -> bool {
         match self.take_pane_in(ti, idx) {
             Some((ps, alive)) => {
+                tracing::info!(uid = %ps.uid, tab = ti, "pane closed");
                 kill_session_of(mgr, &ps.uid, &ps.kind);
+                // Closing the system tab's last pane leaves the tab, not the window: it gets a
+                // fresh shell in the Hyperpane directory (the user closed the agent on purpose,
+                // so it is not relaunched behind their back — they can start it by hand).
+                self.reseed_system_tab(mgr);
                 alive
             }
             None => true,
@@ -2159,6 +2181,9 @@ impl State {
         match self.detach_pane_in(ti, idx) {
             Some(det) => {
                 self.push_closed(ClosedWhat::Pane(Box::new(det)), mgr);
+                // Parking the system tab's last pane keeps the tab (see `take_pane_inner`);
+                // it is refilled so the strip never shows an empty Hyperpane.
+                self.reseed_system_tab(mgr);
                 true
             }
             None => true,
@@ -2167,12 +2192,15 @@ impl State {
 
     /// Whether closing pane `idx` of tab `ti` empties the whole window (the only pane of the
     /// only tab) — the close that quits, and cannot be parked.
+    ///
+    /// Never true for the system tab: its last pane is replaced, not fatal (see
+    /// [`Self::take_pane_inner`]), so the window does not end and the close is parkable.
     fn ends_window_pane(&self, ti: usize, idx: usize) -> bool {
         self.tabs.len() <= 1
             && self
                 .tabs
                 .get(ti)
-                .is_some_and(|t| t.panes.len() <= 1 && idx < t.panes.len())
+                .is_some_and(|t| !t.system && t.panes.len() <= 1 && idx < t.panes.len())
     }
 
     /// Detach the focused pane of the active tab for re-hosting in another window:
@@ -2180,10 +2208,13 @@ impl State {
     /// returning the rebind info + whether this window still has panes. `None` when the
     /// active tab has no panes.
     pub fn detach_focused(&mut self, mgr: &SessionManager) -> Option<(DetachedPane, bool)> {
-        let _ = mgr; // sessions are NOT touched here — that's the whole point of detach.
+        // Sessions are NOT touched here — that's the whole point of detach. The manager is
+        // only for the reseed: a pane torn out of the system tab leaves the tab behind, and
+        // the tab gets a fresh shell so it is never an empty Hyperpane.
         let ti = self.active;
         let idx = self.tabs.get(ti)?.focused;
         let (ps, alive) = self.take_pane_in(ti, idx)?;
+        self.reseed_system_tab(mgr);
         Some((
             DetachedPane {
                 uid: ps.uid,
@@ -2217,9 +2248,10 @@ impl State {
     pub fn adopt_pane_at(&mut self, mgr: &SessionManager, det: DetachedPane, at: usize) {
         let palette = self.settings.frame_palette;
         let (cols, rows) = (80u16, 24u16);
-        let mut pane = TerminalPane::new(
+        let mut pane = TerminalPane::with_scrollback(
             cols as usize,
             rows as usize,
+            self.settings.scrollback as usize,
             Box::new(SoftwareRenderer::new()),
         );
         pane.set_palette(theme::terminal_theme(self.settings.terminal_theme));
@@ -2298,6 +2330,7 @@ impl State {
     /// append a fresh tab, switch to it, and adopt the pane into it.
     pub fn adopt_pane_as_tab(&mut self, mgr: &SessionManager, det: DetachedPane) {
         let tab = self.fresh_tab();
+        tracing::info!(title = %tab.title, "tab created (pane adopted)");
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.editing_tab = -1;
@@ -2485,6 +2518,7 @@ impl State {
     /// A plain shell keeps closing: there `exit` *is* "close this terminal", and respawning
     /// a shell the user just quit would make the pane impossible to get rid of.
     pub fn pane_exited(&mut self, uid: &str, mgr: &SessionManager, code: i32) -> PaneExit {
+        tracing::info!(uid, code, "pane exited");
         match self.find_pane(uid) {
             Some((ti, pi)) => {
                 if let Some(program) = self.exited_program(ti, pi) {
@@ -2495,6 +2529,7 @@ impl State {
                     // Keep the cwd: the point is to land where the program was, so retyping
                     // its name resumes the same work.
                     if let Some((old, new)) = self.restart_pane_at(ti, pi, mgr, cwd, env) {
+                        tracing::info!(old = %old, new = %new, program = %program, "pane respawned as a shell");
                         let p = &mut self.tabs[ti].panes[pi];
                         // The pane runs a shell now, and saying so is not cosmetic: only a
                         // `Terminal` pane may be re-upgraded by the title/foreground sniffs
@@ -2852,19 +2887,15 @@ impl State {
             DividerKind::Main => {
                 let before = t.main_fraction;
                 t.main_fraction = clamp_fraction(t.main_fraction + delta);
-                crate::dbg_log(&format!(
-                    "    resize main: {before:.3} + {delta:.4} -> {:.3} (layout={:?})",
-                    t.main_fraction, t.layout
-                ));
+                tracing::debug!("    resize main: {before:.3} + {delta:.4} -> {:.3} (layout={:?})",
+                    t.main_fraction, t.layout);
             }
             DividerKind::Size => {
                 if index >= 0 {
                     let before = t.sizes.clone();
                     t.sizes = resize_at(&t.sizes, index as usize, delta);
-                    crate::dbg_log(&format!(
-                        "    resize sizes[{index}] delta={delta:.4}: {before:?} -> {:?} (layout={:?})",
-                        t.sizes, t.layout
-                    ));
+                    tracing::debug!("    resize sizes[{index}] delta={delta:.4}: {before:?} -> {:?} (layout={:?})",
+                        t.sizes, t.layout);
                 }
             }
         }
@@ -2913,6 +2944,7 @@ impl State {
             tab.title = t.into();
         }
         tab.system = system;
+        tracing::info!(title = %tab.title, system, "tab created");
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.add_pane_opts(mgr, opts); // seed one pane so the tab is usable
@@ -2939,14 +2971,102 @@ impl State {
         if self.tabs.iter().any(|t| t.system) {
             return false;
         }
-        // Refresh the shipped skills from the bundle. Failing that (a read-only or missing
-        // data dir) there is nowhere to put the tab, so leave it uncreated rather than open
-        // an agent into some arbitrary cwd where its skill would be absent.
-        let Ok(dir) = hyperpanes_core::hyperpane::materialize() else {
-            eprintln!("[hyperpane] could not prepare the Hyperpane directory; tab not created");
+        let Some(dir) = self.materialize_hyperpane_dir() else {
             return false;
         };
+        let opts = self.hyperpane_pane_opts(&dir, true);
+        self.new_tab_with(mgr, Some("Hyperpane"), true, opts);
+        // `new_tab_with` appends; the Hyperpane tab lives at the front. Pinning AFTER the
+        // seed keeps `add_pane_opts`' "active tab" contract intact.
+        self.pin_system_tab_first();
+        tracing::info!(dir = %dir.display(), "Hyperpane tab created");
+        true
+    }
 
+    /// How long a failed [`hyperpanes_core::hyperpane::materialize`] is held before the
+    /// tick's retry is allowed to try again — long enough that a read-only data dir does
+    /// not turn the 8 ms pump into a filesystem hammer, short enough that fixing it (or a
+    /// transient failure passing) is noticed in the same sitting.
+    const HYPERPANE_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Refresh the shipped skills from the bundle and return the Hyperpane directory.
+    ///
+    /// Failing that (a read-only or missing data dir) there is nowhere to put the tab, so
+    /// `None` — the caller leaves it uncreated rather than open an agent into some arbitrary
+    /// cwd where its skill would be absent. The failure is logged at warn and remembered:
+    /// until [`Self::HYPERPANE_RETRY`] has passed the call returns `None` immediately, so
+    /// the app's per-tick retry (which keeps `hyperpane_done` unlatched on failure) is
+    /// bounded rather than every 8 ms.
+    fn materialize_hyperpane_dir(&mut self) -> Option<std::path::PathBuf> {
+        let now = std::time::Instant::now();
+        if self.hyperpane_retry_at.is_some_and(|at| now < at) {
+            return None;
+        }
+        match hyperpanes_core::hyperpane::materialize() {
+            Ok(dir) => {
+                self.hyperpane_retry_at = None;
+                Some(dir)
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "could not prepare the Hyperpane directory ({e}); tab not created, \
+                     retrying in {}s",
+                    Self::HYPERPANE_RETRY.as_secs()
+                );
+                self.hyperpane_retry_at = Some(now + Self::HYPERPANE_RETRY);
+                None
+            }
+        }
+    }
+
+    /// Refill an EMPTIED system tab with a plain shell in the Hyperpane directory.
+    ///
+    /// [`Self::take_pane_inner`] never drops the system tab, so the last pane leaving it —
+    /// closed, moved to another tab, torn off to another window, parked — leaves it with no
+    /// panes. This is the other half of that contract: every caller that owns a manager
+    /// runs it right after the take, and the app's tick runs it as a backstop for the
+    /// callers that don't. Deliberately a SHELL, not the agent: the pane left because the
+    /// user sent it away, and an agent that comes straight back would read as ignoring
+    /// them. The shell sits in the same directory with the same control-API environment,
+    /// so `claude` typed into it is the Hyperpane again.
+    ///
+    /// The directory is re-materialized each time (the same call the creation uses); if
+    /// that fails the shell starts wherever the default cwd lands, because an empty tab is
+    /// the one outcome this exists to prevent. Returns whether a pane was added.
+    pub fn reseed_system_tab(&mut self, mgr: &SessionManager) -> bool {
+        let Some(ti) = self
+            .tabs
+            .iter()
+            .position(|t| t.system && t.panes.is_empty())
+        else {
+            return false;
+        };
+        let dir = self.materialize_hyperpane_dir();
+        let opts = match &dir {
+            Some(dir) => self.hyperpane_pane_opts(dir, false),
+            None => NewPaneOpts {
+                label: Some("hyperpane".to_string()),
+                ..Default::default()
+            },
+        };
+        // `add_pane_opts` seeds the ACTIVE tab; the system tab is not necessarily it.
+        let was = self.active;
+        self.active = ti;
+        let added = self.add_pane_opts(mgr, opts).is_some();
+        self.active = was;
+        if added {
+            tracing::info!(tab = ti, "Hyperpane tab reseeded with a shell");
+        } else {
+            tracing::warn!(tab = ti, "Hyperpane tab could not be reseeded");
+        }
+        self.dirty = true;
+        added
+    }
+
+    /// The pane the Hyperpane tab runs: the user's coding CLI (`agent`) or a plain shell,
+    /// either way in `dir` with the environment the control-API skills need. Shared by
+    /// creation ([`Self::ensure_hyperpane_tab`]) and refill ([`Self::reseed_system_tab`]).
+    fn hyperpane_pane_opts(&self, dir: &std::path::Path, agent: bool) -> NewPaneOpts {
         use hyperpanes_core::tools::{detect, registry};
         let picked = self
             .settings
@@ -2956,6 +3076,7 @@ impl State {
             .chain(registry::by_id("claude"))
             .chain(registry::TOOLS.iter())
             .filter(|t| !registry::EDITOR_IDS.contains(&t.id))
+            .filter(|_| agent)
             .find_map(|t| detect::resolve(t, &self.settings.tool_paths).map(|r| (t, r)));
 
         let (kind, command) = match &picked {
@@ -3003,23 +3124,14 @@ impl State {
             }
         }
 
-        self.new_tab_with(
-            mgr,
-            Some("Hyperpane"),
-            true,
-            NewPaneOpts {
-                label: Some("hyperpane".to_string()),
-                cwd: Some(dir.to_string_lossy().into_owned()),
-                command,
-                kind,
-                env: Some(env),
-                ..Default::default()
-            },
-        );
-        // `new_tab_with` appends; the Hyperpane tab lives at the front. Pinning AFTER the
-        // seed keeps `add_pane_opts`' "active tab" contract intact.
-        self.pin_system_tab_first();
-        true
+        NewPaneOpts {
+            label: Some("hyperpane".to_string()),
+            cwd: Some(dir.to_string_lossy().into_owned()),
+            command,
+            kind,
+            env: Some(env),
+            ..Default::default()
+        }
     }
 
     /// Close tab `idx`, killing its sessions. Returns `false` if nothing remains
@@ -3037,6 +3149,7 @@ impl State {
         if self.tabs[idx].system {
             return true;
         }
+        tracing::info!(tab = idx, title = %self.tabs[idx].title, "tab closed");
         if self.tabs.len() <= 1 {
             // Last tab: kill its sessions and signal quit.
             for p in &self.tabs[idx].panes {
@@ -4141,6 +4254,16 @@ impl State {
     /// [`Settings`] does not have, or gives one a value of the wrong type — all-or-nothing, so
     /// a typo in one key cannot leave the other half applied.
     pub fn patch_settings(&mut self, patch: &serde_json::Value) -> Result<Vec<String>, String> {
+        let keys = self.apply_settings_patch(patch)?;
+        prefs::save(&self.settings);
+        tracing::info!(keys = ?keys, "settings patched");
+        Ok(keys)
+    }
+
+    /// [`Self::patch_settings`] minus the write to disk: validation, the merge, and every
+    /// live effect. Split out so it can be exercised without touching the user's real
+    /// `native-settings.json` (there is no data-dir override for tests).
+    fn apply_settings_patch(&mut self, patch: &serde_json::Value) -> Result<Vec<String>, String> {
         let obj = patch
             .as_object()
             .ok_or_else(|| "settings patch must be a JSON object".to_string())?;
@@ -4158,6 +4281,11 @@ impl State {
         }
         let mut next: Settings =
             serde_json::from_value(merged).map_err(|e| format!("bad settings patch: {e}"))?;
+        // `log_level` is a free string to serde; the logger only understands its own set,
+        // and a typo stored here would silently fall back at the next launch.
+        if !hyperpanes_core::logging::valid_level(&next.log_level) {
+            return Err(format!("bad settings patch: unknown log level {:?}", next.log_level));
+        }
 
         // The panel's widgets can only produce in-range values; a JSON caller can ask for a
         // 400px font or a 3-second idle alert, so clamp on the way in rather than storing
@@ -4166,6 +4294,10 @@ impl State {
         next.idle_alert_seconds = prefs::idle_seconds_on_grid(next.idle_alert_seconds);
         next.frame_palette = next.frame_palette.min(theme::FRAME_PALETTES.len() - 1);
         next.terminal_theme = next.terminal_theme.min(theme::TERMINAL_THEMES.len() - 1);
+        // Everything the clamps above don't cover (palette indices, token-valued strings, the
+        // loop cadences and prompt): one rule set, shared with the save path, so a value the
+        // panel would refuse cannot arrive through the control plane instead.
+        next.validate().map_err(|e| format!("bad settings patch: {e}"))?;
 
         // Then the same live effects `apply_setting` runs, driven off what actually changed —
         // each is expensive enough (a font reload, a repaint of every open pane) to be worth
@@ -4196,9 +4328,24 @@ impl State {
                 }
             }
         }
+        if next.scrollback != self.settings.scrollback {
+            // Resizes every live grid's history in place; lines beyond the new depth are
+            // dropped, a deeper buffer simply starts keeping more from here on.
+            for t in &mut self.tabs {
+                for p in &mut t.panes {
+                    p.pane.set_scrollback(next.scrollback as usize);
+                }
+            }
+        }
+
+        // Turning the sidebar off must also collapse it, exactly as `toggle_sidebar` does:
+        // `show_sidebar` is the preference, `sidebar_open` the live state, and the panel is
+        // drawn from the latter.
+        if !next.show_sidebar && self.settings.show_sidebar {
+            self.sidebar_open = false;
+        }
 
         self.settings = next;
-        prefs::save(&self.settings);
         self.dirty = true;
         Ok(keys)
     }
@@ -4783,7 +4930,7 @@ impl State {
         let file = self.to_library_workspace_file();
         let name = self.active_tab().title.to_string();
         if crate::leftpanel::save_to_library(&name, &file).is_none() {
-            eprintln!("[hyperpanes] failed to save workspace into the library");
+            tracing::warn!("failed to save workspace into the library");
         }
         self.dirty = true;
     }
@@ -4795,8 +4942,8 @@ impl State {
             return;
         };
         let Some(file) = read_workspace(&entry.path) else {
-            eprintln!(
-                "[hyperpanes] {} is not a valid workspace",
+            tracing::warn!(
+                "{} is not a valid workspace",
                 entry.path.display()
             );
             // The row is stale (deleted or corrupted since the scan) — rescan so it goes.
@@ -4820,7 +4967,7 @@ impl State {
     pub fn save_set_to_library(&mut self) {
         let dir = paths::sets_dir();
         if std::fs::create_dir_all(&dir).is_err() {
-            eprintln!("[hyperpanes] failed to create the sets directory");
+            tracing::warn!("failed to create the sets directory");
             return;
         }
         let title = self.active_tab().title.trim().to_string();
@@ -4835,7 +4982,7 @@ impl State {
             name = format!("{base} {n}");
             n += 1;
             if n > 999 {
-                eprintln!("[hyperpanes] too many sets named {base:?}");
+                tracing::warn!("too many sets named {base:?}");
                 return;
             }
         }
@@ -4942,7 +5089,7 @@ impl State {
             Ok(Some(f)) => f,
             Ok(None) => return false,
             Err(e) => {
-                crate::dbg_log(&format!("project file for {root}: {e}"));
+                tracing::debug!("project file for {root}: {e}");
                 return false;
             }
         };
@@ -4994,7 +5141,7 @@ impl State {
         match project::write_project(&root.dir, &project::relativize_cwds(&file, &root.dir)) {
             Ok(_) => self.toast_active("saved to .hyperpanes"),
             Err(e) => {
-                crate::dbg_log(&format!("save to repo: {e}"));
+                tracing::debug!("save to repo: {e}");
                 self.toast_active("could not save to .hyperpanes");
             }
         }
@@ -5207,8 +5354,8 @@ impl State {
             candidates.into_iter().find(|p| p.is_file())
         };
         let Some(persona) = persona else {
-            eprintln!(
-                "[goals] orchestrator persona not found — bundle resources/claude/goal-orchestrator/ \
+            tracing::warn!(
+                "orchestrator persona not found — bundle resources/claude/goal-orchestrator/ \
                  or symlink the skill into ~/.claude/skills; goal not started"
             );
             return false;
@@ -5534,7 +5681,7 @@ impl State {
                 let minutes = (row - crate::contextmenu::CTX_CUSTOM_REMIND_BASE) as u32;
                 return (c.kind == crate::contextmenu::CtxKind::Pane
                     && (1..=1440).contains(&minutes))
-                .then(|| Command::RemindPane(c.target, ReminderOffset::Custom(minutes)));
+                .then_some(Command::RemindPane(c.target, ReminderOffset::Custom(minutes)));
             }
             c.commands.get(row).cloned().flatten()
         })
@@ -5921,20 +6068,116 @@ impl State {
     /// Restart pane `idx`'s shell: spawn a fresh session, swap it into the pane slot (resetting
     /// the grid), and kill the old session. The cwd resets to the default and any per-pane env
     /// overrides are dropped, otherwise chrome (title / color / frame) is preserved.
-    pub fn restart_pane(&mut self, idx: usize, mgr: &SessionManager) {
-        self.restart_pane_at(self.active, idx, mgr, None, None);
+    ///
+    /// Returns the `(old_uid, new_uid)` swap so the caller can re-point anything keyed by the
+    /// old session uid (the control-plane pane-id alias above all) at the replacement.
+    pub fn restart_pane(&mut self, idx: usize, mgr: &SessionManager) -> Option<(String, String)> {
+        self.restart_pane_at(self.active, idx, mgr, None, None)
+    }
+
+    /// The Hyperpane tab's own agent pane: the first pty pane of the system tab.
+    pub fn hyperpane_pane_uid(&self) -> Option<String> {
+        self.tabs
+            .iter()
+            .find(|t| t.system)?
+            .panes
+            .iter()
+            .find(|p| p.kind.is_pty())
+            .map(|p| p.uid.clone())
+    }
+
+    /// The panes the restart loop respawns: every tool pane outside the system tab, as
+    /// `(tab, pane, uid, tool id)`. The system tab's own agent is the one doing the
+    /// monitoring and is left alone.
+    pub fn monitored_panes(&self) -> Vec<(usize, usize, String, String)> {
+        let mut out = Vec::new();
+        for (ti, t) in self.tabs.iter().enumerate() {
+            if t.system {
+                continue;
+            }
+            for (pi, p) in t.panes.iter().enumerate() {
+                if let PaneKind::Tool(tool) = &p.kind {
+                    out.push((ti, pi, p.uid.clone(), tool.clone()));
+                }
+            }
+        }
+        out
+    }
+
+    /// Restart-loop respawn of the monitored tool pane `(ti, pi)`: a fresh shell in the
+    /// same directory with the same env overrides, and the tool typed back into its
+    /// conversation at the shell's first output. The conversation comes from `marker`
+    /// (the pane's Claude session marker, when the hook wrote one) or else the pane's own
+    /// tool mark; with neither, the tool is started fresh. Returns the `(old, new)` uid
+    /// swap for the caller to re-key, like [`Self::pane_exited`] does.
+    pub fn restart_monitored_pane(
+        &mut self,
+        ti: usize,
+        pi: usize,
+        mgr: &SessionManager,
+        marker: Option<&hyperpanes_core::claude_panes::PaneClaudeSession>,
+    ) -> Option<(String, String)> {
+        let (tool, cwd, env, mark) = {
+            let p = self.tabs.get(ti)?.panes.get(pi)?;
+            let PaneKind::Tool(tool) = &p.kind else {
+                return None;
+            };
+            (tool.clone(), p.cwd.clone(), p.env.clone(), p.tool_session.clone())
+        };
+        let bin = hyperpanes_core::tools::by_id(&tool)
+            .map(|t| t.bin)
+            .unwrap_or(tool.as_str());
+        let non_empty = |s: &str| (!s.is_empty()).then(|| s.to_string());
+        let (session, resume_cwd, prefix) = match (marker, &mark) {
+            (Some(m), _) => (
+                Some(m.session_id.clone()),
+                non_empty(&m.cwd).or_else(|| cwd.clone()),
+                non_empty(&m.config_dir)
+                    .filter(|d| hyperpanes_core::claude_panes::valid_config_dir(d))
+                    .map(|d| format!("CLAUDE_CONFIG_DIR='{d}' "))
+                    .unwrap_or_default(),
+            ),
+            (None, Some(mark)) => (
+                Some(mark.id.clone()),
+                non_empty(&mark.cwd).or_else(|| cwd.clone()),
+                String::new(),
+            ),
+            (None, None) => (None, cwd.clone(), String::new()),
+        };
+        let line = crate::loops::restart_line(
+            &tool,
+            bin,
+            resume_cwd.as_deref(),
+            &prefix,
+            session.as_deref(),
+        );
+        let swap = self.restart_pane_at(ti, pi, mgr, cwd, env)?;
+        if let Some(p) = self.tabs.get_mut(ti).and_then(|t| t.panes.get_mut(pi)) {
+            p.startup = Some(line);
+            // The pane still IS this tool's pane (the respawn keeps its kind); remember the
+            // conversation it is being put back into so a later relaunch resumes it too.
+            if let (Some(id), Some(cwd)) = (&session, &resume_cwd) {
+                if let Some(m) = ToolSessionMark::new(id, cwd) {
+                    p.tool_session = Some(ToolSessionMark { tool: mark.and_then(|m| m.tool), ..m });
+                }
+            }
+        }
+        Some(swap)
     }
 
     /// "Refresh Env" (#28): restart pane `idx`'s shell in place but KEEP its live cwd and its
     /// env overrides. The spawn path resolves a fresh registry-backed environment on every
     /// spawn (core `session::env::fresh_env`), so a restart IS the refresh — this variant just
     /// avoids also losing where the user was and what the pane had layered on top.
-    pub fn refresh_env_pane(&mut self, idx: usize, mgr: &SessionManager) {
-        let (cwd, env) = match self.active_tab().panes.get(idx) {
-            Some(p) => (p.cwd.clone(), p.env.clone()),
-            None => return,
-        };
-        self.restart_pane_at(self.active, idx, mgr, cwd, env);
+    ///
+    /// Returns the `(old_uid, new_uid)` swap like [`Self::restart_pane`].
+    pub fn refresh_env_pane(
+        &mut self,
+        idx: usize,
+        mgr: &SessionManager,
+    ) -> Option<(String, String)> {
+        let (cwd, env) = self.active_tab().panes.get(idx).map(|p| (p.cwd.clone(), p.env.clone()))?;
+        self.restart_pane_at(self.active, idx, mgr, cwd, env)
     }
 
     /// Shared respawn core of [`Self::restart_pane`] / [`Self::refresh_env_pane`] / the
@@ -5997,12 +6240,13 @@ impl State {
             integration,
             ..Default::default()
         }) {
-            eprintln!("[hyperpanes] failed to restart {uid}: {e}");
+            tracing::error!("failed to restart {uid}: {e}");
             return None;
         }
-        let mut newgrid = TerminalPane::new(
+        let mut newgrid = TerminalPane::with_scrollback(
             cols as usize,
             rows as usize,
+            self.settings.scrollback as usize,
             Box::new(SoftwareRenderer::new()),
         );
         newgrid.set_palette(theme::terminal_theme(self.settings.terminal_theme));
@@ -6081,9 +6325,10 @@ impl State {
         }
         let palette = self.settings.frame_palette;
         let (cols, rows) = (80u16, 24u16);
-        let mut pane = TerminalPane::new(
+        let mut pane = TerminalPane::with_scrollback(
             cols as usize,
             rows as usize,
+            self.settings.scrollback as usize,
             Box::new(SoftwareRenderer::new()),
         );
         pane.set_palette(theme::terminal_theme(self.settings.terminal_theme));
@@ -6167,6 +6412,7 @@ impl State {
             return;
         };
         let tab = self.fresh_tab();
+        tracing::info!(title = %tab.title, "tab created (pane moved out)");
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.editing_tab = -1;
@@ -6193,6 +6439,9 @@ impl State {
             return;
         }
         self.adopt_into_tab(mgr, dp, target);
+        // Moving the system tab's last pane away does not delete the system tab (it is never
+        // dropped — `take_pane_inner`); it is refilled with a fresh shell instead.
+        self.reseed_system_tab(mgr);
     }
 
     /// Move pane `idx` of tab `from` into tab `target` — the general form of
@@ -6236,6 +6485,8 @@ impl State {
             return;
         }
         self.adopt_into_tab(mgr, dp, target);
+        // Same as the menu path: an emptied system tab is refilled, never dropped.
+        self.reseed_system_tab(mgr);
     }
 
     /// [`Self::move_pane_between_tabs`] with a landing position: the pane ends up at
@@ -6365,13 +6616,63 @@ impl State {
     /// Detach the whole of tab `idx` (its panes as live [`DetachedPane`]s, plus title/layout/
     /// sizes) for re-hosting or parking. Requires ≥2 tabs; fixes the active index. Returns the
     /// detached tab + `source_alive` (always `true` here — other tabs remain).
+    ///
+    /// Refuses the system tab: every consumer of a `DetachedTab` (the closed stack, "Move to
+    /// New Window", tab drag-out) would either lose the Hyperpane or resurrect it as an
+    /// ordinary tab. The one legitimate move — re-homing it when its window closes — goes
+    /// through [`Self::take_system_tab`] / [`Self::adopt_system_tab`], which keep the flag.
     pub fn detach_tab(&mut self, idx: usize) -> Option<(DetachedTab, bool)> {
         if idx >= self.tabs.len() || self.tabs.len() < 2 {
             return None;
         }
+        if self.tabs[idx].system {
+            tracing::info!(tab = idx, "refusing to detach the Hyperpane tab");
+            return None;
+        }
+        tracing::info!(tab = idx, title = %self.tabs[idx].title, "tab detached");
+        Some((self.detach_tab_unchecked(idx), true))
+    }
+
+    /// Lift the system tab out of this window for re-homing into another one (the owner
+    /// window is closing while others survive). `None` when this window does not hold it.
+    /// The active tab is fixed up; the window is NOT left empty by this alone unless the
+    /// system tab was its only tab — the caller is closing it anyway.
+    pub fn take_system_tab(&mut self) -> Option<DetachedTab> {
+        let idx = self.tabs.iter().position(|t| t.system)?;
+        Some(self.detach_tab_unchecked(idx))
+    }
+
+    /// Re-host a system tab lifted by [`Self::take_system_tab`]: it becomes THIS window's
+    /// Hyperpane at index 0, flag intact, sessions alive. The user's current tab stays
+    /// selected — a window closing elsewhere is no reason to yank them to the Hyperpane.
+    /// If this window somehow already has a system tab the incoming one is adopted as an
+    /// ordinary tab so two never coexist (its sessions are worth more than the flag).
+    pub fn adopt_system_tab(&mut self, mgr: &SessionManager, det: DetachedTab) {
+        let had_system = self.tabs.iter().any(|t| t.system);
+        let was_active = self.active;
+        let title = det.title.clone();
+        self.reopen_tab(mgr, det);
+        let ti = self.tabs.len() - 1;
+        if had_system {
+            tracing::warn!(
+                title = %title,
+                "window already holds a Hyperpane tab; adopting the incoming one as ordinary"
+            );
+            self.active = was_active;
+            return;
+        }
+        self.tabs[ti].system = true;
+        // Restore the selection before pinning: the pin rotates indices and fixes `active`.
+        self.active = was_active;
+        self.pin_system_tab_first();
+        tracing::info!(title = %title, "Hyperpane tab re-homed");
+    }
+
+    /// The take half of [`Self::detach_tab`] without its refusals; `idx` must be in range.
+    fn detach_tab_unchecked(&mut self, idx: usize) -> DetachedTab {
         let tab = self.tabs.remove(idx);
         if self.active >= self.tabs.len() {
-            self.active = self.tabs.len() - 1;
+            self.active = self.tabs.len().saturating_sub(1);
         } else if idx < self.active {
             self.active -= 1;
         }
@@ -6398,18 +6699,15 @@ impl State {
                 cwd: p.cwd,
             })
             .collect();
-        Some((
-            DetachedTab {
-                title: tab.title,
-                layout: tab.layout,
-                sizes: tab.sizes,
-                main_fraction: tab.main_fraction,
-                focused,
-                zoomed,
-                panes,
-            },
-            true,
-        ))
+        DetachedTab {
+            title: tab.title,
+            layout: tab.layout,
+            sizes: tab.sizes,
+            main_fraction: tab.main_fraction,
+            focused,
+            zoomed,
+            panes,
+        }
     }
 
     /// Close tab `idx` reopenably: with ≥2 tabs it's parked (sessions alive) on the closed stack;
@@ -6455,6 +6753,7 @@ impl State {
     fn reopen_tab(&mut self, mgr: &SessionManager, det: DetachedTab) {
         let mut tab = Tab::empty(det.title.clone());
         tab.layout = det.layout;
+        tracing::info!(title = %tab.title, "tab created (reopened)");
         self.tabs.push(tab);
         self.active = self.tabs.len() - 1;
         self.editing_tab = -1;
@@ -6483,6 +6782,10 @@ impl State {
         let ti = self.active;
         self.tabs[ti].title = det.title;
         self.tabs[ti].layout = det.layout;
+        // A moved tab is an ordinary tab in its new window, whatever it was before: the
+        // Hyperpane is created per process (`ensure_hyperpane_tab`) and re-homed only via
+        // `adopt_system_tab`. Explicit so a future seed path cannot mint a second one.
+        self.tabs[ti].system = false;
         for dp in det.panes {
             self.adopt_into_tab(mgr, dp, ti);
         }
@@ -6752,8 +7055,10 @@ impl State {
     fn write_workspace_to(&mut self, path: &std::path::Path) -> bool {
         let file = self.to_library_workspace_file();
         let ok = write_workspace(path, &file);
-        if !ok {
-            eprintln!("[hyperpanes] failed to write workspace {}", path.display());
+        if ok {
+            tracing::info!(path = %path.display(), "workspace saved");
+        } else {
+            tracing::warn!("failed to write workspace {}", path.display());
         }
         ok
     }
@@ -6770,7 +7075,7 @@ impl State {
             return;
         };
         let Some(file) = read_workspace(&path) else {
-            eprintln!("[hyperpanes] {} is not a valid workspace", path.display());
+            tracing::warn!("{} is not a valid workspace", path.display());
             return;
         };
         self.load_workspace(file, mgr);
@@ -6830,8 +7135,8 @@ impl State {
                 let _ = std::fs::create_dir_all(parent);
             }
             if !write_workspace(&member_path, &ws) {
-                eprintln!(
-                    "[hyperpanes] failed to write set member {}",
+                tracing::warn!(
+                    "failed to write set member {}",
                     member_path.display()
                 );
                 continue;
@@ -6842,7 +7147,7 @@ impl State {
             });
         }
         if members.is_empty() {
-            eprintln!("[hyperpanes] nothing to save into set {name:?} (no non-empty tabs)");
+            tracing::warn!("nothing to save into set {name:?} (no non-empty tabs)");
             return None;
         }
         let set = sets::WorkspaceSet {
@@ -6850,7 +7155,7 @@ impl State {
             members,
         };
         if !sets::write_set(set_path, &set) {
-            eprintln!("[hyperpanes] failed to write set {}", set_path.display());
+            tracing::warn!("failed to write set {}", set_path.display());
             return None;
         }
         Some(set)
@@ -6877,8 +7182,8 @@ impl State {
     /// workspaces were loaded.
     pub fn open_set_from(&mut self, path: &std::path::Path, mgr: &SessionManager) -> usize {
         let Some(set) = sets::read_set(path) else {
-            eprintln!(
-                "[hyperpanes] {} is not a valid workspace set",
+            tracing::warn!(
+                "{} is not a valid workspace set",
                 path.display()
             );
             return 0;
@@ -6939,7 +7244,24 @@ impl State {
             // produces a ghost empty "term 1" tab next to the restored session (the live
             // 0-pane-tab sighting that motivated the B6 hardening).
             self.purge_empty_tabs();
+            // The Hyperpane is one per process, and lives at index 0: a file whose groups
+            // came from another install (or a hand edit) may carry more than one flagged
+            // group, and `append_tab_from_group` only skips a flagged group when a system
+            // tab ALREADY exists — two flagged groups in the same file both land. Keep the
+            // first as the system tab, demote the rest to ordinary tabs, and pin.
+            let mut seen = false;
+            for t in &mut self.tabs {
+                if t.system {
+                    if seen {
+                        tracing::warn!(title = %t.title, "demoting a duplicate Hyperpane tab");
+                        t.system = false;
+                    }
+                    seen = true;
+                }
+            }
+            self.pin_system_tab_first();
             self.dirty = true;
+            tracing::info!(tabs = self.tabs.len() - first_new, "workspace restored");
             return Some(self.active);
         }
         None
@@ -7124,7 +7446,7 @@ impl State {
         // directory's project, and the snapshot cwd has been observed stale (OSC 7 silence
         // inside a TUI across a GUI re-attach).
         let resume_cwd = (!reattach)
-            .then(|| spec.meta.as_ref())
+            .then_some(spec.meta.as_ref())
             .flatten()
             .and_then(|m| m.get(hyperpanes_core::claude_panes::META_CWD_KEY))
             .filter(|c| hyperpanes_core::claude_panes::valid_resume_cwd(c))
@@ -7134,7 +7456,7 @@ impl State {
         // looks in `~/.claude` and finds nothing (multi-account). Empty/absent ⇒ the default
         // account — leave the env alone.
         let resume_config_dir = (!reattach)
-            .then(|| spec.meta.as_ref())
+            .then_some(spec.meta.as_ref())
             .flatten()
             .and_then(|m| m.get(hyperpanes_core::claude_panes::META_CONFIG_DIR_KEY))
             .filter(|d| hyperpanes_core::claude_panes::valid_config_dir(d))
@@ -7159,10 +7481,12 @@ impl State {
                 .unwrap_or("");
             let head = head.rsplit(['/', '\\']).next().unwrap_or(head);
             if spawn_command.is_none() {
-                startup = Some(match &resume_cwd {
-                    Some(cwd) => format!("cd '{cwd}' && {cfg_prefix}claude --resume {id}\r"),
-                    None => format!("{cfg_prefix}claude --resume {id}\r"),
-                });
+                startup = Some(resume_startup_line(
+                    resume_cwd.as_deref(),
+                    &cfg_prefix,
+                    "claude",
+                    &format!("--resume {id}"),
+                ));
             } else if head == "claude" || head == "claude.exe" {
                 if resume_cwd.is_some() {
                     spawn_cwd = resume_cwd.clone();
@@ -7259,9 +7583,8 @@ impl State {
                         let bin = hyperpanes_core::tools::by_id(&tool)
                             .map(|t| t.bin)
                             .unwrap_or(tool.as_str());
-                        let args = extra.join(" ");
-                        let cwd = &mark.cwd;
-                        startup = Some(format!("cd '{cwd}' && {bin} {args}\r"));
+                        startup =
+                            Some(resume_startup_line(Some(&mark.cwd), "", bin, &extra.join(" ")));
                     }
                 }
             }
@@ -7287,9 +7610,10 @@ impl State {
             Some((c, r)) if c >= 2 && r >= 1 => (c, r),
             _ => (cols, rows),
         };
-        let mut pane = TerminalPane::new(
+        let mut pane = TerminalPane::with_scrollback(
             cols as usize,
             rows as usize,
+            self.settings.scrollback as usize,
             Box::new(SoftwareRenderer::new()),
         );
         pane.set_palette(theme::terminal_theme(self.settings.terminal_theme));
@@ -7383,9 +7707,7 @@ impl State {
             env: None,
             // The resolved shell program → its short header badge (computed once here);
             // suppressed for a view pane for the same reason as in `make_pane`.
-            shell_label: (!is_view)
-                .then(|| shell_label(&shell_path))
-                .unwrap_or_default(),
+            shell_label: if is_view { String::new() } else { shell_label(&shell_path) },
             // Carry the spawned program forward so a later relaunch snapshot still records it
             // (the spec's command/args + the resolved shell).
             spawn_command: (!is_view).then(|| spec.command.clone()).flatten(),
@@ -7405,6 +7727,13 @@ impl State {
     /// tab (parking it would empty the window). The bell list is where it lives meanwhile.
     pub fn remind_pane(&mut self, idx: usize, offset: ReminderOffset) {
         if self.tabs.len() <= 1 && self.active_tab().panes.len() < 2 {
+            return;
+        }
+        // The system tab's only pane is not parked either: there is no manager here to
+        // refill the tab with, and a Hyperpane that sits empty until the bell fires is worse
+        // than a reminder that has to be set on a split. Refused rather than reseeded.
+        if self.active_tab().system && self.active_tab().panes.len() < 2 {
+            tracing::info!("refusing to park the system tab's only pane as a reminder");
             return;
         }
         let Some(dp) = self.detach_pane_idx(idx) else {
@@ -7754,6 +8083,18 @@ fn due_for(since_mid: u64, offset: ReminderOffset) -> (u64, String) {
 }
 
 /// Format a Slint [`Color`] as `#rrggbb` (the workspace-file pane color format).
+/// The line typed into a restored shell pane to resume a tool session, `\r` included:
+/// `cd '<cwd>' && <prefix><bin> <args>`, or without the `cd` when the snapshot recorded no
+/// cwd. `prefix` is an environment assignment such as `CLAUDE_CONFIG_DIR='…' ` (with its
+/// trailing space) or empty. Shared by the Claude shell-pane arm and the generic tool arm
+/// of `make_pane_from_spec`, so a change to the shape reaches both.
+pub(crate) fn resume_startup_line(cwd: Option<&str>, prefix: &str, bin: &str, args: &str) -> String {
+    match cwd {
+        Some(cwd) => format!("cd '{cwd}' && {prefix}{bin} {args}\r"),
+        None => format!("{prefix}{bin} {args}\r"),
+    }
+}
+
 /// Does this saved group describe the app-owned Hyperpane tab? The `system` flag is
 /// authoritative; files written before that flag existed carry none, so a group whose panes
 /// all sit in the Hyperpane directory counts too — nothing else opens there by default.
@@ -11235,6 +11576,10 @@ mod hyperpane_uniqueness_tests {
         State::new(crate::theme::load_font(1.0))
     }
 
+    fn titles(s: &State) -> Vec<String> {
+        s.tabs.iter().map(|t| t.title.to_string()).collect()
+    }
+
     fn mgr() -> SessionManager {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         SessionManager::new(tx)
@@ -11435,6 +11780,232 @@ mod hyperpane_uniqueness_tests {
             s.tabs.iter().filter(|t| t.system).count(),
             1,
             "a flagless Hyperpane is recognized and re-flagged on the way in"
+        );
+    }
+
+    /// A one-tab window of `(title, system)` tabs as a moveable unit.
+    fn det_tab(title: &str, panes: &[&str]) -> DetachedTab {
+        DetachedTab {
+            title: title.into(),
+            layout: Layout::Auto,
+            sizes: Vec::new(),
+            main_fraction: 0.5,
+            focused: 0,
+            zoomed: None,
+            panes: panes.iter().map(|p| det(p)).collect(),
+        }
+    }
+
+    /// Pty spawns (the reseed shell) need a runtime handle on the calling thread.
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn closing_the_hyperpanes_only_pane_leaves_a_system_tab_at_index_0() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let m = mgr();
+        let mut s = strip(&[("Hyperpane", true), ("work", false)]);
+        assert!(s.close_pane_in(0, 0, &m), "the window stays open");
+        assert_eq!(s.tabs.len(), 2, "the tab was kept, not dropped");
+        assert!(s.tabs[0].system, "and it is still the system tab at index 0");
+        assert_eq!(
+            s.tabs[0].panes.len(),
+            1,
+            "an emptied Hyperpane is reseeded with a shell"
+        );
+        assert!(!s.tabs[1].system);
+    }
+
+    #[test]
+    fn moving_the_hyperpanes_only_pane_to_another_tab_keeps_the_system_tab() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let m = mgr();
+        let mut s = strip(&[("Hyperpane", true), ("work", false)]);
+        s.active = 0;
+        s.move_pane_to_tab(0, 1, &m);
+        assert_eq!(s.tabs.len(), 2);
+        assert!(s.tabs[0].system, "the Hyperpane survives its pane leaving");
+        assert_eq!(s.tabs[0].panes.len(), 1, "reseeded");
+        assert_eq!(s.tabs[1].panes.len(), 2, "the pane arrived in the target tab");
+    }
+
+    #[test]
+    fn the_hyperpane_cannot_be_detached_but_an_ordinary_tab_can() {
+        let mut s = strip(&[("Hyperpane", true), ("work", false)]);
+        assert!(s.detach_tab(0).is_none(), "Move to New Window is refused");
+        assert_eq!(titles(&s), ["Hyperpane", "work"]);
+        assert!(s.detach_tab(1).is_some());
+        assert_eq!(titles(&s), ["Hyperpane"]);
+    }
+
+    #[test]
+    fn a_tab_adopted_into_a_new_window_is_never_the_system_tab() {
+        let m = mgr();
+        let mut s = fresh();
+        // Even if the seed tab were somehow flagged, the moved tab arrives ordinary.
+        s.tabs[0].system = true;
+        s.adopt_tab(&m, det_tab("Hyperpane", &["p"]));
+        assert!(!s.tabs[0].system);
+        assert_eq!(s.tabs[0].panes.len(), 1);
+    }
+
+    #[test]
+    fn a_closing_windows_hyperpane_is_rehomed_at_index_0_of_the_survivor() {
+        let m = mgr();
+        let mut closing = strip(&[("Hyperpane", true), ("work", false)]);
+        let mut survivor = strip(&[("other", false), ("more", false)]);
+        survivor.active = 1;
+
+        let det = closing.take_system_tab().expect("the closing window held it");
+        assert_eq!(titles(&closing), ["work"]);
+        assert!(!closing.tabs.iter().any(|t| t.system));
+        assert!(survivor.take_system_tab().is_none(), "nothing to take here");
+
+        survivor.adopt_system_tab(&m, det);
+        assert_eq!(titles(&survivor), ["Hyperpane", "other", "more"]);
+        assert!(survivor.tabs[0].system, "flag intact, pinned first");
+        assert_eq!(survivor.active, 2, "the user's tab stays selected");
+
+        // A second arrival can never make two: it lands as an ordinary tab.
+        survivor.adopt_system_tab(&m, det_tab("Hyperpane", &["x"]));
+        assert_eq!(survivor.tabs.iter().filter(|t| t.system).count(), 1);
+        assert_eq!(survivor.tabs.len(), 4);
+    }
+
+    #[test]
+    fn loading_a_workspace_pins_the_hyperpane_first_and_demotes_duplicates() {
+        let rt = runtime();
+        let _guard = rt.enter();
+        let m = mgr();
+        // Two flagged tabs (a hand-edited file could produce this), neither at index 0.
+        let mut s = strip(&[("work", false), ("A", true), ("B", true)]);
+        let landed = s.load_workspace(
+            WorkspaceFile {
+                groups: Some(vec![GroupSpec {
+                    title: Some("restored".into()),
+                    panes: vec![PaneSpec::default()],
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            &m,
+        );
+        assert!(landed.is_some());
+        assert_eq!(s.tabs.iter().filter(|t| t.system).count(), 1);
+        assert!(s.tabs[0].system, "pinned to index 0");
+        assert_eq!(titles(&s), ["A", "work", "B", "restored"]);
+        assert_eq!(s.active, 3, "landed on the restored tab, index fixed by the pin");
+    }
+
+    #[test]
+    fn a_settings_patch_applies_a_known_key_and_collapses_the_sidebar() {
+        let mut s = fresh();
+        s.settings.show_sidebar = true;
+        s.sidebar_open = true;
+        let keys = s
+            .apply_settings_patch(&serde_json::json!({ "showSidebar": false }))
+            .expect("a known key with the right type");
+        assert_eq!(keys, ["showSidebar"]);
+        assert!(!s.settings.show_sidebar);
+        assert!(!s.sidebar_open, "hiding the sidebar also closes it, as the toggle does");
+        assert!(s.dirty);
+    }
+
+    #[test]
+    fn a_settings_patch_rejects_an_unknown_key() {
+        let mut s = fresh();
+        let err = s
+            .apply_settings_patch(&serde_json::json!({ "noSuchSetting": 1 }))
+            .unwrap_err();
+        assert!(err.contains("unknown setting"), "{err}");
+    }
+
+    #[test]
+    fn a_settings_patch_rejects_a_wrong_type() {
+        let mut s = fresh();
+        let before = s.settings.font_px;
+        let err = s
+            .apply_settings_patch(&serde_json::json!({ "fontPx": "big" }))
+            .unwrap_err();
+        assert!(err.contains("bad settings patch"), "{err}");
+        assert_eq!(s.settings.font_px, before, "nothing applied");
+    }
+
+    #[test]
+    fn a_settings_patch_rejects_an_unknown_log_level() {
+        let mut s = fresh();
+        let before = s.settings.log_level.clone();
+        let err = s
+            .apply_settings_patch(&serde_json::json!({ "logLevel": "loud" }))
+            .unwrap_err();
+        assert!(err.contains("log level"), "{err}");
+        assert_eq!(s.settings.log_level, before);
+        assert!(s
+            .apply_settings_patch(&serde_json::json!({ "logLevel": "debug" }))
+            .is_ok());
+    }
+
+    /// `scrollback` used to be persisted and ignored; now every grid is built at the setting's
+    /// depth and a patch resizes the live ones without a restart.
+    #[tokio::test]
+    async fn a_scrollback_patch_resizes_every_live_pane() {
+        let m = mgr();
+        let mut s = fresh();
+        s.add_pane(&m);
+        s.add_pane(&m);
+        let before = s.settings.scrollback as usize;
+        for p in &s.active_tab().panes {
+            assert_eq!(p.pane.scrollback_capacity(), before, "built at the setting's depth");
+        }
+        s.apply_settings_patch(&serde_json::json!({ "scrollback": 123 })).unwrap();
+        assert_eq!(s.settings.scrollback, 123);
+        for p in &s.active_tab().panes {
+            assert_eq!(p.pane.scrollback_capacity(), 123);
+        }
+        // Beyond alacritty's ceiling is a refused patch, and the live grids are untouched.
+        let err = s
+            .apply_settings_patch(&serde_json::json!({ "scrollback": 1_000_000 }))
+            .unwrap_err();
+        assert!(err.contains("scrollback"), "{err}");
+        assert_eq!(s.settings.scrollback, 123);
+    }
+
+    /// Rules the panel cannot break (a palette index past the end, a loop cadence of a
+    /// year) are still rules for a JSON caller.
+    #[test]
+    fn a_settings_patch_is_checked_by_the_shared_validator() {
+        let mut s = fresh();
+        let err = s
+            .apply_settings_patch(&serde_json::json!({ "restartLoopHours": 100_000 }))
+            .unwrap_err();
+        assert!(err.contains("restartLoopHours"), "{err}");
+        let err = s
+            .apply_settings_patch(&serde_json::json!({ "statusLoopPrompt": "two\nlines" }))
+            .unwrap_err();
+        assert!(err.contains("statusLoopPrompt"), "{err}");
+        assert!(s
+            .apply_settings_patch(&serde_json::json!({ "statusLoopPrompt": "check the panes" }))
+            .is_ok());
+    }
+
+    #[test]
+    fn resume_startup_line_has_both_shapes() {
+        assert_eq!(
+            resume_startup_line(Some("/w/p"), "CLAUDE_CONFIG_DIR='/c' ", "claude", "--resume abc"),
+            "cd '/w/p' && CLAUDE_CONFIG_DIR='/c' claude --resume abc\r"
+        );
+        assert_eq!(
+            resume_startup_line(None, "", "claude", "--resume abc"),
+            "claude --resume abc\r"
+        );
+        assert_eq!(
+            resume_startup_line(Some("/w"), "", "codex", "resume 1234"),
+            "cd '/w' && codex resume 1234\r"
         );
     }
 }

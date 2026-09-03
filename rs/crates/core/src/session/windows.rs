@@ -195,10 +195,8 @@ fn request_takeover(pipe: &str) -> io::Result<()> {
     crate::session::proto::write_frame(&mut conn, &ClientMsg::Takeover)?;
     match transport::read_frame_deadline::<DaemonMsg>(&conn, TAKEOVER_RECV_TIMEOUT)? {
         Some(DaemonMsg::Sessions(sessions)) => {
-            crate::session::daemon_client::dbg(&format!(
-                "takeover: incumbent stood down, {} session(s) stay in the pty-host",
-                sessions.len()
-            ));
+            crate::session::daemon_client::tracing::debug!("takeover: incumbent stood down, {} session(s) stay in the pty-host",
+                sessions.len());
             Ok(())
         }
         _ => Err(io::Error::new(

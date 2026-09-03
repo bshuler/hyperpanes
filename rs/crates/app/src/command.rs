@@ -445,6 +445,11 @@ pub enum Effect {
     /// Relaunch the GUI (scope 1 — the daemon and its panes are left running). Bubbled
     /// rather than done here: the restart is serviced by the app tick, above `State`.
     RestartApp,
+    /// A pane's session was swapped for a fresh one by an in-place restart (`RestartPane` /
+    /// `RefreshEnvPane`): `(old_uid, new_uid)`. Bubbled so the app can re-point the
+    /// control-plane pane-id alias, exactly as the exit-fallback path does — without it a
+    /// menu restart silently gave the pane a new id mid-conversation.
+    Rebound(String, String),
 }
 
 /// The keyboard layout-cycle order (skips `single`, which the menu still offers).
@@ -583,15 +588,23 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
             state.set_fullscreen(on);
             return Effect::SetFullscreen(on);
         }
-        Command::RestartPane(i) => state.restart_pane(i, mgr),
-        Command::RefreshEnvPane(i) => state.refresh_env_pane(i, mgr),
+        Command::RestartPane(i) => {
+            if let Some((old, new)) = state.restart_pane(i, mgr) {
+                return Effect::Rebound(old, new);
+            }
+        }
+        Command::RefreshEnvPane(i) => {
+            if let Some((old, new)) = state.refresh_env_pane(i, mgr) {
+                return Effect::Rebound(old, new);
+            }
+        }
         Command::RevealPaneCwd(i) => {
             // Open the pane's live cwd (reported by shell integration) in the OS file explorer.
             // This used to branch `explorer` / `xdg-open` inline, which meant it did nothing
             // at all on macOS (no `xdg-open` there); `core::open` owns the per-OS launch now.
             if let Some(cwd) = state.active_tab().panes.get(i).and_then(|p| p.cwd.clone()) {
                 if let Err(e) = hyperpanes_core::open::reveal_path(std::path::Path::new(&cwd)) {
-                    crate::dbg_log(&format!("RevealPaneCwd {cwd}: {e}"));
+                    tracing::debug!("RevealPaneCwd {cwd}: {e}");
                 }
             }
         }
@@ -599,12 +612,12 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
             // The routing itself lives in `State::open_link` (it may mount an overlay, so it
             // needs `&mut State`); all that's left here is saying why a link went nowhere.
             if let Err(e) = state.open_link(&url) {
-                crate::dbg_log(&format!("OpenLink: {e}"));
+                tracing::debug!("OpenLink: {e}");
             }
         }
         Command::PickBrowser(i) => {
             if let Err(e) = state.pick_browser(i) {
-                crate::dbg_log(&format!("PickBrowser {i}: {e}"));
+                tracing::debug!("PickBrowser {i}: {e}");
             }
         }
         Command::OpenFileBrowser(i) => {
@@ -773,7 +786,7 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
             // actually runs. Falling back to the registry's bare bin name lets PATH decide,
             // which is right when the override was cleared but the tool is still installed.
             let Some(def) = hyperpanes_core::tools::registry::by_id(&tool) else {
-                crate::dbg_log(&format!("OpenPathWith: unknown tool {tool}"));
+                tracing::debug!("OpenPathWith: unknown tool {tool}");
                 return Effect::None;
             };
             let bin = hyperpanes_core::tools::detect::resolve(def, &state.settings.tool_paths)
@@ -816,7 +829,7 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         Command::OpenPathInApp { path, app } => {
             if let Err(e) = hyperpanes_core::open::open_path_with(&app, std::path::Path::new(&path))
             {
-                crate::dbg_log(&format!("OpenPathInApp {path} in {app}: {e}"));
+                tracing::debug!("OpenPathInApp {path} in {app}: {e}");
             }
         }
         Command::RunPath(path) => {
@@ -860,7 +873,7 @@ pub fn dispatch(state: &mut State, cmd: Command, mgr: &SessionManager) -> Effect
         }
         Command::RevealPath(path) => {
             if let Err(e) = hyperpanes_core::open::reveal_path(std::path::Path::new(&path)) {
-                crate::dbg_log(&format!("RevealPath {path}: {e}"));
+                tracing::debug!("RevealPath {path}: {e}");
             }
         }
         Command::SearchPane(i) => state.open_search(i),
@@ -1183,5 +1196,66 @@ mod rename_from_menu_tests {
         assert_eq!(st.editing_tab, 0);
         dispatch(&mut st, Command::OpenTabContext(0, 0.0, 0.0), &mgr);
         assert_eq!(st.editing_tab, -1);
+    }
+}
+
+#[cfg(test)]
+mod restart_rebinds_the_control_alias_tests {
+    //! Regression: "Restart" / "Refresh Env" from the pane menu swapped the pane's session
+    //! for a fresh one but threw the `(old, new)` uid pair away, so the control-plane pane-id
+    //! alias kept pointing at the dead session and was pruned — the pane got a NEW id
+    //! mid-conversation. The exit-fallback path rebinds; this one must too.
+    use super::*;
+    use hyperpanes_core::session_manager::SessionManager;
+
+    fn mgr() -> SessionManager {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        SessionManager::new(tx)
+    }
+
+    fn fresh() -> State {
+        State::new(theme::load_font(1.0))
+    }
+
+    #[tokio::test]
+    async fn restart_pane_bubbles_the_uid_swap() {
+        let mgr = mgr();
+        let mut st = fresh();
+        st.add_pane(&mgr);
+        let before = st.active_tab().panes[0].uid.clone();
+
+        match dispatch(&mut st, Command::RestartPane(0), &mgr) {
+            Effect::Rebound(old, new) => {
+                assert_eq!(old, before, "old side of the swap is the pane's previous uid");
+                assert_eq!(new, st.active_tab().panes[0].uid, "new side is what the pane holds now");
+                assert_ne!(old, new);
+            }
+            other => panic!("expected a rebound effect, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_env_bubbles_the_uid_swap() {
+        let mgr = mgr();
+        let mut st = fresh();
+        st.add_pane(&mgr);
+        let before = st.active_tab().panes[0].uid.clone();
+
+        match dispatch(&mut st, Command::RefreshEnvPane(0), &mgr) {
+            Effect::Rebound(old, new) => {
+                assert_eq!(old, before);
+                assert_eq!(new, st.active_tab().panes[0].uid);
+            }
+            other => panic!("expected a rebound effect, got {other:?}"),
+        }
+    }
+
+    /// A stale index (the pane closed between the click and the dispatch) is a quiet no-op.
+    #[test]
+    fn restarting_a_pane_that_is_gone_is_a_no_op() {
+        let mgr = mgr();
+        let mut st = fresh();
+        assert!(matches!(dispatch(&mut st, Command::RestartPane(7), &mgr), Effect::None));
+        assert!(matches!(dispatch(&mut st, Command::RefreshEnvPane(7), &mgr), Effect::None));
     }
 }

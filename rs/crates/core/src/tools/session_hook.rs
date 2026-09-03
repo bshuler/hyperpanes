@@ -349,7 +349,7 @@ pub fn ensure_registered() -> usize {
         let file = tool.settings_file(&home);
         match ensure_in_file(&file, &cmd, tool) {
             Ok(true) => {
-                eprintln!(
+                tracing::info!(
                     "[{}-hook] registered {}/{} in {}",
                     tool.id,
                     tool.events[0],
@@ -359,7 +359,7 @@ pub fn ensure_registered() -> usize {
                 changed += 1;
             }
             Ok(false) => {}
-            Err(e) => eprintln!("[{}-hook] {}: {e}", tool.id, file.display()),
+            Err(e) => tracing::warn!("[{}-hook] {}: {e}", tool.id, file.display()),
         }
     }
     changed

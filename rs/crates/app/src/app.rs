@@ -71,16 +71,13 @@ fn persist_last_session(file: &hyperpanes_core::workspace::model::WorkspaceFile)
     match serde_json::to_string_pretty(file) {
         Ok(json) => {
             if let Err(e) = paths::write_atomic(&paths::last_workspace_json(), json.as_bytes()) {
-                crate::dbg_log(&format!("last-session save failed: {e}"));
+                tracing::debug!("last-session save failed: {e}");
             }
         }
-        Err(e) => crate::dbg_log(&format!("last-session serialize failed: {e}")),
+        Err(e) => tracing::debug!("last-session serialize failed: {e}"),
     }
 }
 
-/// Absolute path to `systemd-run` if this is a systemd host, else `None`. Used to launch
-/// the self-restart relauncher in its OWN cgroup so our scope's teardown can't kill it.
-#[cfg(unix)]
 /// The shell command that brings the GUI back after we exit.
 ///
 /// The brief sleep lets the old single-instance socket be released before the new GUI binds
@@ -116,6 +113,9 @@ fn relaunch_command() -> Option<String> {
     Some(format!("sleep 2; exec '{}'", exe.display()))
 }
 
+/// Absolute path to `systemd-run` if this is a systemd host, else `None`. Used to launch
+/// the self-restart relauncher in its OWN cgroup so our scope's teardown can't kill it.
+#[cfg(unix)]
 fn which_systemd_run() -> Option<std::path::PathBuf> {
     for dir in ["/usr/bin", "/bin", "/usr/local/bin"] {
         let p = std::path::Path::new(dir).join("systemd-run");
@@ -276,6 +276,8 @@ pub struct App {
     last_autosave_json: RefCell<String>,
     /// Throttle for the queued-prompt delivery tick (claude-resume speak-first).
     last_prompt_delivery: Cell<Option<std::time::Instant>>,
+    /// The Hyperpane status / restart-all-agents schedules (see `crate::loops`).
+    loops: crate::loops::Loops,
     /// Throttle for the foreground-process sniff (D5): when the panes' foreground programs
     /// were last read. On the daemon backend the read is a shadow-map lookup, but the
     /// in-process backend does two syscalls per pane, so it never rides the 8 ms pump.
@@ -331,6 +333,7 @@ impl App {
             last_autosave: Cell::new(None),
             last_autosave_json: RefCell::new(String::new()),
             last_prompt_delivery: Cell::new(None),
+            loops: crate::loops::Loops::new(),
             last_foreground_sniff: Cell::new(None),
             last_session_adopt: Cell::new(None),
         })
@@ -750,19 +753,187 @@ impl App {
         }
     }
 
+    /// The two Hyperpane scheduler loops (see [`crate::loops`]): ask the persisted schedule
+    /// which are due at the configured intervals, and do their work. A throttled clock
+    /// compare in the common case.
+    fn service_loops(&self, windows: &[Rc<Window>]) {
+        let Some(first) = windows.first() else {
+            return;
+        };
+        let (status_secs, restart_secs, prompt) = {
+            let st = first.state.borrow();
+            (
+                u64::from(st.settings.status_loop_minutes) * 60,
+                u64::from(st.settings.restart_loop_hours) * 3600,
+                st.settings.status_loop_prompt.clone(),
+            )
+        };
+        for kind in self.loops.poll(status_secs, restart_secs) {
+            match kind {
+                crate::loops::LoopKind::Status => {
+                    // The Hyperpane tab is unique across windows; prompt wherever it lives.
+                    match windows
+                        .iter()
+                        .find(|w| w.state.borrow().hyperpane_pane_uid().is_some())
+                    {
+                        Some(w) => self.fire_status_loop(w, &prompt),
+                        None => tracing::warn!("status loop: no Hyperpane pane to prompt"),
+                    }
+                }
+                crate::loops::LoopKind::Restart => {
+                    for w in windows {
+                        self.fire_restart_loop(w);
+                    }
+                }
+            }
+        }
+    }
+
+    /// The status loop: put the status prompt to the Hyperpane pane's agent. Through the
+    /// resume queue when the pane's claude has written its session marker — the queue's
+    /// delivery pass already waits out option forms and paces the submitting Enter — and
+    /// typed straight into the pane otherwise (the same cadence), unless a form is up, in
+    /// which case this round is skipped and logged rather than swallowed by the form.
+    fn fire_status_loop(&self, w: &Window, prompt: &str) {
+        let prompt = if prompt.trim().is_empty() {
+            crate::loops::DEFAULT_STATUS_PROMPT
+        } else {
+            prompt
+        };
+        let Some(uid) = w.state.borrow().hyperpane_pane_uid() else {
+            tracing::warn!("status loop: no Hyperpane pane to prompt");
+            return;
+        };
+        let pane_id = self
+            .control
+            .pane_id_for_uid(&uid)
+            .unwrap_or_else(|| uid.clone());
+        if let Some(s) = hyperpanes_core::claude_panes::read_pane_session(&pane_id) {
+            match hyperpanes_core::resume_queue::enqueue(&s.session_id, prompt) {
+                Ok(()) => tracing::info!(uid = %uid, session = %s.session_id, "status loop: prompt queued for the Hyperpane agent"),
+                Err(e) => tracing::warn!(uid = %uid, error = %e, "status loop: prompt not queued"),
+            }
+            return;
+        }
+        if !self.mgr.has(&uid) {
+            tracing::warn!(uid = %uid, "status loop: Hyperpane pane has no live session");
+            return;
+        }
+        if self
+            .mgr
+            .render_screen(&uid)
+            .as_deref()
+            .is_some_and(screen_shows_option_form)
+        {
+            tracing::warn!(uid = %uid, "status loop: Hyperpane pane is showing a form; this round is skipped");
+            return;
+        }
+        tracing::info!(uid = %uid, "status loop: typing the prompt into the Hyperpane pane");
+        let mgr = self.mgr.clone();
+        let text = prompt.to_string();
+        std::thread::spawn(move || {
+            let _ = mgr.write(&uid, &text);
+            std::thread::sleep(Duration::from_millis(250));
+            let _ = mgr.write(&uid, "\r");
+            std::thread::sleep(Duration::from_millis(600));
+            let _ = mgr.write(&uid, "\r");
+        });
+    }
+
+    /// The restart loop: respawn every monitored agent pane — each tool pane outside the
+    /// system tab — into the same conversation. Each restart mints a new session uid, so the
+    /// control plane's stable pane id follows it, exactly as after an exit-and-respawn.
+    fn fire_restart_loop(&self, w: &Window) {
+        let targets = w.state.borrow().monitored_panes();
+        if targets.is_empty() {
+            tracing::info!(window = w.id, "restart loop: no monitored agent panes");
+            return;
+        }
+        tracing::info!(window = w.id, count = targets.len(), "restart loop: restarting the monitored agents");
+        for (ti, pi, uid, tool) in targets {
+            let pane_id = self
+                .control
+                .pane_id_for_uid(&uid)
+                .unwrap_or_else(|| uid.clone());
+            let marker = (tool == "claude")
+                .then(|| hyperpanes_core::claude_panes::read_pane_session(&pane_id))
+                .flatten();
+            let rebound = w
+                .state
+                .borrow_mut()
+                .restart_monitored_pane(ti, pi, &self.mgr, marker.as_ref());
+            match rebound {
+                Some((old, new)) => {
+                    self.ai.send(crate::ai::AiMsg::Exit { uid: old.clone() });
+                    self.ai_feed.borrow_mut().remove(&old);
+                    self.openurl_carry.borrow_mut().remove(&old);
+                    self.control.rebind_uid(&old, &new);
+                    tracing::info!(tool = %tool, old = %old, new = %new, "restart loop: agent pane restarted");
+                }
+                None => tracing::warn!(tool = %tool, uid = %uid, "restart loop: pane not restarted"),
+            }
+        }
+    }
+
     /// Execute a pending `restartApp` control command (flag set by the route; see
     /// `Shared::restart_app`): flush a final snapshot, spawn a detached relauncher of our
     /// own binary, optionally shut the session daemon down (scope "full" — every pane dies
     /// and the restore path resurrects the workspace), then quit the event loop.
+    /// The "last session" snapshot of `wins`: one [`WindowSpec`] per window that has any
+    /// content, the window holding the Hyperpane tab FIRST, with the top-level
+    /// `name`/`groups`/`active` mirroring that first window. `None` when no window has a
+    /// group (a transient mid-close state that must never clobber a good save).
+    ///
+    /// The mirror matters because `windows` is only honoured by loaders that walk it: the
+    /// launch restore (`PendingSeed::Workspace` → `State::load_workspace`) reads the first
+    /// window only, so at least the Hyperpane window comes back from a bare relaunch; the
+    /// second-instance hand-off spawns a window per spec and restores all of them. A single
+    /// window writes no `windows` list, keeping that file byte-identical to before.
+    fn session_snapshot(
+        &self,
+        wins: &[Rc<Window>],
+    ) -> Option<hyperpanes_core::workspace::model::WorkspaceFile> {
+        use hyperpanes_core::workspace::model::{WindowSpec, WorkspaceFile};
+        let mut files: Vec<(bool, WorkspaceFile)> = Vec::with_capacity(wins.len());
+        for w in wins {
+            let st = w.state.borrow();
+            let mut f = st.to_session_file();
+            let holds_system = st.tabs.iter().any(|t| t.system);
+            drop(st);
+            if f.groups.as_deref().map_or(true, |g| g.is_empty()) {
+                continue;
+            }
+            self.embed_claude_sessions(&mut f);
+            files.push((holds_system, f));
+        }
+        // Stable: among the rest, window order is preserved.
+        files.sort_by_key(|(holds_system, _)| !*holds_system);
+        let mut files: Vec<WorkspaceFile> = files.into_iter().map(|(_, f)| f).collect();
+        if files.len() <= 1 {
+            return files.pop();
+        }
+        let specs: Vec<WindowSpec> = files
+            .iter()
+            .map(|f| WindowSpec {
+                title: f.name.clone(),
+                active: f.active,
+                bounds: None,
+                groups: f.groups.clone().unwrap_or_default(),
+            })
+            .collect();
+        let mut first = files.swap_remove(0);
+        first.windows = Some(specs);
+        Some(first)
+    }
+
     fn service_restart_request(&self) {
         let scope = self.control.take_restart_request();
         if scope == 0 {
             return;
         }
         // Final snapshot NOW — don't rely on the last autosave tick being fresh.
-        if let Some(w) = self.windows.borrow().first() {
-            let mut f = w.state.borrow().to_session_file();
-            self.embed_claude_sessions(&mut f);
+        let wins: Vec<Rc<Window>> = self.windows.borrow().clone();
+        if let Some(f) = self.session_snapshot(&wins) {
             persist_last_session(&f);
         }
         // Detached relauncher. It must outlive us AND escape our cgroup: `setsid` alone
@@ -834,18 +1005,12 @@ impl App {
                 return;
             }
         }
-        let file = match self.windows.borrow().first() {
-            Some(w) => {
-                let mut f = w.state.borrow().to_session_file();
-                self.embed_claude_sessions(&mut f);
-                f
-            }
-            None => return,
-        };
-        // Never clobber a good save with a transient empty snapshot (e.g. mid window-close).
-        if file.groups.as_deref().map_or(true, |g| g.is_empty()) {
+        // `session_snapshot` is `None` when no window has content — never clobber a good
+        // save with a transient empty snapshot (e.g. mid window-close).
+        let wins: Vec<Rc<Window>> = self.windows.borrow().clone();
+        let Some(file) = self.session_snapshot(&wins) else {
             return;
-        }
+        };
         let json = match serde_json::to_string(&file) {
             Ok(j) => j,
             Err(_) => return,
@@ -915,17 +1080,15 @@ impl App {
         crate::perf::mark("spawn_window: seeding first pane");
         self.apply_seed(&mut state, seed);
         crate::perf::mark("spawn_window: first pane seeded (pty spawn queued)");
-        crate::dbg_log(&format!(
-            "spawn_window[{id}]: seeded tabs={} active={} panes={:?}",
+        tracing::debug!("spawn_window[{id}]: seeded tabs={} active={} panes={:?}",
             state.tabs.len(),
             state.active,
-            state.tabs.iter().map(|t| t.panes.len()).collect::<Vec<_>>()
-        ));
+            state.tabs.iter().map(|t| t.panes.len()).collect::<Vec<_>>());
 
         let aw = match AppWindow::new() {
             Ok(a) => a,
             Err(e) => {
-                eprintln!("[hyperpanes] failed to create window: {e}");
+                tracing::error!("failed to create window: {e}");
                 return;
             }
         };
@@ -1011,16 +1174,23 @@ impl App {
         // Any command is user activity — snap the pump back to the fast cadence (#3) so the
         // result renders immediately even if we'd dropped to the idle cadence.
         self.wake();
-        crate::dbg_log(&format!("cmd[{}] {cmd:?}", win.id));
+        tracing::debug!("cmd[{}] {cmd:?}", win.id);
         let eff = {
             let mut st = win.state.borrow_mut();
             dispatch(&mut st, cmd, &self.mgr)
         };
-        crate::dbg_log(&format!("  -> effect {eff:?}"));
+        tracing::debug!("  -> effect {eff:?}");
         match eff {
             Effect::None => {}
             Effect::Quit => win.closing.set(true),
             Effect::SetFullscreen(on) => self.set_fullscreen(win, on),
+            Effect::Rebound(old, new) => {
+                // Same contract as the exit fallback: the restarted pane is the SAME pane to
+                // anyone driving this process from outside, so its control pane-id follows
+                // the new session uid.
+                tracing::info!(%old, %new, "pane restarted in place; control alias rebound");
+                self.control.rebind_uid(&old, &new);
+            }
             Effect::NewWindow => self.spawn_window(PendingSeed::EmptyTab),
             Effect::MoveToNewWindow { det, source_alive } => {
                 self.spawn_window(PendingSeed::Adopt(det));
@@ -1253,6 +1423,23 @@ impl App {
             crate::leftpanel::publish_window_claims(&self.mgr, claims);
         }
 
+        // 2g. Hyperpane invariants. (a) Creation failed on every seed so far (its directory
+        //     could not be prepared): retry on the first window — `State` rate-limits the
+        //     filesystem attempt, so this is a cheap latch check per tick. (b) A pane path
+        //     without a `SessionManager` (drag-out, `detach_uid`) can leave the system tab
+        //     empty; `take_pane_inner` never drops it, and this refills it.
+        if !self.hyperpane_done.get() {
+            if let Some(w) = windows.first() {
+                if matches!(*w.seed.borrow(), PendingSeed::Done) {
+                    let mut st = w.state.borrow_mut();
+                    self.ensure_hyperpane_tab(&mut st);
+                }
+            }
+        }
+        for w in &windows {
+            w.state.borrow_mut().reseed_system_tab(&self.mgr);
+        }
+
         // 3. Render each window from its own state. Aggregate per-window activity so the
         //    adaptive cadence (#3) can tell a busy frame (streaming output / animation) from a
         //    truly idle one (a bare cursor blink does NOT count as work — see `paneview::pump`).
@@ -1307,13 +1494,29 @@ impl App {
         //    the last session (tabs, layout, focus, per-pane zoom — #14) via core's
         //    `resolve_launch_workspace` fallback.
         if windows.iter().any(|w| w.closing.get()) {
-            let mut survivors = Vec::new();
-            let mut last_session = None;
-            for w in self.windows.borrow().iter() {
-                if w.closing.get() {
-                    let mut f = w.state.borrow().to_session_file();
-                    self.embed_claude_sessions(&mut f);
-                    last_session = Some(f);
+            // Re-read rather than reuse `windows`: an effect above may have spawned one.
+            let all: Vec<Rc<Window>> = self.windows.borrow().clone();
+            let (closing, survivors): (Vec<Rc<Window>>, Vec<Rc<Window>>) =
+                all.into_iter().partition(|w| w.closing.get());
+            // The Hyperpane tab outlives its window: before the closing window's sessions
+            // die, lift the tab out and re-home it at index 0 of the first survivor. With
+            // no survivor the process is quitting and the snapshot below carries it.
+            if let Some(home) = survivors.first() {
+                for w in &closing {
+                    let taken = w.state.borrow_mut().take_system_tab();
+                    if let Some(det) = taken {
+                        tracing::info!(from = w.id, to = home.id, "re-homing the Hyperpane tab");
+                        home.state.borrow_mut().adopt_system_tab(&self.mgr, det);
+                    }
+                }
+            }
+            let last_session = if survivors.is_empty() {
+                self.session_snapshot(&closing)
+            } else {
+                None
+            };
+            for w in &closing {
+                {
                     // Tell the AI engine to forget this window's panes, and drop its context sig.
                     self.ai.send(crate::ai::AiMsg::DropWindow {
                         window_id: w.id as i64,
@@ -1328,8 +1531,6 @@ impl App {
                     // session list click would hunt for a pane in a window that is gone.
                     crate::leftpanel::forget_window(w.id);
                     let _ = w.app.window().hide();
-                } else {
-                    survivors.push(w.clone());
                 }
             }
             *self.windows.borrow_mut() = survivors;
@@ -1356,6 +1557,8 @@ impl App {
         self.adopt_tool_sessions(&windows);
         self.deliver_pending_goals();
         self.service_restart_request();
+        // 5e. The Hyperpane scheduler loops: a throttled clock compare unless one is due.
+        self.service_loops(&windows);
 
         // ---- adaptive idle cadence (#3) ----
         // A tick "did work" if it drained any session output, animated/rendered real pane
@@ -1446,7 +1649,7 @@ impl App {
                 for url in urls {
                     let mut st = w.state.borrow_mut();
                     if let Err(e) = st.open_link(&url) {
-                        crate::dbg_log(&format!("openurl from {uid}: {e}"));
+                        tracing::debug!("openurl from {uid}: {e}");
                     }
                 }
                 fed
@@ -1470,10 +1673,8 @@ impl App {
                     if let Some((old, new)) = &out.rebound {
                         self.control.rebind_uid(old, new);
                     }
-                    crate::dbg_log(&format!(
-                        "exit[{}] uid={uid} code={code} alive={} rebound={:?}",
-                        w.id, out.alive, out.rebound
-                    ));
+                    tracing::debug!("exit[{}] uid={uid} code={code} alive={} rebound={:?}",
+                        w.id, out.alive, out.rebound);
                     if !out.alive {
                         w.closing.set(true);
                     }
@@ -1961,15 +2162,13 @@ impl App {
     fn apply_handoff(self: &Rc<Self>, msg: hyperpanes_core::single_instance::HandoffMessage) {
         use hyperpanes_core::cli::parse::{AttachAs, LaunchRouting};
         use hyperpanes_core::workspace::model::WorkspaceFile;
-        crate::dbg_log(&format!("second-instance handoff argv={:?}", msg.argv));
+        tracing::debug!("second-instance handoff argv={:?}", msg.argv);
         self.wake();
         let si =
             hyperpanes_core::cli::routing::resolve_second_instance_windows(&msg.argv, &msg.cwd);
-        crate::dbg_log(&format!(
-            "handoff resolved: windows={} routing={:?}",
+        tracing::debug!("handoff resolved: windows={} routing={:?}",
             si.windows.len(),
-            si.routing
-        ));
+            si.routing);
         if si.windows.is_empty() {
             return; // a bare relaunch just focuses the primary (nothing to open)
         }
@@ -2021,8 +2220,7 @@ impl App {
         // the echo renders without the idle-cadence delay (#3). Commands go through
         // `run_command` (which also wakes); this covers raw typing routed straight to the pty.
         self.wake();
-        crate::dbg_log(&format!(
-            "key raw text={:x?} ctrl={} alt={} shift={} meta={}",
+        tracing::debug!("key raw text={:x?} ctrl={} alt={} shift={} meta={}",
             msg.text.chars().map(|c| c as u32).collect::<Vec<_>>(),
             msg.control,
             msg.alt,
@@ -2030,17 +2228,14 @@ impl App {
             // `meta` is the physical Control key on macOS (see `crate::pty_ctrl`), so without
             // it this line cannot tell a Ctrl+C apart from a plain "c" on the one platform
             // where the two modifiers are swapped.
-            msg.meta
-        ));
+            msg.meta);
         // Ctrl+Shift is fully app-reserved: run the mapped command and ALWAYS swallow.
         if msg.control && msg.shift {
             let cmd = crate::route_chord(&win.state.borrow().keymap, &msg);
-            crate::dbg_log(&format!(
-                "key ctrl+shift text={:x?} alt={} -> {:?}",
+            tracing::debug!("key ctrl+shift text={:x?} alt={} -> {:?}",
                 msg.text.chars().map(|c| c as u32).collect::<Vec<_>>(),
                 msg.alt,
-                cmd
-            ));
+                cmd);
             if let Some(cmd) = cmd {
                 self.run_command(win, cmd);
             }
@@ -2151,14 +2346,12 @@ impl App {
             let clears = keys::clears_selection(&msg.text, ctrl, msg.alt);
             let mut st = win.state.borrow_mut();
             if let Some(ps) = st.active_tab_mut().panes.get_mut(idx) {
-                crate::dbg_log(&format!(
-                    "key pane={} text={:x?} clears={} drag={} on_cursor_row={}",
+                tracing::debug!("key pane={} text={:x?} clears={} drag={} on_cursor_row={}",
                     idx,
                     msg.text.chars().map(|c| c as u32).collect::<Vec<_>>(),
                     clears,
                     ps.pane.selection_is_drag(),
-                    ps.pane.selection_on_cursor_row()
-                ));
+                    ps.pane.selection_on_cursor_row());
                 if clears && ps.pane.selection_is_drag() {
                     // Prompt-line TYPE-OVER: a printable key over a single-row selection on the
                     // cursor's own row first ERASES the selected text (clamp-safe arrow/
@@ -2215,10 +2408,8 @@ impl App {
             let Some((pos, down)) = drag::global_pointer().poll() else {
                 return;
             };
-            crate::dbg_log(&format!(
-                "pane-grab win={} idx={} uid={}",
-                win.id, pane_idx, uid
-            ));
+            tracing::debug!("pane-grab win={} idx={} uid={}",
+                win.id, pane_idx, uid);
             let mut ds = DragState::new(win.id, DragKind::Pane { uid }, (pos.x, pos.y));
             // The button is down right now (this fires on pointer-down); arm immediately so
             // a click faster than one tick still resolves its release.
@@ -2239,7 +2430,7 @@ impl App {
         let Some((pos, down)) = drag::global_pointer().poll() else {
             return;
         };
-        crate::dbg_log(&format!("tab-grab win={} idx={}", win.id, tab_idx));
+        tracing::debug!("tab-grab win={} idx={}", win.id, tab_idx);
         // Select the grabbed tab so it's visually distinct (active chip) while dragging.
         win.state.borrow_mut().switch_tab(tab_idx);
         let mut ds = DragState::new(win.id, DragKind::Tab { index: tab_idx }, (pos.x, pos.y));
@@ -2345,14 +2536,12 @@ impl App {
             let d = self.drag.borrow_mut().take().unwrap();
             if d.active {
                 let hover = self.compute_hover(windows, cursor);
-                crate::dbg_log(&format!(
-                    "drag release: source_win={} pane={} hover{{win={:?} strip={} pane_idx={:?} slot={} tab_slot={}}}",
+                tracing::debug!("drag release: source_win={} pane={} hover{{win={:?} strip={} pane_idx={:?} slot={} tab_slot={}}}",
                     d.source_win, d.is_pane(), hover.win, hover.over_strip, hover.pane_idx,
-                    hover.slot_index, hover.tab_slot
-                ));
+                    hover.slot_index, hover.tab_slot);
                 self.apply_drop(windows, &d, &hover, cursor);
             } else {
-                crate::dbg_log("drag release: was a plain click (never crossed threshold)");
+                tracing::debug!("drag release: was a plain click (never crossed threshold)");
             }
             if let Some(g) = self.ghost.borrow().as_ref() {
                 g.hide();
@@ -3259,14 +3448,14 @@ impl App {
             let app = app.clone();
             let id = win.id;
             win.app.on_pane_paste(move |i| {
-                crate::dbg_log(&format!("on_pane_paste i={i}"));
+                tracing::debug!("on_pane_paste i={i}");
                 if let Some(w) = app.window_by_id(id) {
                     // RefCell rule: the borrow ends at the statement, before run_command.
                     let copied = w
                         .state
                         .borrow_mut()
                         .copy_selection_on_right_click(i as usize);
-                    crate::dbg_log(&format!("on_pane_paste i={i} copied={copied}"));
+                    tracing::debug!("on_pane_paste i={i} copied={copied}");
                     if !copied {
                         app.run_command(&w, Command::PastePane(i as usize));
                     }
@@ -3879,7 +4068,7 @@ impl App {
                         .and_then(hyperpanes_core::tools::claude_desktop::deep_link)
                     {
                         if let Err(e) = hyperpanes_core::open::open_url(&link) {
-                            eprintln!("[hyperpanes] could not raise Claude Desktop: {e}");
+                            tracing::warn!("could not raise Claude Desktop: {e}");
                         }
                         return;
                     }
@@ -4212,11 +4401,11 @@ impl App {
                 // trash in the UI is not a guarantee — re-check here before touching the
                 // filesystem.
                 if row.is_main {
-                    crate::dbg_log("worktree remove refused: target is the main checkout");
+                    tracing::debug!("worktree remove refused: target is the main checkout");
                     return;
                 }
                 if row.locked {
-                    crate::dbg_log("worktree remove refused: target worktree is locked");
+                    tracing::debug!("worktree remove refused: target worktree is locked");
                     return;
                 }
                 let wt_path = row.path;
@@ -4227,7 +4416,7 @@ impl App {
                         // swallowing it to a debug log — the popup closed, so the user believes
                         // it worked. Toast it on the focused pane and invalidate so the next
                         // projection re-enumerates reality (the worktree is still there).
-                        crate::dbg_log(&format!("worktree remove failed for {wt_path}: {e}"));
+                        tracing::debug!("worktree remove failed for {wt_path}: {e}");
                         crate::sidebar::invalidate(&repo);
                         let mut st = w.state.borrow_mut();
                         let f = st.active_tab().focused;

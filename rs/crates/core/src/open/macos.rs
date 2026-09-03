@@ -372,7 +372,7 @@ fn index() -> &'static [AppTypes] {
             .filter_map(|p| read_app(p))
             .filter(|a| seen.insert(a.bundle_id.clone()))
             .collect();
-        apps.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        apps.sort_by_cached_key(|a| a.name.to_lowercase());
         apps
     })
 }

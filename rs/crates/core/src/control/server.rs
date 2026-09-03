@@ -218,8 +218,8 @@ impl Shared {
                 // claims belong to dead workers — requeue them (exhausted ones dead-letter).
                 let recovered = wq.recover_in_flight(now_ms());
                 if !recovered.is_empty() {
-                    eprintln!(
-                        "[work] durable queue opened ({}); recovered {} in-flight task(s)",
+                    tracing::info!(
+                        "durable queue opened ({}); recovered {} in-flight task(s)",
                         path.display(),
                         recovered.len()
                     );
@@ -227,8 +227,8 @@ impl Shared {
                 *self.work.lock().unwrap() = wq;
             }
             Err(e) => {
-                eprintln!(
-                    "[work] could not open durable queue at {} ({e}); staying in-memory",
+                tracing::warn!(
+                    "could not open durable queue at {} ({e}); staying in-memory",
                     path.display()
                 );
             }
@@ -456,7 +456,7 @@ pub async fn run_server(shared: Arc<Shared>) -> io::Result<()> {
         Err(e) if addr != "127.0.0.1" || req_port != 0 => {
             // A configured remote bind that fails (port taken, iface gone) must not brick
             // the LOCAL control API — fall back to the frozen loopback/ephemeral default.
-            eprintln!("[control] bind {addr}:{req_port} failed ({e}); falling back to 127.0.0.1:0");
+            tracing::warn!("bind {addr}:{req_port} failed ({e}); falling back to 127.0.0.1:0");
             shared.set_bind("127.0.0.1", 0);
             tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?
         }
@@ -464,6 +464,7 @@ pub async fn run_server(shared: Arc<Shared>) -> io::Result<()> {
     };
     let port = listener.local_addr()?.port();
     shared.port.store(port, Ordering::SeqCst);
+    tracing::info!(address = %addr, port, "control server listening");
 
     shared
         .tokens
@@ -568,6 +569,11 @@ fn reconcile_exits(shared: &Arc<Shared>) {
         let Some((pane_id, coords)) = marked else {
             continue;
         };
+        tracing::warn!(
+            pane_id = %pane_id,
+            uid = %pr.session_uid,
+            "pane demoted to exited: its session vanished without an exit event"
+        );
         shared.events.broadcast_for_pane(
             Some(&coords),
             &ControlEvent::Exit {
@@ -646,8 +652,8 @@ pub async fn run_reaper_ticker(shared: Arc<Shared>) {
         interval.tick().await;
         let reaped = shared.work.lock().unwrap().reap_expired(now_ms());
         if !reaped.is_empty() {
-            eprintln!(
-                "[work] reaper requeued/dead-lettered {} task(s)",
+            tracing::info!(
+                "reaper requeued/dead-lettered {} task(s)",
                 reaped.len()
             );
         }
@@ -706,7 +712,7 @@ pub fn process_session_event(shared: &Arc<Shared>, ev: SessionEvent) {
                     shared.events.broadcast_for_pane(
                         Some(&coords),
                         &ControlEvent::Exit {
-                            session_uid: uid,
+                            session_uid: uid.clone(),
                             pane_id: Some(pane_id.clone()),
                             code,
                         },
@@ -720,7 +726,7 @@ pub fn process_session_event(shared: &Arc<Shared>, ev: SessionEvent) {
                     );
                     notify_state(shared);
                     // Phase-5 supervisor hook (no-op unless the pane opted in).
-                    supervise_exit(shared, &pane_id, code);
+                    supervise_exit(shared, &pane_id, &uid, code);
                 }
                 None => {
                     if shared.events.has_clients() {
@@ -742,14 +748,20 @@ pub fn process_session_event(shared: &Arc<Shared>, ev: SessionEvent) {
 /// Phase-5: apply the supervisor's decision for one exit. Emits a `supervisor` frame for
 /// every actionable outcome and, for a [`Decision::Restart`], schedules a delayed respawn
 /// via [`Shared::spawn_task`] (no lock held across the delay — schedule and return).
-fn supervise_exit(shared: &Arc<Shared>, pane_id: &str, code: i32) {
+///
+/// `exited_uid` is the session that just died. The scheduled restart carries it so that a
+/// pane the user restarted by hand during the backoff (a different, live uid by then) is
+/// left alone rather than respawned on top of — see [`do_restart`].
+fn supervise_exit(shared: &Arc<Shared>, pane_id: &str, exited_uid: &str, code: i32) {
     let decision = shared.supervisor.lock().unwrap().on_exit(pane_id, code);
     match decision {
         Decision::None => {}
         Decision::Completed { code } => {
+            tracing::info!(pane_id, code, "supervised pane completed");
             broadcast_supervisor(shared, pane_id, "completed", None, None, None, Some(code));
         }
         Decision::Exhausted { attempt, max, code } => {
+            tracing::warn!(pane_id, attempt, max, code, "supervised pane exhausted its restarts");
             broadcast_supervisor(
                 shared,
                 pane_id,
@@ -775,11 +787,13 @@ fn supervise_exit(shared: &Arc<Shared>, pane_id: &str, code: i32) {
                 Some(delay_ms),
                 Some(code),
             );
+            tracing::info!(pane_id, attempt, max, delay_ms, code, "supervised pane restart scheduled");
             let shared = Arc::clone(shared);
             let pane_id = pane_id.to_string();
+            let exited_uid = exited_uid.to_string();
             shared.clone().spawn_task(async move {
                 tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                do_restart(&shared, &pane_id, attempt, max, code);
+                do_restart(&shared, &pane_id, &exited_uid, attempt, max, code);
             });
         }
     }
@@ -787,16 +801,28 @@ fn supervise_exit(shared: &Arc<Shared>, pane_id: &str, code: i32) {
 
 /// Execute a scheduled restart: re-read the pane's spawn recipe, spawn a fresh session,
 /// and swap the read-model's uid. Aborts if the pane vanished during the backoff window
-/// (closed / manually restarted). Emits `restarted` on success or `crashed` on a respawn
-/// error. STUB: this respawns from the read-model's recorded recipe (shell/args/command/
+/// (closed), or if it is no longer the pane that died: a pane already `Running`, or one
+/// whose `session_uid` is not `exited_uid` any more, was restarted by hand in the meantime
+/// and respawning it would orphan that live session. Emits `restarted` on success or
+/// `crashed` on a respawn error. STUB: this respawns from the read-model's recorded recipe (shell/args/command/
 /// cwd) rather than a full spawn ledger, so it does not yet re-attach `env`/`integration`
 /// (the same lossy set `restartPane` had pre-supervisor). A later pass adds the ledger.
-fn do_restart(shared: &Arc<Shared>, pane_id: &str, attempt: u32, max: u32, code: i32) {
-    // Snapshot the spawn recipe under the model lock; abort if the pane is gone.
+fn do_restart(
+    shared: &Arc<Shared>,
+    pane_id: &str,
+    exited_uid: &str,
+    attempt: u32,
+    max: u32,
+    code: i32,
+) {
+    // Snapshot the spawn recipe under the model lock; abort if the pane is gone or is no
+    // longer the dead one we were scheduled for.
     let recipe = {
         let m = shared.model.lock().unwrap();
         m.pane(pane_id).map(|p| {
             (
+                p.status,
+                p.session_uid.clone(),
                 p.shell.clone(),
                 p.args.clone(),
                 p.command.clone(),
@@ -804,9 +830,20 @@ fn do_restart(shared: &Arc<Shared>, pane_id: &str, attempt: u32, max: u32, code:
             )
         })
     };
-    let Some((shell, args, command, cwd)) = recipe else {
-        return; // pane closed during backoff — drop the restart
+    let Some((status, current_uid, shell, args, command, cwd)) = recipe else {
+        tracing::info!(pane_id, "supervised restart dropped: pane closed during backoff");
+        return;
     };
+    if status == PaneStatus::Running || current_uid != exited_uid {
+        tracing::warn!(
+            pane_id,
+            exited_uid,
+            current_uid = %current_uid,
+            status = ?status,
+            "supervised restart skipped: pane was restarted by hand during backoff"
+        );
+        return;
+    }
     let new_uid = uuid::Uuid::new_v4().to_string();
     let opts = crate::session_manager::SpawnOptions {
         uid: new_uid.clone(),
@@ -825,6 +862,7 @@ fn do_restart(shared: &Arc<Shared>, pane_id: &str, attempt: u32, max: u32, code:
         Ok(()) => {
             shared.model.lock().unwrap().respawn_pane(pane_id, &new_uid);
             let used = shared.supervisor.lock().unwrap().record_restart(pane_id);
+            tracing::info!(pane_id, uid = %new_uid, attempt = used, max, "supervised pane restarted");
             broadcast_supervisor(
                 shared,
                 pane_id,
@@ -836,7 +874,8 @@ fn do_restart(shared: &Arc<Shared>, pane_id: &str, attempt: u32, max: u32, code:
             );
             notify_state(shared);
         }
-        Err(_) => {
+        Err(e) => {
+            tracing::warn!(pane_id, attempt, max, error = %e, "supervised pane respawn failed");
             broadcast_supervisor(
                 shared,
                 pane_id,
@@ -1045,6 +1084,37 @@ mod tests {
             }],
         });
         (shared, "u1".to_string())
+    }
+
+    /// The backoff window is exactly when a user is likely to hit "restart" themselves. A
+    /// scheduled respawn that fires after that would spawn a second shell and swap the pane
+    /// onto it, orphaning the one the user just started.
+    #[test]
+    fn scheduled_restart_is_dropped_when_the_pane_was_restarted_by_hand() {
+        let (shared, uid) = shared_with_pane();
+        shared.model.lock().unwrap().mark_exited(&uid, 1);
+        // The user restarts the pane during the backoff: new uid, running again.
+        shared.model.lock().unwrap().respawn_pane("p1", "u2");
+
+        do_restart(&shared, "p1", &uid, 1, 3, 1);
+
+        let pane = shared.model.lock().unwrap().pane("p1").unwrap().clone();
+        assert_eq!(pane.session_uid, "u2", "the hand-started session must be left alone");
+        assert_eq!(pane.status, PaneStatus::Running);
+        assert_eq!(shared.supervisor.lock().unwrap().retries_used("p1"), 0);
+    }
+
+    /// Same guard from the other side: the pane still carries the dead uid but is Running
+    /// again (a respawn that reused the uid, or a model that has not caught up) — not ours.
+    #[test]
+    fn scheduled_restart_is_dropped_when_the_pane_is_running() {
+        let (shared, uid) = shared_with_pane();
+        // Never exited from the model's point of view.
+        do_restart(&shared, "p1", &uid, 1, 3, 1);
+
+        let pane = shared.model.lock().unwrap().pane("p1").unwrap().clone();
+        assert_eq!(pane.session_uid, uid);
+        assert_eq!(shared.supervisor.lock().unwrap().retries_used("p1"), 0);
     }
 
     #[test]

@@ -908,7 +908,7 @@ impl PaneRenderer for GpuRenderer {
                 img
             }
             Err(_) => {
-                eprintln!("[gpu] wgpu texture import into slint failed; using fallback frame");
+                tracing::warn!("[gpu] wgpu texture import into slint failed; using fallback frame");
                 self.last_image.clone().unwrap_or_default()
             }
         }

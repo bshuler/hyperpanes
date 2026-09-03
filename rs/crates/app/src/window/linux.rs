@@ -143,7 +143,7 @@ pub fn hwnd_of(win: &slint::Window) -> isize {
         Poll::Ready(Ok(w)) => w,
         Poll::Ready(Err(e)) => {
             // Wrong backend / window torn down — permanent for this window, worth a trace.
-            crate::dbg_log(&format!("hwnd_of: winit accessor failed: {e}"));
+            tracing::debug!("hwnd_of: winit accessor failed: {e}");
             return 0;
         }
         Poll::Pending => return 0, // not realized yet; the caller retries next tick
@@ -172,10 +172,8 @@ pub fn hwnd_of(win: &slint::Window) -> isize {
         }
     });
     if let Some(frameless) = fresh {
-        crate::dbg_log(&format!(
-            "hwnd_of: realized raw={raw} wayland={}",
-            WAYLAND.get().copied().unwrap_or(false)
-        ));
+        tracing::debug!("hwnd_of: realized raw={raw} wayland={}",
+            WAYLAND.get().copied().unwrap_or(false));
         // The hook does double duty:
         //  * feed the pointer tracker (the Wayland drag fallback) from this window's
         //    event stream — positions are physical px, window-relative;
@@ -206,7 +204,7 @@ pub fn hwnd_of(win: &slint::Window) -> isize {
                             t.pos = (position.x as i32, position.y as i32);
                             t.inside = true;
                             if t.left_down {
-                                crate::dbg_log(&format!("ptr-move-held pos={:?}", t.pos));
+                                tracing::debug!("ptr-move-held pos={:?}", t.pos);
                             }
                         }
                         WindowEvent::CursorLeft { .. } => {
@@ -222,7 +220,7 @@ pub fn hwnd_of(win: &slint::Window) -> isize {
                             t.raw = raw;
                             t.left_down = *state == ElementState::Pressed;
                             if t.left_down {
-                                crate::dbg_log(&format!("ptr-press raw={raw} pos={:?}", t.pos));
+                                tracing::debug!("ptr-press raw={raw} pos={:?}", t.pos);
                             }
                         }
                         _ => {}
@@ -254,10 +252,10 @@ pub fn make_frameless(raw: isize) {
 /// Must be called from a pointer-down gesture (both backends key the move off the
 /// active button grab) — which is exactly how the top bar wires it.
 pub fn start_drag(raw: isize) {
-    crate::dbg_log(&format!("start_drag raw={raw}"));
+    tracing::debug!("start_drag raw={raw}");
     with_window(raw, |w| {
         if let Err(e) = w.drag_window() {
-            crate::dbg_log(&format!("start_drag: drag_window failed: {e}"));
+            tracing::debug!("start_drag: drag_window failed: {e}");
         }
     });
 }

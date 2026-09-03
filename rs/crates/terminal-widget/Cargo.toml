@@ -43,6 +43,8 @@ etagere = "0.2"
 # Plain-old-data casts for instance/vertex buffers.
 bytemuck = { version = "1", features = ["derive"] }
 anyhow = "1.0.102"
+# Log macros + `#[instrument]`; the subscriber is installed by the host process.
+tracing = "0.1"
 
 # System clipboard for copy-on-select / right-click paste (matches the Electron behavior).
 arboard = "3"
