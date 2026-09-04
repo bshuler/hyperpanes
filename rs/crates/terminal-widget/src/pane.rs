@@ -1442,14 +1442,18 @@ impl TerminalPane {
     /// bytes the controller should write to the pty when the wheel belongs to the **application**
     /// instead of our scrollback:
     ///
-    /// * a **mouse-grabbing app** (DECSET 1000/1002/1003 — vim, htop, Claude Code) → a mouse-wheel
-    ///   report at the pointer cell, so the app scrolls its own view;
+    /// * a **mouse-grabbing app** (DECSET 1000/1002/1003 — vim, htop) → a mouse-wheel report at
+    ///   the pointer cell, so the app scrolls its own view;
     /// * the **alternate screen** with no mouse mode (less, man, a pager) → up/down arrow keys
     ///   (xterm's "alternate scroll"), so the pager scrolls a line at a time.
     ///
-    /// Otherwise it scrolls our own scrollback viewport and returns `None`. This is the fix for
-    /// "can't scroll Claude": in the alt screen there is no scrollback for `scroll_by` to move, so
-    /// the wheel must be forwarded to the app.
+    /// Otherwise it scrolls our own scrollback viewport and returns `None`. Do not read the two
+    /// forwarding cases as covering every full-screen program: an agent CLI that repaints in the
+    /// primary screen without grabbing the mouse takes this last path, and then the wheel can only
+    /// move history the emulator actually has. That in turn needs the pty to be the size of the
+    /// grid, so the program's cursor reaches the last row and pushes lines into scrollback — see
+    /// `flush_pty_resizes` in the app crate, where a silently dropped resize once left such panes
+    /// unscrollable for their whole life.
     #[tracing::instrument(level = "debug", ret, skip(self))]
     pub fn wheel(
         &mut self,

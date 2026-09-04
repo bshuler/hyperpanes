@@ -672,13 +672,32 @@ const PTY_RESIZE_SETTLE: Duration = Duration::from_millis(300);
 /// settled size pending indefinitely on an idle app.
 #[tracing::instrument(level = "debug", skip_all)]
 fn flush_pty_resizes(state: &mut State, mgr: &SessionManager, now: Instant) {
+    flush_pty_resizes_to(state, now, |uid, cols, rows| mgr.resize(uid, cols, rows));
+}
+
+/// [`flush_pty_resizes`] with the session backend abstracted to `deliver`, which answers
+/// whether the resize actually reached a pty. Tests drive the debounce and the retry through
+/// this without spawning real PTYs; production passes `SessionManager::resize`.
+fn flush_pty_resizes_to(
+    state: &mut State,
+    now: Instant,
+    mut deliver: impl FnMut(&str, u16, u16) -> bool,
+) {
     for tab in &mut state.tabs {
         for p in &mut tab.panes {
             if p.applied != p.pty && now.duration_since(p.pty_since) >= PTY_RESIZE_SETTLE {
                 // Degenerate sizes never reach a pty (a pane that has not been laid out yet
                 // sits at (0, 0) — telling the shell that would be a lie, not a resize).
-                if p.applied.0 >= 2 && p.applied.1 >= 1 {
-                    mgr.resize(&p.uid, p.applied.0 as u16, p.applied.1 as u16);
+                // A dropped resize stays pending. `deliver` answers `false` when it went
+                // nowhere — the commonest case being a control-spawned pane laid out before
+                // the daemon has confirmed its session — and recording the delivery anyway
+                // left that pane's pty at its 80x24 spawn size permanently, with a grid the
+                // program never fills, no scrollback, and so a dead mouse wheel. `pty_since`
+                // is already past the settle window, so this retries on the next tick.
+                if p.applied.0 >= 2
+                    && p.applied.1 >= 1
+                    && deliver(&p.uid, p.applied.0 as u16, p.applied.1 as u16)
+                {
                     p.pty = p.applied;
                 }
             }
@@ -2152,8 +2171,7 @@ mod pty_resize_tests {
     #[test]
     fn only_a_settled_grid_size_reaches_the_pty() {
         let mut st = fresh();
-        let m = mgr();
-        st.adopt_pane(&m, det("a"));
+        st.adopt_pane(&mgr(), det("a"));
         let start = Instant::now();
         {
             let p = &mut st.active_tab_mut().panes[0];
@@ -2161,16 +2179,19 @@ mod pty_resize_tests {
             p.applied = (100, 30); // an intermediate layout pass
             p.pty_since = start;
         }
+        let mut sent: Vec<(String, u16, u16)> = Vec::new();
 
         // Still inside the settle window: nothing goes out, however many ticks run.
-        flush_pty_resizes(
+        flush_pty_resizes_to(
             &mut st,
-            &m,
             start + PTY_RESIZE_SETTLE - Duration::from_millis(1),
+            |u, c, r| {
+                sent.push((u.into(), c, r));
+                true
+            },
         );
-        assert_eq!(
-            st.active_tab().panes[0].pty,
-            (47, 18),
+        assert!(
+            sent.is_empty(),
             "an intermediate size must not reach the shell"
         );
 
@@ -2181,21 +2202,79 @@ mod pty_resize_tests {
             p.applied = (47, 18);
             p.pty_since = start + Duration::from_millis(50);
         }
-        flush_pty_resizes(&mut st, &m, start + Duration::from_secs(5));
-        assert_eq!(
-            st.active_tab().panes[0].pty,
-            (47, 18),
+        flush_pty_resizes_to(&mut st, start + Duration::from_secs(5), |u, c, r| {
+            sent.push((u.into(), c, r));
+            true
+        });
+        assert!(
+            sent.is_empty(),
             "settling back on the size the pty already has costs zero SIGWINCH"
         );
 
-        // A real, settled change does go out.
+        // A real, settled change does go out — once.
         {
             let p = &mut st.active_tab_mut().panes[0];
             p.applied = (60, 20);
             p.pty_since = start + Duration::from_secs(5);
         }
-        flush_pty_resizes(&mut st, &m, start + Duration::from_secs(10));
+        flush_pty_resizes_to(&mut st, start + Duration::from_secs(10), |u, c, r| {
+            sent.push((u.into(), c, r));
+            true
+        });
+        assert_eq!(sent, vec![("a".to_string(), 60, 20)]);
         assert_eq!(st.active_tab().panes[0].pty, (60, 20));
+    }
+
+    /// A resize that went nowhere must stay pending and be retried, not be recorded as
+    /// delivered.
+    ///
+    /// This is the mouse-wheel bug. A control-spawned pane is adopted and laid out a tick or
+    /// two after `create`, before the daemon has confirmed the session — and the daemon's
+    /// `Resize` arm silently no-ops on a uid it does not know yet. Committing `p.pty` anyway
+    /// meant the pane never asked again: its pty stayed at the 80x24 spawn size for life, the
+    /// program painted in the top-left corner of a much larger grid, its cursor never reached
+    /// the last row, nothing was ever pushed into scrollback, and the wheel had no history to
+    /// scroll (and no scrollbar to show).
+    #[test]
+    fn a_dropped_resize_is_retried_rather_than_recorded_as_delivered() {
+        let mut st = fresh();
+        st.adopt_pane(&mgr(), det("a"));
+        let start = Instant::now();
+        {
+            let p = &mut st.active_tab_mut().panes[0];
+            p.pty = (80, 24); // the spawn default the pty is stuck at
+            p.applied = (96, 23);
+            p.pty_since = start;
+        }
+        let settled = start + PTY_RESIZE_SETTLE;
+
+        let mut attempts = 0;
+        flush_pty_resizes_to(&mut st, settled, |_, _, _| {
+            attempts += 1;
+            false // the daemon has not registered the session yet
+        });
+        assert_eq!(attempts, 1);
+        assert_eq!(
+            st.active_tab().panes[0].pty,
+            (80, 24),
+            "a resize the session dropped must not be booked as delivered"
+        );
+
+        // Next tick, with the session now confirmed. `pty_since` is already past the settle
+        // window, so the retry needs no further wait.
+        flush_pty_resizes_to(&mut st, settled, |_, _, _| {
+            attempts += 1;
+            true
+        });
+        assert_eq!(attempts, 2, "the dropped resize is tried again");
+        assert_eq!(st.active_tab().panes[0].pty, (96, 23));
+
+        // And once it has landed, it stops being sent.
+        flush_pty_resizes_to(&mut st, settled + Duration::from_secs(5), |_, _, _| {
+            attempts += 1;
+            true
+        });
+        assert_eq!(attempts, 2, "a settled, delivered size is not resent");
     }
 
     /// A pane the pump has never laid out sits at (0, 0). That is "no size yet", not a grid,
@@ -2203,8 +2282,7 @@ mod pty_resize_tests {
     #[test]
     fn an_unlaid_out_pane_is_never_reported() {
         let mut st = fresh();
-        let m = mgr();
-        st.adopt_pane(&m, det("a"));
+        st.adopt_pane(&mgr(), det("a"));
         let start = Instant::now();
         {
             let p = &mut st.active_tab_mut().panes[0];
@@ -2212,7 +2290,12 @@ mod pty_resize_tests {
             p.applied = (0, 0);
             p.pty_since = start;
         }
-        flush_pty_resizes(&mut st, &m, start + Duration::from_secs(10));
+        let mut sent = 0;
+        flush_pty_resizes_to(&mut st, start + Duration::from_secs(10), |_, _, _| {
+            sent += 1;
+            true
+        });
+        assert_eq!(sent, 0);
         assert_eq!(st.active_tab().panes[0].pty, (47, 18));
     }
 }

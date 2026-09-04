@@ -3391,8 +3391,9 @@ impl App {
             // Plain mouse-wheel over a pane body. The TerminalPane emits `scroll-requested(x, y,
             // ±lines)`; paneview forwards it here as `pane-scroll`. (Ctrl+wheel is font-zoom.)
             // `TerminalPane::wheel` either moves our scrollback viewport (marks the grid dirty so
-            // the pump repaints) OR — in the alternate screen / a mouse-grabbing app like Claude
-            // Code — returns bytes (a wheel report or arrow keys) to forward to the pty.
+            // the pump repaints) OR — in the alternate screen / a mouse-grabbing app (vim, htop) —
+            // returns bytes (a wheel report or arrow keys) to forward to the pty. A program that
+            // does neither, as agent CLIs generally do not, relies entirely on the first path.
             let app = app.clone();
             let id = win.id;
             win.app.on_pane_scroll(move |i, x, y, d| {

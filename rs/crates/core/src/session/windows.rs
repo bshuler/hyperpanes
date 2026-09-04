@@ -586,7 +586,9 @@ impl Daemon {
                 }
             }
             ClientMsg::Write { uid, data } => self.sessions.write(&uid, &data),
-            ClientMsg::Resize { uid, cols, rows } => self.sessions.resize(&uid, cols, rows),
+            ClientMsg::Resize { uid, cols, rows } => {
+                self.sessions.resize(&uid, cols, rows);
+            }
             ClientMsg::Kill { uid } => {
                 self.sessions.kill(&uid);
                 self.cwds.lock().unwrap().remove(&uid);

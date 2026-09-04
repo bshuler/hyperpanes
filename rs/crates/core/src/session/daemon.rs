@@ -1229,7 +1229,9 @@ impl Daemon {
                     tracing::debug!("write to {uid} failed: {e}");
                 }
             }
-            ClientMsg::Resize { uid, cols, rows } => self.registry.resize(&uid, cols, rows),
+            ClientMsg::Resize { uid, cols, rows } => {
+                self.registry.resize(&uid, cols, rows);
+            }
             ClientMsg::Kill { uid } => {
                 tracing::info!(conn = conn_id, uid = %uid, "kill requested");
                 self.registry.kill(&uid);

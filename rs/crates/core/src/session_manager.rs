@@ -758,9 +758,11 @@ impl SessionRegistry {
         map.get(uid).map(|s| s.shared.liveness())
     }
 
-    /// Resize the pane (≥1×1) — both the pty grid and the live screen model.
+    /// Resize the pane (≥1×1) — both the pty grid and the live screen model. `false` when
+    /// the uid is unknown, so a caller that resized ahead of the spawn can retry rather than
+    /// record a delivery that silently went nowhere.
     #[tracing::instrument(level = "debug", ret, skip(self))]
-    pub fn resize(&self, uid: &str, cols: u16, rows: u16) {
+    pub fn resize(&self, uid: &str, cols: u16, rows: u16) -> bool {
         let cols = cols.max(1);
         let rows = rows.max(1);
         // Same discipline as `write`: never hold the registry lock across a pty call.
@@ -771,7 +773,9 @@ impl SessionRegistry {
             // advancing post-resize (which would wrap at the new width inconsistently).
             shared.sync_screen();
             shared.screen.lock().unwrap().resize(cols, rows);
+            return true;
         }
+        false
     }
 
     /// Kill the pane's pty and forget it. The natural-exit `Exit` event is suppressed
@@ -1103,9 +1107,11 @@ impl SessionManager {
         }
     }
 
-    /// Resize the pane (≥1×1) — both the pty grid and the live screen model.
+    /// Resize the pane (≥1×1) — both the pty grid and the live screen model. `false` when
+    /// the resize was dropped (unknown uid, or a daemon session not confirmed yet); the
+    /// caller should keep the size pending and try again rather than assume it landed.
     #[tracing::instrument(level = "debug", ret, skip(self))]
-    pub fn resize(&self, uid: &str, cols: u16, rows: u16) {
+    pub fn resize(&self, uid: &str, cols: u16, rows: u16) -> bool {
         match self {
             SessionManager::InProcess(r) => r.resize(uid, cols, rows),
             SessionManager::Daemon(d) => d.resize(uid, cols, rows),

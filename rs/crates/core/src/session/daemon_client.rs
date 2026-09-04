@@ -745,14 +745,50 @@ impl DaemonSessionManager {
         })
     }
 
-    /// Resize the pane — fire-and-forget.
+    /// Resize the pane. `true` once the request is on the wire to a session the daemon has
+    /// *confirmed*; `false` when it was dropped and the caller must try again.
+    ///
+    /// A resize stays fire-and-forget (a round-trip does not belong on a layout path), so
+    /// this is not an acknowledgement — but it does close the two ways a resize used to be
+    /// lost in silence. The daemon answers `Resize` with `registry.resize(&uid, ..)`, which
+    /// is a no-op for a uid it does not know; a pane opened through the control plane is
+    /// adopted and laid out by the GUI within a tick or two of `create`, well before the
+    /// daemon has confirmed the spawn, so its first resize lands on nothing. The caller then
+    /// recorded a delivery that never happened and never retried, leaving the pty at its
+    /// 80x24 spawn default for the life of the pane: the program paints inside the top-left
+    /// corner of a much larger grid, its cursor never reaches the last row, so nothing is
+    /// ever pushed into scrollback and the wheel has no history to scroll.
     #[tracing::instrument(level = "debug", ret, skip(self))]
-    pub fn resize(&self, uid: &str, cols: u16, rows: u16) {
-        let _ = self.send(&ClientMsg::Resize {
-            uid: uid.to_string(),
-            cols,
-            rows,
-        });
+    pub fn resize(&self, uid: &str, cols: u16, rows: u16) -> bool {
+        if !self.is_connected() {
+            return false;
+        }
+        let cols = cols.max(1);
+        let rows = rows.max(1);
+        // `pending` is exactly "created locally, not yet seen in a daemon snapshot" — the
+        // window in which the daemon would drop this.
+        if !matches!(self.shadows.lock().unwrap().get(uid), Some(s) if !s.pending) {
+            return false;
+        }
+        if self
+            .send(&ClientMsg::Resize {
+                uid: uid.to_string(),
+                cols,
+                rows,
+            })
+            .inspect_err(|_| self.note_disconnected())
+            .is_err()
+        {
+            return false;
+        }
+        // Keep the shadow honest. `dims` is what `/state` reports and what a re-attaching
+        // view seeds its grid with before replaying; it was previously frozen at the spawn
+        // size however often the pane was resized, which made this whole class of bug
+        // invisible to anything asking the control API what size a pane is.
+        if let Some(s) = self.shadows.lock().unwrap().get_mut(uid) {
+            s.dims = Some((cols, rows));
+        }
+        true
     }
 
     /// Kill the pane — fire-and-forget — and forget its shadow locally (the daemon
@@ -2172,6 +2208,106 @@ mod tests {
         );
 
         mgr2.kill("surv");
+    }
+
+    /// A resize that the daemon would drop must be reported as dropped, and one that lands
+    /// must move the shadow the control API reads.
+    ///
+    /// The daemon's `Resize` arm no-ops on a uid it does not know, so a caller resizing ahead
+    /// of the spawn got silence. `flush_pty_resizes` read that silence as success and never
+    /// tried again — which is how a control-spawned pane ends up rendering a big grid while
+    /// its program still believes it has 80x24, never scrolls, and never builds scrollback.
+    #[test]
+    fn a_resize_the_daemon_would_drop_is_reported_as_dropped() {
+        let socket = temp_socket("resize-dropped");
+        let _daemon = spawn_in_process(&socket).expect("daemon binds");
+        let (mgr, mut rx) = connect_manager(&socket);
+
+        assert!(
+            !mgr.resize("no-such-uid", 120, 40),
+            "a uid the daemon has never heard of must not be reported as resized"
+        );
+
+        mgr.create(SpawnOptions {
+            uid: "rd".into(),
+            shell: Some("/bin/sh".into()),
+            args: Some(vec!["-i".into()]),
+            cols: Some(80),
+            rows: Some(24),
+            ..Default::default()
+        })
+        .expect("create");
+        mgr.write("rd", "echo READY\n")
+            .expect("the marker reached the session");
+        assert!(
+            recv_event_until(&mut rx, Dur::from_secs(10), |e| {
+                matches!(e, SessionEvent::Data { uid, data, .. } if uid == "rd" && data.contains("READY"))
+            })
+            .is_some(),
+            "session should come up"
+        );
+
+        assert!(
+            mgr.resize("rd", 120, 40),
+            "a confirmed session accepts the resize"
+        );
+        assert_eq!(
+            mgr.dims("rd"),
+            Some((120, 40)),
+            "the shadow /state reads must follow the resize, not stay frozen at the spawn size"
+        );
+        mgr.kill("rd");
+    }
+
+    /// A resize sent over the daemon must reach the CHILD's `TIOCGWINSZ`, not just the
+    /// daemon's screen model. A break in this link is silent: the pane's local grid renders
+    /// at the real size while the program still believes it has the 80x24 spawn default. It
+    /// then paints inside the top-left corner, its cursor never reaches the last row, nothing
+    /// is ever pushed into scrollback, and the wheel has no history to scroll.
+    #[test]
+    fn a_resize_over_the_daemon_reaches_the_childs_winsize() {
+        let socket = temp_socket("resize-winsize");
+        let _daemon = spawn_in_process(&socket).expect("daemon binds");
+
+        let (mgr, mut rx) = connect_manager(&socket);
+        mgr.create(SpawnOptions {
+            uid: "rz".into(),
+            shell: Some("/bin/sh".into()),
+            args: Some(vec!["-i".into()]),
+            cols: Some(80),
+            rows: Some(24),
+            ..Default::default()
+        })
+        .expect("create");
+        mgr.write("rz", "echo READY\n")
+            .expect("the marker reached the session");
+        assert!(
+            recv_event_until(&mut rx, Dur::from_secs(10), |e| {
+                matches!(e, SessionEvent::Data { uid, data, .. } if uid == "rz" && data.contains("READY"))
+            })
+            .is_some(),
+            "session should come up"
+        );
+
+        mgr.resize("rz", 120, 40);
+        mgr.write("rz", "stty size\n")
+            .expect("the query reached the session");
+
+        // Output arrives in arbitrary chunks, so accumulate before matching.
+        let mut seen = String::new();
+        let got = recv_event_until(&mut rx, Dur::from_secs(10), |e| {
+            if let SessionEvent::Data { uid, data, .. } = e {
+                if uid == "rz" {
+                    seen.push_str(data);
+                }
+            }
+            seen.contains("40 120")
+        });
+        mgr.kill("rz");
+        assert!(
+            got.is_some(),
+            "the child's winsize must follow the resize; saw {seen:?}"
+        );
     }
 
     // ---- M2 re-attach: the SessionManager-level decision the GUI restore branches on ----
