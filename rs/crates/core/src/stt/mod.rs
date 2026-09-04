@@ -32,6 +32,7 @@
 //! and its model cache), [`backend`] (detection + argv construction) and [`dictation`] (the per-pane record → stop → transcribe state
 //! machine). This file holds only the persisted settings shape.
 
+pub mod archive;
 pub mod backend;
 pub mod dictation;
 pub mod native;

@@ -231,6 +231,10 @@ struct DictationOut {
     recorder: String,
     transcriber: String,
     recording_panes: Vec<String>,
+    /// Where finished recordings and their transcripts are kept. Reported so that
+    /// "the transcript was wrong" has an answer that does not require knowing the
+    /// layout of the state directory by heart.
+    kept_in: String,
 }
 
 #[derive(Serialize)]
@@ -266,6 +270,7 @@ async fn state(State(shared): State<Arc<Shared>>, headers: HeaderMap) -> Respons
             recorder: dictation.recorder,
             transcriber: dictation.transcriber,
             recording_panes: dictation.recording_panes,
+            kept_in: dictation.kept_in,
         },
     })
 }
@@ -1785,6 +1790,9 @@ async fn dictation_command(
                         "text": d.text,
                         "backend": d.backend,
                         "submitted": d.submitted,
+                        // Where the audio and this text were kept, so a caller that got a
+                        // transcript it does not believe has something to go back to.
+                        "kept": d.kept.as_ref().map(|p| p.display().to_string()),
                     }),
                 ),
                 Err(e) => jstatus(400, json!({ "error": e, "paneId": found.pane_id })),

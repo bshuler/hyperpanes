@@ -7,6 +7,7 @@
 //! `tokio::task::spawn_blocking` — so nothing about this file has to be async to be
 //! correct.
 
+use super::archive;
 use super::backend::{
     clean_transcript, detect_recorder, detect_transcriber, Recorder, StopKind, Transcriber,
 };
@@ -16,6 +17,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -57,9 +59,15 @@ struct Recording {
 pub struct Dictation {
     /// Pane id → its in-flight recording. A pane not present here is not recording.
     live: Mutex<HashMap<String, Recording>>,
-    /// Where WAVs are written. Runtime scratch: nothing here outlives a transcription.
+    /// Where a recording is captured to. Scratch, and per-recording: see [`Self::start`].
     dir: PathBuf,
+    /// Where a finished recording and its transcript are kept, by [`super::archive`].
+    archive: PathBuf,
 }
+
+/// Distinguishes one recording's scratch file from the next. See [`Dictation::start`] for
+/// why a per-pane name was not enough.
+static SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// What a finished dictation produced.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,15 +75,35 @@ pub struct Transcript {
     pub text: String,
     /// Which transcriber produced it, for the result the control API reports back.
     pub backend: &'static str,
+    /// Where the recording and this text were kept, so the caller can point the user at
+    /// their own words. `None` only when the archive could not be written.
+    pub kept: Option<PathBuf>,
 }
 
 impl Dictation {
+    /// Capture to `dir`, and keep finished recordings in `dir/kept`.
     #[tracing::instrument(level = "debug")]
     pub fn new(dir: PathBuf) -> Self {
+        let archive = dir.join("kept");
+        Self::new_with_archive(dir, archive)
+    }
+
+    /// Capture to `dir`, but keep finished recordings somewhere else — which is what the
+    /// real service does, because `dir` is a temporary directory that the OS is entitled
+    /// to empty and the whole point of the archive is that it survives.
+    #[tracing::instrument(level = "debug")]
+    pub fn new_with_archive(dir: PathBuf, archive: PathBuf) -> Self {
         Self {
             live: Mutex::new(HashMap::new()),
             dir,
+            archive,
         }
+    }
+
+    /// Where finished recordings and their transcripts are kept.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
+    pub fn archive_dir(&self) -> &Path {
+        &self.archive
     }
 
     /// Panes currently recording, for the read-model's mic indicator.
@@ -128,8 +156,18 @@ impl Dictation {
         super::whisper::prefetch(settings);
 
         std::fs::create_dir_all(&self.dir).map_err(|e| format!("dictation dir: {e}"))?;
-        let wav = self.dir.join(format!("{}.wav", sanitize(pane_id)));
-        let _ = std::fs::remove_file(&wav);
+        // Per *recording*, not per pane. A fixed per-pane path plus the `remove_file`
+        // that used to sit here is a way to lose most of a dictation: unlink leaves the
+        // running recorder writing happily to an inode that no longer has a name, the
+        // next recorder creates a fresh file at the same path, and the transcriber reads
+        // whichever one it finds — the tail of the recording rather than the whole of it,
+        // with nothing anywhere saying so. A name nothing else can claim makes that
+        // impossible rather than unlikely.
+        let wav = self.dir.join(format!(
+            "{}-{}.wav",
+            sanitize(pane_id),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
 
         let capture = if recorder == Recorder::Native {
             Capture::Native(native::start(&wav, MAX_RECORD)?)
@@ -174,10 +212,56 @@ impl Dictation {
         finish_recording(rec);
 
         let result = transcribe(&wav, elapsed, settings);
-        // The WAV is scratch either way: a failed transcription is not made better by
-        // leaving raw audio of the user on disk.
-        let _ = std::fs::remove_file(&wav);
-        result
+
+        // The one line that says which half of this pipeline is at fault. Held recording
+        // time against captured audio time answers "did the microphone hear all of it";
+        // captured audio against transcript length answers "did the model transcribe all
+        // of it"; and the caller logs what it managed to type. Cheap, and worth more than
+        // any amount of after-the-fact reasoning about a recording nobody kept.
+        let (bytes, seconds) = wav_size(&wav);
+        match &result {
+            Ok(t) => tracing::info!(
+                pane = %pane_id,
+                held_s = elapsed.as_secs_f32(),
+                audio_s = seconds,
+                wav_bytes = bytes,
+                chars = t.text.len(),
+                backend = t.backend,
+                "dictation transcribed"
+            ),
+            Err(e) => tracing::warn!(
+                pane = %pane_id,
+                held_s = elapsed.as_secs_f32(),
+                audio_s = seconds,
+                wav_bytes = bytes,
+                error = %e,
+                "dictation produced no transcript"
+            ),
+        }
+
+        // Both halves are kept, and a failure is kept hardest: a recording that produced
+        // nothing is the one someone will actually want to listen to.
+        let outcome = match &result {
+            Ok(t) => Ok(t.text.as_str()),
+            Err(e) => Err(e.as_str()),
+        };
+        let kept = archive::keep(&self.archive, &wav, &sanitize(pane_id), outcome);
+        if let Some(k) = &kept {
+            tracing::info!(wav = %k.wav.display(), text = %k.text.display(), "dictation kept");
+        }
+
+        match result {
+            Ok(t) => Ok(Transcript {
+                kept: kept.map(|k| k.text),
+                ..t
+            }),
+            // The error is what the user sees, so it is where the path has to go — being
+            // told the words are gone is very different from being told where they are.
+            Err(e) => Err(match kept {
+                Some(k) => format!("{e} — the recording was kept at {}", k.wav.display()),
+                None => e,
+            }),
+        }
     }
 
     /// Throw away `pane_id`'s recording without transcribing it — the pane closed, or the
@@ -190,7 +274,14 @@ impl Dictation {
         };
         let wav = rec.wav.clone();
         finish_recording(rec);
-        let _ = std::fs::remove_file(&wav);
+        // Kept too. A cancel is usually a closing pane, but it is also what happens when
+        // the app goes down mid-sentence, and that recording is not the app's to discard.
+        archive::keep(
+            &self.archive,
+            &wav,
+            &sanitize(pane_id),
+            Err("cancelled before transcription"),
+        );
     }
 
     /// Cancel every recording — process shutdown, so no recorder outlives the app.
@@ -286,7 +377,11 @@ fn transcribe(wav: &Path, elapsed: Duration, settings: &SttSettings) -> Result<T
         if text.is_empty() {
             return Err("no speech in the recording".to_string());
         }
-        return Ok(Transcript { text, backend });
+        return Ok(Transcript {
+            text,
+            backend,
+            kept: None,
+        });
     }
     // Unreachable from detection now that the in-process engine is the floor; what is
     // left is a `transcribeTemplate` that resolved to no runnable command.
@@ -307,7 +402,26 @@ fn transcribe(wav: &Path, elapsed: Duration, settings: &SttSettings) -> Result<T
     if text.is_empty() {
         return Err("no speech in the recording".to_string());
     }
-    Ok(Transcript { text, backend })
+    Ok(Transcript {
+        text,
+        backend,
+        kept: None,
+    })
+}
+
+/// Bytes on disk and seconds of audio in the header.
+///
+/// The two are reported together because only the pair is diagnostic: bytes alone cannot
+/// tell a five-second recording from a five-minute one that was captured at the wrong
+/// sample rate. Seconds is `None` for a file `hound` will not open, which is itself the
+/// answer when a recorder was killed before it wrote its length back into the header.
+#[tracing::instrument(level = "debug", ret)]
+fn wav_size(wav: &Path) -> (u64, Option<f32>) {
+    let bytes = std::fs::metadata(wav).map(|m| m.len()).unwrap_or(0);
+    let seconds = hound::WavReader::open(wav)
+        .ok()
+        .map(|r| r.duration() as f32 / r.spec().sample_rate.max(1) as f32);
+    (bytes, seconds)
 }
 
 /// Pane ids come from the control API, so they reach here unvalidated — keep the WAV name
@@ -354,6 +468,66 @@ mod tests {
         ]
     }
 
+    /// End to end over a real recording, with the real transcriber.
+    ///
+    /// The unit tests above use a recorder that writes zeros and a transcriber that echoes
+    /// a fixed string, which proves the plumbing and nothing about the audio. This one
+    /// stands in a genuine spoken WAV for the recorder's output and lets whisper.cpp
+    /// actually read it, because the failure that motivated the archive — two minutes of
+    /// speech arriving as four letters — is invisible to a fake on both ends.
+    ///
+    /// `HP_STT_WAV` is a mono 16 kHz WAV of someone talking:
+    /// `say -f words.txt -o t.aiff && afconvert -f WAVE -d LEI16@16000 -c 1 t.aiff t.wav`
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "needs HP_STT_WAV and runs the real model"]
+    fn a_real_recording_survives_the_whole_dictation_path() {
+        let src = std::env::var("HP_STT_WAV").expect("set HP_STT_WAV to a spoken wav file");
+        let src_seconds = wav_size(Path::new(&src)).1.expect("HP_STT_WAV is not a readable wav");
+
+        let dir = temp_dir("real");
+        let d = Dictation::new(dir.clone());
+        let s = SttSettings {
+            record_template: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!("cp {src} \"$1\"; sleep 30"),
+                "sh".into(),
+                "{wav}".into(),
+            ]),
+            ..Default::default()
+        };
+        d.start("p1", &s).unwrap();
+        wait_for_audio(&dir, "p1");
+        let t = d.stop("p1", &s).unwrap();
+
+        let kept = t.kept.expect("kept");
+        let audio = kept.with_extension("wav");
+        // The whole recording is kept, not a fragment of it: this is what the user is
+        // meant to be able to go back to.
+        let kept_seconds = wav_size(&audio).1.expect("kept audio is not a readable wav");
+        assert!(
+            (kept_seconds - src_seconds).abs() < 0.05,
+            "kept {kept_seconds}s of a {src_seconds}s recording"
+        );
+        // And the transcript is the length of a transcript, not of a stray last word. A
+        // hard number rather than "non-empty" is the point: non-empty is exactly what the
+        // four-letter failure was.
+        assert!(
+            t.text.split_whitespace().count() > (src_seconds as usize) / 2,
+            "{} words from {src_seconds}s of speech: {:?}",
+            t.text.split_whitespace().count(),
+            t.text
+        );
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), t.text);
+        eprintln!(
+            "kept {} ({kept_seconds:.1}s) + {} ({} words)",
+            audio.display(),
+            kept.display(),
+            t.text.split_whitespace().count()
+        );
+    }
+
     #[cfg(unix)]
     fn echo_transcriber(text: &str) -> Vec<String> {
         vec!["/bin/echo".into(), text.into()]
@@ -365,15 +539,32 @@ mod tests {
     /// the mic lights up immediately — but it means a test that stops on the next line
     /// would be measuring the spawn race, not the pipeline.
     #[cfg(unix)]
+    /// Wait for the pane's in-flight recording to hold real audio. Found by prefix, not
+    /// by an exact name: each recording gets its own numbered file.
     fn wait_for_audio(dir: &Path, pane_id: &str) {
-        let wav = dir.join(format!("{}.wav", sanitize(pane_id)));
+        let prefix = format!("{}-", sanitize(pane_id));
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if std::fs::metadata(&wav).map(|m| m.len()).unwrap_or(0) >= MIN_WAV_BYTES {
-                return;
+            if let Some(w) = scratch_wav(dir, &prefix) {
+                if std::fs::metadata(&w).map(|m| m.len()).unwrap_or(0) >= MIN_WAV_BYTES {
+                    return;
+                }
             }
             std::thread::sleep(POLL);
         }
+    }
+
+    /// The pane's scratch recording, if one is there.
+    fn scratch_wav(dir: &Path, prefix: &str) -> Option<PathBuf> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.extension().is_some_and(|x| x == "wav")
+                    && p.file_name()
+                        .is_some_and(|n| n.to_string_lossy().starts_with(prefix))
+            })
     }
 
     // ---- name sanitizing ----
@@ -490,8 +681,8 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_wav_never_outlives_the_transcription() {
-        let dir = temp_dir("cleanup");
+    fn a_dictation_leaves_the_recording_and_its_transcript_behind() {
+        let dir = temp_dir("keep");
         let d = Dictation::new(dir.clone());
         let s = SttSettings {
             record_template: Some(fake_recorder(8192)),
@@ -500,9 +691,102 @@ mod tests {
         };
         d.start("p1", &s).unwrap();
         wait_for_audio(&dir, "p1");
-        d.stop("p1", &s).unwrap();
-        let left: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
-        assert!(left.is_empty(), "recorded audio left on disk: {left:?}");
+        let t = d.stop("p1", &s).unwrap();
+
+        // The scratch copy is moved out, so a recording is never counted twice.
+        assert!(
+            scratch_wav(&dir, "p1-").is_none(),
+            "the scratch recording should have been moved into the archive"
+        );
+        // Both halves are there, and the transcript is the pasteable one the caller got.
+        let kept = t.kept.expect("the transcript should have been kept");
+        assert_eq!(std::fs::read_to_string(&kept).unwrap(), t.text);
+        assert!(kept.starts_with(d.archive_dir()));
+        assert!(
+            kept.with_extension("wav").exists(),
+            "the audio should be kept too"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_transcription_that_fails_still_keeps_the_audio_and_says_where() {
+        let dir = temp_dir("keepfail");
+        let d = Dictation::new(dir.clone());
+        let s = SttSettings {
+            record_template: Some(fake_recorder(8192)),
+            transcribe_template: Some(vec!["/bin/sh".into(), "-c".into(), "exit 1".into()]),
+            ..Default::default()
+        };
+        d.start("p1", &s).unwrap();
+        wait_for_audio(&dir, "p1");
+        let err = d.stop("p1", &s).unwrap_err();
+
+        // Being told the words are gone is very different from being told where they are.
+        assert!(
+            err.contains("kept at"),
+            "error should point at the recording: {err}"
+        );
+        let kept: Vec<_> = std::fs::read_dir(d.archive_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(kept.len(), 2, "audio and transcript: {kept:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cancelled_recording_is_kept_rather_than_thrown_away() {
+        let dir = temp_dir("keepcancel");
+        let d = Dictation::new(dir.clone());
+        let s = SttSettings {
+            record_template: Some(fake_recorder(8192)),
+            ..Default::default()
+        };
+        d.start("p1", &s).unwrap();
+        wait_for_audio(&dir, "p1");
+        d.cancel("p1");
+
+        assert!(scratch_wav(&dir, "p1-").is_none());
+        let kept: Vec<_> = std::fs::read_dir(d.archive_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "wav"))
+            .collect();
+        assert_eq!(kept.len(), 1, "the audio should still be there: {kept:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_second_recording_cannot_overwrite_the_first_ones_audio() {
+        // The shape of the bug this guards: a fixed per-pane path meant a restarted
+        // recorder wrote over the file the running one had open, and the transcriber read
+        // the tail. Two recordings, two names, no overlap.
+        let dir = temp_dir("uniq");
+        let d = Dictation::new(dir.clone());
+        let s = SttSettings {
+            record_template: Some(fake_recorder(8192)),
+            transcribe_template: Some(echo_transcriber("done")),
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            d.start("p1", &s).unwrap();
+            wait_for_audio(&dir, "p1");
+            d.stop("p1", &s).unwrap();
+        }
+        let wavs: Vec<_> = std::fs::read_dir(d.archive_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "wav"))
+            .collect();
+        assert_eq!(
+            wavs.len(),
+            2,
+            "each recording keeps its own audio: {wavs:?}"
+        );
     }
 
     #[cfg(unix)]

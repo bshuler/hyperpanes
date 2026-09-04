@@ -22,6 +22,8 @@ pub struct DictationStatus {
     pub recorder: String,
     pub transcriber: String,
     pub recording_panes: Vec<String>,
+    /// Where finished recordings and their transcripts are kept.
+    pub kept_in: String,
 }
 
 /// Owns dictation settings and every pane's recording state.
@@ -32,19 +34,30 @@ pub struct DictationService {
 }
 
 impl DictationService {
-    /// `settings_path` is `stt.json`'s path. Recordings are scratch and go to a
-    /// pid-scoped temp directory — never beside the settings, and never anywhere a
-    /// backup or a dotfile sync would pick up raw audio of the user.
+    /// `settings_path` is `stt.json`'s path.
+    ///
+    /// Capture goes to a pid-scoped temp directory, so two instances never share a
+    /// scratch file. The finished recording and its transcript then move to
+    /// `<state>/dictation`, which is the whole point: a transcript that came out wrong is
+    /// only fixable if the words are still somewhere the user can open and paste from,
+    /// and temp is not that place.
     #[tracing::instrument(level = "debug")]
     pub fn new(settings_path: PathBuf) -> Self {
         let settings = stt::load(&settings_path);
         let wav_dir =
             std::env::temp_dir().join(format!("hyperpanes-dictation-{}", std::process::id()));
+        let archive = crate::persistence::paths::state_dir().join("dictation");
         DictationService {
             settings_path,
             settings: Mutex::new(settings),
-            dictation: Dictation::new(wav_dir),
+            dictation: Dictation::new_with_archive(wav_dir, archive),
         }
+    }
+
+    /// Where finished recordings and their transcripts are kept.
+    #[tracing::instrument(level = "debug", ret, skip(self))]
+    pub fn archive_dir(&self) -> std::path::PathBuf {
+        self.dictation.archive_dir().to_path_buf()
     }
 
     #[tracing::instrument(level = "debug", ret, skip(self))]
@@ -130,6 +143,7 @@ impl DictationService {
                 .name()
                 .to_string(),
             recording_panes: self.dictation.recording_panes(),
+            kept_in: self.archive_dir().display().to_string(),
         }
     }
 }
@@ -139,6 +153,9 @@ pub struct Delivered {
     pub text: String,
     pub backend: &'static str,
     pub submitted: bool,
+    /// The kept transcript, for a caller that wants to tell the user where their words
+    /// are. `None` only when the archive could not be written.
+    pub kept: Option<PathBuf>,
 }
 
 /// Stop `pane_id`'s recording, transcribe it, and type the result into `uid`'s pty.
@@ -155,6 +172,16 @@ pub fn stop_and_deliver(shared: &Shared, pane_id: &str, uid: &str) -> Result<Del
         return Err("no speech in the recording".to_string());
     }
     let want_submit = shared.dictation.submit_after_insert();
+    // Paired with the `dictation transcribed` line: the transcript's length against what
+    // was handed to the pty is the difference between "the model lost it" and "the pane
+    // did". Sanitizing only ever replaces characters, so these should match.
+    tracing::info!(
+        pane = %pane_id,
+        transcript_chars = transcript.text.len(),
+        delivered_chars = text.len(),
+        submit = want_submit,
+        "delivering dictation to the pane"
+    );
     // The recording is already consumed by this point, so a failed write means the user's
     // speech is simply gone. Saying so is the only useful thing left to do — reporting a
     // successful delivery would leave them looking for words that were never typed.
@@ -173,6 +200,7 @@ pub fn stop_and_deliver(shared: &Shared, pane_id: &str, uid: &str) -> Result<Del
         text,
         backend: transcript.backend,
         submitted,
+        kept: transcript.kept,
     })
 }
 
@@ -234,6 +262,11 @@ mod tests {
         assert!(!s.recorder.is_empty());
         assert!(!s.transcriber.is_empty());
         assert!(s.recording_panes.is_empty());
+        assert!(
+            s.kept_in.ends_with("dictation"),
+            "recordings should be kept somewhere nameable: {}",
+            s.kept_in
+        );
     }
 
     #[test]

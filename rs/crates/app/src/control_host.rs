@@ -482,8 +482,13 @@ impl ControlHost {
         let uid = uid.to_string();
         std::thread::spawn(move || {
             let msg = match dictation_service::stop_and_deliver(&shared, &pane_id, &uid) {
-                Ok(d) if d.submitted => format!("Dictated + sent ({})", d.backend),
-                Ok(d) => format!("Dictated ({})", d.backend),
+                // The word count is in the toast on purpose: it is the one number that
+                // tells the user at a glance whether the pane got what they said, without
+                // reading the log or counting what appeared in the box.
+                Ok(d) if d.submitted => {
+                    format!("Dictated + sent ({}, {} words)", d.backend, words(&d.text))
+                }
+                Ok(d) => format!("Dictated ({}, {} words)", d.backend, words(&d.text)),
                 Err(e) => e,
             };
             if let Ok(mut q) = notices.lock() {
@@ -1517,6 +1522,16 @@ fn env_truthy(name: &str) -> bool {
     )
 }
 
+/// Words in a transcript, for the dictation toast.
+///
+/// Whitespace-separated and nothing cleverer: this is a magnitude, not a word count worth
+/// arguing about. Two minutes of speech reads as a few hundred; four letters reads as one,
+/// which is precisely the case that has to be visible without opening a log.
+#[tracing::instrument(level = "debug", ret)]
+fn words(text: &str) -> usize {
+    text.split_whitespace().count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1595,5 +1610,12 @@ mod tests {
         let model = model_with(vec![pane("ctl-1", "u-old")]);
         let lost = lost_control_panes(&ids, &model, &HashSet::new(), &|_| true);
         assert!(lost.is_empty(), "unexpected heal targets: {lost:?}");
+    }
+
+    #[test]
+    fn the_toast_counts_words_so_a_truncated_dictation_is_obvious() {
+        assert_eq!(words(""), 0);
+        assert_eq!(words("  them  "), 1);
+        assert_eq!(words("the recorder writes mono audio"), 5);
     }
 }

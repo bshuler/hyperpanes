@@ -128,7 +128,17 @@ fn state_is_byte_exact_over_a_real_socket() {
         !transcriber.is_empty(),
         "expected a transcriber name: {body}"
     );
-    assert_eq!(rest, r#","recordingPanes":[]}}"#, "unexpected body: {body}");
+    // `keptIn` is an absolute path under this machine's state directory, so like the
+    // backend names it is checked for shape rather than value.
+    let mid = r#","recordingPanes":[],"keptIn":""#;
+    assert!(rest.starts_with(mid), "unexpected body: {body}");
+    let rest = &rest[mid.len()..];
+    let (kept_in, rest) = rest.split_once('"').expect("unterminated archive path");
+    assert!(
+        kept_in.ends_with("dictation"),
+        "expected a dictation archive path: {body}"
+    );
+    assert_eq!(rest, "}}", "unexpected body: {body}");
 }
 
 #[test]
