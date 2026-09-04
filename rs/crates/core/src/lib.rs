@@ -31,5 +31,6 @@ pub mod shell_integration;
 pub mod single_instance;
 pub mod speech;
 pub mod stt;
+pub mod sync;
 pub mod tools;
 pub mod workspace;
