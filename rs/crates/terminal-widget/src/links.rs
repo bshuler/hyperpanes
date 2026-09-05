@@ -287,6 +287,75 @@ pub fn trim_trailing_punct(s: &str) -> &str {
     s.trim_end_matches(TRAIL)
 }
 
+/// True for the box-drawing, block, arrow, geometric and braille glyphs a TUI paints as chrome:
+/// the `⎿` opening a tool-result line, the `│` dividing two panels, a spinner, a nerd-font icon.
+///
+/// A filename may legally contain every one of these — the kernel bars only `/` and NUL — and in
+/// practice none ever does. That gap is what makes them worth testing: they are the cheapest
+/// evidence available that a row is *beginning* something rather than resuming a path the
+/// printing program cut in half, and the rejoin in the pane needs that answer before it is worth
+/// spending a `stat` on.
+#[tracing::instrument(level = "debug", ret)]
+pub fn is_terminal_furniture(ch: char) -> bool {
+    matches!(ch as u32,
+        0x2190..=0x21FF   // arrows
+        | 0x2300..=0x23FF // misc technical — `⎿` is U+23BF
+        | 0x2500..=0x257F // box drawing
+        | 0x2580..=0x259F // block elements
+        | 0x25A0..=0x25FF // geometric shapes
+        | 0x2800..=0x28FF // braille patterns (spinners)
+        | 0xE000..=0xF8FF // private use (nerd fonts)
+    )
+}
+
+/// True where a character may continue a path token: the boundaries [`tokenize`] splits on —
+/// whitespace and quotes — plus controls, which no path anyone means to open survives.
+#[tracing::instrument(level = "debug", ret)]
+fn continues_token(ch: char) -> bool {
+    !ch.is_whitespace() && ch != '"' && ch != '\'' && !ch.is_control()
+}
+
+/// The span of the LAST token of `text`, but only when `text` ends flush in a character that
+/// could continue a path.
+///
+/// `text` is one wrap-run of the grid, space-padded to the full width, so a line the program
+/// ended on its own terms ends in blanks and answers `None`. A line whose *final column* holds a
+/// path character is one the program had more to say about and broke anyway — the signature of a
+/// hard newline mid-path, and the only trace of it the grid keeps.
+#[tracing::instrument(level = "debug", ret)]
+pub fn trailing_path_fragment(text: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let last = *chars.last()?;
+    if !continues_token(last) || is_terminal_furniture(last) {
+        return None;
+    }
+    let end = chars.len();
+    let mut start = end;
+    while start > 0 && continues_token(chars[start - 1]) {
+        start -= 1;
+    }
+    Some((start, end))
+}
+
+/// The span of the FIRST token of `text`, past whatever indent the printing program uses to align
+/// its continuation lines under the first one.
+///
+/// `None` when that token opens with [`is_terminal_furniture`]: a row starting `⎿` or `│` is
+/// announcing something new, not finishing the path above it.
+#[tracing::instrument(level = "debug", ret)]
+pub fn leading_path_fragment(text: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let start = chars.iter().position(|c| continues_token(*c))?;
+    if is_terminal_furniture(chars[start]) {
+        return None;
+    }
+    let mut end = start;
+    while end < chars.len() && continues_token(chars[end]) {
+        end += 1;
+    }
+    Some((start, end))
+}
+
 /// A detected `http://`/`https://` URL and the column range it occupies on the row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UrlCandidate {
@@ -782,5 +851,71 @@ mod tests {
         assert_eq!(hashes("(a920101)"), ["a920101"]);
         assert_eq!(hashes("`febe69b`, then"), ["febe69b"]);
         assert_eq!(hashes("at 1a5bbd8."), ["1a5bbd8"]);
+    }
+
+    fn frag(text: &str, span: Option<(usize, usize)>) -> Option<String> {
+        let chars: Vec<char> = text.chars().collect();
+        span.map(|(a, b)| chars[a..b].iter().collect())
+    }
+
+    #[test]
+    fn a_row_that_ends_flush_in_a_path_hands_back_its_last_token() {
+        // 40 columns wide, and the path is still going when the column runs out.
+        let row = "  ⎿  Read ../../../private/tmp/claude-501";
+        assert_eq!(
+            frag(row, trailing_path_fragment(row)).as_deref(),
+            Some("../../../private/tmp/claude-501")
+        );
+    }
+
+    #[test]
+    fn a_row_the_program_ended_on_its_own_terms_hands_back_nothing() {
+        // The grid pads every row to the full width, so a line with anything left to say is the
+        // only kind that reaches the last column with a path character in it.
+        assert_eq!(
+            trailing_path_fragment("  ⎿  Read src/main.rs            "),
+            None
+        );
+        assert_eq!(trailing_path_fragment(""), None);
+    }
+
+    #[test]
+    fn a_row_ending_in_chrome_is_not_a_severed_path() {
+        assert_eq!(trailing_path_fragment("│ src/main.rs        ⎿"), None);
+        assert_eq!(trailing_path_fragment("building ⠋"), None);
+        assert_eq!(trailing_path_fragment("──────"), None);
+    }
+
+    #[test]
+    fn a_continuation_row_hands_back_its_first_token_past_the_indent() {
+        let row = "     -14e8-4982-b389/scratchpad/coverage.py (163 lines)";
+        assert_eq!(
+            frag(row, leading_path_fragment(row)).as_deref(),
+            Some("-14e8-4982-b389/scratchpad/coverage.py")
+        );
+    }
+
+    #[test]
+    fn a_row_that_opens_with_chrome_is_starting_something_not_finishing_it() {
+        // `⎿` opens a fresh tool result. Whatever the row above left dangling, this is not it.
+        assert_eq!(leading_path_fragment("  ⎿  Referenced file a/b.md"), None);
+        assert_eq!(leading_path_fragment("  │  more output"), None);
+        assert_eq!(leading_path_fragment("       "), None);
+    }
+
+    #[test]
+    fn a_quote_ends_a_fragment_on_either_side() {
+        // `tokenize` treats quotes as boundaries; the fragment scans must agree with it or a
+        // rejoin would glue a path to the string that followed it.
+        let head = "cp \"a/b/c";
+        assert_eq!(
+            frag(head, trailing_path_fragment(head)).as_deref(),
+            Some("a/b/c")
+        );
+        let tail = "  d/e.txt\" done";
+        assert_eq!(
+            frag(tail, leading_path_fragment(tail)).as_deref(),
+            Some("d/e.txt")
+        );
     }
 }

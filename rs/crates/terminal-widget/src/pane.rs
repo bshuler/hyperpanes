@@ -25,7 +25,8 @@ use crate::font::Font;
 use crate::grid::TermGrid;
 use crate::links::{
     extract_commit_candidates, extract_path_candidates, extract_url_candidates, is_path_root,
-    trim_trailing_punct, PathCandidate, UrlCandidate,
+    leading_path_fragment, trailing_path_fragment, trim_trailing_punct, PathCandidate,
+    UrlCandidate,
 };
 use crate::render::{PaneRenderer, RenderOpts};
 use crate::search::{self, Match};
@@ -178,7 +179,37 @@ pub enum LinkAction {
 /// What [`TerminalPane::locate`] found under the pointer: the resolved token, its `line` /
 /// `col` suffixes, the grid `(line, start col, end col)` it spans, and the surface x/y it was
 /// hit at.
-type Located = (ResolveResult, Option<u32>, Option<u32>, usize, usize, usize, f32, f32);
+type Located = (
+    ResolveResult,
+    Option<u32>,
+    Option<u32>,
+    usize,
+    usize,
+    usize,
+    f32,
+    f32,
+);
+
+/// One wrap-run of the grid contributing a slice to a path its printing program broke apart:
+/// the run's first row, how many rows it spans, and the char span within that run's joined text
+/// — the coordinates [`TerminalPane::row_segment`] takes.
+#[derive(Debug, Clone, Copy)]
+struct Piece {
+    first: usize,
+    rows: usize,
+    start: usize,
+    end: usize,
+}
+
+/// A path reassembled out of several [`Piece`]s, with whatever `:line:col` suffix the joined
+/// text turned out to be carrying.
+#[derive(Debug)]
+struct Rejoined {
+    path: String,
+    line: Option<u32>,
+    col: Option<u32>,
+    pieces: Vec<Piece>,
+}
 
 impl TerminalPane {
     /// Create a pane of `cols`×`rows` cells driving the given renderer. Use
@@ -472,17 +503,35 @@ impl TerminalPane {
         }
 
         // A candidate that runs to the last column of a run that does NOT wrap was cut off by
-        // the program that printed it — it chose its own line width and emitted a hard newline
-        // mid-path — and nothing in the grid records what came after. The danger is not the
-        // missing link, it is that the surviving prefix can be a real directory: hovering
-        // `/System/Volumes/Data` broken at the edge would offer to open `/System/Volumes`, and
-        // a link that opens the wrong thing is worse than no link at all. So: refuse.
+        // the program that printed it: it chose its own line width and emitted a hard newline
+        // mid-path, so alacritty recorded no `WRAPLINE` and `logical_line` had nothing to join
+        // on. The rest of the path is still on screen — it is simply on a line the grid says is
+        // unrelated. `join_hard_wraps` goes and gets it.
+        //
+        // What must not happen is the tempting halfway house of linking the surviving prefix:
+        // `/System/Volumes/Data` broken at the edge would offer to open `/System/Volumes`, which
+        // exists, and a link that opens the wrong thing is worse than no link at all. So when the
+        // rejoin fails to find something real, the old refusal stands.
+        let text_len = text.chars().count();
         let run_rows = text.chars().count() / snap.cols.max(1);
-        if cand.end >= text.chars().count()
-            && run_rows > 0
-            && !self.grid.row_wraps(first + run_rows - 1)
-        {
-            return None;
+        let cut_at_end =
+            cand.end >= text_len && run_rows > 0 && !self.grid.row_wraps(first + run_rows - 1);
+        // The mirror case: the pointer is on a continuation row, whose fragment opens the run
+        // because the indent is all that precedes it. The head is above.
+        let cut_before = text.chars().take(cand.start).all(char::is_whitespace)
+            && first > 0
+            && !self.grid.row_wraps(first - 1)
+            && self
+                .logical_line(&snap, first - 1, 0)
+                .is_some_and(|(above, _, _)| trailing_path_fragment(&above).is_some());
+        if cut_at_end || cut_before {
+            if let Some(j) = self.join_hard_wraps(&snap, &text, &cand, first, run_rows, cut_at_end)
+            {
+                return self.located(j, row, snap.cols, cell_w, cell_h);
+            }
+            if cut_at_end {
+                return None;
+            }
         }
 
         let key = self.cache_key(&cand.path);
@@ -513,6 +562,177 @@ impl TerminalPane {
         Some((
             resolved, cand.line, cand.col, start, end, row, cell_w, cell_h,
         ))
+    }
+
+    /// A backstop, not the limiter. [`Self::viable_prefix`] ends nearly every hopeless search
+    /// after a single `stat`; this only bounds the pathological screen where every row keeps a
+    /// live directory prefix alive.
+    const MAX_JOIN_ROWS: usize = 32;
+
+    /// Is it still worth appending another row to `partial`?
+    ///
+    /// Everything up to the last separator is committed — no continuation can change it — so if
+    /// that directory does not exist, nothing appended to `partial` will ever name a real file.
+    /// One `stat` per row buys the right to abandon the search instead of walking the screen.
+    fn viable_prefix(&self, partial: &str) -> bool {
+        match partial.rfind(['/', '\\']) {
+            None | Some(0) => true,
+            Some(i) => paths::resolve_path(self.cwd.as_deref(), &partial[..i]).exists,
+        }
+    }
+
+    /// Does `joined` name something that exists? Hands back the normalized candidate along with
+    /// how many characters [`extract_path_candidates`] trimmed off each end, so the underline can
+    /// be pulled back off punctuation that was never part of the path.
+    fn accept_joined(&self, joined: &str) -> Option<(PathCandidate, usize, usize)> {
+        let cand = extract_path_candidates(joined).into_iter().next()?;
+        if !paths::resolve_path(self.cwd.as_deref(), &cand.path).exists {
+            return None;
+        }
+        let back = joined.chars().count().saturating_sub(cand.end);
+        let front = cand.start;
+        Some((cand, front, back))
+    }
+
+    /// Reassemble a path the printing program cut across several rows with hard newlines.
+    ///
+    /// Walks up while the fragment in hand opens its run and the run above ends flush, then down
+    /// while each run keeps ending flush — as many rows as it takes. The search is bounded from
+    /// the front rather than by a row count: the moment the committed directory prefix fails to
+    /// exist, no continuation can rescue it and the walk stops.
+    ///
+    /// Existence is only *claimed* once, at the end, when the text stops being severed. Accepting
+    /// the first joined prefix that happens to exist would put `/System/Volumes` back on screen.
+    #[tracing::instrument(level = "debug", ret, skip(self, snap, text))]
+    fn join_hard_wraps(
+        &self,
+        snap: &crate::grid::GridSnapshot,
+        text: &str,
+        cand: &PathCandidate,
+        first: usize,
+        run_rows: usize,
+        cut_at_end: bool,
+    ) -> Option<Rejoined> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut joined: String = chars.get(cand.start..cand.end)?.iter().collect();
+        let mut pieces = vec![Piece {
+            first,
+            rows: run_rows.max(1),
+            start: cand.start,
+            end: cand.end,
+        }];
+
+        let mut opens = chars[..cand.start].iter().all(|c| c.is_whitespace());
+        while opens && pieces[0].first > 0 && pieces.len() < Self::MAX_JOIN_ROWS {
+            let above = pieces[0].first - 1;
+            if self.grid.row_wraps(above) {
+                break; // a soft wrap — `logical_line` would already have joined it
+            }
+            let Some((atext, _, afirst)) = self.logical_line(snap, above, 0) else {
+                break;
+            };
+            let Some((s, e)) = trailing_path_fragment(&atext) else {
+                break;
+            };
+            let ac: Vec<char> = atext.chars().collect();
+            joined.insert_str(0, &ac[s..e].iter().collect::<String>());
+            pieces.insert(
+                0,
+                Piece {
+                    first: afirst,
+                    rows: above - afirst + 1,
+                    start: s,
+                    end: e,
+                },
+            );
+            opens = ac[..s].iter().all(|c| c.is_whitespace());
+        }
+
+        let mut cut = cut_at_end;
+        loop {
+            if !cut {
+                let (c, front, back) = self.accept_joined(&joined)?;
+                return Some(Self::trimmed(c, pieces, front, back));
+            }
+            if pieces.len() >= Self::MAX_JOIN_ROWS || !self.viable_prefix(&joined) {
+                return None;
+            }
+            let last = pieces.last()?;
+            let next = last.first + last.rows;
+            if next >= snap.rows {
+                return None;
+            }
+            let (ntext, _, nfirst) = self.logical_line(snap, next, 0)?;
+            let (s, e) = leading_path_fragment(&ntext)?;
+            let nc: Vec<char> = ntext.chars().collect();
+            joined.push_str(&nc[s..e].iter().collect::<String>());
+            pieces.push(Piece {
+                first: nfirst,
+                rows: (nc.len() / snap.cols.max(1)).max(1),
+                start: s,
+                end: e,
+            });
+            cut = e >= nc.len();
+        }
+    }
+
+    /// Pull the underline in off whatever punctuation `links` trimmed, spending each trim against
+    /// the pieces from the outside in, and drop any piece left with nothing to draw.
+    fn trimmed(cand: PathCandidate, mut pieces: Vec<Piece>, front: usize, back: usize) -> Rejoined {
+        let mut front = front;
+        for p in pieces.iter_mut() {
+            let take = front.min(p.end - p.start);
+            p.start += take;
+            front -= take;
+            if front == 0 {
+                break;
+            }
+        }
+        let mut back = back;
+        for p in pieces.iter_mut().rev() {
+            let take = back.min(p.end - p.start);
+            p.end -= take;
+            back -= take;
+            if back == 0 {
+                break;
+            }
+        }
+        pieces.retain(|p| p.end > p.start);
+        Rejoined {
+            path: cand.path,
+            line: cand.line,
+            col: cand.col,
+            pieces,
+        }
+    }
+
+    /// Turn a rejoined path into the hit for the row actually under the pointer: every piece
+    /// carries the same destination, only the underline differs.
+    fn located(
+        &mut self,
+        j: Rejoined,
+        row: usize,
+        cols: usize,
+        cell_w: f32,
+        cell_h: f32,
+    ) -> Option<Located> {
+        let p = *j
+            .pieces
+            .iter()
+            .find(|p| row >= p.first && row < p.first + p.rows)?;
+        let key = self.cache_key(&j.path);
+        let resolved = match self.verified.get(&key) {
+            Some(hit) => hit.clone(),
+            None => {
+                // Only reached once the join has proved the path exists, so this is a hit and
+                // caching it is safe.
+                let r = paths::resolve_path(self.cwd.as_deref(), &j.path);
+                self.verified.insert(key, r.clone());
+                r
+            }
+        };
+        let (start, end) = Self::row_segment(p.start, p.end, row, p.first, cols);
+        Some((resolved, j.line, j.col, start, end, row, cell_w, cell_h))
     }
 
     /// Grow `cand` across single spaces, in both directions, while the result keeps naming a
@@ -1923,7 +2143,11 @@ fn hard_row_offset(rows: &[HardRow], lo: i32, line: i32, col: usize) -> i32 {
     let mut acc: i32 = 0;
     for (k, r) in rows.iter().enumerate().take(idx) {
         // A terminal soft-wrap continues at column 0 of the next row.
-        let start = if k > 0 && rows[k - 1].wraps { 0 } else { r.start };
+        let start = if k > 0 && rows[k - 1].wraps {
+            0
+        } else {
+            r.start
+        };
         if r.wraps {
             acc += (r.shape.right_limit.max(start) - start) as i32;
         } else {
@@ -1935,7 +2159,11 @@ fn hard_row_offset(rows: &[HardRow], lo: i32, line: i32, col: usize) -> i32 {
         }
     }
     let r = &rows[idx];
-    let start = if idx > 0 && rows[idx - 1].wraps { 0 } else { r.start };
+    let start = if idx > 0 && rows[idx - 1].wraps {
+        0
+    } else {
+        r.start
+    };
     acc + (col.clamp(start, r.end.max(start)) - start) as i32
 }
 
@@ -2040,9 +2268,10 @@ mod tests {
     }
 
     /// A path the printing program broke across lines itself leaves a prefix that can be a real
-    /// directory. Offering it would open the wrong thing; the honest answer is no link.
+    /// directory. The rest of it is still on screen, one row down, so go and get it — and when
+    /// that fails, the prefix must never stand in for the whole.
     #[test]
-    fn a_path_cut_off_by_a_hard_wrap_offers_no_link_at_all() {
+    fn a_path_cut_off_by_a_hard_wrap_is_rejoined_or_refused_never_truncated() {
         let dir = std::env::temp_dir().join(format!("hp_pane_cut_{}", std::process::id()));
         std::fs::create_dir_all(dir.join("Volumes").join("Data")).unwrap();
 
@@ -2052,12 +2281,98 @@ mod tests {
         wide.feed("xxx ./Volumes");
         assert!(wide.link_at(6.5, 0.5, 20.0, 3.0).is_some());
 
-        // Same text in a pane exactly its width, with the rest on a line of its own: the run
-        // does not wrap, so `./Volumes` is a fragment and must not stand in for `./Volumes/Data`.
+        // Same text in a pane exactly its width, with the rest on a line of its own. The run
+        // does not wrap, so the grid says the halves are unrelated -- but `/Data` is right there
+        // and `./Volumes/Data` exists, so the link is the whole path, from either half.
         let mut tight = unit_pane(13, 3);
         tight.set_cwd(Some(dir.to_string_lossy().into_owned()));
         tight.feed("xxx ./Volumes\r\n/Data");
-        assert!(tight.link_at(6.5, 0.5, 13.0, 3.0).is_none());
+        let head = tight
+            .link_at(6.5, 0.5, 13.0, 3.0)
+            .expect("the severed head should link");
+        assert!(head.abs_path.ends_with("Volumes/Data"), "{}", head.abs_path);
+        assert_eq!((head.x, head.w), (4.0, 9.0), "underline covers `./Volumes`");
+        let tail = tight
+            .link_at(2.5, 1.5, 13.0, 3.0)
+            .expect("the continuation should link to the same file");
+        assert_eq!(tail.abs_path, head.abs_path);
+        assert_eq!((tail.x, tail.w), (0.0, 5.0), "underline covers `/Data`");
+
+        // The `/System/Volumes` hazard, which is the whole reason this is delicate: when the
+        // rejoin does not land on something real, the answer stays no link. Never the prefix.
+        let mut wrong = unit_pane(13, 3);
+        wrong.set_cwd(Some(dir.to_string_lossy().into_owned()));
+        wrong.feed("xxx ./Volumes\r\n/Nope");
+        assert!(wrong.link_at(6.5, 0.5, 13.0, 3.0).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The case from the field: Claude Code hard-wraps its own transcript and indents the
+    /// continuation, so a long relative path arrives in three unrelated-looking pieces.
+    #[test]
+    fn a_path_hard_wrapped_across_three_rows_links_from_any_of_them() {
+        let dir = std::env::temp_dir().join(format!("hp_pane_rejoin3_{}", std::process::id()));
+        let rel = "scratchpad/reports/G2-misc-second-half.md";
+        std::fs::create_dir_all(dir.join("scratchpad/reports")).unwrap();
+        std::fs::write(dir.join(rel), b"hi").unwrap();
+
+        let cols = 20;
+        let mut p = unit_pane(cols, 5);
+        p.set_cwd(Some(dir.to_string_lossy().into_owned()));
+        // Row 0 fills the last column and breaks; rows 1 and 2 are indented continuations.
+        p.feed(&format!(
+            "Read {}\r\n  {}\r\n  {}",
+            &rel[..15],
+            &rel[15..33],
+            &rel[33..]
+        ));
+        let (w, h) = (cols as f32, 5.0);
+        let want = dir.join(rel).to_string_lossy().into_owned();
+
+        for (label, x, y, ux, uw) in [
+            ("head", 7.5, 0.5, 5.0, 15.0),
+            ("middle", 5.5, 1.5, 2.0, 18.0),
+            ("tail", 4.5, 2.5, 2.0, 8.0),
+        ] {
+            let hit = p
+                .link_at(x, y, w, h)
+                .unwrap_or_else(|| panic!("{label} row should link"));
+            assert_eq!(hit.abs_path, want, "{label}");
+            assert!(hit.exists, "{label}");
+            assert_eq!((hit.x, hit.w), (ux, uw), "{label} underline");
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A row that opens with a TUI's own box-drawing is announcing a new line, not finishing the
+    /// one above. Gluing the two together would invent a path nobody printed.
+    #[test]
+    fn a_continuation_row_that_starts_with_chrome_is_not_joined() {
+        let dir = std::env::temp_dir().join(format!("hp_pane_chrome_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Volumes").join("Data")).unwrap();
+
+        let mut p = unit_pane(13, 3);
+        p.set_cwd(Some(dir.to_string_lossy().into_owned()));
+        p.feed("xxx ./Volumes\r\n\u{23bf} /Data");
+        assert!(p.link_at(6.5, 0.5, 13.0, 3.0).is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The stopping rule: once the committed directory prefix is known not to exist, no
+    /// continuation can rescue it, so the walk gives up instead of reading the rest of the pane.
+    #[test]
+    fn a_cut_path_under_a_missing_directory_stops_looking() {
+        let dir = std::env::temp_dir().join(format!("hp_pane_prune_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut p = unit_pane(13, 4);
+        p.set_cwd(Some(dir.to_string_lossy().into_owned()));
+        // `./ghostdir` does not exist, so `./ghostdir/x/y.txt` cannot either.
+        p.feed("xxx ./ghostdir\r\n/x\r\n/y.txt");
+        assert!(p.link_at(6.5, 0.5, 13.0, 4.0).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2834,7 +3149,13 @@ mod tests {
         let s = HardRowShape::of(&"│ > hello   │".chars().collect::<Vec<_>>(), 13);
         assert_eq!(
             s,
-            HardRowShape { bordered: true, marker: true, text_start: 4, text_end: 9, right_limit: 12 }
+            HardRowShape {
+                bordered: true,
+                marker: true,
+                text_start: 4,
+                text_end: 9,
+                right_limit: 12
+            }
         );
         let s = HardRowShape::of(&"  plain".chars().collect::<Vec<_>>(), 7);
         assert!(!s.bordered && !s.marker);
